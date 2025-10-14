@@ -32,7 +32,7 @@ class UserMessage(BaseMessage):
     """User message to agent."""
 
     type: Literal["user_message"] = "user_message"
-    content: str = Field(..., description="User message content")
+    message: str = Field(..., description="User message content")
 
 
 class ToolResult(BaseMessage):
