@@ -1,10 +1,10 @@
 {
   "current_mode": "design",
   "project": "fl_js",
-  "task": "settings_tab_feature_designed",
+  "task": "evaluate import pattern options",
   "architecture": "FastAPI+WS backend with PydanticAI + FastMCP, JS chat sidebar client, realtime tool callbacks",
   "project_status": "new project inspired by legacy FL_JS/FL_WF_Agent",
-  "focus": "comprehensive feature plan for .env configuration UI",
+  "focus": "choosing between relative imports vs package imports for ComfyUI custom node",
   "plans_created": "6 detailed implementation plans + summary",
   "next_step": "create backend directory structure and config files",
   "ui_integration": "app.extensionManager.registerSidebarTab",
@@ -52,5 +52,6 @@
     "backend/server.py",
     "web/js/extension.js"
   ],
-  "features_designed": "start_button, settings_tab"
+  "features_designed": "start_button, settings_tab",
+  "issue_location": "__init__.py line 33 and server.py line 373"
 }
