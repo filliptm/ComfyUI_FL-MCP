@@ -8,11 +8,11 @@ from typing import Any
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
-from backend.config import settings
-from backend.websocket import manager
-from backend.callback_router import CallbackRouter, current_session_id
-from backend.agent import agent_manager
-from backend.models import (
+from config import settings
+from websocket import manager
+from callback_router import CallbackRouter, current_session_id
+from agent import agent_manager
+from models import (
     Handshake,
     UserMessage,
     ToolResult,
