@@ -9,9 +9,9 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
 from config import settings
-from websocket import manager
+from .websocket import manager
 from callback_router import CallbackRouter, current_session_id
-from agent import agent_manager
+from .agent import agent_manager
 from models import (
     Handshake,
     UserMessage,
@@ -55,7 +55,7 @@ async def lifespan(app: FastAPI):  # type: ignore
     logger.info("Callback router initialized")
     
     # Initialize MCP server with callback router
-    from backend.mcp_server import set_callback_router
+    from mcp_server import set_callback_router
     set_callback_router(callback_router)
     logger.info("MCP server configured with callback router")
     
