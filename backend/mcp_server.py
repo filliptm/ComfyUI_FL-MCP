@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Optional, Union
 from fastmcp import FastMCP
 from pydantic import Field
 
-from backend.models import WorkflowQuery
+from models import WorkflowQuery
 
 logger = logging.getLogger(__name__)
 

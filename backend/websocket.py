@@ -5,7 +5,7 @@ from typing import Dict, Optional
 from datetime import datetime, timedelta
 import logging
 
-from backend.models import (
+from models import (
     HandshakeAck,
     Pong,
     ErrorMessage,
