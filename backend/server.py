@@ -269,8 +269,8 @@ async def handle_user_message(session_id: str, data: dict[str, Any]) -> None:
         await manager.send_message(session_id, {
             "type": "agent_response",
             "session_id": session_id,
-            "message": response.message,
-            "tool_calls": response.tool_calls,
+            "message": response.output,
+            "tool_calls": response.new_messages_json(),
             "is_final": True,
         })
         
