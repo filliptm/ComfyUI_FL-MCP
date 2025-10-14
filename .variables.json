@@ -45,9 +45,14 @@
     ".env.example",
     "README.md"
   ],
-  "phase_2_step": "2_fl_api_wrapper",
+  "phase_2_step": "complete",
   "analysis_complete": "true",
   "files_completed": [
-    "backend/callback_router.py"
+    "backend/callback_router.py",
+    "web/js/fl_api.js",
+    "web/js/tool_executor.js",
+    "backend/mcp_server.py",
+    "backend/server.py",
+    "web/js/extension.js"
   ]
 }

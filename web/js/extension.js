@@ -12,6 +12,7 @@
 import { app } from "../../scripts/app.js";
 import SessionManager from "./session_manager.js";
 import WSClient from "./ws_client.js";
+import { ToolExecutor } from "./tool_executor.js";
 
 app.registerExtension({
     name: "fl_js.agentic_system",
@@ -32,6 +33,10 @@ app.registerExtension({
                 heartbeatInterval: 30000,
                 maxReconnectAttempts: 5,
             });
+            
+            // Initialize tool executor
+            const toolExecutor = new ToolExecutor(wsClient);
+            console.log("[FL_JS] Tool executor initialized");
             
             // Set up event handlers
             wsClient.onConnect = () => {
@@ -54,9 +59,10 @@ app.registerExtension({
                 // TODO: Display in chat UI (Phase 4)
             };
             
-            wsClient.onToolRequest = (message) => {
+            wsClient.onToolRequest = async (message) => {
                 console.log("[FL_JS] Tool request received:", message.tool_name);
-                // TODO: Execute tool (Phase 2)
+                // Execute tool via tool executor
+                await toolExecutor.executeToolRequest(message);
             };
             
             wsClient.onTypingIndicator = (message) => {
@@ -78,6 +84,7 @@ app.registerExtension({
             window.FL_JS = {
                 sessionManager,
                 wsClient,
+                toolExecutor,
                 app,
                 version: '0.1.5',
             };

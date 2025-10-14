@@ -10,6 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from backend.config import settings
 from backend.websocket import manager
+from backend.callback_router import CallbackRouter, current_session_id
 from backend.models import (
     Handshake,
     UserMessage,
@@ -23,6 +24,9 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+# Global callback router instance
+callback_router: CallbackRouter | None = None
 
 
 # Background tasks
@@ -38,10 +42,21 @@ async def cleanup_task() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):  # type: ignore
     """Application lifespan manager."""
+    global callback_router
+    
     # Startup
     logger.info("Starting FL_JS backend server")
     logger.info(f"LLM Provider: {settings.llm_provider}")
     logger.info(f"LLM Model: {settings.llm_model}")
+    
+    # Initialize callback router
+    callback_router = CallbackRouter(manager, default_timeout=30.0)
+    logger.info("Callback router initialized")
+    
+    # Initialize MCP server with callback router
+    from backend.mcp_server import set_callback_router
+    set_callback_router(callback_router)
+    logger.info("MCP server configured with callback router")
     
     # Start background tasks
     cleanup_task_handle = asyncio.create_task(cleanup_task())
@@ -92,6 +107,7 @@ async def health() -> dict[str, Any]:
         "status": "healthy",
         "active_connections": manager.get_active_session_count(),
         "total_sessions": manager.get_total_session_count(),
+        "pending_callbacks": callback_router.get_pending_count() if callback_router else 0,
     }
 
 
@@ -198,12 +214,18 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     except WebSocketDisconnect:
         if session_id:
             manager.disconnect(session_id)
+            # Cancel any pending callbacks for this session
+            if callback_router:
+                callback_router.cancel_pending_callbacks(session_id)
             logger.info(f"Session {session_id} disconnected")
     
     except Exception as e:
         logger.error(f"Error in WebSocket connection: {e}", exc_info=True)
         if session_id:
             manager.disconnect(session_id)
+            # Cancel any pending callbacks for this session
+            if callback_router:
+                callback_router.cancel_pending_callbacks(session_id)
             await manager.send_error(
                 session_id,
                 "INTERNAL_ERROR",
@@ -238,6 +260,9 @@ async def handle_user_message(session_id: str, data: dict[str, Any]) -> None:
         message = UserMessage(**data)
         logger.info(f"User message from {session_id}: {message.content[:50]}...")
         
+        # Set session context for tool callbacks
+        current_session_id.set(session_id)
+        
         # TODO: Process with agent
         # For now, just echo back
         await manager.send_message(session_id, {
@@ -255,6 +280,9 @@ async def handle_user_message(session_id: str, data: dict[str, Any]) -> None:
             "Failed to process message",
             {"error": str(e)},
         )
+    finally:
+        # Clear session context
+        current_session_id.set(None)
 
 
 async def handle_tool_result(session_id: str, data: dict[str, Any]) -> None:
@@ -266,13 +294,22 @@ async def handle_tool_result(session_id: str, data: dict[str, Any]) -> None:
     """
     try:
         result = ToolResult(**data)
-        logger.info(
-            f"Tool result from {session_id}: {result.tool_name} "
+        logger.debug(
+            f"Tool result from {session_id}: request_id={result.request_id} "
             f"({'success' if result.success else 'failed'})"
         )
         
-        # TODO: Route to callback_router
-        pass
+        # Route to callback router
+        if callback_router:
+            await callback_router.handle_tool_result(
+                request_id=result.request_id,
+                success=result.success,
+                data=result.data,
+                error=result.error,
+                execution_time_ms=result.execution_time_ms
+            )
+        else:
+            logger.error("Callback router not initialized, cannot handle tool result")
     
     except Exception as e:
         logger.error(f"Error handling tool result: {e}", exc_info=True)
