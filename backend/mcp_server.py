@@ -1,40 +1,221 @@
 """MCP Server implementation using FastMCP.
 
 This module defines all tools available to the AI agent for controlling
-ComfyUI workflows through the callback router.
+ComfyUI workflows through WebSocket-based tool execution.
 """
 
+import asyncio
+import json
 import logging
-from typing import Any, Dict, List, Optional, Union
-from fastmcp import FastMCP
+import os
+import uuid
+from contextlib import asynccontextmanager
+from typing import Any, AsyncIterator, Dict, List, Optional, Union
+
+import websockets
+from fastmcp import FastMCP, Context
 from pydantic import Field
 
 from backend.models import WorkflowQuery
 
 logger = logging.getLogger(__name__)
 
-# Initialize FastMCP server
-mcp = FastMCP("FL_Agent Workflow Tools")
 
-# Import callback router functions (will be set during server initialization)
+# ============================================================================
+# WebSocket Client for MCP Subprocess
+# ============================================================================
+
+class MCPWebSocketClient:
+    """WebSocket client for MCP subprocess to communicate with backend."""
+    
+    def __init__(self, session_id: str, ws_url: str):
+        self.session_id = session_id
+        self.ws_url = ws_url
+        self.ws = None
+        self.pending_requests = {}  # request_id -> asyncio.Future
+        self.connected = False
+        self._receive_task = None
+        
+    async def connect(self):
+        """Connect to backend WebSocket server."""
+        logger.info(f"[MCP-WS] Connecting to {self.ws_url} with session {self.session_id}")
+        
+        try:
+            self.ws = await websockets.connect(self.ws_url)
+            
+            # Send handshake
+            await self.ws.send(json.dumps({
+                'type': 'handshake',
+                'session_id': self.session_id,
+                'client_version': '1.0.0-mcp',
+            }))
+            
+            # Wait for handshake ack
+            response = await self.ws.recv()
+            data = json.loads(response)
+            
+            if data.get('type') == 'handshake_ack':
+                self.connected = True
+                logger.info(f"[MCP-WS] Connected and handshake complete")
+                
+                # Start receive loop
+                self._receive_task = asyncio.create_task(self._receive_loop())
+            else:
+                raise RuntimeError(f"Unexpected handshake response: {data}")
+                
+        except Exception as e:
+            logger.error(f"[MCP-WS] Connection failed: {e}")
+            raise
+    
+    async def _receive_loop(self):
+        """Receive and process messages from backend."""
+        try:
+            async for message in self.ws:
+                data = json.loads(message)
+                await self._handle_message(data)
+        except websockets.exceptions.ConnectionClosed:
+            logger.warning(f"[MCP-WS] Connection closed")
+            self.connected = False
+        except Exception as e:
+            logger.error(f"[MCP-WS] Receive loop error: {e}")
+            self.connected = False
+    
+    async def _handle_message(self, data: dict):
+        """Handle incoming message from backend."""
+        msg_type = data.get('type')
+        
+        if msg_type == 'tool_result':
+            # Tool execution result from frontend
+            request_id = data.get('request_id')
+            future = self.pending_requests.get(request_id)
+            
+            if future and not future.done():
+                if data.get('success'):
+                    future.set_result(data.get('data'))
+                else:
+                    future.set_exception(
+                        RuntimeError(data.get('error', 'Tool execution failed'))
+                    )
+                # Clean up
+                self.pending_requests.pop(request_id, None)
+        else:
+            logger.warning(f"[MCP-WS] Unexpected message type: {msg_type}")
+    
+    async def execute_tool(self, tool_name: str, parameters: dict, timeout_ms: int = 30000) -> dict:
+        """Execute a tool via WebSocket callback."""
+        if not self.connected:
+            raise RuntimeError("WebSocket not connected")
+        
+        # Generate unique request ID
+        request_id = str(uuid.uuid4())
+        
+        # Create future for this request
+        future = asyncio.get_event_loop().create_future()
+        self.pending_requests[request_id] = future
+        
+        logger.info(f"[MCP-WS] Executing tool: {tool_name} (request_id: {request_id})")
+        
+        try:
+            # Send tool request
+            await self.ws.send(json.dumps({
+                'type': 'tool_request',
+                'session_id': self.session_id,
+                'request_id': request_id,
+                'tool_name': tool_name,
+                'parameters': parameters,
+                'timeout_ms': timeout_ms,
+            }))
+            
+            # Wait for result with timeout
+            timeout_seconds = timeout_ms / 1000.0
+            result = await asyncio.wait_for(future, timeout=timeout_seconds)
+            
+            logger.info(f"[MCP-WS] Tool execution complete: {request_id}")
+            return result
+            
+        except asyncio.TimeoutError:
+            logger.error(f"[MCP-WS] Tool execution timeout: {request_id}")
+            self.pending_requests.pop(request_id, None)
+            raise RuntimeError(f"Tool execution timeout after {timeout_seconds}s")
+        except Exception as e:
+            logger.error(f"[MCP-WS] Tool execution error: {e}")
+            self.pending_requests.pop(request_id, None)
+            raise
+    
+    async def disconnect(self):
+        """Disconnect from WebSocket server."""
+        if self._receive_task:
+            self._receive_task.cancel()
+            try:
+                await self._receive_task
+            except asyncio.CancelledError:
+                pass
+        if self.ws:
+            await self.ws.close()
+        self.connected = False
+        logger.info("[MCP-WS] Disconnected")
+
+
+# Global WebSocket client for this MCP subprocess
+_ws_client: Optional[MCPWebSocketClient] = None
+
+
+@asynccontextmanager
+async def mcp_lifespan(server: FastMCP) -> AsyncIterator[Any]:
+    """Manage MCP server lifespan and WebSocket connection."""
+    
+    # Check if running in subprocess mode
+    if os.getenv('FL_MCP_MODE') == 'subprocess':
+        session_id = os.getenv('FL_SESSION_ID')
+        ws_url = os.getenv('FL_WS_URL')
+        
+        if not session_id or not ws_url:
+            logger.error("Missing FL_SESSION_ID or FL_WS_URL environment variables")
+            raise RuntimeError("MCP subprocess not properly configured")
+        
+        logger.info(f"[MCP] Starting in subprocess mode for session: {session_id}")
+        
+        # Create and connect WebSocket client
+        _ws_client = MCPWebSocketClient(session_id, ws_url)
+        await _ws_client.connect()
+        
+        logger.info("[MCP] WebSocket client connected")
+        
+    else:
+        logger.info("[MCP] Running in standalone mode (no WebSocket)")
+    
+    yield {"client": _ws_client}
+    
+    # # Cleanup
+    # if _ws_client:
+    #     await _ws_client.disconnect()
+    #     logger.info("[MCP] WebSocket client disconnected")
+
+
+# Initialize FastMCP server with lifespan
+mcp = FastMCP("FL_Agent Workflow Tools", lifespan=mcp_lifespan)
+
+
+# Import callback router functions (legacy, kept for backwards compatibility)
 _callback_router = None
 
 
 def set_callback_router(router):
-    """Set the callback router instance.
+    """Set the callback router instance (legacy).
     
-    This must be called during server initialization before any tools are used.
+    This is kept for backwards compatibility but is no longer used
+    when running in subprocess mode.
     
     Args:
         router: CallbackRouter instance
     """
     global _callback_router
     _callback_router = router
-    logger.info("Callback router set for MCP server")
+    logger.info("Callback router set for MCP server (legacy mode)")
 
 
-async def _execute_tool(tool_name: str, parameters: Dict[str, Any], timeout_ms: Optional[int] = None) -> Dict[str, Any]:
-    """Execute a tool via callback router.
+async def _execute_tool(ctx: Context, tool_name: str, parameters: Dict[str, Any], timeout_ms: Optional[int] = None) -> Dict[str, Any]:
+    """Execute a tool via WebSocket callback.
     
     Args:
         tool_name: Name of the tool to execute
@@ -45,15 +226,16 @@ async def _execute_tool(tool_name: str, parameters: Dict[str, Any], timeout_ms: 
         Tool execution result
         
     Raises:
-        RuntimeError: If callback router not initialized
+        RuntimeError: If WebSocket client not initialized
     """
-    if _callback_router is None:
-        raise RuntimeError("Callback router not initialized. Call set_callback_router() first.")
+    _ws_client = ctx.request_context.lifespan_context.client
+    if _ws_client is None:
+        raise RuntimeError("WebSocket client not initialized. MCP server not running in subprocess mode.")
     
-    return await _callback_router.execute_tool_callback(
+    return await _ws_client.execute_tool(
         tool_name=tool_name,
         parameters=parameters,
-        timeout_ms=timeout_ms
+        timeout_ms=timeout_ms or 30000
     )
 
 

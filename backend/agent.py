@@ -217,7 +217,23 @@ def create_agent(session_id: str) -> Agent:
     # Load system prompt
     system_prompt = load_system_prompt()
     
-    mcp_servers = [MCPServerStdio('python', ['backend/mcp_server.py'])]
+    # Prepare environment for MCP subprocess
+    mcp_env = {
+        'FL_SESSION_ID': session_id,
+        'FL_WS_URL': f'ws://{settings.ws_host}:{settings.ws_port}/ws',
+        'FL_MCP_MODE': 'subprocess',  # Flag to indicate subprocess mode
+    }
+    
+    logger.info(f"MCP subprocess environment: session_id={session_id}, ws_url={mcp_env['FL_WS_URL']}")
+    
+    # Launch MCP server with environment
+    mcp_servers = [
+        MCPServerStdio(
+            'python',
+            ['backend/mcp_server.py'],
+            env=mcp_env  # Pass environment to subprocess
+        )
+    ]
     
     # Create agent (tools will be provided via MCP)
     agent = Agent(
@@ -270,6 +286,14 @@ class AgentManager:
         if session_id in self.agents:
             del self.agents[session_id]
             logger.info(f"Removed agent for session: {session_id}")
+    
+    def get_agent_count(self) -> int:
+        """Get number of active agents.
+        
+        Returns:
+            Number of agents
+        """
+        return len(self.agents)
     
     def clear_all(self):
         """Clear all agents."""

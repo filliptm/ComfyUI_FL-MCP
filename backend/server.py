@@ -127,6 +127,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
         websocket: WebSocket connection
     """
     session_id: str | None = None
+    connection_type: str = 'frontend'  # Default to frontend
     
     try:
         # Accept connection
@@ -150,6 +151,16 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
         try:
             handshake = Handshake(**handshake_data)
             session_id = handshake.session_id
+            
+            # Detect connection type from client_version
+            # MCP subprocess sends client_version like "1.0.0-mcp"
+            if handshake.client_version and 'mcp' in handshake.client_version.lower():
+                connection_type = 'mcp'
+            else:
+                connection_type = 'frontend'
+            
+            logger.info(f"Detected connection type: {connection_type}")
+            
         except Exception as e:
             await websocket.send_json({
                 "type": "error",
@@ -168,15 +179,16 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
             await websocket.close()
             return
         
-        # Register connection
-        is_reconnect = session_id in manager.session_contexts
-        context = await manager.connect(websocket, session_id)
+        # Register connection with type
+        is_reconnect = manager.has_connection(session_id, connection_type)
+        context = await manager.connect(websocket, session_id, connection_type)
         
         # Send handshake acknowledgment
-        await manager.send_handshake_ack(session_id, is_reconnect)
+        await manager.send_handshake_ack(session_id, is_reconnect, connection_type)
         
         logger.info(
-            f"Session {session_id} {'reconnected' if is_reconnect else 'connected'}"
+            f"Session {session_id} - {connection_type} "
+            f"{'reconnected' if is_reconnect else 'connected'}"
         )
         
         # Message loop
@@ -190,6 +202,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     session_id,
                     "SESSION_MISMATCH",
                     f"Message session_id '{msg_session_id}' does not match connection session_id '{session_id}'",
+                    target=connection_type
                 )
                 continue
             
@@ -202,25 +215,30 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
             elif msg_type == "tool_result":
                 await handle_tool_result(session_id, data)
             
+            elif msg_type == "tool_request":
+                # Tool request from MCP subprocess - route to frontend
+                await route_tool_request_to_frontend(session_id, data)
+            
             else:
                 await manager.send_error(
                     session_id,
                     "UNKNOWN_MESSAGE_TYPE",
                     f"Unknown message type: {msg_type}",
+                    target=connection_type
                 )
     
     except WebSocketDisconnect:
         if session_id:
-            manager.disconnect(session_id)
+            manager.disconnect(session_id, connection_type)
             # Cancel any pending callbacks for this session
             if callback_router:
                 callback_router.cancel_pending_callbacks(session_id)
-            logger.info(f"Session {session_id} disconnected")
+            logger.info(f"Session {session_id} - {connection_type} disconnected")
     
     except Exception as e:
         logger.error(f"Error in WebSocket connection: {e}", exc_info=True)
         if session_id:
-            manager.disconnect(session_id)
+            manager.disconnect(session_id, connection_type)
             # Cancel any pending callbacks for this session
             if callback_router:
                 callback_router.cancel_pending_callbacks(session_id)
@@ -229,6 +247,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 "INTERNAL_ERROR",
                 "An internal error occurred",
                 {"error": str(e)},
+                target=connection_type
             )
         try:
             await websocket.close()
@@ -290,7 +309,9 @@ async def handle_user_message(session_id: str, data: dict[str, Any]) -> None:
 
 
 async def handle_tool_result(session_id: str, data: dict[str, Any]) -> None:
-    """Handle tool execution result.
+    """Handle tool execution result from frontend.
+    
+    This result needs to be routed back to the MCP subprocess that requested it.
 
     Args:
         session_id: Session ID
@@ -298,12 +319,21 @@ async def handle_tool_result(session_id: str, data: dict[str, Any]) -> None:
     """
     try:
         result = ToolResult(**data)
-        logger.debug(
+        logger.info(
             f"Tool result from {session_id}: request_id={result.request_id} "
             f"({'success' if result.success else 'failed'})"
         )
         
-        # Route to callback router
+        # Route result back to MCP subprocess
+        if manager.has_connection(session_id, 'mcp'):
+            await manager.send_message(session_id, data, target='mcp')
+            logger.info(f"Tool result routed to MCP subprocess for session {session_id}")
+        else:
+            logger.warning(
+                f"No MCP connection for session {session_id}, cannot route tool result"
+            )
+        
+        # Also route to callback router (legacy support)
         if callback_router:
             await callback_router.handle_tool_result(
                 request_id=result.request_id,
@@ -312,8 +342,6 @@ async def handle_tool_result(session_id: str, data: dict[str, Any]) -> None:
                 error=result.error,
                 execution_time_ms=result.execution_time_ms
             )
-        else:
-            logger.error("Callback router not initialized, cannot handle tool result")
     
     except Exception as e:
         logger.error(f"Error handling tool result: {e}", exc_info=True)
@@ -323,6 +351,56 @@ async def handle_tool_result(session_id: str, data: dict[str, Any]) -> None:
             "Failed to process tool result",
             {"error": str(e)},
         )
+
+
+async def route_tool_request_to_frontend(session_id: str, data: dict) -> None:
+    """Route tool request from MCP subprocess to frontend.
+    
+    Args:
+        session_id: Session ID
+        data: Tool request data
+    """
+    try:
+        logger.info(
+            f"Routing tool request to frontend: session={session_id}, "
+            f"tool={data.get('tool_name')}, request_id={data.get('request_id')}"
+        )
+        
+        # Check if frontend is connected
+        if not manager.has_connection(session_id, 'frontend'):
+            error_msg = f"No frontend connection for session {session_id}"
+            logger.error(error_msg)
+            
+            # Send error back to MCP subprocess
+            await manager.send_message(session_id, {
+                'type': 'tool_result',
+                'session_id': session_id,
+                'request_id': data.get('request_id'),
+                'success': False,
+                'error': error_msg,
+                'execution_time_ms': 0,
+            }, target='mcp')
+            return
+        
+        # Forward the message to frontend
+        await manager.send_message(session_id, data, target='frontend')
+        logger.info(f"Tool request forwarded to frontend for session {session_id}")
+        
+    except Exception as e:
+        logger.error(f"Error routing tool request: {e}", exc_info=True)
+        
+        # Send error back to MCP subprocess
+        try:
+            await manager.send_message(session_id, {
+                'type': 'tool_result',
+                'session_id': session_id,
+                'request_id': data.get('request_id'),
+                'success': False,
+                'error': str(e),
+                'execution_time_ms': 0,
+            }, target='mcp')
+        except Exception as send_error:
+            logger.error(f"Failed to send error response: {send_error}")
 
 
 if __name__ == "__main__":
