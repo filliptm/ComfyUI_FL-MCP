@@ -16,7 +16,7 @@ import websockets
 from fastmcp import FastMCP, Context
 from pydantic import BaseModel, Field
 
-from backend.models import WorkflowQuery
+from models import WorkflowQuery
 
 logger = logging.getLogger(__name__)
 
