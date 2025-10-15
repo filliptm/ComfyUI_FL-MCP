@@ -104,6 +104,9 @@ class ConnectionManager:
 
         connections = self.active_connections[session_id]
         
+        # Log what connections are available and what we're targeting
+        logger.debug(f"[SEND] {message.get('type', 'unknown')} -> {target} | available: {list(connections.keys())} | session: {session_id[:8]}...")
+        
         # Determine which connections to send to
         if target == 'all':
             targets = list(connections.values())
@@ -119,9 +122,12 @@ class ConnectionManager:
             if websocket:
                 try:
                     await websocket.send_json(message)
+                    logger.debug(f"[SEND] ✅ Sent {message.get('type', 'unknown')} to {target}")
                     sent = True
                 except Exception as e:
-                    logger.error(f"Error sending message to {session_id}: {e}")
+                    logger.error(f"[SEND] ❌ Error sending to {target}: {e}")
+            else:
+                logger.warning(f"[SEND] ⚠️  WebSocket is None for {target} in session {session_id[:8]}...")
         
         # Update last activity if any message was sent
         if sent and session_id in self.session_contexts:

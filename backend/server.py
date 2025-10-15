@@ -385,9 +385,13 @@ async def route_tool_request_to_frontend(session_id: str, data: dict) -> None:
             }, target='mcp')
             return
         
-        # Forward the message to frontend
-        await manager.send_message(session_id, data, target='frontend')
-        logger.info(f"Tool request forwarded to frontend for session {session_id}")
+        # Forward the message to frontend and check result
+        result = await manager.send_message(session_id, data, target='frontend')
+        
+        if result:
+            logger.info(f"✅ Tool request successfully forwarded to frontend for session {session_id}")
+        else:
+            logger.error(f"❌ Failed to forward tool request to frontend for session {session_id}")
         
     except Exception as e:
         logger.error(f"Error routing tool request: {e}", exc_info=True)
