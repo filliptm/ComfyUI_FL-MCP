@@ -22,7 +22,7 @@ from comfy_models import (
     ComfyReadFileRequest, ComfyReadFileResponse,
     ComfySearchFilesRequest, ComfySearchFilesResponse
 )
-from .comfy_tools import get_comfy_tools, ComfyUIError, ComfyUINotFoundError
+from comfy_tools import get_comfy_tools, ComfyUIError, ComfyUINotFoundError
 
 logger = logging.getLogger(__name__)
 
