@@ -1,7 +1,7 @@
 {
   "current_mode": "debugging",
   "project": "fl_js",
-  "task": "clarifying the actual problem",
+  "task": "clarifying if create_task fix was applied",
   "architecture": "FastAPI+WS backend with PydanticAI + FastMCP, JS chat sidebar client, realtime tool callbacks",
   "project_status": "new project inspired by legacy FL_JS/FL_WF_Agent",
   "focus": "checking if tool_result or tool_request can block",
@@ -59,7 +59,7 @@
   ],
   "root_cause_hypothesis": "ChatUI._initializeUI() sets innerHTML but browser hasn't parsed/rendered it yet when _attachEventHandlers() tries to getElementById",
   "root_cause": "blocking await prevents loop from receiving tool_result",
-  "confidence": "95% - clear evidence in logs",
+  "confidence": "85% - frontend loop definitely blocked",
   "root_cause_1": "send() requires handshakeComplete for ALL messages including handshake itself",
   "root_cause_2": "messagesContainer is null when _addWelcomeMessage runs - DOM timing issue",
   "root_cause_3": "heartbeat adds unnecessary complexity and noise",
@@ -93,5 +93,7 @@
   "solution": "use asyncio.create_task() to make handlers non-blocking",
   "analysis_stage": "reviewing handler implementations",
   "confusion": "thought we found deadlock but logs show MCP loop IS waiting",
-  "need": "clear determination of what the actual problem is"
+  "need": "clear determination of what the actual problem is",
+  "critical_finding": "frontend loop blocked - never resumed after user_message",
+  "need_to_check": "1. backend/server.py for create_task, 2. frontend.log for tool_result routing"
 }

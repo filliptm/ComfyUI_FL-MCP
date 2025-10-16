@@ -264,6 +264,9 @@ class CreateNodeRequest(BaseModel):
     node_type: str = Field(..., description="ComfyUI node class name (e.g., 'CheckpointLoaderSimple')")
     parameters: Optional[Dict[str, Any]] = Field(None, description="Node parameter values as key-value pairs")
     position: Optional[Dict[str, float]] = Field(None, description="Node position {x, y}")
+    
+class CreateNodesRequest(BaseModel):
+    nodes: List[CreateNodeRequest] = Field(..., description="List of nodes to create each their own parameters")
 
 class RemoveNodesRequest(BaseModel):
     """Request to remove nodes from workflow."""
@@ -318,6 +321,9 @@ class SetNodeRectRequest(BaseModel):
     y: Optional[float] = Field(None, description="Y position (null to keep current)")
     width: Optional[float] = Field(None, description="Width (null to keep current)")
     height: Optional[float] = Field(None, description="Height (null to keep current)")
+    
+class BatchLayoutRequest(BaseModel):
+    node_rects: List[SetNodeRectRequest] = Field(..., description="A List of nodes with their new rectangle settings for full or partial quick layout changes")
 
 class PositionNodeLeftRequest(BaseModel):
     """Request to position node to the left of another."""
@@ -447,6 +453,9 @@ async def workflow_diagram(request: WorkflowDiagramRequest, ctx: Context) -> Dic
 # NODE MANAGEMENT TOOLS
 # ============================================================================
 
+# TODO: Add tools to see what nodes are installed in the comfy sort of python environment (checking custom_nodes folder?) (needs web research)
+#       kinda also needs a way to see what's like in each node pack somehow (is there an easy comfy lib way for this?)
+
 @mcp.tool()
 async def find_node(request: FindNodeRequest, ctx: Context) -> Dict[str, Any]:
     """Find a node by ID, type, or title."""
@@ -454,9 +463,12 @@ async def find_node(request: FindNodeRequest, ctx: Context) -> Dict[str, Any]:
 
 
 @mcp.tool()
-async def create_node(request: CreateNodeRequest, ctx: Context) -> Dict[str, Any]:
-    """Create a new node in the workflow."""
-    return await _execute_tool(ctx, "create_node", request.model_dump())
+async def create_nodes(request: CreateNodesRequest, ctx: Context) -> List[Dict[str, Any]]:
+    """Create one or more new node in the workflow."""
+    o = []
+    for node in request.nodes:
+        o.append(await _execute_tool(ctx, "create_node", node.model_dump()))
+    return o
 
 
 @mcp.tool()
@@ -532,6 +544,13 @@ async def set_node_rect(request: SetNodeRectRequest, ctx: Context) -> Dict[str, 
     """Set node position and/or size."""
     return await _execute_tool(ctx, "set_node_rect", request.model_dump())
 
+@mcp.tool()
+async def modify_layout(request: BatchLayoutRequest, ctx: Context) -> List[Dict[str, Any]]:
+    """Modify the layout of multiple nodes by setting their bounding boxes. Use this when moving many nodes at a time. Attempt to avoid overlaps."""
+    o = []
+    for rect in request.node_rects:
+        o.append(await _execute_tool(ctx, "set_node_rect", rect.model_dump()))
+    return o
 
 @mcp.tool()
 async def position_node_left(request: PositionNodeLeftRequest, ctx: Context) -> Dict[str, Any]:
@@ -646,6 +665,7 @@ async def send_images(request: SendImagesRequest, ctx: Context) -> Dict[str, Any
 # ============================================================================
 # UTILITY TOOLS
 # ============================================================================
+# TODO: These all can use python instead of the frontend bridge, lol!
 
 @mcp.tool()
 async def generate_seed(request: GenerateSeedRequest, ctx: Context) -> Dict[str, Any]:
@@ -670,6 +690,11 @@ async def random_choice(request: RandomChoiceRequest, ctx: Context) -> Dict[str,
     """Pick a random item from a list."""
     return await _execute_tool(ctx, "random_choice", request.model_dump())
 
+
+# Other Ideas
+#   Meta-Awareness: Awareness of the full environment including installed plugins (this is through python I'm assuming!)
+#   Workspace awareness: what tabs do you have? can we switch workflow tabs? etc.
+#   Workflow awareness: list workflows, find workflows? or like rather, be pointed at a folder or workflow to load? loading, etc. stuff that's in the file menu?
 
 def main():
     """Run the MCP server as a standalone application."""
