@@ -439,6 +439,9 @@ export class FL_API {
                 node.onResize(node.size);
             }
 
+            // 🔥 Force canvas refresh
+            this._refreshCanvas();
+
             console.log(`[FL_API] Set rect for node ${node.id}`);
             return this.getRect(nodeId);
         } catch (error) {
@@ -465,6 +468,9 @@ export class FL_API {
             targetNode.pos[0] = anchorNode.pos[0] - targetNode.size[0] - margin;
             targetNode.pos[1] = anchorNode.pos[1];
 
+            // 🔥 Force canvas refresh
+            this._refreshCanvas();
+
             console.log(`[FL_API] Positioned node ${targetNode.id} left of ${anchorNode.id}`);
         } catch (error) {
             console.error("[FL_API] putOnLeft error:", error);
@@ -486,6 +492,9 @@ export class FL_API {
 
             targetNode.pos[0] = anchorNode.pos[0] + anchorNode.size[0] + margin;
             targetNode.pos[1] = anchorNode.pos[1];
+
+            // 🔥 Force canvas refresh
+            this._refreshCanvas();
 
             console.log(`[FL_API] Positioned node ${targetNode.id} right of ${anchorNode.id}`);
         } catch (error) {
@@ -509,6 +518,9 @@ export class FL_API {
             targetNode.pos[0] = anchorNode.pos[0];
             targetNode.pos[1] = anchorNode.pos[1] - targetNode.size[1] - margin;
 
+            // 🔥 Force canvas refresh
+            this._refreshCanvas();
+
             console.log(`[FL_API] Positioned node ${targetNode.id} top of ${anchorNode.id}`);
         } catch (error) {
             console.error("[FL_API] putOnTop error:", error);
@@ -530,6 +542,9 @@ export class FL_API {
 
             targetNode.pos[0] = anchorNode.pos[0];
             targetNode.pos[1] = anchorNode.pos[1] + anchorNode.size[1] + margin;
+
+            // 🔥 Force canvas refresh
+            this._refreshCanvas();
 
             console.log(`[FL_API] Positioned node ${targetNode.id} bottom of ${anchorNode.id}`);
         } catch (error) {
@@ -567,6 +582,9 @@ export class FL_API {
                 }
             }
 
+            // 🔥 Force canvas refresh
+            this._refreshCanvas();
+
             console.log(`[FL_API] Moved node ${targetNode.id} to right (${iterations} iterations)`);
         } catch (error) {
             console.error("[FL_API] moveToRight error:", error);
@@ -602,6 +620,9 @@ export class FL_API {
                     }
                 }
             }
+
+            // 🔥 Force canvas refresh
+            this._refreshCanvas();
 
             console.log(`[FL_API] Moved node ${targetNode.id} to bottom (${iterations} iterations)`);
         } catch (error) {
@@ -892,6 +913,18 @@ export class FL_API {
     }
 
     // ==================== PRIVATE HELPERS ====================
+
+    /**
+     * Force canvas refresh after layout changes
+     * @private
+     */
+    _refreshCanvas() {
+        try {
+            app.canvas.setDirty(true, true);
+        } catch (error) {
+            console.warn("[FL_API] Could not refresh canvas:", error);
+        }
+    }
 
     _match(node, query) {
         if (typeof query === "number") {
