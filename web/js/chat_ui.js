@@ -297,6 +297,46 @@ export class ChatUI {
                 font-size: 12px;
             }
 
+            /* Ren Welcome Message */
+            .fl-message.ren-welcome .fl-message-content {
+                background: linear-gradient(135deg, #ff6b35 0%, #c44536 100%);
+                border: none;
+                color: white;
+                text-align: left;
+                font-size: 13px;
+                padding: 16px;
+            }
+
+            .fl-message.ren-welcome .fl-message-header {
+                display: none;
+            }
+
+            /* Starter Questions */
+            .fl-starter-questions {
+                display: flex;
+                flex-direction: column;
+                gap: 8px;
+                margin-top: 12px;
+            }
+
+            .fl-starter-question {
+                background: rgba(255, 255, 255, 0.1);
+                border: 1px solid rgba(255, 255, 255, 0.2);
+                border-radius: 8px;
+                padding: 10px 12px;
+                cursor: pointer;
+                transition: all 0.2s;
+                color: white;
+                font-size: 13px;
+                line-height: 1.4;
+            }
+
+            .fl-starter-question:hover {
+                background: rgba(255, 255, 255, 0.2);
+                border-color: rgba(255, 255, 255, 0.3);
+                transform: translateX(2px);
+            }
+
             /* Markdown Styles */
             .fl-message-content p {
                 margin: 0 0 8px 0;
@@ -508,37 +548,74 @@ export class ChatUI {
     }
 
     /**
-     * Add welcome message
+     * Add welcome message with Ren introduction
      * @private
      */
     _addWelcomeMessage() {
-        const welcomeText = `👋 **Welcome to FL_JS Assistant!**
-
-I'm your ComfyUI workflow automation agent. I can help you with:
-
-**Workflow Management:**
-- 🎨 Creating and modifying nodes
-- 🔗 Connecting nodes and building pipelines
-- 📐 Querying and analyzing your workflow
-- 🎯 Adjusting layouts and organization
-- ▶️ Running and executing workflows
-
-**ComfyUI Discovery:**
-- 🔍 Finding installed custom nodes and plugins
-- 📚 Reading node documentation and source code
-- 🧩 Discovering node capabilities and interfaces
-- 📦 Listing available models (checkpoints, LoRAs, VAE, etc.)
-- 🔎 Searching for specific functionality
-
-**Smart Assistance:**
-- 💡 Recommending nodes for your tasks
-- 🛠️ Understanding node parameters and types
-- 🎓 Explaining ComfyUI concepts and workflows
-- 🚀 Optimizing workflow performance
-
-Just ask me anything! I have deep access to your ComfyUI installation.`;
+        const message = {
+            role: 'ren-welcome',
+            content: '',
+            timestamp: new Date(),
+            displayRole: 'ren-welcome'
+        };
         
-        this.addMessage('system', welcomeText, 'assistant');
+        this.messages.push(message);
+        this._renderRenWelcome(message);
+        this._scrollToBottom();
+    }
+
+    /**
+     * Render Ren's welcome message with starter questions
+     * @private
+     */
+    _renderRenWelcome(message) {
+        if (!this.messagesContainer) {
+            console.error('[ChatUI] Cannot render welcome, messagesContainer not ready');
+            return;
+        }
+        
+        const messageEl = document.createElement('div');
+        messageEl.className = 'fl-message ren-welcome';
+        
+        const contentEl = document.createElement('div');
+        contentEl.className = 'fl-message-content';
+        
+        // Ren's introduction
+        const intro = document.createElement('div');
+        intro.innerHTML = `<strong>I'm Ren (蓮)</strong>, your ComfyUI workflow assistant.<br>Think of me as the bridge between what you imagine and what you create.`;
+        contentEl.appendChild(intro);
+        
+        // Starter questions
+        const starterQuestions = [
+            "Show me what's in my current workflow",
+            "Help me build a text-to-image workflow",
+            "What nodes do I have for upscaling?",
+            "Explain how the sampler works",
+            "My workflow isn't working—can you help debug it?",
+            "How can I organize my nodes better?"
+        ];
+        
+        const questionsContainer = document.createElement('div');
+        questionsContainer.className = 'fl-starter-questions';
+        
+        starterQuestions.forEach(question => {
+            const questionEl = document.createElement('div');
+            questionEl.className = 'fl-starter-question';
+            questionEl.textContent = question;
+            questionEl.addEventListener('click', () => {
+                this.inputField.value = question;
+                this.inputField.focus();
+                // Auto-resize after setting value
+                this.inputField.style.height = 'auto';
+                this.inputField.style.height = this.inputField.scrollHeight + 'px';
+            });
+            questionsContainer.appendChild(questionEl);
+        });
+        
+        contentEl.appendChild(questionsContainer);
+        messageEl.appendChild(contentEl);
+        
+        this.messagesContainer.appendChild(messageEl);
     }
 
     /**
@@ -696,7 +773,7 @@ Just ask me anything! I have deep access to your ComfyUI installation.`;
     _formatRole(role) {
         const roleMap = {
             'user': 'You',
-            'assistant': 'Assistant',
+            'assistant': 'Ren',
             'system': 'System',
             'error': 'Error'
         };
