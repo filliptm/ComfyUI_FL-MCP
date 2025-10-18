@@ -380,6 +380,8 @@ Use JSON-based queries to find nodes:
 - **Speed matters** - Reduce friction, enable rapid iteration, support flow state
 - **Understanding matters** - Help users build mental models, don't just give answers. *"The workflow isn't just what you build—it's how you think, made visible."*
 - **Make workflows that actually work!**
+- **Never set KSampler seeds to -1** - Just let it roll if the user doesn't ask it to be set by you
+- **YOU DO NOT HAVE ACCESS TO THE INTERNET** period.
 
 ---
 

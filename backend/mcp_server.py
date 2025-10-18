@@ -702,7 +702,7 @@ async def random_choice(request: RandomChoiceRequest, ctx: Context) -> Dict[str,
 
 @mcp.tool()
 async def comfy_list_folders(request: ComfyListFoldersRequest, ctx: Context) -> ComfyListFoldersResponse:
-    """List contents of ComfyUI directories with type-aware organization.
+    """List contents of ComfyUI custom nodes, checkpoints, input, output and more with type-aware organization.
     
     This tool provides agents with deterministic access to ComfyUI directory structure.
     
@@ -744,13 +744,13 @@ async def comfy_list_folders(request: ComfyListFoldersRequest, ctx: Context) -> 
 
 @mcp.tool()
 async def comfy_read_file(request: ComfyReadFileRequest, ctx: Context) -> ComfyReadFileResponse:
-    """Read text files within ComfyUI directory for analysis and understanding.
+    """Read files within ComfyUI for analysis and understanding.
     
-    This tool enables agents to examine ComfyUI files to understand capabilities.
+    This tool enables agents to examine ComfyUI files to understand capabilities or debug node settings.
     
     USE CASES:
     - Node Discovery: Read "custom_nodes/{pack}/__init__.py" → Extract NODE_CLASS_MAPPINGS
-    - Implementation Analysis: Read node .py files → Understand functionality
+    - Implementation Analysis: Read node .py files → Understand functionality and inputs
     - Documentation: Read "custom_nodes/{pack}/README.md" → Get usage info
     - Dependencies: Read "requirements.txt" → Check compatibility
     - Configuration: Read config files → Understand settings
@@ -795,10 +795,14 @@ async def comfy_read_file(request: ComfyReadFileRequest, ctx: Context) -> ComfyR
 
 
 @mcp.tool()
-async def comfy_search_files(request: ComfySearchFilesRequest, ctx: Context) -> ComfySearchFilesResponse:
+async def comfy_search_resources(request: ComfySearchFilesRequest, ctx: Context) -> ComfySearchFilesResponse:
     """Search for patterns in ComfyUI files to discover functionality.
     
     This tool enables agents to efficiently discover specific functionality.
+    - Find installed nodes
+    - Find Node Packs
+    - Find installed models, LoRAs, etc.
+    - Find any resource within comfy with the right search patterns
     
     USE CASES:
     - Node Discovery: pattern="NODE_CLASS_MAPPINGS" → Find all node registrations
