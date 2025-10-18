@@ -348,7 +348,7 @@ class WSClient extends EventEmitter {
             this.send({
                 type: "execution_event",
                 event: "executing",
-                data: event.detail
+                data: {run_id: event.detail}
             });
         });
         
