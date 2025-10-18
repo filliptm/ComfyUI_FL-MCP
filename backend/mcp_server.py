@@ -581,7 +581,7 @@ class NodeLibraryFindCompatibleRequest(BaseModel):
 @mcp.tool()
 async def calculate_expressions(request: CalcBatchParams, ctx: Context) -> Dict[str, Any]:
     """
-    Evaluate a *batch* of math expressions safely and return their results. Great for
+    Evaluate a *batch* of math AST expressions return their results. Great for calculating simple math expressions for calculating bounding boxes for layout modification. Don't include comments.
 
     Features:
       • Supports + - * / // % **, parentheses, unary +/-
@@ -598,8 +598,12 @@ async def calculate_expressions(request: CalcBatchParams, ctx: Context) -> Dict[
     -------
     list[float] : one numeric result per input expression (assignment returns assigned value)
     """
-    response = await acalc_batch(request)
-    return {"results": response}
+    try:
+        response = await acalc_batch(request)
+        return {"results": response}
+    except Exception as e:
+        ctx.error(str(e))
+        raise
 
 @mcp.tool()
 async def wait(request: WaitRequest) -> Dict[str, Any]:
