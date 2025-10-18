@@ -30,6 +30,7 @@ from node_library import (
     NodeTypeNotFoundError
 )
 from manager import manager
+from calc import acalc_batch, CalcBatchParams
 
 logger = logging.getLogger(__name__)
 
@@ -382,7 +383,6 @@ class NodeRect(BaseModel):
     width: Optional[float] = Field(None, description="Width (omit to keep current)")
     height: Optional[float] = Field(None, description="Height (omit to keep current)")
     
-    
 class BatchLayoutRequest(BaseModel):
     node_rects: Dict[int, NodeRect] = Field(..., description="A map of node id's (int) with their new rectangle settings for full or partial quick layout changes")
 
@@ -574,9 +574,36 @@ class NodeLibraryFindCompatibleRequest(BaseModel):
         description="Maximum results per direction (1-100)"
     )
 
+# ===========================================================================
+# GENERAL UTILITIES
+# ===========================================================================
+
+@mcp.tool()
+async def calculate_expressions(request: CalcBatchParams, ctx: Context) -> Dict[str, Any]:
+    """
+    Evaluate a *batch* of math expressions safely and return their results. Great for
+
+    Features:
+      • Supports + - * / // % **, parentheses, unary +/-
+      • Variables & **simple assignments** (`x = 2+3`) that persist across lines
+      • Math funcs: sin, cos, tan, asin, acos, atan, atan2, sinh, cosh, tanh,
+        exp, log, log10, log2, sqrt, floor, ceil, hypot, radians, degrees
+      • Builtins: abs, round, min, max, pow
+      • Constants: pi, e, tau
+      • Random (seeded via `params.seed`): `rand()` / `random()`, `uniform(a,b)`, `randint(a,b)`
+      • No `eval` or attributes; AST is strictly whitelisted
+      • If `params.variables` is given, it is **updated** with numeric names
+
+    Returns
+    -------
+    list[float] : one numeric result per input expression (assignment returns assigned value)
+    """
+    response = await acalc_batch(request)
+    return {"results": response}
 
 @mcp.tool()
 async def wait(request: WaitRequest) -> Dict[str, Any]:
+    """Use this to wait for some short period of time, perhaps after generating an image"""
     await asyncio.sleep(float(request.delay))
     return {"waited_for": request.delay}
 
