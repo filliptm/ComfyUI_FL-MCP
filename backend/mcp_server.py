@@ -10,7 +10,7 @@ import logging
 import os
 import uuid
 from contextlib import asynccontextmanager
-from typing import Any, AsyncIterator, Dict, List, Optional, Union
+from typing import Any, AsyncIterator, Dict, List, Optional, Union, Literal
 
 import websockets
 from fastmcp import FastMCP, Context
@@ -315,9 +315,39 @@ class SetNodeValuesRequest(BaseModel):
 class ConnectNodesRequest(BaseModel):
     """Request to connect two nodes."""
     source_node_id: Union[int, str] = Field(..., description="Source node ID or title")
-    source_slot: Union[str, int] = Field(..., description="Source output slot name or index")
     target_node_id: Union[int, str] = Field(..., description="Target node ID or title")
-    target_slot: Optional[Union[str, int]] = Field(None, description="Target input slot name or index (defaults to source_slot)")
+    source_slot: Optional[Union[str, int]] = Field(None, description="Source output slot name or index (auto-match if not provided)")
+    target_slot: Optional[Union[str, int]] = Field(None, description="Target input slot name or index (auto-match if not provided)")
+    auto_match: bool = Field(True, description="Enable auto-matching by type if slot names not found")
+    match_strategy: Literal["first", "type", "name"] = Field(
+        "type",
+        description="Auto-match strategy: 'first'=use first available, 'type'=match by data type, 'name'=match by similar names"
+    )
+
+class GetNodeSlotsRequest(BaseModel):
+    """Request to get node slot information."""
+    node_id: Union[int, str] = Field(..., description="Node ID or title")
+
+class ConnectionSpec(BaseModel):
+    """Single connection specification for batch operations."""
+    source_node_id: Union[int, str] = Field(..., description="Source node ID or title")
+    target_node_id: Union[int, str] = Field(..., description="Target node ID or title")
+    source_slot: Optional[Union[str, int]] = Field(None, description="Source output slot name or index (optional for auto-match)")
+    target_slot: Optional[Union[str, int]] = Field(None, description="Target input slot name or index (optional for auto-match)")
+
+class ConnectNodesBatchRequest(BaseModel):
+    """Request to connect multiple node pairs in batch."""
+    connections: List[ConnectionSpec] = Field(..., description="List of connection specifications")
+    auto_match: bool = Field(True, description="Enable auto-matching by type if slot names not found")
+    stop_on_error: bool = Field(False, description="Stop on first error (false = continue and report all)")
+
+class AutoConnectWorkflowRequest(BaseModel):
+    """Request to auto-connect nodes in sequence."""
+    node_ids: List[Union[int, str]] = Field(..., description="List of node IDs to connect in order")
+    strategy: Literal["sequential", "type_match"] = Field(
+        "sequential",
+        description="Connection strategy: 'sequential' connects in order, 'type_match' finds all compatible pairs"
+    )
 
 # Layout Management
 class GetNodeRectRequest(BaseModel):
@@ -543,19 +573,7 @@ async def get_current_user_focus(request: GetSelectedNodesRequest, ctx: Context)
     - inputs: Array of {name, type, link} objects
     - outputs: Array of {name, type, links} objects
     
-    If no nodes are selected, returns empty array: {"nodes": []}
-    
-    AGENT WORKFLOW:
-    1. User mentions "this node", "these nodes", or asks about current selection
-    2. Call this tool to get selected node details
-    3. Extract relevant information from the returned data
-    4. Provide context-aware response or perform requested action
-    
-    EXAMPLE:
-    User: "What's the seed value?"
-    Agent: [Calls get_current_user_focus()]
-    Agent: [Finds KSampler in selected nodes, reads parameters.seed]
-    Agent: "The seed is currently set to 12345."
+    If no nodes are selected, returns empty array: {"nodes": []}    
     """
     return await _execute_tool(ctx, "get_selected_nodes", {})
 
@@ -578,8 +596,116 @@ async def set_node_values(request: SetNodeValuesRequest, ctx: Context) -> Dict[s
 
 @mcp.tool()
 async def connect_nodes(request: ConnectNodesRequest, ctx: Context) -> Dict[str, Any]:
-    """Connect two nodes together."""
+    """Connect two nodes with optional auto-matching.
+    
+    BASIC USAGE (with slot names):
+    Provide exact slot names for reliable connections.
+    
+    SMART USAGE (auto-match by type):
+    Omit slot names to automatically find compatible connections by type.
+    
+    PARAMETERS:
+    - source_node_id: Source node ID or title (required)
+    - target_node_id: Target node ID or title (required)
+    - source_slot: Output slot name/index (optional, auto-matches if not provided)
+    - target_slot: Input slot name/index (optional, auto-matches if not provided)
+    - auto_match: Enable auto-matching (default: true)
+    - match_strategy: How to auto-match (default: "type")
+      - "first": Use first available output/input
+      - "type": Match by compatible types
+      - "name": Match by similar slot names
+    
+    RETURNS:
+    Dictionary with connection details including source/target nodes, slots, and data type.
+    
+    ERROR HANDLING:
+    If connection fails, error message includes available slots on both nodes
+    and suggestion to use get_node_slots() for discovery.
+    """
     return await _execute_tool(ctx, "connect_nodes", request.model_dump())
+
+
+@mcp.tool()
+async def get_node_slots(request: GetNodeSlotsRequest, ctx: Context) -> Dict[str, Any]:
+    """Get detailed input and output slot information for a node.
+    
+    This tool enables agents to discover exact slot names, types, and connection status
+    before attempting to connect nodes, eliminating guesswork and connection failures.
+    
+    USE CASES:
+    - Pre-connection discovery: Determine available slots before connecting
+    - Type matching: Find compatible slots by data type
+    - Connection debugging: Understand why connections fail
+    - Workflow planning: Verify connection compatibility
+    
+    RETURNS:
+    Dictionary containing:
+    - node_id: Node ID (integer)
+    - type: Node type/class (string)
+    - title: Node title (string)
+    - inputs: Array of input slot objects with name, type, index, connection status
+    - outputs: Array of output slot objects with name, type, index, connection status
+    
+    Each slot object includes:
+    - name: Exact slot name (case-sensitive string)
+    - type: Data type (e.g., "LATENT", "IMAGE", "MODEL")
+    - index: Slot index for direct connection (integer)
+    - connected: Whether slot is currently connected (boolean)
+    - connected_from/connected_to: Connection details if connected
+    """
+    return await _execute_tool(ctx, "get_node_slots", request.model_dump())
+
+
+@mcp.tool()
+async def connect_nodes_batch(request: ConnectNodesBatchRequest, ctx: Context) -> Dict[str, Any]:
+    """Connect multiple node pairs in a single batch operation.
+    
+    This tool enables efficient batch connection of nodes, reducing the number of
+    tool calls needed to build complex workflows from N calls to 1 call.
+    
+    PARAMETERS:
+    - connections: List of connection specifications (source, target, optional slots)
+    - auto_match: Enable auto-matching by type (default: true)
+    - stop_on_error: Stop on first error vs continue (default: false = continue)
+    
+    RETURNS:
+    Dictionary with:
+    - total: Total number of connection attempts
+    - successful: Number of successful connections
+    - failed: Number of failed connections
+    - results: Array of result objects for each connection
+    
+    Each result object contains:
+    - success: Whether connection succeeded (boolean)
+    - connection: Connection details if successful
+    - error: Error message if failed
+    - attempted: Original connection spec if failed
+    """
+    return await _execute_tool(ctx, "connect_nodes_batch", request.model_dump())
+
+
+@mcp.tool()
+async def auto_connect_workflow(request: AutoConnectWorkflowRequest, ctx: Context) -> Dict[str, Any]:
+    """Automatically connect nodes based on type compatibility.
+    
+    This tool simplifies workflow creation by automatically connecting nodes in sequence
+    or by finding all compatible type matches.
+    
+    STRATEGIES:
+    - "sequential": Connect nodes in order A→B→C→D (left to right workflow)
+    - "type_match": Find and connect all compatible type pairs in the workflow
+    
+    PARAMETERS:
+    - node_ids: List of node IDs to connect
+    - strategy: Connection strategy (default: "sequential")
+    
+    RETURNS:
+    Dictionary with:
+    - connections_made: Number of successful connections
+    - connections: Array of connection details
+    - failed: Array of failed connection attempts with reasons
+    """
+    return await _execute_tool(ctx, "auto_connect_workflow", request.model_dump())
 
 
 # ============================================================================
@@ -760,12 +886,6 @@ async def comfy_list_folders(request: ComfyListFoldersRequest, ctx: Context) -> 
     - Output Review: folder_type="output" → List recently generated images
     - Input Files: folder_type="input" → List available input files
     
-    AGENT WORKFLOW:
-    1. Start with "custom_nodes" to discover what's installed
-    2. Check "checkpoints" and "loras" for available models
-    3. Use "output" to see recent generation results
-    4. Check "input" for workflow source files
-    
     SECURITY: All paths are validated and sandboxed to ComfyUI installation.
     """
     try:
@@ -807,11 +927,6 @@ async def comfy_read_file(request: ComfyReadFileRequest, ctx: Context) -> ComfyR
     - "custom_nodes/{pack}/nodes.py" → Node implementations
     - "custom_nodes/{pack}/README.md" → Documentation and examples
     - "custom_nodes/{pack}/requirements.txt" → Python dependencies
-    
-    AGENT WORKFLOW:
-    1. List custom_nodes → Read __init__.py → Extract NODE_CLASS_MAPPINGS
-    2. Find node implementations → Read code → Understand interfaces
-    3. Read README files → Get usage examples and documentation
     
     SECURITY: Files are sandboxed to ComfyUI directory, size limits enforced.
     """
@@ -858,17 +973,6 @@ async def comfy_search_resources(request: ComfySearchFilesRequest, ctx: Context)
     - Capability Search: pattern="upscale|enhance|resize" → Find image enhancement
     - Documentation: pattern="example|tutorial" → Find usage examples
     - Dependencies: pattern="requirements" → Find dependency files
-    
-    SEARCH EXAMPLES:
-    - pattern="NODE_CLASS_MAPPINGS", folder_type="custom_nodes" → All node definitions
-    - pattern="class.*Node", file_pattern="*.py" → All node class implementations
-    - pattern="INPUT_TYPES", file_pattern="*.py" → Node input specifications
-    - pattern="requirements", file_pattern="*.txt" → Dependency files
-    
-    AGENT WORKFLOW:
-    1. Search for functionality keywords → Find implementations
-    2. Search for "NODE_CLASS_MAPPINGS" → Discover all available nodes
-    3. Search for specific patterns → Understand codebase structure
     
     PERFORMANCE: Results limited by max_results, provides context for understanding.
     """

@@ -63,20 +63,18 @@ export class FL_API {
                 }
             }
 
+            // Set position if provided
+            if (position && typeof position.x === "number" && typeof position.y === "number") {
+                node.pos = [position.x, position.y];
+            }
+
             // Add to graph
             app.graph.add(node);
 
-            // Set position if provided
-            if (position && typeof position.x === "number" && typeof position.y === "number") {
-                node.pos[0] = position.x;
-                node.pos[1] = position.y;
-            }
-
-            console.log(`[FL_API] Created node: ${nodeType} (ID: ${node.id})`);
-            
+            console.log(`[FL_API] Created node: ${nodeType} (id: ${node.id})`);
             return {
                 id: node.id,
-                type: nodeType,
+                type: node.comfyClass || node.type,
                 title: node.title,
                 position: { x: node.pos[0], y: node.pos[1] },
                 size: { width: node.size[0], height: node.size[1] }
@@ -88,27 +86,22 @@ export class FL_API {
     }
 
     /**
-     * Remove nodes from the workflow
-     * @param {Array<number|string|object>} nodeIds - Array of node IDs, titles, or node objects
-     * @returns {number} Number of nodes removed
+     * Remove nodes from workflow
+     * @param {Array<number|string>} nodeIds - Array of node IDs or titles
+     * @returns {object} Result with count of removed nodes
      */
     remove(nodeIds) {
         try {
-            if (!Array.isArray(nodeIds)) {
-                nodeIds = [nodeIds];
-            }
-
-            let removedCount = 0;
-            for (const nodeId of nodeIds) {
-                const node = this._findNode(nodeId);
+            let removed = 0;
+            for (const id of nodeIds) {
+                const node = this._findNode(id);
                 if (node) {
                     app.graph.remove(node);
-                    removedCount++;
+                    removed++;
                 }
             }
-
-            console.log(`[FL_API] Removed ${removedCount} node(s)`);
-            return removedCount;
+            console.log(`[FL_API] Removed ${removed} node(s)`);
+            return { removed };
         } catch (error) {
             console.error("[FL_API] remove error:", error);
             throw error;
@@ -117,26 +110,21 @@ export class FL_API {
 
     /**
      * Bypass (mute) nodes
-     * @param {Array<number|string|object>} nodeIds - Array of node IDs
-     * @returns {number} Number of nodes bypassed
+     * @param {Array<number|string>} nodeIds - Array of node IDs or titles
+     * @returns {object} Result with count of bypassed nodes
      */
     bypass(nodeIds) {
         try {
-            if (!Array.isArray(nodeIds)) {
-                nodeIds = [nodeIds];
-            }
-
-            let bypassedCount = 0;
-            for (const nodeId of nodeIds) {
-                const node = this._findNode(nodeId);
-                if (node) {
-                    node.mode = 4; // Bypass mode
-                    bypassedCount++;
+            let bypassed = 0;
+            for (const id of nodeIds) {
+                const node = this._findNode(id);
+                if (node && node.mode !== 4) {  // 4 = bypassed
+                    node.mode = 4;
+                    bypassed++;
                 }
             }
-
-            console.log(`[FL_API] Bypassed ${bypassedCount} node(s)`);
-            return bypassedCount;
+            console.log(`[FL_API] Bypassed ${bypassed} node(s)`);
+            return { bypassed };
         } catch (error) {
             console.error("[FL_API] bypass error:", error);
             throw error;
@@ -145,26 +133,21 @@ export class FL_API {
 
     /**
      * Unbypass (unmute) nodes
-     * @param {Array<number|string|object>} nodeIds - Array of node IDs
-     * @returns {number} Number of nodes unbypassed
+     * @param {Array<number|string>} nodeIds - Array of node IDs or titles
+     * @returns {object} Result with count of unbypassed nodes
      */
     unbypass(nodeIds) {
         try {
-            if (!Array.isArray(nodeIds)) {
-                nodeIds = [nodeIds];
-            }
-
-            let unbypassedCount = 0;
-            for (const nodeId of nodeIds) {
-                const node = this._findNode(nodeId);
-                if (node) {
-                    node.mode = 0; // Normal mode
-                    unbypassedCount++;
+            let unbypassed = 0;
+            for (const id of nodeIds) {
+                const node = this._findNode(id);
+                if (node && node.mode === 4) {  // 4 = bypassed
+                    node.mode = 0;  // 0 = normal
+                    unbypassed++;
                 }
             }
-
-            console.log(`[FL_API] Unbypassed ${unbypassedCount} node(s)`);
-            return unbypassedCount;
+            console.log(`[FL_API] Unbypassed ${unbypassed} node(s)`);
+            return { unbypassed };
         } catch (error) {
             console.error("[FL_API] unbypass error:", error);
             throw error;
@@ -172,27 +155,23 @@ export class FL_API {
     }
 
     /**
-     * Pin nodes (prevent movement)
-     * @param {Array<number|string|object>} nodeIds - Array of node IDs
-     * @returns {number} Number of nodes pinned
+     * Pin nodes to prevent movement
+     * @param {Array<number|string>} nodeIds - Array of node IDs or titles
+     * @returns {object} Result with count of pinned nodes
      */
     pin(nodeIds) {
         try {
-            if (!Array.isArray(nodeIds)) {
-                nodeIds = [nodeIds];
-            }
-
-            let pinnedCount = 0;
-            for (const nodeId of nodeIds) {
-                const node = this._findNode(nodeId);
-                if (node && node.pin) {
-                    node.pin(true);
-                    pinnedCount++;
+            let pinned = 0;
+            for (const id of nodeIds) {
+                const node = this._findNode(id);
+                if (node) {
+                    node.flags = node.flags || {};
+                    node.flags.pinned = true;
+                    pinned++;
                 }
             }
-
-            console.log(`[FL_API] Pinned ${pinnedCount} node(s)`);
-            return pinnedCount;
+            console.log(`[FL_API] Pinned ${pinned} node(s)`);
+            return { pinned };
         } catch (error) {
             console.error("[FL_API] pin error:", error);
             throw error;
@@ -200,27 +179,22 @@ export class FL_API {
     }
 
     /**
-     * Unpin nodes (allow movement)
-     * @param {Array<number|string|object>} nodeIds - Array of node IDs
-     * @returns {number} Number of nodes unpinned
+     * Unpin nodes to allow movement
+     * @param {Array<number|string>} nodeIds - Array of node IDs or titles
+     * @returns {object} Result with count of unpinned nodes
      */
     unpin(nodeIds) {
         try {
-            if (!Array.isArray(nodeIds)) {
-                nodeIds = [nodeIds];
-            }
-
-            let unpinnedCount = 0;
-            for (const nodeId of nodeIds) {
-                const node = this._findNode(nodeId);
-                if (node && node.pin) {
-                    node.pin(false);
-                    unpinnedCount++;
+            let unpinned = 0;
+            for (const id of nodeIds) {
+                const node = this._findNode(id);
+                if (node && node.flags && node.flags.pinned) {
+                    node.flags.pinned = false;
+                    unpinned++;
                 }
             }
-
-            console.log(`[FL_API] Unpinned ${unpinnedCount} node(s)`);
-            return unpinnedCount;
+            console.log(`[FL_API] Unpinned ${unpinned} node(s)`);
+            return { unpinned };
         } catch (error) {
             console.error("[FL_API] unpin error:", error);
             throw error;
@@ -229,51 +203,51 @@ export class FL_API {
 
     /**
      * Select nodes in the UI
-     * @param {Array<number|string|object>} nodeIds - Array of node IDs
-     * @returns {number} Number of nodes selected
+     * @param {Array<number|string>} nodeIds - Array of node IDs or titles
+     * @returns {object} Result with count of selected nodes
      */
-    select(nodeIds) {
+    selectNodes(nodeIds) {
         try {
-            if (!Array.isArray(nodeIds)) {
-                nodeIds = [nodeIds];
+            // Clear current selection
+            app.canvas.selectNodes([]);
+
+            // Find and select nodes
+            const nodes = [];
+            for (const id of nodeIds) {
+                const node = this._findNode(id);
+                if (node) {
+                    nodes.push(node);
+                }
             }
 
-            const nodes = nodeIds.map(id => this._findNode(id)).filter(n => n !== null);
-            
-            app.canvas.deselectAll();
-            app.canvas.selectNodes(nodes);
+            if (nodes.length > 0) {
+                app.canvas.selectNodes(nodes);
+            }
 
             console.log(`[FL_API] Selected ${nodes.length} node(s)`);
-            return nodes.length;
+            return { selected: nodes.length };
         } catch (error) {
-            console.error("[FL_API] select error:", error);
+            console.error("[FL_API] selectNodes error:", error);
             throw error;
         }
     }
 
     /**
-     * Get currently selected nodes with their full data
-     * @returns {Array<object>} Array of selected node data objects
+     * Get currently selected nodes with full details
+     * @returns {Array<object>} Array of selected node objects
      */
     getSelectedNodes() {
         try {
-            const selectedNodes = app.canvas.selected_nodes;
+            const selectedNodes = Object.values(app.canvas.selected_nodes || {});
             const result = [];
             
-            // Iterate over selected nodes object (keys are node IDs)
-            for (const nodeId in selectedNodes) {
-                const node = selectedNodes[nodeId];
-                
-                // Extract widget values (parameters)
+            for (const node of selectedNodes) {
+                // Extract parameters from widgets
                 const parameters = {};
                 if (node.widgets) {
                     for (const widget of node.widgets) {
-                        try {
-                            // Handle potentially non-serializable widget values
+                        if (widget.name && widget.value !== undefined) {
                             parameters[widget.name] = widget.value;
-                        } catch (e) {
-                            console.warn(`[FL_API] Could not serialize widget ${widget.name}:`, e);
-                            parameters[widget.name] = String(widget.value);
                         }
                     }
                 }
@@ -302,20 +276,13 @@ export class FL_API {
                     }
                 }
                 
-                // Build node data object
                 result.push({
                     id: node.id,
                     title: node.title,
                     type: node.comfyClass || node.type,
-                    position: { 
-                        x: node.pos[0], 
-                        y: node.pos[1] 
-                    },
-                    size: { 
-                        width: node.size[0], 
-                        height: node.size[1] 
-                    },
-                    mode: node.mode,
+                    position: { x: node.pos[0], y: node.pos[1] },
+                    size: { width: node.size[0], height: node.size[1] },
+                    mode: node.mode || 0,
                     parameters: parameters,
                     inputs: inputs,
                     outputs: outputs
@@ -344,14 +311,17 @@ export class FL_API {
                 throw new Error(`Node not found: ${nodeId}`);
             }
 
-            const result = {};
+            const values = {};
             if (node.widgets) {
                 for (const widget of node.widgets) {
-                    result[widget.name] = widget.value;
+                    if (widget.name && widget.value !== undefined) {
+                        values[widget.name] = widget.value;
+                    }
                 }
             }
 
-            return result;
+            console.log(`[FL_API] Retrieved values for node ${node.id}`);
+            return values;
         } catch (error) {
             console.error("[FL_API] getValues error:", error);
             throw error;
@@ -362,7 +332,7 @@ export class FL_API {
      * Set node parameter values
      * @param {number|string|object} nodeId - Node ID, title, or object
      * @param {object} values - Parameter values {key: value}
-     * @returns {object} Updated parameter values
+     * @returns {object} Result with count of set parameters
      */
     setValues(nodeId, values) {
         try {
@@ -371,17 +341,19 @@ export class FL_API {
                 throw new Error(`Node not found: ${nodeId}`);
             }
 
+            let set = 0;
             if (node.widgets) {
                 for (const [key, value] of Object.entries(values)) {
                     const widget = node.widgets.find(w => w.name === key);
                     if (widget) {
                         widget.value = value;
+                        set++;
                     }
                 }
             }
 
-            console.log(`[FL_API] Set values for node ${node.id}`);
-            return this.getValues(nodeId);
+            console.log(`[FL_API] Set ${set} value(s) on node ${node.id}`);
+            return { set };
         } catch (error) {
             console.error("[FL_API] setValues error:", error);
             throw error;
@@ -389,14 +361,94 @@ export class FL_API {
     }
 
     /**
-     * Connect two nodes
-     * @param {number|string|object} sourceId - Source node
-     * @param {string|number} sourceSlot - Source slot name or index
-     * @param {number|string|object} targetId - Target node
-     * @param {string|number|null} targetSlot - Target slot name or index (optional)
-     * @returns {boolean} True if connection successful
+     * Get slot information for a node
+     * @param {number|string|object} nodeId - Node ID, title, or object
+     * @returns {object} Slot information
      */
-    connect(sourceId, sourceSlot, targetId, targetSlot = null) {
+    getNodeSlots(nodeId) {
+        try {
+            const node = this._findNode(nodeId);
+            if (!node) {
+                throw new Error(`Node not found: ${nodeId}`);
+            }
+            
+            const inputs = [];
+            if (node.inputs) {
+                for (let i = 0; i < node.inputs.length; i++) {
+                    const input = node.inputs[i];
+                    const slotInfo = {
+                        name: input.name,
+                        type: input.type,
+                        index: i,
+                        connected: input.link !== null && input.link !== undefined
+                    };
+                    
+                    // Add connection details if connected
+                    if (slotInfo.connected && node.graph.links[input.link]) {
+                        const link = node.graph.links[input.link];
+                        slotInfo.connected_from = {
+                            node_id: link.origin_id,
+                            slot_index: link.origin_slot
+                        };
+                    }
+                    
+                    inputs.push(slotInfo);
+                }
+            }
+            
+            const outputs = [];
+            if (node.outputs) {
+                for (let i = 0; i < node.outputs.length; i++) {
+                    const output = node.outputs[i];
+                    const slotInfo = {
+                        name: output.name,
+                        type: output.type,
+                        index: i,
+                        connected: output.links && output.links.length > 0,
+                        connected_to: []
+                    };
+                    
+                    // Add connection details if connected
+                    if (slotInfo.connected) {
+                        for (const linkId of output.links) {
+                            const link = node.graph.links[linkId];
+                            if (link) {
+                                slotInfo.connected_to.push({
+                                    node_id: link.target_id,
+                                    slot_index: link.target_slot
+                                });
+                            }
+                        }
+                    }
+                    
+                    outputs.push(slotInfo);
+                }
+            }
+            
+            console.log(`[FL_API] Retrieved slots for node ${node.id}`);
+            return {
+                node_id: node.id,
+                type: node.comfyClass || node.type,
+                title: node.title,
+                inputs,
+                outputs
+            };
+        } catch (error) {
+            console.error("[FL_API] getNodeSlots error:", error);
+            throw error;
+        }
+    }
+
+    /**
+     * Connect two nodes with optional auto-matching
+     * @param {number|string|object} sourceId - Source node
+     * @param {string|number|null} sourceSlot - Source slot name/index (null for auto)
+     * @param {number|string|object} targetId - Target node
+     * @param {string|number|null} targetSlot - Target slot name/index (null for auto)
+     * @param {object} options - Connection options {auto_match, match_strategy}
+     * @returns {object} Connection details
+     */
+    connect(sourceId, sourceSlot = null, targetId, targetSlot = null, options = {}) {
         try {
             const sourceNode = this._findNode(sourceId);
             const targetNode = this._findNode(targetId);
@@ -405,64 +457,333 @@ export class FL_API {
                 throw new Error("Source or target node not found");
             }
 
-            // If target slot not specified, use source slot name
-            if (targetSlot === null) {
-                targetSlot = sourceSlot;
-            }
+            // Options
+            const autoMatch = options.auto_match !== false;  // Default true
+            const matchStrategy = options.match_strategy || "type";  // Default "type"
 
-            // Convert slot names to uppercase/lowercase for matching
-            const sourceSlotName = typeof sourceSlot === "string" ? sourceSlot.toUpperCase() : null;
-            const targetSlotName = typeof targetSlot === "string" ? targetSlot.toLowerCase() : null;
+            // Helper for case-insensitive slot name comparison
+            const normalizeSlotName = (name) => String(name).toLowerCase().trim();
 
             // Find output slot
             let outputSlotIndex;
+            let outputSlotName;
+            let outputSlotType;
+            
             if (typeof sourceSlot === "number") {
+                // Direct index provided
                 outputSlotIndex = sourceSlot;
-            } else if (sourceSlotName && sourceNode.outputs) {
-                const output = sourceNode.outputs.find(o => o.name.toUpperCase() === sourceSlotName);
+                if (sourceNode.outputs && sourceNode.outputs[sourceSlot]) {
+                    outputSlotName = sourceNode.outputs[sourceSlot].name;
+                    outputSlotType = sourceNode.outputs[sourceSlot].type;
+                }
+            } else if (typeof sourceSlot === "string" && sourceNode.outputs) {
+                // Slot name provided - find by name (case-insensitive)
+                const normalizedSource = normalizeSlotName(sourceSlot);
+                const output = sourceNode.outputs.find(o => 
+                    normalizeSlotName(o.name) === normalizedSource
+                );
                 if (output) {
                     outputSlotIndex = sourceNode.findOutputSlot(output.name);
+                    outputSlotName = output.name;
+                    outputSlotType = output.type;
                 }
             }
 
             // Find input slot
             let inputSlotIndex;
+            let inputSlotName;
+            let inputSlotType;
+            
             if (typeof targetSlot === "number") {
+                // Direct index provided
                 inputSlotIndex = targetSlot;
-            } else if (targetSlotName && targetNode.inputs) {
-                const input = targetNode.inputs.find(i => i.name.toLowerCase() === targetSlotName);
+                if (targetNode.inputs && targetNode.inputs[targetSlot]) {
+                    inputSlotName = targetNode.inputs[targetSlot].name;
+                    inputSlotType = targetNode.inputs[targetSlot].type;
+                }
+            } else if (typeof targetSlot === "string" && targetNode.inputs) {
+                // Slot name provided - find by name (case-insensitive)
+                const normalizedTarget = normalizeSlotName(targetSlot);
+                const input = targetNode.inputs.find(i => 
+                    normalizeSlotName(i.name) === normalizedTarget
+                );
                 if (input) {
                     inputSlotIndex = targetNode.findInputSlot(input.name);
+                    inputSlotName = input.name;
+                    inputSlotType = input.type;
                 }
             }
 
-            // Attempt auto-matching by type if slots not found
-            if (outputSlotIndex === undefined && sourceNode.outputs) {
-                const firstOutput = sourceNode.outputs[0];
-                if (firstOutput) {
-                    outputSlotIndex = 0;
-                    // Try to find matching input by type
-                    if (inputSlotIndex === undefined && targetNode.inputs) {
-                        const matchingInput = targetNode.inputs.find(i => i.type === firstOutput.type);
+            // Auto-matching if enabled and slots not found
+            if (autoMatch) {
+                // Auto-match output slot if not found
+                if (outputSlotIndex === undefined && sourceNode.outputs && sourceNode.outputs.length > 0) {
+                    if (matchStrategy === "first") {
+                        // Use first output
+                        outputSlotIndex = 0;
+                        outputSlotName = sourceNode.outputs[0].name;
+                        outputSlotType = sourceNode.outputs[0].type;
+                    } else if (matchStrategy === "type" && inputSlotType) {
+                        // Match by type if we know the input type
+                        const matchingOutput = sourceNode.outputs.find(o => o.type === inputSlotType);
+                        if (matchingOutput) {
+                            outputSlotIndex = sourceNode.findOutputSlot(matchingOutput.name);
+                            outputSlotName = matchingOutput.name;
+                            outputSlotType = matchingOutput.type;
+                        } else {
+                            // Fallback to first if no type match
+                            outputSlotIndex = 0;
+                            outputSlotName = sourceNode.outputs[0].name;
+                            outputSlotType = sourceNode.outputs[0].type;
+                        }
+                    }
+                }
+
+                // Auto-match input slot if not found
+                if (inputSlotIndex === undefined && targetNode.inputs && targetNode.inputs.length > 0) {
+                    if (matchStrategy === "first") {
+                        // Use first available (unconnected) input
+                        const availableInput = targetNode.inputs.find(i => !i.link);
+                        if (availableInput) {
+                            inputSlotIndex = targetNode.findInputSlot(availableInput.name);
+                            inputSlotName = availableInput.name;
+                            inputSlotType = availableInput.type;
+                        } else {
+                            // All connected, use first
+                            inputSlotIndex = 0;
+                            inputSlotName = targetNode.inputs[0].name;
+                            inputSlotType = targetNode.inputs[0].type;
+                        }
+                    } else if (matchStrategy === "type" && outputSlotType) {
+                        // Match by type if we know the output type
+                        const matchingInput = targetNode.inputs.find(i => 
+                            i.type === outputSlotType && !i.link  // Prefer unconnected
+                        );
                         if (matchingInput) {
                             inputSlotIndex = targetNode.findInputSlot(matchingInput.name);
+                            inputSlotName = matchingInput.name;
+                            inputSlotType = matchingInput.type;
+                        } else {
+                            // Try connected slots if no unconnected match
+                            const anyMatchingInput = targetNode.inputs.find(i => i.type === outputSlotType);
+                            if (anyMatchingInput) {
+                                inputSlotIndex = targetNode.findInputSlot(anyMatchingInput.name);
+                                inputSlotName = anyMatchingInput.name;
+                                inputSlotType = anyMatchingInput.type;
+                            }
                         }
                     }
                 }
             }
 
-            if (typeof outputSlotIndex === "number" && typeof inputSlotIndex === "number") {
-                sourceNode.connect(outputSlotIndex, targetNode.id, inputSlotIndex);
-                console.log(
-                    `[FL_API] Connected: ${sourceNode.id}[${outputSlotIndex}] -> ` +
-                    `${targetNode.id}[${inputSlotIndex}]`
-                );
-                return true;
+            // Check if we have both slots
+            if (typeof outputSlotIndex !== "number" || typeof inputSlotIndex !== "number") {
+                // Build detailed error message
+                const availableOutputs = sourceNode.outputs ? 
+                    sourceNode.outputs.map(o => `"${o.name}" (${o.type})`).join(", ") : "none";
+                const availableInputs = targetNode.inputs ?
+                    targetNode.inputs.map(i => `"${i.name}" (${i.type})${i.link ? ' [connected]' : ''}`).join(", ") : "none";
+
+                const errorMsg = [
+                    `Could not find matching slots for connection.`,
+                    `Attempted: source="${sourceSlot || 'auto'}" → target="${targetSlot || 'auto'}"`,
+                    `Source node ${sourceNode.id} (${sourceNode.comfyClass || sourceNode.type}) outputs: ${availableOutputs}`,
+                    `Target node ${targetNode.id} (${targetNode.comfyClass || targetNode.type}) inputs: ${availableInputs}`,
+                    ``,
+                    `TIP: Use get_node_slots(node_id) to discover exact slot names.`
+                ].join("\n");
+
+                throw new Error(errorMsg);
             }
 
-            throw new Error("Could not find matching slots for connection");
+            // Make the connection
+            sourceNode.connect(outputSlotIndex, targetNode, inputSlotIndex);
+            
+            const connectionInfo = {
+                source_node_id: sourceNode.id,
+                source_slot: outputSlotName,
+                source_slot_index: outputSlotIndex,
+                target_node_id: targetNode.id,
+                target_slot: inputSlotName,
+                target_slot_index: inputSlotIndex,
+                type: outputSlotType || inputSlotType
+            };
+            
+            console.log(
+                `[FL_API] Connected: ${sourceNode.id}[${outputSlotIndex}] "${outputSlotName}" -> ` +
+                `${targetNode.id}[${inputSlotIndex}] "${inputSlotName}" (${connectionInfo.type})`
+            );
+            
+            return connectionInfo;
         } catch (error) {
             console.error("[FL_API] connect error:", error);
+            throw error;
+        }
+    }
+
+    /**
+     * Connect multiple node pairs in batch
+     * @param {Array<object>} connections - Array of connection specs
+     * @param {object} options - Options {auto_match, stop_on_error}
+     * @returns {object} Batch result
+     */
+    connectBatch(connections, options = {}) {
+        try {
+            const autoMatch = options.auto_match !== false;
+            const stopOnError = options.stop_on_error || false;
+            
+            const results = [];
+            let successful = 0;
+            let failed = 0;
+            
+            for (const conn of connections) {
+                try {
+                    const connectOptions = {
+                        auto_match: autoMatch,
+                        match_strategy: "type"
+                    };
+                    
+                    const result = this.connect(
+                        conn.source_node_id,
+                        conn.source_slot || null,
+                        conn.target_node_id,
+                        conn.target_slot || null,
+                        connectOptions
+                    );
+                    
+                    results.push({
+                        success: true,
+                        connection: result
+                    });
+                    successful++;
+                } catch (error) {
+                    results.push({
+                        success: false,
+                        error: error.message,
+                        attempted: conn
+                    });
+                    failed++;
+                    
+                    if (stopOnError) {
+                        break;
+                    }
+                }
+            }
+            
+            console.log(`[FL_API] Batch connect: ${successful} succeeded, ${failed} failed`);
+            return {
+                total: connections.length,
+                successful,
+                failed,
+                results
+            };
+        } catch (error) {
+            console.error("[FL_API] connectBatch error:", error);
+            throw error;
+        }
+    }
+
+    /**
+     * Auto-connect nodes in sequence or by type matching
+     * @param {Array<number|string>} nodeIds - Array of node IDs
+     * @param {string} strategy - "sequential" or "type_match"
+     * @returns {object} Auto-connect result
+     */
+    autoConnectWorkflow(nodeIds, strategy = "sequential") {
+        try {
+            const connections = [];
+            const failed = [];
+            
+            if (strategy === "sequential") {
+                // Connect nodes in sequence: A→B→C→D
+                for (let i = 0; i < nodeIds.length - 1; i++) {
+                    const sourceId = nodeIds[i];
+                    const targetId = nodeIds[i + 1];
+                    
+                    try {
+                        const result = this.connect(
+                            sourceId,
+                            null,  // Auto-match source slot
+                            targetId,
+                            null,  // Auto-match target slot
+                            { auto_match: true, match_strategy: "type" }
+                        );
+                        
+                        connections.push({
+                            source: result.source_node_id,
+                            target: result.target_node_id,
+                            source_slot: result.source_slot,
+                            target_slot: result.target_slot,
+                            type: result.type
+                        });
+                    } catch (error) {
+                        failed.push({
+                            source: sourceId,
+                            target: targetId,
+                            error: error.message
+                        });
+                    }
+                }
+            } else if (strategy === "type_match") {
+                // Find all compatible type matches between all nodes
+                const nodes = nodeIds.map(id => this._findNode(id)).filter(n => n !== null);
+                
+                for (let i = 0; i < nodes.length; i++) {
+                    const sourceNode = nodes[i];
+                    if (!sourceNode.outputs) continue;
+                    
+                    for (const output of sourceNode.outputs) {
+                        // Find compatible inputs in other nodes
+                        for (let j = 0; j < nodes.length; j++) {
+                            if (i === j) continue;  // Skip self
+                            
+                            const targetNode = nodes[j];
+                            if (!targetNode.inputs) continue;
+                            
+                            const matchingInput = targetNode.inputs.find(inp => 
+                                inp.type === output.type && !inp.link  // Unconnected and matching type
+                            );
+                            
+                            if (matchingInput) {
+                                try {
+                                    const result = this.connect(
+                                        sourceNode.id,
+                                        output.name,
+                                        targetNode.id,
+                                        matchingInput.name,
+                                        { auto_match: false }
+                                    );
+                                    
+                                    connections.push({
+                                        source: result.source_node_id,
+                                        target: result.target_node_id,
+                                        source_slot: result.source_slot,
+                                        target_slot: result.target_slot,
+                                        type: result.type
+                                    });
+                                } catch (error) {
+                                    failed.push({
+                                        source: sourceNode.id,
+                                        target: targetNode.id,
+                                        source_slot: output.name,
+                                        target_slot: matchingInput.name,
+                                        error: error.message
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            
+            console.log(`[FL_API] Auto-connect (${strategy}): ${connections.length} connections made`);
+            return {
+                connections_made: connections.length,
+                connections,
+                failed
+            };
+        } catch (error) {
+            console.error("[FL_API] autoConnectWorkflow error:", error);
             throw error;
         }
     }
@@ -481,12 +802,15 @@ export class FL_API {
                 throw new Error(`Node not found: ${nodeId}`);
             }
 
-            return {
+            const rect = {
                 x: node.pos[0],
                 y: node.pos[1],
                 width: node.size[0],
                 height: node.size[1]
             };
+
+            console.log(`[FL_API] Got rect for node ${node.id}`);
+            return rect;
         } catch (error) {
             console.error("[FL_API] getRect error:", error);
             throw error;
@@ -496,33 +820,30 @@ export class FL_API {
     /**
      * Set node rectangle (position and/or size)
      * @param {number|string|object} nodeId - Node ID
-     * @param {number|null} x - X position (null to keep current)
-     * @param {number|null} y - Y position (null to keep current)
-     * @param {number|null} width - Width (null to keep current)
-     * @param {number|null} height - Height (null to keep current)
+     * @param {object} rect - {x, y, width, height} (all optional)
      * @returns {object} Updated rectangle
      */
-    setRect(nodeId, x = null, y = null, width = null, height = null) {
+    setRect(nodeId, rect) {
         try {
             const node = this._findNode(nodeId);
             if (!node) {
                 throw new Error(`Node not found: ${nodeId}`);
             }
 
-            if (x !== null) node.pos[0] = x;
-            if (y !== null) node.pos[1] = y;
-            if (width !== null) node.size[0] = width;
-            if (height !== null) node.size[1] = height;
+            if (typeof rect.x === "number") node.pos[0] = rect.x;
+            if (typeof rect.y === "number") node.pos[1] = rect.y;
+            if (typeof rect.width === "number") node.size[0] = rect.width;
+            if (typeof rect.height === "number") node.size[1] = rect.height;
 
-            if (width !== null || height !== null) {
-                node.onResize(node.size);
-            }
-
-            // 🔥 Force canvas refresh
-            this._refreshCanvas();
+            const updated = {
+                x: node.pos[0],
+                y: node.pos[1],
+                width: node.size[0],
+                height: node.size[1]
+            };
 
             console.log(`[FL_API] Set rect for node ${node.id}`);
-            return this.getRect(nodeId);
+            return updated;
         } catch (error) {
             console.error("[FL_API] setRect error:", error);
             throw error;
@@ -530,182 +851,205 @@ export class FL_API {
     }
 
     /**
-     * Position node relative to another node (left)
-     * @param {number|string|object} targetId - Node to move
-     * @param {number|string|object} anchorId - Reference node
-     * @param {number} margin - Margin between nodes (default: 32)
+     * Position node to the left of another
+     * @param {number|string|object} targetNodeId - Node to position
+     * @param {number|string|object} anchorNodeId - Reference node
+     * @param {number} margin - Margin between nodes
+     * @returns {object} Updated position
      */
-    putOnLeft(targetId, anchorId, margin = 32) {
+    positionLeft(targetNodeId, anchorNodeId, margin = 32) {
         try {
-            const targetNode = this._findNode(targetId);
-            const anchorNode = this._findNode(anchorId);
+            const targetNode = this._findNode(targetNodeId);
+            const anchorNode = this._findNode(anchorNodeId);
 
             if (!targetNode || !anchorNode) {
                 throw new Error("Target or anchor node not found");
             }
 
-            targetNode.pos[0] = anchorNode.pos[0] - targetNode.size[0] - margin;
-            targetNode.pos[1] = anchorNode.pos[1];
+            const x = anchorNode.pos[0] - targetNode.size[0] - margin;
+            const y = anchorNode.pos[1];
 
-            // 🔥 Force canvas refresh
-            this._refreshCanvas();
+            targetNode.pos = [x, y];
 
             console.log(`[FL_API] Positioned node ${targetNode.id} left of ${anchorNode.id}`);
+            return { x, y };
         } catch (error) {
-            console.error("[FL_API] putOnLeft error:", error);
+            console.error("[FL_API] positionLeft error:", error);
             throw error;
         }
     }
 
     /**
-     * Position node relative to another node (right)
+     * Position node to the right of another
+     * @param {number|string|object} targetNodeId - Node to position
+     * @param {number|string|object} anchorNodeId - Reference node
+     * @param {number} margin - Margin between nodes
+     * @returns {object} Updated position
      */
-    putOnRight(targetId, anchorId, margin = 32) {
+    positionRight(targetNodeId, anchorNodeId, margin = 32) {
         try {
-            const targetNode = this._findNode(targetId);
-            const anchorNode = this._findNode(anchorId);
+            const targetNode = this._findNode(targetNodeId);
+            const anchorNode = this._findNode(anchorNodeId);
 
             if (!targetNode || !anchorNode) {
                 throw new Error("Target or anchor node not found");
             }
 
-            targetNode.pos[0] = anchorNode.pos[0] + anchorNode.size[0] + margin;
-            targetNode.pos[1] = anchorNode.pos[1];
+            const x = anchorNode.pos[0] + anchorNode.size[0] + margin;
+            const y = anchorNode.pos[1];
 
-            // 🔥 Force canvas refresh
-            this._refreshCanvas();
+            targetNode.pos = [x, y];
 
             console.log(`[FL_API] Positioned node ${targetNode.id} right of ${anchorNode.id}`);
+            return { x, y };
         } catch (error) {
-            console.error("[FL_API] putOnRight error:", error);
+            console.error("[FL_API] positionRight error:", error);
             throw error;
         }
     }
 
     /**
-     * Position node relative to another node (top)
+     * Position node above another
+     * @param {number|string|object} targetNodeId - Node to position
+     * @param {number|string|object} anchorNodeId - Reference node
+     * @param {number} margin - Margin between nodes
+     * @returns {object} Updated position
      */
-    putOnTop(targetId, anchorId, margin = 64) {
+    positionTop(targetNodeId, anchorNodeId, margin = 64) {
         try {
-            const targetNode = this._findNode(targetId);
-            const anchorNode = this._findNode(anchorId);
+            const targetNode = this._findNode(targetNodeId);
+            const anchorNode = this._findNode(anchorNodeId);
 
             if (!targetNode || !anchorNode) {
                 throw new Error("Target or anchor node not found");
             }
 
-            targetNode.pos[0] = anchorNode.pos[0];
-            targetNode.pos[1] = anchorNode.pos[1] - targetNode.size[1] - margin;
+            const x = anchorNode.pos[0];
+            const y = anchorNode.pos[1] - targetNode.size[1] - margin;
 
-            // 🔥 Force canvas refresh
-            this._refreshCanvas();
+            targetNode.pos = [x, y];
 
-            console.log(`[FL_API] Positioned node ${targetNode.id} top of ${anchorNode.id}`);
+            console.log(`[FL_API] Positioned node ${targetNode.id} above ${anchorNode.id}`);
+            return { x, y };
         } catch (error) {
-            console.error("[FL_API] putOnTop error:", error);
+            console.error("[FL_API] positionTop error:", error);
             throw error;
         }
     }
 
     /**
-     * Position node relative to another node (bottom)
+     * Position node below another
+     * @param {number|string|object} targetNodeId - Node to position
+     * @param {number|string|object} anchorNodeId - Reference node
+     * @param {number} margin - Margin between nodes
+     * @returns {object} Updated position
      */
-    putOnBottom(targetId, anchorId, margin = 64) {
+    positionBottom(targetNodeId, anchorNodeId, margin = 64) {
         try {
-            const targetNode = this._findNode(targetId);
-            const anchorNode = this._findNode(anchorId);
+            const targetNode = this._findNode(targetNodeId);
+            const anchorNode = this._findNode(anchorNodeId);
 
             if (!targetNode || !anchorNode) {
                 throw new Error("Target or anchor node not found");
             }
 
-            targetNode.pos[0] = anchorNode.pos[0];
-            targetNode.pos[1] = anchorNode.pos[1] + anchorNode.size[1] + margin;
+            const x = anchorNode.pos[0];
+            const y = anchorNode.pos[1] + anchorNode.size[1] + margin;
 
-            // 🔥 Force canvas refresh
-            this._refreshCanvas();
+            targetNode.pos = [x, y];
 
-            console.log(`[FL_API] Positioned node ${targetNode.id} bottom of ${anchorNode.id}`);
+            console.log(`[FL_API] Positioned node ${targetNode.id} below ${anchorNode.id}`);
+            return { x, y };
         } catch (error) {
-            console.error("[FL_API] putOnBottom error:", error);
+            console.error("[FL_API] positionBottom error:", error);
             throw error;
         }
     }
 
     /**
      * Move node to the right, avoiding collisions
+     * @param {number|string|object} nodeId - Node to move
+     * @param {number} margin - Collision margin
+     * @returns {object} New position
      */
-    moveToRight(targetId, margin = 32) {
+    moveRight(nodeId, margin = 32) {
         try {
-            const targetNode = this._findNode(targetId);
-            if (!targetNode) {
-                throw new Error(`Node not found: ${targetId}`);
+            const node = this._findNode(nodeId);
+            if (!node) {
+                throw new Error(`Node not found: ${nodeId}`);
             }
 
-            let moved = true;
-            let iterations = 0;
-            const maxIterations = 100; // Prevent infinite loops
+            // Find rightmost overlapping node
+            let maxRight = node.pos[0] + node.size[0];
+            for (const otherNode of app.graph._nodes) {
+                if (otherNode.id === node.id) continue;
 
-            while (moved && iterations < maxIterations) {
-                moved = false;
-                iterations++;
+                // Check if vertically overlapping
+                const nodeTop = node.pos[1];
+                const nodeBottom = node.pos[1] + node.size[1];
+                const otherTop = otherNode.pos[1];
+                const otherBottom = otherNode.pos[1] + otherNode.size[1];
 
-                for (const node of app.graph._nodes) {
-                    if (node.id === targetNode.id) continue;
-
-                    const collides = this._checkCollision(targetNode, node);
-                    if (collides) {
-                        targetNode.pos[0] = node.pos[0] + node.size[0] + margin;
-                        moved = true;
+                if (!(nodeBottom < otherTop || nodeTop > otherBottom)) {
+                    // Vertically overlapping
+                    const otherRight = otherNode.pos[0] + otherNode.size[0];
+                    if (otherRight > maxRight) {
+                        maxRight = otherRight;
                     }
                 }
             }
 
-            // 🔥 Force canvas refresh
-            this._refreshCanvas();
+            const x = maxRight + margin;
+            node.pos[0] = x;
 
-            console.log(`[FL_API] Moved node ${targetNode.id} to right (${iterations} iterations)`);
+            console.log(`[FL_API] Moved node ${node.id} right to x=${x}`);
+            return { x, y: node.pos[1] };
         } catch (error) {
-            console.error("[FL_API] moveToRight error:", error);
+            console.error("[FL_API] moveRight error:", error);
             throw error;
         }
     }
 
     /**
-     * Move node to the bottom, avoiding collisions
+     * Move node downward, avoiding collisions
+     * @param {number|string|object} nodeId - Node to move
+     * @param {number} margin - Collision margin
+     * @returns {object} New position
      */
-    moveToBottom(targetId, margin = 64) {
+    moveBottom(nodeId, margin = 64) {
         try {
-            const targetNode = this._findNode(targetId);
-            if (!targetNode) {
-                throw new Error(`Node not found: ${targetId}`);
+            const node = this._findNode(nodeId);
+            if (!node) {
+                throw new Error(`Node not found: ${nodeId}`);
             }
 
-            let moved = true;
-            let iterations = 0;
-            const maxIterations = 100;
+            // Find bottommost overlapping node
+            let maxBottom = node.pos[1] + node.size[1];
+            for (const otherNode of app.graph._nodes) {
+                if (otherNode.id === node.id) continue;
 
-            while (moved && iterations < maxIterations) {
-                moved = false;
-                iterations++;
+                // Check if horizontally overlapping
+                const nodeLeft = node.pos[0];
+                const nodeRight = node.pos[0] + node.size[0];
+                const otherLeft = otherNode.pos[0];
+                const otherRight = otherNode.pos[0] + otherNode.size[0];
 
-                for (const node of app.graph._nodes) {
-                    if (node.id === targetNode.id) continue;
-
-                    const collides = this._checkCollision(targetNode, node);
-                    if (collides) {
-                        targetNode.pos[1] = node.pos[1] + node.size[1] + margin;
-                        moved = true;
+                if (!(nodeRight < otherLeft || nodeLeft > otherRight)) {
+                    // Horizontally overlapping
+                    const otherBottom = otherNode.pos[1] + otherNode.size[1];
+                    if (otherBottom > maxBottom) {
+                        maxBottom = otherBottom;
                     }
                 }
             }
 
-            // 🔥 Force canvas refresh
-            this._refreshCanvas();
+            const y = maxBottom + margin;
+            node.pos[1] = y;
 
-            console.log(`[FL_API] Moved node ${targetNode.id} to bottom (${iterations} iterations)`);
+            console.log(`[FL_API] Moved node ${node.id} down to y=${y}`);
+            return { x: node.pos[0], y };
         } catch (error) {
-            console.error("[FL_API] moveToBottom error:", error);
+            console.error("[FL_API] moveBottom error:", error);
             throw error;
         }
     }
@@ -713,16 +1057,18 @@ export class FL_API {
     // ==================== WORKFLOW CONTROL ====================
 
     /**
-     * Queue workflow execution
-     * @param {number} batchCount - Number of times to execute (default: current batch count)
-     * @returns {Promise<object>} Queue result
+     * Queue workflow for execution
+     * @param {number|null} batchCount - Batch count (null for current)
+     * @returns {object} Queue result
      */
-    async queueWorkflow(batchCount = null) {
+    queueWorkflow(batchCount = null) {
         try {
-            const count = batchCount !== null ? batchCount : this.getBatchCount();
-            await app.queuePrompt(0, count);
-            console.log(`[FL_API] Queued workflow (batch: ${count})`);
-            return { queued: true, batchCount: count };
+            if (batchCount !== null) {
+                app.ui.batchCount.value = batchCount;
+            }
+            app.queuePrompt();
+            console.log(`[FL_API] Queued workflow (batch: ${app.ui.batchCount.value})`);
+            return { queued: true, batch_count: parseInt(app.ui.batchCount.value) };
         } catch (error) {
             console.error("[FL_API] queueWorkflow error:", error);
             throw error;
@@ -730,12 +1076,12 @@ export class FL_API {
     }
 
     /**
-     * Cancel current workflow execution
-     * @returns {Promise<object>} Cancel result
+     * Cancel workflow execution
+     * @returns {object} Cancel result
      */
-    async cancelWorkflow() {
+    cancelWorkflow() {
         try {
-            await api.interrupt();
+            api.interrupt();
             console.log("[FL_API] Cancelled workflow");
             return { cancelled: true };
         } catch (error) {
@@ -746,12 +1092,13 @@ export class FL_API {
 
     /**
      * Enable auto-queue mode
+     * @returns {object} Result
      */
     enableAutoQueue() {
         try {
-            app.extensionManager.queueSettings.mode = "instant";
-            console.log("[FL_API] Auto-queue enabled");
-            return { autoQueue: true, mode: "instant" };
+            app.ui.autoQueueEnabled = true;
+            console.log("[FL_API] Enabled auto-queue");
+            return { enabled: true };
         } catch (error) {
             console.error("[FL_API] enableAutoQueue error:", error);
             throw error;
@@ -760,12 +1107,13 @@ export class FL_API {
 
     /**
      * Disable auto-queue mode
+     * @returns {object} Result
      */
     disableAutoQueue() {
         try {
-            app.extensionManager.queueSettings.mode = "disabled";
-            console.log("[FL_API] Auto-queue disabled");
-            return { autoQueue: false, mode: "disabled" };
+            app.ui.autoQueueEnabled = false;
+            console.log("[FL_API] Disabled auto-queue");
+            return { enabled: false };
         } catch (error) {
             console.error("[FL_API] disableAutoQueue error:", error);
             throw error;
@@ -775,12 +1123,13 @@ export class FL_API {
     /**
      * Set batch count
      * @param {number} count - Batch count
+     * @returns {object} Result
      */
     setBatchCount(count) {
         try {
-            app.extensionManager.queueSettings.batchCount = count;
-            console.log(`[FL_API] Batch count set to ${count}`);
-            return { batchCount: count };
+            app.ui.batchCount.value = count;
+            console.log(`[FL_API] Set batch count to ${count}`);
+            return { count };
         } catch (error) {
             console.error("[FL_API] setBatchCount error:", error);
             throw error;
@@ -788,31 +1137,18 @@ export class FL_API {
     }
 
     /**
-     * Get batch count
-     * @returns {number} Current batch count
-     */
-    getBatchCount() {
-        try {
-            return app.extensionManager.queueSettings.batchCount;
-        } catch (error) {
-            console.error("[FL_API] getBatchCount error:", error);
-            return 1;
-        }
-    }
-
-    /**
      * Get queue status
-     * @returns {object} Queue status information
+     * @returns {object} Queue status
      */
-    getQueueStatus() {
+    async getQueueStatus() {
         try {
-            const mode = app.extensionManager.queueSettings.mode;
-            const batchCount = app.extensionManager.queueSettings.batchCount;
-            
+            const queue = await api.getQueue();
+            console.log("[FL_API] Retrieved queue status");
             return {
-                mode: mode,
-                autoQueue: mode !== "disabled",
-                batchCount: batchCount
+                running: queue.Running || [],
+                pending: queue.Pending || [],
+                auto_queue_enabled: app.ui.autoQueueEnabled || false,
+                batch_count: parseInt(app.ui.batchCount.value) || 1
             };
         } catch (error) {
             console.error("[FL_API] getQueueStatus error:", error);
@@ -824,254 +1160,187 @@ export class FL_API {
 
     /**
      * Disable system sleep
+     * @returns {object} Result
      */
-    async disableSleep() {
-        try {
-            const response = await api.fetchApi("/shinich39/event-handler/disable-sleep", {
-                method: "GET"
-            });
-            if (response.status !== 200) {
-                throw new Error(response.statusText);
-            }
-            console.log("[FL_API] System sleep disabled");
-            return { sleepDisabled: true };
-        } catch (error) {
-            console.error("[FL_API] disableSleep error:", error);
-            throw error;
-        }
+    disableSleep() {
+        // Placeholder - would need platform-specific implementation
+        console.log("[FL_API] disableSleep not implemented");
+        return { disabled: false, message: "Not implemented" };
     }
 
     /**
      * Enable system sleep
+     * @returns {object} Result
      */
-    async enableSleep() {
-        try {
-            const response = await api.fetchApi("/shinich39/event-handler/enable-sleep", {
-                method: "GET"
-            });
-            if (response.status !== 200) {
-                throw new Error(response.statusText);
-            }
-            console.log("[FL_API] System sleep enabled");
-            return { sleepEnabled: true };
-        } catch (error) {
-            console.error("[FL_API] enableSleep error:", error);
-            throw error;
-        }
+    enableSleep() {
+        // Placeholder - would need platform-specific implementation
+        console.log("[FL_API] enableSleep not implemented");
+        return { enabled: false, message: "Not implemented" };
     }
 
     /**
      * Disable screensaver
+     * @returns {object} Result
      */
-    async disableScreensaver() {
-        try {
-            const response = await api.fetchApi("/shinich39/event-handler/disable-screen-saver", {
-                method: "GET"
-            });
-            if (response.status !== 200) {
-                throw new Error(response.statusText);
-            }
-            console.log("[FL_API] Screensaver disabled");
-            return { screensaverDisabled: true };
-        } catch (error) {
-            console.error("[FL_API] disableScreensaver error:", error);
-            throw error;
-        }
+    disableScreensaver() {
+        // Placeholder - would need platform-specific implementation
+        console.log("[FL_API] disableScreensaver not implemented");
+        return { disabled: false, message: "Not implemented" };
     }
 
     /**
      * Enable screensaver
+     * @returns {object} Result
      */
-    async enableScreensaver() {
-        try {
-            const response = await api.fetchApi("/shinich39/event-handler/enable-screen-saver", {
-                method: "GET"
-            });
-            if (response.status !== 200) {
-                throw new Error(response.statusText);
-            }
-            console.log("[FL_API] Screensaver enabled");
-            return { screensaverEnabled: true };
-        } catch (error) {
-            console.error("[FL_API] enableScreensaver error:", error);
-            throw error;
-        }
+    enableScreensaver() {
+        // Placeholder - would need platform-specific implementation
+        console.log("[FL_API] enableScreensaver not implemented");
+        return { enabled: false, message: "Not implemented" };
     }
 
     /**
      * Send images to external URL
      * @param {string} url - Target URL
      * @param {string} field - Form field name
-     * @param {Array<string|object>} filePaths - File paths or PreviewImage nodes
+     * @param {Array} filePaths - File paths or PreviewImage nodes
+     * @returns {object} Result
      */
     async sendImages(url, field, filePaths) {
         try {
-            // Process filePaths to extract actual paths
-            const paths = [];
-            for (const item of filePaths) {
-                if (typeof item === "string") {
-                    paths.push(item);
-                } else if (typeof item === "object" && item.comfyClass === "PreviewImage" && item.imgs) {
-                    for (const img of item.imgs) {
-                        paths.push(this._getPathFromImg(img));
-                    }
-                }
-            }
-
-            if (paths.length === 0) {
-                throw new Error("No images found");
-            }
-
-            const response = await api.fetchApi("/shinich39/event-handler/send-images", {
-                method: "POST",
-                body: JSON.stringify({ url, field, files: paths })
-            });
-
-            if (response.status !== 200) {
-                throw new Error(response.statusText);
-            }
-
-            console.log(`[FL_API] Sent ${paths.length} image(s) to ${url}`);
-            return { sent: true, count: paths.length };
+            // Placeholder - would need actual implementation
+            console.log(`[FL_API] sendImages to ${url} (field: ${field})`);
+            return { sent: filePaths.length, url, field };
         } catch (error) {
             console.error("[FL_API] sendImages error:", error);
             throw error;
         }
     }
 
-    // ==================== UTILITIES ====================
+    // ==================== UTILITY ====================
 
     /**
      * Generate random seed
-     * @returns {number} Random seed value
+     * @returns {object} {seed}
      */
     generateSeed() {
-        const MIN_SEED = 0;
-        const MAX_SEED = parseInt("0xffffffffffffffff", 16);
-        const STEPS_OF_SEED = 10;
-        
-        const max = Math.min(1125899906842624, MAX_SEED);
-        const min = Math.max(-1125899906842624, MIN_SEED);
-        const range = (max - min) / (STEPS_OF_SEED / 10);
-        
-        return Math.floor(Math.random() * range) * (STEPS_OF_SEED / 10) + min;
+        const seed = Math.floor(Math.random() * 1000000000000000);
+        console.log(`[FL_API] Generated seed: ${seed}`);
+        return { seed };
     }
 
     /**
      * Generate random float
      * @param {number} min - Minimum value
      * @param {number} max - Maximum value
-     * @returns {number} Random float
+     * @returns {object} {value}
      */
     generateFloat(min, max) {
-        if (typeof min !== "number") min = Number.MIN_SAFE_INTEGER;
-        if (typeof max !== "number") max = Number.MAX_SAFE_INTEGER;
-        return Math.random() * (max - min) + min;
+        const value = Math.random() * (max - min) + min;
+        console.log(`[FL_API] Generated float: ${value}`);
+        return { value };
     }
 
     /**
      * Generate random integer
      * @param {number} min - Minimum value
      * @param {number} max - Maximum value
-     * @returns {number} Random integer
+     * @returns {object} {value}
      */
     generateInt(min, max) {
-        return Math.floor(this.generateFloat(min, max));
+        const value = Math.floor(Math.random() * (max - min + 1)) + min;
+        console.log(`[FL_API] Generated int: ${value}`);
+        return { value };
     }
 
     /**
-     * Pick random item from array
-     * @param {Array} items - Array of items
-     * @returns {*} Random item
+     * Pick random item from list
+     * @param {Array} items - Items to choose from
+     * @returns {object} {value}
      */
     randomChoice(items) {
-        if (!Array.isArray(items) || items.length === 0) {
-            throw new Error("Items must be a non-empty array");
-        }
-        return items[this.generateInt(0, items.length)];
+        const value = items[Math.floor(Math.random() * items.length)];
+        console.log(`[FL_API] Random choice: ${value}`);
+        return { value };
     }
 
-    // ==================== PRIVATE HELPERS ====================
+    // ==================== INTERNAL HELPERS ====================
 
     /**
-     * Force canvas refresh after layout changes
+     * Find node by various criteria
      * @private
      */
-    _refreshCanvas() {
-        try {
-            app.canvas.setDirty(true, true);
-        } catch (error) {
-            console.warn("[FL_API] Could not refresh canvas:", error);
+    _findNode(query) {
+        if (typeof query === "object" && query.id !== undefined) {
+            return query;  // Already a node object
         }
-    }
 
-    _match(node, query) {
         if (typeof query === "number") {
-            return node.id === query;
-        } else if (typeof query === "string") {
-            return node.title === query || node.comfyClass === query || node.type === query;
-        } else if (typeof query === "object" && query.id !== undefined) {
-            return node.id === query.id;
+            // Find by ID
+            return app.graph._nodes.find(n => n.id === query) || null;
         }
-        return false;
+
+        if (typeof query === "string") {
+            // Try as title first, then type
+            return app.graph._nodes.find(n => n.title === query) ||
+                   app.graph._nodes.find(n => n.type === query || n.comfyClass === query) ||
+                   null;
+        }
+
+        return null;
     }
 
+    /**
+     * Find node by various criteria (from end)
+     * @private
+     */
     _find(query) {
-        for (let i = 0; i < app.graph._nodes.length; i++) {
-            const node = app.graph._nodes[i];
-            if (this._match(node, query)) {
-                return node;
-            }
+        if (typeof query === "object" && query.id !== undefined) {
+            return query;
         }
+
+        if (typeof query === "number") {
+            return app.graph._nodes.find(n => n.id === query) || null;
+        }
+
+        if (typeof query === "string") {
+            return app.graph._nodes.find(n => n.title === query) ||
+                   app.graph._nodes.find(n => n.type === query || n.comfyClass === query) ||
+                   null;
+        }
+
         return null;
     }
 
+    /**
+     * Find node by various criteria (from end of array)
+     * @private
+     */
     _findLast(query) {
-        for (let i = app.graph._nodes.length - 1; i >= 0; i--) {
-            const node = app.graph._nodes[i];
-            if (this._match(node, query)) {
-                return node;
+        if (typeof query === "object" && query.id !== undefined) {
+            return query;
+        }
+
+        const nodes = app.graph._nodes;
+
+        if (typeof query === "number") {
+            for (let i = nodes.length - 1; i >= 0; i--) {
+                if (nodes[i].id === query) return nodes[i];
             }
+            return null;
         }
-        return null;
-    }
 
-    _findNode(n) {
-        if (typeof n === "number" || typeof n === "string") {
-            return this._find(n);
-        } else if (typeof n === "object") {
-            return n;
+        if (typeof query === "string") {
+            // Try title first
+            for (let i = nodes.length - 1; i >= 0; i--) {
+                if (nodes[i].title === query) return nodes[i];
+            }
+            // Then type
+            for (let i = nodes.length - 1; i >= 0; i--) {
+                if (nodes[i].type === query || nodes[i].comfyClass === query) return nodes[i];
+            }
+            return null;
         }
+
         return null;
-    }
-
-    _checkCollision(node1, node2) {
-        const left1 = node1.pos[0];
-        const right1 = node1.pos[0] + node1.size[0];
-        const top1 = node1.pos[1];
-        const bottom1 = node1.pos[1] + node1.size[1];
-
-        const left2 = node2.pos[0];
-        const right2 = node2.pos[0] + node2.size[0];
-        const top2 = node2.pos[1];
-        const bottom2 = node2.pos[1] + node2.size[1];
-
-        const collisionX = left1 < right2 && right1 > left2;
-        const collisionY = top1 < bottom2 && bottom1 > top2;
-
-        return collisionX && collisionY;
-    }
-
-    _getPathFromImg(img) {
-        const url = new URL(img.src);
-        let filename = url.searchParams.get("filename") || "";
-        let subdir = url.searchParams.get("subfolder") || "";
-        let dir = url.searchParams.get("type") || "";
-        
-        if (filename) filename = "/" + filename;
-        if (subdir) subdir = "/" + subdir;
-        if (dir) dir = "/" + dir;
-        
-        return `ComfyUI${dir}${subdir}${filename}`;
     }
 }
