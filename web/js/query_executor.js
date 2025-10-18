@@ -504,11 +504,87 @@ export class QueryExecutor {
     }
 
     /**
-     * Get workflow overview
+     * Check if an input slot is required for a node
+     * @param {object} rawNode - Raw LiteGraph node
+     * @param {object} input - Input slot
+     * @returns {boolean} True if the input is required
+     */
+    isInputSlotRequired(rawNode, input) {
+        // In ComfyUI, most inputs are required unless they have default values or are optional
+        // We'll use several heuristics to determine if an input is required:
+        
+        // 1. Check if the input type ends with "?" (optional marker)
+        if (input.type && input.type.endsWith('?')) {
+            return false;
+        }
+        
+        // 2. Check common optional slot names
+        const optionalSlots = [
+            'seed', 'noise_seed', 'control_after_generate', 'force_full_denoise',
+            'return_with_leftover_noise', 'disable_noise', 'preview_method',
+            'vae_decode', 'tiled', 'tile_size', 'fast', 'steps', 'cfg',
+            'sampler_name', 'scheduler', 'positive', 'negative', 'latent_image',
+            'denoise', 'model', 'clip', 'vae', 'image', 'mask', 'filename_prefix'
+        ];
+        
+        const slotName = input.name ? input.name.toLowerCase() : '';
+        
+        // 3. Some slots are commonly optional
+        if (optionalSlots.some(optional => slotName.includes(optional))) {
+            // But still check if there's a widget with the same name (which would make it not required)
+            if (rawNode.widgets) {
+                const hasWidget = rawNode.widgets.some(w => w.name && w.name.toLowerCase() === slotName);
+                if (hasWidget) {
+                    return false;
+                }
+            }
+        }
+        
+        // 4. Check if there's a corresponding widget that provides a default value
+        if (rawNode.widgets && input.name) {
+            const correspondingWidget = rawNode.widgets.find(w => w.name === input.name);
+            if (correspondingWidget && correspondingWidget.value !== undefined && correspondingWidget.value !== null) {
+                return false;
+            }
+        }
+        
+        // 5. Some node types have specific patterns
+        const nodeType = rawNode.comfyClass || rawNode.type;
+        if (nodeType) {
+            // Loader nodes typically require their main input
+            if (nodeType.includes('Loader') || nodeType.includes('Load')) {
+                if (slotName.includes('name') || slotName.includes('path') || slotName.includes('ckpt')) {
+                    return true;
+                }
+            }
+            
+            // Sampler nodes typically require model, positive, negative, latent
+            if (nodeType.includes('Sampler') || nodeType.includes('Sample')) {
+                if (['model', 'positive', 'negative', 'latent_image'].includes(slotName)) {
+                    return true;
+                }
+            }
+            
+            // VAE nodes typically require their inputs
+            if (nodeType.includes('VAE')) {
+                if (['samples', 'images', 'vae'].includes(slotName)) {
+                    return true;
+                }
+            }
+        }
+        
+        // 6. Default: assume inputs without widgets are required
+        // This is a reasonable default for ComfyUI where most data flow inputs are required
+        return true;
+    }
+
+    /**
+     * Get workflow overview with enhanced connection analysis
      * @returns {object} Workflow overview
      */
     getWorkflowOverview() {
         const nodes = this.getAllNodes();
+        const rawNodes = this.app.graph ? this.app.graph._nodes : [];
         
         // Count nodes by type
         const typeCount = {};
@@ -516,12 +592,55 @@ export class QueryExecutor {
             typeCount[node.type] = (typeCount[node.type] || 0) + 1;
         }
         
-        // Find disconnected nodes
+        // Find disconnected nodes (completely isolated)
         const disconnected = nodes.filter(n => {
             const hasInputs = n.connections.inputs.some(i => i.connected_to.length > 0);
             const hasOutputs = n.connections.outputs.some(o => o.connected_to.length > 0);
             return !hasInputs && !hasOutputs;
         });
+        
+        // Find nodes with missing required slot connections
+        const requiredSlotsMissing = [];
+        
+        for (const node of nodes) {
+            // Find the corresponding raw node to access more detailed information
+            const rawNode = rawNodes.find(rn => rn.id === node.id);
+            if (!rawNode) continue;
+            
+            const missingSlots = [];
+            
+            // Check each input slot
+            for (const input of node.connections.inputs) {
+                // Skip if already connected
+                if (input.connected_to.length > 0) {
+                    continue;
+                }
+                
+                // Find the corresponding raw input
+                const rawInput = rawNode.inputs ? rawNode.inputs.find(ri => ri.name === input.slot) : null;
+                if (!rawInput) continue;
+                
+                // Check if this input is required
+                if (this.isInputSlotRequired(rawNode, rawInput)) {
+                    missingSlots.push({
+                        slot_name: input.slot,
+                        slot_type: input.type,
+                        reason: 'Required input not connected'
+                    });
+                }
+            }
+            
+            // If this node has missing required slots, add it to the list
+            if (missingSlots.length > 0) {
+                requiredSlotsMissing.push({
+                    id: node.id,
+                    type: node.type,
+                    title: node.title,
+                    missing_slots: missingSlots,
+                    missing_count: missingSlots.length
+                });
+            }
+        }
         
         return {
             total_nodes: nodes.length,
@@ -531,6 +650,12 @@ export class QueryExecutor {
                 type: n.type,
                 title: n.title
             })),
+            required_slots_missing: requiredSlotsMissing,
+            connection_issues: {
+                completely_disconnected: disconnected.length,
+                missing_required_connections: requiredSlotsMissing.length,
+                total_missing_slots: requiredSlotsMissing.reduce((sum, node) => sum + node.missing_count, 0)
+            },
             diagram: this.generateDiagram(nodes)
         };
     }

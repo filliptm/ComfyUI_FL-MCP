@@ -158,6 +158,12 @@ app.registerExtension({
                 }, 100);
             }
         });
+
+        // Custom Stylesheet
+        const style = document.createElement("link");
+        style.rel = "stylesheet";
+        style.href = new URL("./style.css", import.meta.url);
+        document.head.appendChild(style);
         
         console.log("[FL_JS] Registering sidebar tab...");
         

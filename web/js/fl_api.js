@@ -1334,7 +1334,7 @@ export class FL_API {
      * @private
      */
     _find(query) {
-        if (query == null) return null;
+        // if (query == null) return null;
         if (typeof query === "object" && query.id !== undefined) {
             return query;
         }

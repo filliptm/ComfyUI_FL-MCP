@@ -61,6 +61,7 @@ export class ToolExecutor {
             "get_node_rect": this._handleGetNodeRect.bind(this),
             "get_layout": this._handleGetLayout.bind(this),
             "set_node_rect": this._handleSetNodeRect.bind(this),
+            "modify_layout": this._handleModifyLayout.bind(this),
             "position_node_left": this._handlePositionNodeLeft.bind(this),
             "position_node_right": this._handlePositionNodeRight.bind(this),
             "position_node_top": this._handlePositionNodeTop.bind(this),
@@ -400,6 +401,17 @@ export class ToolExecutor {
             height !== undefined ? height : null
         );
         return { node_id, rect };
+    }
+
+    async _handleModifyLayout(params) {
+        const { node_rects } = params;
+        const results = this.flApi.modifyLayout(node_rects);
+        return { 
+            results,
+            total_processed: results.length,
+            successful: results.filter(r => r.success).length,
+            failed: results.filter(r => !r.success).length
+        };
     }
 
     async _handlePositionNodeLeft(params) {

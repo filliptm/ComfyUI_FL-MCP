@@ -370,14 +370,21 @@ class GetLayoutRequest(BaseModel):
 
 class SetNodeRectRequest(BaseModel):
     """Request to set node position and/or size."""
-    node_id: Union[int, str] = Field(..., description="Node ID or title")
+    node_id: int = Field(..., description="Node id of the node who's layout rectangle to set.")
     x: Optional[float] = Field(None, description="X position (null to keep current)")
     y: Optional[float] = Field(None, description="Y position (null to keep current)")
     width: Optional[float] = Field(None, description="Width (null to keep current)")
     height: Optional[float] = Field(None, description="Height (null to keep current)")
+
+class NodeRect(BaseModel):
+    x: Optional[float] = Field(None, description="X position (omit to keep current)")
+    y: Optional[float] = Field(None, description="Y position (omit to keep current)")
+    width: Optional[float] = Field(None, description="Width (omit to keep current)")
+    height: Optional[float] = Field(None, description="Height (omit to keep current)")
+    
     
 class BatchLayoutRequest(BaseModel):
-    node_rects: List[SetNodeRectRequest] = Field(..., description="A List of nodes with their new rectangle settings for full or partial quick layout changes")
+    node_rects: Dict[int, NodeRect] = Field(..., description="A map of node id's (int) with their new rectangle settings for full or partial quick layout changes")
 
 class PositionNodeLeftRequest(BaseModel):
     """Request to position node to the left of another."""
@@ -856,10 +863,11 @@ async def get_layout(request: GetLayoutRequest, ctx: Context) -> Dict[str, Any]:
 @mcp.tool()
 async def modify_layout(request: BatchLayoutRequest, ctx: Context) -> List[Dict[str, Any]]:
     """Modify the layout of multiple nodes by setting their bounding boxes. Use this to rearrange many nodes at a time. Attempt to avoid overlaps. Before calling this tool call `get_layout` to get the current workflow layout or for some set of nodes"""
-    o = []
-    for rect in request.node_rects:
-        o.append(await _execute_tool(ctx, "set_node_rect", rect.model_dump()))
-    return o
+    return await _execute_tool(ctx, "modify_layout", request.model_dump())
+    # o = []
+    # for rect in request.node_rects:
+    #     o.append(await _execute_tool(ctx, "set_node_rect", rect.model_dump()))
+    # return o
 
 # @mcp.tool()
 # async def position_node_left(request: PositionNodeLeftRequest, ctx: Context) -> Dict[str, Any]:
