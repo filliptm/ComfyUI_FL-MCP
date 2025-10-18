@@ -488,6 +488,13 @@ class ClearErrorBufferRequest(BaseModel):
     """Request to clear the error buffer."""
     pass
 
+class WaitRequest(BaseModel):
+    delay: float = Field(..., description="Brief period of time to wait (keep between 5 and 20 seconds). Great for waiting a bit after the workflow is queued to show some result")
+
+@mcp.tool()
+async def wait(request: WaitRequest) -> Dict[str, Any]:
+    await asyncio.sleep(float(request.delay))
+    return {"waited_for": request.delay}
 
 # ============================================================================
 # QUERY & ANALYSIS TOOLS
