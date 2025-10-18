@@ -1,7 +1,7 @@
 {
-  "current_mode": "implementation",
+  "current_mode": "debugging",
   "project": "fl_js",
-  "task": "node library tools implementation complete",
+  "task": "error feedback investigation complete",
   "architecture": "FastAPI+WS backend with PydanticAI + FastMCP, JS chat sidebar client, realtime tool callbacks",
   "project_status": "new project inspired by legacy FL_JS/FL_WF_Agent",
   "focus": "all files created/modified successfully",
@@ -60,7 +60,7 @@
   "notes_created": "notes/connect/backend.log, frontend.log, analysis.md, investigation.md, proposal.md",
   "root_cause_hypothesis": "HTTP 400 validation errors not captured, only execution errors",
   "root_cause": "blocking await prevents loop from receiving tool_result",
-  "confidence": "90%",
+  "confidence": "95%",
   "root_cause_1": "send() requires handshakeComplete for ALL messages including handshake itself",
   "root_cause_2": "messagesContainer is null when _addWelcomeMessage runs - DOM timing issue",
   "root_cause_3": "heartbeat adds unnecessary complexity and noise",
@@ -71,7 +71,7 @@
   "diagnostic_question": "what does the client send in the user_message payload?",
   "status": "ready for review and implementation",
   "main_focus": "fl_api.js function to expose selected nodes to MCP server tool",
-  "investigation_complete": "true",
+  "investigation_complete": true,
   "phase_1_complete": "true",
   "phase_2_complete": "true",
   "phase_3_complete": "true",
@@ -125,5 +125,7 @@
   "agent_name_change": "FL_JS -> Ren",
   "target_file": "backend/mcp_server.py",
   "notes_location": "notes/node_lib/research.md",
-  "implementation_ready": "true"
+  "implementation_ready": "true",
+  "root_cause_confirmed": "validation errors not captured - need to wrap app.queuePrompt()",
+  "ready_for_fix": true
 }
