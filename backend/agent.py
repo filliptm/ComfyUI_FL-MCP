@@ -9,6 +9,7 @@ import os
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 from contextvars import ContextVar
+from pathlib import Path
 
 from pydantic import BaseModel, Field
 from pydantic_ai import Agent
@@ -262,12 +263,15 @@ def create_agent(session_id: str) -> Agent:
     }
     
     logger.info(f"MCP subprocess environment: session_id={session_id}, ws_url={mcp_env['FL_WS_URL']}")
-    
+
+    # Get absolute path to mcp_server.py
+    mcp_server_path = str(Path(__file__).parent / 'mcp_server.py')
+
     # Launch MCP server with environment
     mcp_servers = [
         MCPServerStdio(
             'python',
-            ['backend/mcp_server.py'],
+            [mcp_server_path],
             env=mcp_env  # Pass environment to subprocess
         )
     ]
