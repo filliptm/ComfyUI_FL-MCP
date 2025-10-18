@@ -826,20 +826,9 @@ async def auto_connect_workflow(request: AutoConnectWorkflowRequest, ctx: Contex
 
 @mcp.tool()
 async def get_layout(request: GetLayoutRequest, ctx: Context) -> Dict[str, Any]:
-    """Get position and size for all nodes (or specified nodes) in the workflow.
+    """Get position and size for all nodes (or specified nodes) in the workflow. Use it to understand node spatial organization or understanding visual workflow structure.
     
-    This tool retrieves layout information for the entire workflow at once, which is
-    significantly more efficient than calling get_node_rect() multiple times.
-    
-    Useful for:
-    - Understanding overall workflow spatial organization
-    - Calculating new layouts before applying them with modify_layout
-    - Detecting overlaps or spacing issues across the workflow
-    - Exporting workflow layout data
-    - Analyzing workflow structure and density
-    
-    Args:
-        request: GetLayoutRequest with optional node_ids filter
+    This tool retrieves layout information for the entire workflow at once. Use it before calling `modify_layout`.
     
     Returns:
         {
@@ -859,14 +848,14 @@ async def get_layout(request: GetLayoutRequest, ctx: Context) -> Dict[str, Any]:
     return await _execute_tool(ctx, "get_layout", request.model_dump())
 
 
-@mcp.tool()
-async def set_node_rect(request: SetNodeRectRequest, ctx: Context) -> Dict[str, Any]:
-    """Set node position and/or size."""
-    return await _execute_tool(ctx, "set_node_rect", request.model_dump())
+# @mcp.tool()
+# async def set_node_rect(request: SetNodeRectRequest, ctx: Context) -> Dict[str, Any]:
+#     """Set node position and/or size."""
+#     return await _execute_tool(ctx, "set_node_rect", request.model_dump())
 
 @mcp.tool()
 async def modify_layout(request: BatchLayoutRequest, ctx: Context) -> List[Dict[str, Any]]:
-    """Modify the layout of multiple nodes by setting their bounding boxes. Use this when moving many nodes at a time. Attempt to avoid overlaps."""
+    """Modify the layout of multiple nodes by setting their bounding boxes. Use this to rearrange many nodes at a time. Attempt to avoid overlaps. Before calling this tool call `get_layout` to get the current workflow layout or for some set of nodes"""
     o = []
     for rect in request.node_rects:
         o.append(await _execute_tool(ctx, "set_node_rect", rect.model_dump()))
