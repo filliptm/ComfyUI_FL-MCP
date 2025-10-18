@@ -59,6 +59,7 @@ export class ToolExecutor {
             
             // Layout Management
             "get_node_rect": this._handleGetNodeRect.bind(this),
+            "get_layout": this._handleGetLayout.bind(this),
             "set_node_rect": this._handleSetNodeRect.bind(this),
             "position_node_left": this._handlePositionNodeLeft.bind(this),
             "position_node_right": this._handlePositionNodeRight.bind(this),
@@ -381,6 +382,12 @@ export class ToolExecutor {
         const { node_id } = params;
         const rect = this.flApi.getRect(node_id);
         return { node_id, rect };
+    }
+
+    async _handleGetLayout(params) {
+        const { node_ids } = params;
+        const layout = this.flApi.getLayout(node_ids);
+        return { layout };
     }
 
     async _handleSetNodeRect(params) {

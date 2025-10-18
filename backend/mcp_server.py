@@ -818,10 +818,10 @@ async def auto_connect_workflow(request: AutoConnectWorkflowRequest, ctx: Contex
 # LAYOUT MANAGEMENT TOOLS
 # ============================================================================
 
-@mcp.tool()
-async def get_node_rect(request: GetNodeRectRequest, ctx: Context) -> Dict[str, Any]:
-    """Get node position and size."""
-    return await _execute_tool(ctx, "get_node_rect", request.model_dump())
+# @mcp.tool()
+# async def get_node_rect(request: GetNodeRectRequest, ctx: Context) -> Dict[str, Any]:
+#     """Get node position and size. Only use this to """
+#     return await _execute_tool(ctx, "get_node_rect", request.model_dump())
 
 
 @mcp.tool()
@@ -872,40 +872,40 @@ async def modify_layout(request: BatchLayoutRequest, ctx: Context) -> List[Dict[
         o.append(await _execute_tool(ctx, "set_node_rect", rect.model_dump()))
     return o
 
-@mcp.tool()
-async def position_node_left(request: PositionNodeLeftRequest, ctx: Context) -> Dict[str, Any]:
-    """Position a node to the left of another node."""
-    return await _execute_tool(ctx, "position_node_left", request.model_dump())
+# @mcp.tool()
+# async def position_node_left(request: PositionNodeLeftRequest, ctx: Context) -> Dict[str, Any]:
+#     """Position a node to the left of another node."""
+#     return await _execute_tool(ctx, "position_node_left", request.model_dump())
 
 
-@mcp.tool()
-async def position_node_right(request: PositionNodeRightRequest, ctx: Context) -> Dict[str, Any]:
-    """Position a node to the right of another node."""
-    return await _execute_tool(ctx, "position_node_right", request.model_dump())
+# @mcp.tool()
+# async def position_node_right(request: PositionNodeRightRequest, ctx: Context) -> Dict[str, Any]:
+#     """Position a node to the right of another node."""
+#     return await _execute_tool(ctx, "position_node_right", request.model_dump())
 
 
-@mcp.tool()
-async def position_node_top(request: PositionNodeTopRequest, ctx: Context) -> Dict[str, Any]:
-    """Position a node above another node."""
-    return await _execute_tool(ctx, "position_node_top", request.model_dump())
+# @mcp.tool()
+# async def position_node_top(request: PositionNodeTopRequest, ctx: Context) -> Dict[str, Any]:
+#     """Position a node above another node."""
+#     return await _execute_tool(ctx, "position_node_top", request.model_dump())
 
 
-@mcp.tool()
-async def position_node_bottom(request: PositionNodeBottomRequest, ctx: Context) -> Dict[str, Any]:
-    """Position a node below another node."""
-    return await _execute_tool(ctx, "position_node_bottom", request.model_dump())
+# @mcp.tool()
+# async def position_node_bottom(request: PositionNodeBottomRequest, ctx: Context) -> Dict[str, Any]:
+#     """Position a node below another node."""
+#     return await _execute_tool(ctx, "position_node_bottom", request.model_dump())
 
 
-@mcp.tool()
-async def move_node_right(request: MoveNodeRightRequest, ctx: Context) -> Dict[str, Any]:
-    """Move a node to the right, avoiding collisions."""
-    return await _execute_tool(ctx, "move_node_right", request.model_dump())
+# @mcp.tool()
+# async def move_node_right(request: MoveNodeRightRequest, ctx: Context) -> Dict[str, Any]:
+#     """Move a node to the right, avoiding collisions."""
+#     return await _execute_tool(ctx, "move_node_right", request.model_dump())
 
 
-@mcp.tool()
-async def move_node_bottom(request: MoveNodeBottomRequest, ctx: Context) -> Dict[str, Any]:
-    """Move a node downward, avoiding collisions."""
-    return await _execute_tool(ctx, "move_node_bottom", request.model_dump())
+# @mcp.tool()
+# async def move_node_bottom(request: MoveNodeBottomRequest, ctx: Context) -> Dict[str, Any]:
+#     """Move a node downward, avoiding collisions."""
+#     return await _execute_tool(ctx, "move_node_bottom", request.model_dump())
 
 
 # ============================================================================

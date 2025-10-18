@@ -818,6 +818,46 @@ export class FL_API {
     }
 
     /**
+     * Get layout (rects) for all nodes or specific nodes
+     * @param {Array<number|string>|null} nodeIds - Optional array of node IDs or titles (null for all)
+     * @returns {object} {nodes: Array<{node_id, title, type, rect}>, count: number}
+     */
+    getLayout(nodeIds = null) {
+        try {
+            // Safety check for graph
+            if (!app.graph || !app.graph._nodes) {
+                console.warn("[FL_API] Graph not ready");
+                return { nodes: [], count: 0 };
+            }
+            
+            // Get nodes to process
+            const nodes = nodeIds 
+                ? nodeIds.map(id => this._findNode(id)).filter(n => n !== null)
+                : app.graph._nodes;
+            
+            // Collect layout data
+            const layout = nodes.map(node => ({
+                node_id: node.id,
+                title: node.title,
+                type: node.comfyClass || node.type,
+                rect: {
+                    x: node.pos[0],
+                    y: node.pos[1],
+                    width: node.size[0],
+                    height: node.size[1]
+                }
+            }));
+            
+            console.log(`[FL_API] Got layout for ${layout.length} node(s)`);
+            return { nodes: layout, count: layout.length };
+        } catch (error) {
+            console.error("[FL_API] getLayout error:", error);
+            throw error;
+        }
+    }
+
+
+    /**
      * Set node rectangle (position and/or size)
      * @param {number|string|object} nodeId - Node ID
      * @param {object} rect - {x, y, width, height} (all optional)
