@@ -9,10 +9,12 @@ import json
 import logging
 import os
 import uuid
+import contextlib
 from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator, Dict, List, Optional, Union, Literal
 
 import websockets
+from websockets.exceptions import ConnectionClosed, ConnectionClosedOK
 from fastmcp import FastMCP, Context
 from pydantic import BaseModel, Field
 
@@ -40,168 +42,257 @@ logger = logging.getLogger(__name__)
 # ============================================================================
 
 class MCPWebSocketClient:
-    """WebSocket client for MCP subprocess to communicate with backend."""
-    
-    def __init__(self, session_id: str, ws_url: str):
+    """Long-lived WebSocket bridge with auto-reconnect + request/response routing."""
+
+    def __init__(
+        self,
+        session_id: str,
+        ws_url: str,
+        token_provider: callable | None = None,
+        *,
+        ping_interval: int = 20,
+        ping_timeout: int = 20,
+        open_timeout: int = 20,
+        close_timeout: int = 10,
+        max_queue: int | None = None,
+        reconnect_min: float = 0.5,
+        reconnect_max: float = 10.0,
+    ):
         self.session_id = session_id
         self.ws_url = ws_url
-        self.ws = None
-        self.pending_requests = {}  # request_id -> asyncio.Future
+        self.token_provider = token_provider
+
+        self.ping_interval = ping_interval
+        self.ping_timeout = ping_timeout
+        self.open_timeout = open_timeout
+        self.close_timeout = close_timeout
+        self.max_queue = max_queue
+
+        self.reconnect_min = reconnect_min
+        self.reconnect_max = reconnect_max
+
+        self.ws: websockets.WebSocketClientProtocol | None = None
         self.connected = False
-        self._receive_task = None
-        
+
+        self._receive_task: asyncio.Task | None = None
+        self._connect_lock = asyncio.Lock()
+        self._closing = asyncio.Event()
+
+        # request_id -> Future
+        self.pending_requests: dict[str, asyncio.Future] = {}
+
+    # -------------------- connection management --------------------
+
     async def connect(self):
-        """Connect to backend WebSocket server."""
-        logger.info(f"[MCP-WS] Connecting to {self.ws_url} with session {self.session_id}")
-        
-        try:
-            self.ws = await websockets.connect(self.ws_url)
-            
-            # Send handshake
+        """Connect (or reconnect) and start background receive loop."""
+        async with self._connect_lock:
+            if self.connected and self.ws and not self.ws.closed:
+                return
+
+            headers = {}
+            if self.token_provider:
+                tok = await self._maybe_call(self.token_provider)
+                if tok:
+                    headers["Authorization"] = f"Bearer {tok}"
+
+            logger.info(f"[MCP-WS] Connecting to {self.ws_url} (session={self.session_id})")
+            self.ws = await websockets.connect(
+                self.ws_url,
+                extra_headers=headers,
+                ping_interval=self.ping_interval,
+                ping_timeout=self.ping_timeout,
+                close_timeout=self.close_timeout,
+                open_timeout=self.open_timeout,
+                max_queue=self.max_queue,  # None avoids unexpected backpressure closes
+            )
+
+            # handshake
             await self.ws.send(json.dumps({
-                'type': 'handshake',
-                'session_id': self.session_id,
-                'client_version': '1.0.0-mcp',
+                "type": "handshake",
+                "session_id": self.session_id,
+                "client_version": "1.0.0-mcp",
             }))
-            
-            # Wait for handshake ack
-            response = await self.ws.recv()
-            data = json.loads(response)
-            
-            if data.get('type') == 'handshake_ack':
-                self.connected = True
-                logger.info(f"[MCP-WS] Connected and handshake complete")
-                
-                # Start receive loop
-                self._receive_task = asyncio.create_task(self._receive_loop())
-            else:
-                raise RuntimeError(f"Unexpected handshake response: {data}")
-                
-        except Exception as e:
-            logger.error(f"[MCP-WS] Connection failed: {e}")
-            raise
-    
+            resp = json.loads(await self.ws.recv())
+            if resp.get("type") != "handshake_ack":
+                await self._hard_close(code=4000, reason="bad-handshake")
+                raise RuntimeError(f"Unexpected handshake response: {resp}")
+
+            self.connected = True
+            logger.info("[MCP-WS] Connected & handshake complete")
+
+            # start/replace receive loop
+            if self._receive_task and not self._receive_task.done():
+                self._receive_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await self._receive_task
+            self._receive_task = asyncio.create_task(self._receive_loop())
+
+    async def ensure(self):
+        """Ensure a live connection (reconnect if needed)."""
+        if not self.connected or not self.ws or self.ws.closed:
+            await self.connect()
+
     async def _receive_loop(self):
-        """Receive and process messages from backend."""
-        try:
-            async for message in self.ws:
-                data = json.loads(message)
-                await self._handle_message(data)
-        except websockets.exceptions.ConnectionClosed:
-            logger.warning(f"[MCP-WS] Connection closed")
-            self.connected = False
-        except Exception as e:
-            logger.error(f"[MCP-WS] Receive loop error: {e}")
-            self.connected = False
-    
-    async def _handle_message(self, data: dict):
-        """Handle incoming message from backend."""
-        msg_type = data.get('type')
-        
-        if msg_type == 'tool_result':
-            # Tool execution result from frontend
-            request_id = data.get('request_id')
-            future = self.pending_requests.get(request_id)
-            
-            if future and not future.done():
-                if data.get('success'):
-                    future.set_result(data.get('data'))
-                else:
-                    future.set_exception(
-                        RuntimeError(data.get('error', 'Tool execution failed'))
-                    )
-                # Clean up
-                self.pending_requests.pop(request_id, None)
-        else:
-            logger.warning(f"[MCP-WS] Unexpected message type: {msg_type}")
-    
-    async def execute_tool(self, tool_name: str, parameters: dict, timeout_ms: int = 30000) -> dict:
-        """Execute a tool via WebSocket callback."""
-        if not self.connected:
-            raise RuntimeError("WebSocket not connected")
-        
-        # Generate unique request ID
-        request_id = str(uuid.uuid4())
-        
-        # Create future for this request
-        future = asyncio.get_event_loop().create_future()
-        self.pending_requests[request_id] = future
-        
-        logger.info(f"[MCP-WS] Executing tool: {tool_name} (request_id: {request_id})")
-        
-        try:
-            # Send tool request
-            await self.ws.send(json.dumps({
-                'type': 'tool_request',
-                'session_id': self.session_id,
-                'request_id': request_id,
-                'tool_name': tool_name,
-                'parameters': parameters,
-                'timeout_ms': timeout_ms,
-            }))
-            
-            # Wait for result with timeout
-            timeout_seconds = timeout_ms / 1000.0
-            result = await asyncio.wait_for(future, timeout=timeout_seconds)
-            
-            logger.info(f"[MCP-WS] Tool execution complete: {request_id}")
-            return result
-            
-        except asyncio.TimeoutError:
-            logger.error(f"[MCP-WS] Tool execution timeout: {request_id}")
-            self.pending_requests.pop(request_id, None)
-            raise RuntimeError(f"Tool execution timeout after {timeout_seconds}s")
-        except Exception as e:
-            logger.error(f"[MCP-WS] Tool execution error: {e}")
-            self.pending_requests.pop(request_id, None)
-            raise
-    
-    async def disconnect(self):
-        """Disconnect from WebSocket server."""
+        """Keeps reading messages; on close, marks disconnected and triggers reconnect backoff."""
+        backoff = self.reconnect_min
+        while not self._closing.is_set():
+            try:
+                assert self.ws is not None
+                async for message in self.ws:
+                    data = json.loads(message)
+                    await self._handle_message(data)
+                # loop ends on clean close
+                raise ConnectionClosedOK(1000, "clean-close")
+            except (ConnectionClosedOK, ConnectionClosed) as e:
+                code = getattr(e, "code", None)
+                reason = getattr(e, "reason", None)
+                logger.warning(f"[MCP-WS] Closed (code={code}, reason={reason}); draining & will reconnect")
+                await self._on_close(e)
+                # backoff + reconnect
+                await asyncio.sleep(backoff)
+                backoff = min(self.reconnect_max, backoff * 2)
+                with contextlib.suppress(Exception):
+                    await self.connect()
+                # reset backoff on success
+                if self.connected:
+                    backoff = self.reconnect_min
+            except Exception as e:
+                logger.exception(f"[MCP-WS] Receive loop error: {e}")
+                await self._on_close(e)
+                await asyncio.sleep(backoff)
+                backoff = min(self.reconnect_max, backoff * 2)
+                with contextlib.suppress(Exception):
+                    await self.connect()
+                if self.connected:
+                    backoff = self.reconnect_min
+
+    async def _on_close(self, exc: Exception | None):
+        self.connected = False
+        # fail all in-flight requests so callers can retry
+        for rid, fut in list(self.pending_requests.items()):
+            if not fut.done():
+                fut.set_exception(RuntimeError(f"WebSocket closed during request {rid}"))
+            self.pending_requests.pop(rid, None)
+
+    async def _hard_close(self, *, code=1000, reason="shutdown"):
+        if self.ws and not self.ws.closed:
+            with contextlib.suppress(Exception):
+                await self.ws.close(code=code, reason=reason)
+        self.connected = False
+
+    async def close(self):
+        """App/process shutdown."""
+        self._closing.set()
         if self._receive_task:
             self._receive_task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await self._receive_task
-            except asyncio.CancelledError:
-                pass
-        if self.ws:
-            await self.ws.close()
-        self.connected = False
-        logger.info("[MCP-WS] Disconnected")
+        await self._hard_close(code=1000, reason="shutdown")
 
+    # -------------------- messaging API --------------------
+
+    async def _handle_message(self, data: dict):
+        msg_type = data.get("type")
+        if msg_type == "tool_result":
+            rid = data.get("request_id")
+            fut = self.pending_requests.get(rid)
+            if fut and not fut.done():
+                if data.get("success"):
+                    fut.set_result(data.get("data"))
+                else:
+                    fut.set_exception(RuntimeError(data.get("error") or "Tool execution failed"))
+                self.pending_requests.pop(rid, None)
+        else:
+            logger.warning(f"[MCP-WS] Unexpected message type: {msg_type}")
+
+    async def execute_tool(self, tool_name: str, parameters: dict, timeout_ms: int = 30000) -> dict:
+        """Idempotent-friendly request with one reconnect+retry path."""
+        await self.ensure()
+        request_id = str(uuid.uuid4())
+        loop = asyncio.get_running_loop()
+        fut = loop.create_future()
+        self.pending_requests[request_id] = fut
+
+        payload = {
+            "type": "tool_request",
+            "session_id": self.session_id,
+            "request_id": request_id,
+            "tool_name": tool_name,
+            "parameters": parameters,
+            "timeout_ms": timeout_ms,
+        }
+
+        async def _send_and_wait():
+            assert self.ws is not None
+            await self.ws.send(json.dumps(payload))
+            timeout = timeout_ms / 1000.0
+            return await asyncio.wait_for(fut, timeout=timeout)
+
+        try:
+            return await _send_and_wait()
+        except (asyncio.TimeoutError, ConnectionClosed, ConnectionClosedOK) as e:
+            # one reconnect & retry (caller should keep requests idempotent)
+            logger.warning(f"[MCP-WS] send/wait failed ({type(e).__name__}); reconnect+retry once")
+            # clean up the old fut if still pending
+            if not fut.done():
+                fut.set_exception(RuntimeError("retrying after reconnect"))
+            self.pending_requests.pop(request_id, None)
+            await self.connect()
+
+            # new future for retry
+            request_id2 = str(uuid.uuid4())
+            fut2 = loop.create_future()
+            self.pending_requests[request_id2] = fut2
+            payload["request_id"] = request_id2
+            await self.ws.send(json.dumps(payload))
+            timeout = timeout_ms / 1000.0
+            return await asyncio.wait_for(fut2, timeout=timeout)
+        finally:
+            # in case of success, the fut is popped in handler; otherwise clean here
+            self.pending_requests.pop(request_id, None)
+
+    @staticmethod
+    async def _maybe_call(fn):
+        res = fn() if callable(fn) else fn
+        if asyncio.iscoroutine(res):
+            res = await res
+        return res
 
 @asynccontextmanager
-async def mcp_lifespan(server: FastMCP) -> AsyncIterator[Any]:
-    """Manage MCP server lifespan and WebSocket connection."""
-    
+async def mcp_lifespan(server: FastMCP):
     _ws_client = None
-    
-    # Check if running in subprocess mode
-    if os.getenv('FL_MCP_MODE') == 'subprocess':
-        session_id = os.getenv('FL_SESSION_ID')
-        ws_url = os.getenv('FL_WS_URL')
-        
+    if os.getenv("FL_MCP_MODE") == "subprocess":
+        session_id = os.getenv("FL_SESSION_ID")
+        ws_url = os.getenv("FL_WS_URL")
         if not session_id or not ws_url:
-            logger.error("Missing FL_SESSION_ID or FL_WS_URL environment variables")
             raise RuntimeError("MCP subprocess not properly configured")
-        
-        logger.info(f"[MCP] Starting in subprocess mode for session: {session_id}")
-        
-        # Create and connect WebSocket client
-        _ws_client = MCPWebSocketClient(session_id, ws_url)
+
+        async def token_provider():
+            # if you have rotating auth, fetch here; else return None
+            return os.getenv("FL_WS_TOKEN")
+
+        _ws_client = MCPWebSocketClient(
+            session_id=session_id,
+            ws_url=ws_url,
+            token_provider=token_provider,
+            ping_interval=20,
+            ping_timeout=20,
+            max_queue=None,
+        )
         await _ws_client.connect()
-        
         logger.info("[MCP] WebSocket client connected")
-        
-    else:
-        logger.info("[MCP] Running in standalone mode (no WebSocket)")
-    
-    yield {"client": _ws_client}
-    
-    # # Cleanup
-    # if _ws_client:
-    #     await _ws_client.disconnect()
-    #     logger.info("[MCP] WebSocket client disconnected")
+
+        # inject wherever your tools can reach it:
+        server.state = getattr(server, "state", {})
+        server.state["ws_client"] = _ws_client
+
+    try:
+        yield {"client": _ws_client}
+    finally:
+        # graceful shutdown; will cancel receive task and close socket
+        if _ws_client:
+            await _ws_client.close()
+            logger.info("[MCP] WebSocket client disconnected")
 
 
 # Initialize FastMCP server with lifespan
