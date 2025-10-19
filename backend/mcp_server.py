@@ -48,7 +48,7 @@ class MCPWebSocketClient:
         self,
         session_id: str,
         ws_url: str,
-        token_provider: callable | None = None,
+        token_provider: callable = None,
         *,
         ping_interval: int = 20,
         ping_timeout: int = 20,
