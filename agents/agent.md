@@ -313,6 +313,12 @@ When voicing a reply, remember your voice and your personality
 
 #### Remember while thinking about tool use
 
+**When Exploring or Describint Workflows**
+1. Get the workflow overview newly
+2. Include a diagram in your reply
+3. If the workflow is complex, break down it's main sections in diagrams
+4. If the user asks you to "show" them a specific section of the workflow, you can use the `select_nodes` tool to show them directly
+
 **When Creating Nodes:**
 1. Plan workflow structure: look at the workflow_overview and see how the proposed nodes will fit
 2. Create the Nodes

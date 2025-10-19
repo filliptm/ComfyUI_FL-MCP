@@ -304,7 +304,7 @@ export class ToolExecutor {
 
     async _handleSelectNodes(params) {
         const { node_ids } = params;
-        const count = this.flApi.select(node_ids);
+        const count = this.flApi.selectNodes(node_ids);
         return { selected_count: count };
     }
 
