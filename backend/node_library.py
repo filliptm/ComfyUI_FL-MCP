@@ -328,15 +328,18 @@ class NodeLibraryClient:
         
         if node_info is not None:
             # Search in display name
-            if query_lower in node_info.get('display_name', '').lower():
+            dn = node_info.get('display_name', '')
+            if dn and query_lower in str(dn).lower():
                 return True
             
             # Search in description
-            if query_lower in node_info.get('description', '').lower():
+            dsc = node_info.get('description', '')
+            if dsc and query_lower in str(dsc).lower():
                 return True
             
             # Search in category
-            if query_lower in node_info.get('category', '').lower():
+            cat = node_info.get('category', '')
+            if query_lower in str(cat).lower():
                 return True
         
         return False
