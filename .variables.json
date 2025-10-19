@@ -1,10 +1,10 @@
 {
-  "current_mode": "implementation",
+  "current_mode": "debugging",
   "project": "fl_js",
-  "task": "tool activity implementation complete",
+  "task": "investigating tool activity cards not showing",
   "architecture": "FastAPI+WS backend with PydanticAI + FastMCP, JS chat sidebar client, realtime tool callbacks",
   "project_status": "new project inspired by legacy FL_JS/FL_WF_Agent",
-  "focus": "all files created and modified",
+  "focus": "visual rendering issue despite console activity",
   "plans_created": "6 detailed implementation plans + summary",
   "next_step": "testing and verification",
   "ui_integration": "app.extensionManager.registerSidebarTab",
@@ -19,7 +19,7 @@
   "next_phase": "ready for implementation mode",
   "files_created": "web/js/tool_activity.js",
   "blocker": "need to understand ComfyUI initialization hooks",
-  "next_action": "wait for user review of implementation.md",
+  "next_action": "diagnostic questions and verification tests",
   "overall_progress": "35%",
   "research_complete": true,
   "decisions": {
@@ -38,7 +38,7 @@
   ],
   "files_modified": "web/js/chat_ui.js, web/js/extension.js",
   "phase_2_step": "complete",
-  "analysis_complete": true,
+  "analysis_complete": "true",
   "files_completed": [
     "backend/callback_router.py",
     "web/js/fl_api.js",
@@ -148,7 +148,7 @@
   "implementation_components": 5,
   "analysis_status": "complete",
   "minor_issue": "simplified_docstring",
-  "confidence_level": "95%",
+  "confidence_level": "high - likely CSS positioning or timing issue",
   "plan_loaded": true,
   "document_location": "notes/mcp_persist/verification.md",
   "understanding_complete": false,
@@ -168,5 +168,6 @@
   "refined_ideas_document": "notes/expressing_tools/ideas.md",
   "key_findings": "simplified trigger logic, lightweight overlay design, ComfyUI integration strategy",
   "implementation_document": "notes/expressing_tools/implementation.md",
-  "key_components": "ToolActivity class, ChatUI integration, extension event handlers"
+  "key_components": "ToolActivity class, ChatUI integration, extension event handlers",
+  "primary_suspects": "CSS positioning, tool execution speed, DOM insertion"
 }

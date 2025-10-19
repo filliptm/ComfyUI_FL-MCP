@@ -127,6 +127,20 @@ export class ChatUI {
         // Add styles
         this._injectStyles();
         
+        // Add debug styles for tool activity
+        const debugStyle = document.createElement('style');
+        debugStyle.textContent = `
+          .fl-chat-layout {
+            overflow: visible !important;
+            min-height: 100px; /* Ensure space for tool cards */
+          }
+          .fl-tool-activity-overlay {
+            bottom: 20px !important; /* Fixed position above input */
+            max-height: 60vh; /* Prevent overflow */
+          }
+        `;
+        document.head.appendChild(debugStyle);
+        
         // ✅ FIX #2: Verify DOM is ready before adding welcome message
         if (this.messagesContainer) {
             // Add welcome message after a tick to ensure DOM is fully inserted

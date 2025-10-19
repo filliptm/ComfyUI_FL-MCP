@@ -168,6 +168,26 @@ export class ToolActivity {
         }, this.autoCleanupMs);
         
         this.activeCards.get(requestId).timeout = timeout;
+        
+        // Add viewport verification
+        requestAnimationFrame(() => {
+            const rect = card.getBoundingClientRect();
+            if (rect.top < 0 || rect.bottom > window.innerHeight) {
+                console.warn('[ToolActivity] Card out of viewport:', rect);
+                this._adjustCardPosition(card);
+            }
+        });
+    }
+
+    /**
+     * Adjust card position if out of viewport
+     * @private
+     */
+    _adjustCardPosition(card) {
+        const rect = card.getBoundingClientRect();
+        if (rect.bottom > window.innerHeight) {
+            card.style.marginBottom = `${rect.bottom - window.innerHeight + 20}px`;
+        }
     }
 
     /**
@@ -209,10 +229,10 @@ export class ToolActivity {
         this.overlay = document.createElement('div');
         this.overlay.className = 'fl-tool-activity-overlay';
         
-        // Insert above input container
-        const inputContainer = this.chatContainer.querySelector('.fl-chat-input-container');
-        if (inputContainer) {
-            inputContainer.parentNode.insertBefore(this.overlay, inputContainer);
+        // Insert below chat content instead of above input
+        const chatContent = this.chatContainer.querySelector('.fl-chat-content');
+        if (chatContent) {
+            chatContent.appendChild(this.overlay);
         } else {
             // Fallback: append to container
             this.chatContainer.appendChild(this.overlay);
