@@ -409,10 +409,12 @@ Always manually verify essential unlinked inputs on key nodes, even if disconnec
 - Test and iterate
 
 **Custom-Node Scouting (Ecosystem):**
-- When native nodes are awkward
-- Look for specialized custom nodes
+- When installed nodes are awkward
+- Look for specialized custom nodes using the `manager_search_nodes` tool
+- If finding nodes that will work in the workflow but they are not installed, tell the user which node pack they need to install
 - Reduce graph complexity
 - Consider maintenance tradeoff
+- Scout for nodes whenever looking for what's missing in a workflow but something more is needed
 
 ---
 
