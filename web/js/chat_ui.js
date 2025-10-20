@@ -708,6 +708,18 @@ export class ChatUI {
                 }
                 this._handleError(data);
             });
+
+            // Check current connection state and update UI immediately
+            // This handles the race condition where connection happens before listeners attach
+            const state = this.wsClient.getState();
+            if (state.connected && state.handshakeComplete) {
+                this._updateConnectionStatus('connected');
+            } else if (state.connected && !state.handshakeComplete) {
+                this._updateConnectionStatus('connecting');
+            } else {
+                // Keep default "Connecting..." state from initialization
+                this._updateConnectionStatus('connecting');
+            }
         }
     }
 
