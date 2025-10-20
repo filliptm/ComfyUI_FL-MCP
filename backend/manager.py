@@ -1,9 +1,12 @@
 """WebSocket connection manager with multi-client session support."""
 
 from fastapi import WebSocket
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List
 from datetime import datetime, timedelta
 import logging
+from collections import deque
+
+import json
 
 from models import (
     HandshakeAck,
@@ -12,6 +15,195 @@ from models import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class ErrorBuffer:
+    """Circular buffer for storing ComfyUI execution errors."""
+    
+    def __init__(self, max_size: int = 100):
+        self.errors = deque(maxlen=max_size)
+        self.errors_by_prompt: Dict[str, List[Dict[str, Any]]] = {}
+        self.max_size = max_size
+        
+    def add_error(self, error_data: Dict[str, Any]) -> None:
+        """Add error to buffer with timestamp and indexing."""
+        error_entry = {
+            "timestamp": datetime.now().isoformat(),
+            "error_type": error_data.get("error_type", "execution_error"),
+            "prompt_id": error_data.get("prompt_id"),
+            "node_id": error_data.get("node_id"),
+            "node_type": error_data.get("node_type"),
+            "exception_type": error_data.get("exception_type"),
+            "exception_message": error_data.get("exception_message"),
+            "traceback": error_data.get("traceback", []),
+            "executed_nodes": error_data.get("executed", []),
+            "current_inputs": error_data.get("current_inputs", {}),
+            "current_outputs": error_data.get("current_outputs", []),
+        }
+        
+        self.errors.append(error_entry)
+        
+        prompt_id = error_entry["prompt_id"]
+        if prompt_id:
+            if prompt_id not in self.errors_by_prompt:
+                self.errors_by_prompt[prompt_id] = []
+            self.errors_by_prompt[prompt_id].append(error_entry)
+            
+            if len(self.errors_by_prompt[prompt_id]) > self.max_size:
+                self.errors_by_prompt[prompt_id].pop(0)
+        
+        logger.debug(f"Error added to buffer: {error_entry['error_type']} for prompt {prompt_id}")
+        
+    def get_recent_errors(self, limit: int = 10) -> List[Dict[str, Any]]:
+        """Get N most recent errors."""
+        return list(self.errors)[-limit:]
+        
+    def get_errors_for_prompt(self, prompt_id: str) -> List[Dict[str, Any]]:
+        """Get all errors for a specific prompt/run."""
+        return self.errors_by_prompt.get(prompt_id, [])
+        
+    def get_all_errors(self) -> List[Dict[str, Any]]:
+        """Get all errors in buffer."""
+        return list(self.errors)
+        
+    def clear(self) -> None:
+        """Clear all errors from buffer."""
+        self.errors.clear()
+        self.errors_by_prompt.clear()
+        logger.info("Error buffer cleared")
+        
+    def get_count(self) -> int:
+        """Get total number of errors in buffer."""
+        return len(self.errors)
+
+
+class ExecutionTracker:
+    """Tracks active workflow executions and queue status."""
+    
+    def __init__(self):
+        self.active_executions: Dict[str, Dict[str, Any]] = {}
+        self.queue_status = {
+            "running": [],
+            "pending": [],
+            "queue_remaining": 0
+        }
+        
+    def handle_execution_start(self, data: Dict[str, Any]) -> None:
+        """Handle execution_start event."""
+        prompt_id = data.get("prompt_id")
+        if not prompt_id:
+            return
+            
+        self.active_executions[prompt_id] = {
+            "status": "running",
+            "start_time": datetime.now().isoformat(),
+            "current_node": None,
+            "executed_nodes": [],
+            "cached_nodes": [],
+        }
+        
+        if prompt_id not in self.queue_status["running"]:
+            self.queue_status["running"].append(prompt_id)
+            
+        logger.debug(f"Execution started: {prompt_id}")
+        
+    def handle_executing(self, data: Dict[str, Any]) -> None:
+        """Handle executing event (node execution tracking)."""
+        try:
+            prompt_id = data.get("prompt_id")
+            node_id = data.get("node")
+        except Exception as e:
+            print(f"Error extracting message ids: {e}, Data: type({type(data)}) > {data}")
+            if isinstance(data, str):
+                data = json.loads(data)
+                prompt_id = data.get("prompt_id")
+                node_id = data.get("node")
+        
+        if not prompt_id or prompt_id not in self.active_executions:
+            return
+            
+        execution = self.active_executions[prompt_id]
+        
+        if node_id is None:
+            execution["current_node"] = None
+            execution["status"] = "completing"
+        else:
+            execution["current_node"] = node_id
+            if node_id not in execution["executed_nodes"]:
+                execution["executed_nodes"].append(node_id)
+                
+    def handle_execution_cached(self, data: Dict[str, Any]) -> None:
+        """Handle execution_cached event."""
+        prompt_id = data.get("prompt_id")
+        if prompt_id and prompt_id in self.active_executions:
+            self.active_executions[prompt_id]["cached_nodes"] = data.get("nodes", [])
+            
+    def handle_execution_success(self, data: Dict[str, Any]) -> None:
+        """Handle execution_success event."""
+        prompt_id = data.get("prompt_id")
+        if prompt_id and prompt_id in self.active_executions:
+            self.active_executions[prompt_id]["status"] = "success"
+            self.active_executions[prompt_id]["end_time"] = datetime.now().isoformat()
+            
+            if prompt_id in self.queue_status["running"]:
+                self.queue_status["running"].remove(prompt_id)
+                
+            logger.debug(f"Execution succeeded: {prompt_id}")
+            
+    def handle_execution_error(self, data: Dict[str, Any]) -> None:
+        """Handle execution_error event."""
+        prompt_id = data.get("prompt_id")
+        if prompt_id and prompt_id in self.active_executions:
+            self.active_executions[prompt_id]["status"] = "error"
+            self.active_executions[prompt_id]["end_time"] = datetime.now().isoformat()
+            self.active_executions[prompt_id]["error"] = {
+                "node_id": data.get("node_id"),
+                "exception_type": data.get("exception_type"),
+                "message": data.get("exception_message"),
+            }
+            
+            if prompt_id in self.queue_status["running"]:
+                self.queue_status["running"].remove(prompt_id)
+                
+            logger.debug(f"Execution failed: {prompt_id}")
+            
+    def handle_status(self, data: Dict[str, Any]) -> None:
+        """Handle status event (queue updates)."""
+        exec_info = data.get("exec_info", {})
+        self.queue_status["queue_remaining"] = exec_info.get("queue_remaining", 0)
+        
+    def get_execution_state(self, prompt_id: str) -> Optional[Dict[str, Any]]:
+        """Get execution state for a specific prompt."""
+        return self.active_executions.get(prompt_id)
+        
+    def get_all_executions(self) -> Dict[str, Dict[str, Any]]:
+        """Get all active executions."""
+        return self.active_executions.copy()
+        
+    def get_queue_status(self) -> Dict[str, Any]:
+        """Get current queue status."""
+        return self.queue_status.copy()
+        
+    def cleanup_old_executions(self, max_age_hours: int = 24) -> int:
+        """Clean up old completed executions."""
+        cutoff = datetime.now() - timedelta(hours=max_age_hours)
+        to_remove = []
+        
+        for prompt_id, execution in self.active_executions.items():
+            if execution["status"] in ["success", "error"]:
+                end_time_str = execution.get("end_time")
+                if end_time_str:
+                    end_time = datetime.fromisoformat(end_time_str)
+                    if end_time < cutoff:
+                        to_remove.append(prompt_id)
+                    
+        for prompt_id in to_remove:
+            del self.active_executions[prompt_id]
+            
+        if to_remove:
+            logger.info(f"Cleaned up {len(to_remove)} old executions")
+            
+        return len(to_remove)
 
 
 class ConnectionManager:
@@ -33,6 +225,12 @@ class ConnectionManager:
         self.session_agents: Dict[str, Any] = {}  # type: ignore
         # Session timeout
         self.session_timeout = timedelta(seconds=session_timeout_seconds)
+        
+        # Error tracking
+        self.error_buffer = ErrorBuffer(max_size=100)
+        self.execution_tracker = ExecutionTracker()
+        
+        logger.info("ConnectionManager initialized with error tracking")
 
     async def connect(
         self, websocket: WebSocket, session_id: str, connection_type: str = 'frontend'
@@ -251,6 +449,39 @@ class ConnectionManager:
             conn_type: True
             for conn_type in self.active_connections[session_id].keys()
         }
+    
+    async def handle_comfy_error(self, data: Dict[str, Any]) -> None:
+        """Handle error from ComfyUI frontend."""
+        error_type = data.get("error_type")
+        
+        if error_type == "execution_error":
+            self.error_buffer.add_error(data)
+            self.execution_tracker.handle_execution_error(data)
+            logger.error(
+                f"ComfyUI execution error in node {data.get('node_id')} "
+                f"({data.get('node_type')}): {data.get('exception_message')}"
+            )
+        elif error_type == "execution_interrupted":
+            self.error_buffer.add_error(data)
+            logger.warning(
+                f"ComfyUI execution interrupted at node {data.get('node_id')}"
+            )
+            
+    async def handle_queue_status(self, data: Dict[str, Any]) -> None:
+        """Handle queue status update from ComfyUI."""
+        self.execution_tracker.handle_status(data)
+        logger.debug(f"Queue status: {data.get('exec_info', {}).get('queue_remaining', 0)} remaining")
+        
+    async def handle_execution_event(self, event: str, data: Dict[str, Any]) -> None:
+        """Handle execution lifecycle events from ComfyUI."""
+        if event == "start":
+            self.execution_tracker.handle_execution_start(data)
+        elif event == "executing":
+            self.execution_tracker.handle_executing(data)
+        elif event == "cached":
+            self.execution_tracker.handle_execution_cached(data)
+        elif event == "success":
+            self.execution_tracker.handle_execution_success(data)
 
 
 # Global connection manager instance

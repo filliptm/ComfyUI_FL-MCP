@@ -10,7 +10,7 @@ import logging
 import os
 import uuid
 from contextlib import asynccontextmanager
-from typing import Any, AsyncIterator, Dict, List, Optional, Union
+from typing import Any, AsyncIterator, Dict, List, Optional, Union, Literal
 
 import websockets
 from fastmcp import FastMCP, Context
@@ -23,12 +23,20 @@ from comfy_models import (
     ComfySearchFilesRequest, ComfySearchFilesResponse
 )
 from comfy_tools import get_comfy_tools, ComfyUIError, ComfyUINotFoundError
+from node_library import (
+    get_node_library_client,
+    NodeLibraryError,
+    NodeLibraryConnectionError,
+    NodeTypeNotFoundError
+)
+from manager import manager
+from calc import acalc_batch, CalcBatchParams
 
 logger = logging.getLogger(__name__)
 
 
 # ============================================================================
-# WebSocket Client for MCP Subprocess
+# WebSocket Client for MCP Subprocess (persist across tool calls)
 # ============================================================================
 
 class MCPWebSocketClient:
@@ -43,35 +51,33 @@ class MCPWebSocketClient:
         self._receive_task = None
         
     async def connect(self):
-        """Connect to backend WebSocket server."""
+        """Connect to backend WebSocket server (one-time, persistent)."""
+        if self.connected and self.ws and not self.ws.closed:
+            return
+
         logger.info(f"[MCP-WS] Connecting to {self.ws_url} with session {self.session_id}")
+        self.ws = await websockets.connect(self.ws_url)
+
+        # Send handshake
+        await self.ws.send(json.dumps({
+            'type': 'handshake',
+            'session_id': self.session_id,
+            'client_version': '1.0.0-mcp',
+        }))
         
-        try:
-            self.ws = await websockets.connect(self.ws_url)
-            
-            # Send handshake
-            await self.ws.send(json.dumps({
-                'type': 'handshake',
-                'session_id': self.session_id,
-                'client_version': '1.0.0-mcp',
-            }))
-            
-            # Wait for handshake ack
-            response = await self.ws.recv()
-            data = json.loads(response)
-            
-            if data.get('type') == 'handshake_ack':
-                self.connected = True
-                logger.info(f"[MCP-WS] Connected and handshake complete")
-                
-                # Start receive loop
-                self._receive_task = asyncio.create_task(self._receive_loop())
-            else:
-                raise RuntimeError(f"Unexpected handshake response: {data}")
-                
-        except Exception as e:
-            logger.error(f"[MCP-WS] Connection failed: {e}")
-            raise
+        # Wait for handshake ack
+        response = await self.ws.recv()
+        data = json.loads(response)
+        
+        if data.get('type') != 'handshake_ack':
+            raise RuntimeError(f"Unexpected handshake response: {data}")
+
+        self.connected = True
+        logger.info(f"[MCP-WS] Connected and handshake complete")
+
+        # Start a single persistent receive loop
+        if not self._receive_task or self._receive_task.done():
+            self._receive_task = asyncio.create_task(self._receive_loop())
     
     async def _receive_loop(self):
         """Receive and process messages from backend."""
@@ -79,50 +85,50 @@ class MCPWebSocketClient:
             async for message in self.ws:
                 data = json.loads(message)
                 await self._handle_message(data)
-        except websockets.exceptions.ConnectionClosed:
+        except websockets.exceptions.ConnectionClosed:  # includes OK(1000)
             logger.warning(f"[MCP-WS] Connection closed")
             self.connected = False
+            await self._fail_all_pending(RuntimeError("WebSocket closed"))
         except Exception as e:
             logger.error(f"[MCP-WS] Receive loop error: {e}")
             self.connected = False
+            await self._fail_all_pending(RuntimeError(f"WebSocket error: {e!r}"))
     
     async def _handle_message(self, data: dict):
         """Handle incoming message from backend."""
         msg_type = data.get('type')
         
         if msg_type == 'tool_result':
-            # Tool execution result from frontend
             request_id = data.get('request_id')
             future = self.pending_requests.get(request_id)
-            
             if future and not future.done():
                 if data.get('success'):
                     future.set_result(data.get('data'))
                 else:
-                    future.set_exception(
-                        RuntimeError(data.get('error', 'Tool execution failed'))
-                    )
-                # Clean up
+                    future.set_exception(RuntimeError(data.get('error', 'Tool execution failed')))
                 self.pending_requests.pop(request_id, None)
         else:
             logger.warning(f"[MCP-WS] Unexpected message type: {msg_type}")
-    
+
+    async def _fail_all_pending(self, exc: Exception):
+        # Fail and clear all outstanding tool calls so they don't hang to timeout
+        for rid, fut in list(self.pending_requests.items()):
+            if not fut.done():
+                fut.set_exception(exc)
+            self.pending_requests.pop(rid, None)
+
     async def execute_tool(self, tool_name: str, parameters: dict, timeout_ms: int = 30000) -> dict:
         """Execute a tool via WebSocket callback."""
-        if not self.connected:
+        if not self.connected or not self.ws:
             raise RuntimeError("WebSocket not connected")
         
-        # Generate unique request ID
         request_id = str(uuid.uuid4())
-        
-        # Create future for this request
-        future = asyncio.get_event_loop().create_future()
+        future = asyncio.get_running_loop().create_future()
         self.pending_requests[request_id] = future
         
         logger.info(f"[MCP-WS] Executing tool: {tool_name} (request_id: {request_id})")
         
         try:
-            # Send tool request
             await self.ws.send(json.dumps({
                 'type': 'tool_request',
                 'session_id': self.session_id,
@@ -132,68 +138,70 @@ class MCPWebSocketClient:
                 'timeout_ms': timeout_ms,
             }))
             
-            # Wait for result with timeout
             timeout_seconds = timeout_ms / 1000.0
             result = await asyncio.wait_for(future, timeout=timeout_seconds)
-            
             logger.info(f"[MCP-WS] Tool execution complete: {request_id}")
             return result
-            
-        except asyncio.TimeoutError:
-            logger.error(f"[MCP-WS] Tool execution timeout: {request_id}")
-            self.pending_requests.pop(request_id, None)
-            raise RuntimeError(f"Tool execution timeout after {timeout_seconds}s")
+
         except Exception as e:
             logger.error(f"[MCP-WS] Tool execution error: {e}")
+            # ensure future is cleaned up on any error path
             self.pending_requests.pop(request_id, None)
             raise
     
     async def disconnect(self):
-        """Disconnect from WebSocket server."""
+        """Optional explicit shutdown (not used by lifespan)."""
         if self._receive_task:
             self._receive_task.cancel()
             try:
                 await self._receive_task
             except asyncio.CancelledError:
                 pass
-        if self.ws:
+        if self.ws and not self.ws.closed:
             await self.ws.close()
         self.connected = False
         logger.info("[MCP-WS] Disconnected")
 
 
+# ============================================================================
+# FastMCP lifespan: reuse a single persistent client (no teardown)
+# ============================================================================
+
+_WS_CLIENT = None  # module-level singleton
+
 @asynccontextmanager
 async def mcp_lifespan(server: FastMCP) -> AsyncIterator[Any]:
-    """Manage MCP server lifespan and WebSocket connection."""
-    
-    _ws_client = None
-    
-    # Check if running in subprocess mode
+    """Manage MCP server lifespan and persistent WebSocket connection."""
+    global _WS_CLIENT
+
     if os.getenv('FL_MCP_MODE') == 'subprocess':
         session_id = os.getenv('FL_SESSION_ID')
         ws_url = os.getenv('FL_WS_URL')
-        
         if not session_id or not ws_url:
             logger.error("Missing FL_SESSION_ID or FL_WS_URL environment variables")
             raise RuntimeError("MCP subprocess not properly configured")
         
         logger.info(f"[MCP] Starting in subprocess mode for session: {session_id}")
+
+        # Create once and keep alive across tool calls
+        if _WS_CLIENT is None:
+            _WS_CLIENT = MCPWebSocketClient(session_id, ws_url)
+            await _WS_CLIENT.connect()
+            logger.info("[MCP] WebSocket client connected (persistent)")
+        elif not _WS_CLIENT.connected or (_WS_CLIENT.ws and _WS_CLIENT.ws.closed):
+            # Session exists but not connected (e.g., prior close). No auto-reconnect logic here;
+            # just try to connect once.
+            await _WS_CLIENT.connect()
+            logger.info("[MCP] WebSocket client reconnected (persistent)")
         
-        # Create and connect WebSocket client
-        _ws_client = MCPWebSocketClient(session_id, ws_url)
-        await _ws_client.connect()
-        
-        logger.info("[MCP] WebSocket client connected")
-        
-    else:
-        logger.info("[MCP] Running in standalone mode (no WebSocket)")
-    
-    yield {"client": _ws_client}
-    
-    # # Cleanup
-    # if _ws_client:
-    #     await _ws_client.disconnect()
-    #     logger.info("[MCP] WebSocket client disconnected")
+        yield {"client": _WS_CLIENT}
+
+        # NOTE: no disconnect/teardown here; keep WS open for the process lifetime.
+        return
+
+    # Standalone (no WebSocket bridge)
+    logger.info("[MCP] Running in standalone mode (no WebSocket)")
+    yield {"client": None}
 
 
 # Initialize FastMCP server with lifespan
@@ -314,26 +322,69 @@ class SetNodeValuesRequest(BaseModel):
 
 class ConnectNodesRequest(BaseModel):
     """Request to connect two nodes."""
+    source_node_id: Union[int, str] = Field(..., description="Source node ID or title, must be a number: 1-9999")
+    target_node_id: Union[int, str] = Field(..., description="Target node ID or title, must be a number: 1-9999")
+    source_slot: Optional[Union[str, int]] = Field(None, description="Source output slot name or index (auto-match if not provided)")
+    target_slot: Optional[Union[str, int]] = Field(None, description="Target input slot name or index (auto-match if not provided)")
+    auto_match: bool = Field(True, description="Enable auto-matching by type if slot names not found")
+    match_strategy: Literal["first", "type", "name"] = Field(
+        "type",
+        description="Auto-match strategy: 'first'=use first available, 'type'=match by data type, 'name'=match by similar names"
+    )
+
+class GetNodeSlotsRequest(BaseModel):
+    """Request to get node slot information."""
+    node_id: Union[int, str] = Field(..., description="Node ID or title")
+
+class ConnectionSpec(BaseModel):
+    """Single connection specification for batch operations."""
     source_node_id: Union[int, str] = Field(..., description="Source node ID or title")
-    source_slot: Union[str, int] = Field(..., description="Source output slot name or index")
     target_node_id: Union[int, str] = Field(..., description="Target node ID or title")
-    target_slot: Optional[Union[str, int]] = Field(None, description="Target input slot name or index (defaults to source_slot)")
+    source_slot: Optional[Union[str, int]] = Field(None, description="Source output slot name or index (optional for auto-match)")
+    target_slot: Optional[Union[str, int]] = Field(None, description="Target input slot name or index (optional for auto-match)")
+
+class ConnectNodesBatchRequest(BaseModel):
+    """Request to connect multiple node pairs in batch."""
+    connections: List[ConnectionSpec] = Field(..., description="List of connection specifications")
+    auto_match: bool = Field(True, description="Enable auto-matching by type if slot names not found")
+    stop_on_error: bool = Field(False, description="Stop on first error (false = continue and report all)")
+
+class AutoConnectWorkflowRequest(BaseModel):
+    """Request to auto-connect nodes in sequence."""
+    node_ids: List[Union[int, str]] = Field(..., description="List of node IDs to connect in order")
+    strategy: Literal["sequential", "type_match"] = Field(
+        "sequential",
+        description="Connection strategy: 'sequential' connects in order, 'type_match' finds all compatible pairs"
+    )
 
 # Layout Management
 class GetNodeRectRequest(BaseModel):
     """Request to get node position and size."""
     node_id: Union[int, str] = Field(..., description="Node ID or title")
 
+class GetLayoutRequest(BaseModel):
+    """Request to get layout for all nodes or specific nodes."""
+    node_ids: Optional[List[Union[int, str]]] = Field(
+        None, 
+        description="Optional list of node IDs or titles to get rects for (omit for all nodes)"
+    )
+
 class SetNodeRectRequest(BaseModel):
     """Request to set node position and/or size."""
-    node_id: Union[int, str] = Field(..., description="Node ID or title")
+    node_id: int = Field(..., description="Node id of the node who's layout rectangle to set.")
     x: Optional[float] = Field(None, description="X position (null to keep current)")
     y: Optional[float] = Field(None, description="Y position (null to keep current)")
     width: Optional[float] = Field(None, description="Width (null to keep current)")
     height: Optional[float] = Field(None, description="Height (null to keep current)")
+
+class NodeRect(BaseModel):
+    x: Optional[float] = Field(None, description="X position (omit to keep current)")
+    y: Optional[float] = Field(None, description="Y position (omit to keep current)")
+    width: Optional[float] = Field(None, description="Width (omit to keep current)")
+    height: Optional[float] = Field(None, description="Height (omit to keep current)")
     
 class BatchLayoutRequest(BaseModel):
-    node_rects: List[SetNodeRectRequest] = Field(..., description="A List of nodes with their new rectangle settings for full or partial quick layout changes")
+    node_rects: Dict[int, NodeRect] = Field(..., description="A map of node id's (int) with their new rectangle settings for full or partial quick layout changes")
 
 class PositionNodeLeftRequest(BaseModel):
     """Request to position node to the left of another."""
@@ -436,6 +487,129 @@ class RandomChoiceRequest(BaseModel):
     """Request to pick random item from list."""
     items: List[Any] = Field(..., description="List of items to choose from")
 
+# Error Feedback
+class GetRecentErrorsRequest(BaseModel):
+    """Request to get recent execution errors."""
+    limit: int = Field(10, description="Number of recent errors to retrieve (default: 10, max: 100)")
+
+class GetErrorsForRunRequest(BaseModel):
+    """Request to get errors for a specific workflow run."""
+    prompt_id: str = Field(..., description="The prompt/run ID to get errors for")
+
+class GetQueueStatusDetailsRequest(BaseModel):
+    """Request to get detailed queue status and active executions."""
+    pass
+
+class GetExecutionDetailsRequest(BaseModel):
+    """Request to get execution details for a specific run."""
+    prompt_id: str = Field(..., description="The prompt/run ID to get details for")
+
+class ClearErrorBufferRequest(BaseModel):
+    """Request to clear the error buffer."""
+    pass
+
+class WaitRequest(BaseModel):
+    delay: float = Field(..., description="Brief period of time to wait (keep between 5 and 20 seconds). Great for waiting a bit after the workflow is queued to show some result")
+
+# ============================================================================
+# NODE LIBRARY REQUEST MODELS
+# ============================================================================
+
+class NodeLibrarySearchRequest(BaseModel):
+    """Search for ComfyUI node types by various criteria."""
+    query: Optional[str] = Field(
+        None,
+        description="Text search in node type names and descriptions (case-insensitive)"
+    )
+    category: Optional[str] = Field(
+        None,
+        description="Filter by node category (e.g., 'sampling', 'loaders', 'image')"
+    )
+    input_type: Optional[str] = Field(
+        None,
+        description="Find node types accepting this input type (e.g., 'LATENT', 'IMAGE')"
+    )
+    output_type: Optional[str] = Field(
+        None,
+        description="Find node types producing this output type (e.g., 'IMAGE', 'LATENT')"
+    )
+    max_results: int = Field(
+        20,
+        ge=1,
+        le=50,
+        description="Maximum number of results to return (1-50)"
+    )
+
+
+class NodeLibraryGetDetailsRequest(BaseModel):
+    """Get detailed information about a specific node type."""
+    node_type: str = Field(
+        ...,
+        description="Exact node type name (e.g., 'KSampler', 'CheckpointLoaderSimple')"
+    )
+
+
+class NodeLibraryFindCompatibleRequest(BaseModel):
+    """Find node types compatible with a given node type."""
+    node_type: str = Field(
+        ...,
+        description="Source node type name (e.g., 'KSampler')"
+    )
+    direction: Literal["downstream", "upstream", "both"] = Field(
+        "downstream",
+        description="downstream=connects AFTER, upstream=connects BEFORE, both=both directions"
+    )
+    output_slot: Optional[str] = Field(
+        None,
+        description="Specific output slot name to match (downstream only)"
+    )
+    input_slot: Optional[str] = Field(
+        None,
+        description="Specific input slot name to match (upstream only)"
+    )
+    max_results: int = Field(
+        30,
+        ge=1,
+        le=100,
+        description="Maximum results per direction (1-100)"
+    )
+
+# ===========================================================================
+# GENERAL UTILITIES
+# ===========================================================================
+
+@mcp.tool()
+async def calculate_expressions(request: CalcBatchParams, ctx: Context) -> Dict[str, Any]:
+    """
+    Evaluate a *batch* of math AST expressions return their results. Great for calculating simple math expressions for calculating bounding boxes for layout modification. Don't include comments.
+
+    Features:
+      • Supports + - * / // % **, parentheses, unary +/-
+      • Variables & **simple assignments** (`x = 2+3`) that persist across lines
+      • Math funcs: sin, cos, tan, asin, acos, atan, atan2, sinh, cosh, tanh,
+        exp, log, log10, log2, sqrt, floor, ceil, hypot, radians, degrees
+      • Builtins: abs, round, min, max, pow
+      • Constants: pi, e, tau
+      • Random (seeded via `params.seed`): `rand()` / `random()`, `uniform(a,b)`, `randint(a,b)`
+      • No `eval` or attributes; AST is strictly whitelisted
+      • If `params.variables` is given, it is **updated** with numeric names
+
+    Returns
+    -------
+    list[float] : one numeric result per input expression (assignment returns assigned value)
+    """
+    try:
+        response = await acalc_batch(request)
+        return {"results": response}
+    except Exception as e:
+        ctx.error(str(e))
+        raise
+
+@mcp.tool()
+async def wait(request: WaitRequest) -> Dict[str, Any]:
+    """Use this to wait for some short period of time, perhaps after generating an image"""
+    await asyncio.sleep(float(request.delay))
+    return {"waited_for": request.delay}
 
 # ============================================================================
 # QUERY & ANALYSIS TOOLS
@@ -474,7 +648,7 @@ async def find_node(request: FindNodeRequest, ctx: Context) -> Dict[str, Any]:
 
 @mcp.tool()
 async def create_nodes(request: CreateNodesRequest, ctx: Context) -> List[Dict[str, Any]]:
-    """Create one or more new node in the workflow."""
+    """Create one or more new node in the workflow. BEFORE CALLING THIS TOOL: check to see that the node exists by searching using node_library_search tool."""
     o = []
     for node in request.nodes:
         o.append(await _execute_tool(ctx, "create_node", node.model_dump()))
@@ -518,7 +692,7 @@ async def select_nodes(request: SelectNodesRequest, ctx: Context) -> Dict[str, A
 
 
 @mcp.tool()
-async def get_current_user_focus(request: GetSelectedNodesRequest, ctx: Context) -> Dict[str, Any]:
+async def get_current_node_selection(request: GetSelectedNodesRequest, ctx: Context) -> Dict[str, Any]:
     """Get currently selected nodes in ComfyUI to understand user's current focus.
     
     This tool provides context-aware assistance by returning detailed information
@@ -543,19 +717,7 @@ async def get_current_user_focus(request: GetSelectedNodesRequest, ctx: Context)
     - inputs: Array of {name, type, link} objects
     - outputs: Array of {name, type, links} objects
     
-    If no nodes are selected, returns empty array: {"nodes": []}
-    
-    AGENT WORKFLOW:
-    1. User mentions "this node", "these nodes", or asks about current selection
-    2. Call this tool to get selected node details
-    3. Extract relevant information from the returned data
-    4. Provide context-aware response or perform requested action
-    
-    EXAMPLE:
-    User: "What's the seed value?"
-    Agent: [Calls get_current_user_focus()]
-    Agent: [Finds KSampler in selected nodes, reads parameters.seed]
-    Agent: "The seed is currently set to 12345."
+    If no nodes are selected, returns empty array: {"nodes": []}    
     """
     return await _execute_tool(ctx, "get_selected_nodes", {})
 
@@ -578,67 +740,203 @@ async def set_node_values(request: SetNodeValuesRequest, ctx: Context) -> Dict[s
 
 @mcp.tool()
 async def connect_nodes(request: ConnectNodesRequest, ctx: Context) -> Dict[str, Any]:
-    """Connect two nodes together."""
+    """Connect two nodes with optional auto-matching.
+    
+    BASIC USAGE (with slot names):
+    Provide exact slot names for reliable connections.
+    
+    SMART USAGE (auto-match by type):
+    Omit slot names to automatically find compatible connections by type.
+    
+    PARAMETERS:
+    - source_node_id: Source node ID or title (required)
+    - target_node_id: Target node ID or title (required)
+    - source_slot: Output slot name/index (optional, auto-matches if not provided)
+    - target_slot: Input slot name/index (optional, auto-matches if not provided)
+    - auto_match: Enable auto-matching (default: true)
+    - match_strategy: How to auto-match (default: "type")
+      - "first": Use first available output/input
+      - "type": Match by compatible types
+      - "name": Match by similar slot names
+    
+    RETURNS:
+    Dictionary with connection details including source/target nodes, slots, and data type.
+    
+    ERROR HANDLING:
+    If connection fails, error message includes available slots on both nodes
+    and suggestion to use get_node_slots() for discovery.
+    """
     return await _execute_tool(ctx, "connect_nodes", request.model_dump())
+
+
+@mcp.tool()
+async def get_node_slots(request: GetNodeSlotsRequest, ctx: Context) -> Dict[str, Any]:
+    """Get detailed input and output slot information for a node.
+    
+    This tool enables agents to discover exact slot names, types, and connection status
+    before attempting to connect nodes, eliminating guesswork and connection failures.
+    
+    USE CASES:
+    - Pre-connection discovery: Determine available slots before connecting
+    - Type matching: Find compatible slots by data type
+    - Connection debugging: Understand why connections fail
+    - Workflow planning: Verify connection compatibility
+    
+    RETURNS:
+    Dictionary containing:
+    - node_id: Node ID (integer)
+    - type: Node type/class (string)
+    - title: Node title (string)
+    - inputs: Array of input slot objects with name, type, index, connection status
+    - outputs: Array of output slot objects with name, type, index, connection status
+    
+    Each slot object includes:
+    - name: Exact slot name (case-sensitive string)
+    - type: Data type (e.g., "LATENT", "IMAGE", "MODEL")
+    - index: Slot index for direct connection (integer)
+    - connected: Whether slot is currently connected (boolean)
+    - connected_from/connected_to: Connection details if connected
+    """
+    return await _execute_tool(ctx, "get_node_slots", request.model_dump())
+
+
+@mcp.tool()
+async def connect_nodes_batch(request: ConnectNodesBatchRequest, ctx: Context) -> Dict[str, Any]:
+    """Connect multiple node pairs in a single batch operation.
+    
+    This tool enables efficient batch connection of nodes, reducing the number of
+    tool calls needed to build complex workflows from N calls to 1 call.
+    
+    PARAMETERS:
+    - connections: List of connection specifications (source, target, optional slots)
+    - auto_match: Enable auto-matching by type (default: true)
+    - stop_on_error: Stop on first error vs continue (default: false = continue)
+    
+    RETURNS:
+    Dictionary with:
+    - total: Total number of connection attempts
+    - successful: Number of successful connections
+    - failed: Number of failed connections
+    - results: Array of result objects for each connection
+    
+    Each result object contains:
+    - success: Whether connection succeeded (boolean)
+    - connection: Connection details if successful
+    - error: Error message if failed
+    - attempted: Original connection spec if failed
+    """
+    return await _execute_tool(ctx, "connect_nodes_batch", request.model_dump())
+
+
+@mcp.tool()
+async def auto_connect_workflow(request: AutoConnectWorkflowRequest, ctx: Context) -> Dict[str, Any]:
+    """Automatically connect nodes based on type compatibility.
+    
+    This tool simplifies workflow creation by automatically connecting nodes in sequence
+    or by finding all compatible type matches.
+    
+    STRATEGIES:
+    - "sequential": Connect nodes in order A→B→C→D (left to right workflow)
+    - "type_match": Find and connect all compatible type pairs in the workflow
+    
+    PARAMETERS:
+    - node_ids: List of node IDs to connect
+    - strategy: Connection strategy (default: "sequential")
+    
+    RETURNS:
+    Dictionary with:
+    - connections_made: Number of successful connections
+    - connections: Array of connection details
+    - failed: Array of failed connection attempts with reasons
+    """
+    return await _execute_tool(ctx, "auto_connect_workflow", request.model_dump())
 
 
 # ============================================================================
 # LAYOUT MANAGEMENT TOOLS
 # ============================================================================
 
-@mcp.tool()
-async def get_node_rect(request: GetNodeRectRequest, ctx: Context) -> Dict[str, Any]:
-    """Get node position and size."""
-    return await _execute_tool(ctx, "get_node_rect", request.model_dump())
+# @mcp.tool()
+# async def get_node_rect(request: GetNodeRectRequest, ctx: Context) -> Dict[str, Any]:
+#     """Get node position and size. Only use this to """
+#     return await _execute_tool(ctx, "get_node_rect", request.model_dump())
 
 
 @mcp.tool()
-async def set_node_rect(request: SetNodeRectRequest, ctx: Context) -> Dict[str, Any]:
-    """Set node position and/or size."""
-    return await _execute_tool(ctx, "set_node_rect", request.model_dump())
+async def get_layout(request: GetLayoutRequest, ctx: Context) -> Dict[str, Any]:
+    """Get position and size for all nodes (or specified nodes) in the workflow. Use it to understand node spatial organization or understanding visual workflow structure.
+    
+    This tool retrieves layout information for the entire workflow at once. Use it before calling `modify_layout`.
+    
+    Returns:
+        {
+            "nodes": [
+                {
+                    "node_id": int,
+                    "title": str,
+                    "type": str,
+                    "rect": {"x": float, "y": float, "width": float, "height": float}
+                },
+                ...
+            ],
+            "count": int
+        }
+        
+    """
+    return await _execute_tool(ctx, "get_layout", request.model_dump())
+
+
+# @mcp.tool()
+# async def set_node_rect(request: SetNodeRectRequest, ctx: Context) -> Dict[str, Any]:
+#     """Set node position and/or size."""
+#     return await _execute_tool(ctx, "set_node_rect", request.model_dump())
 
 @mcp.tool()
 async def modify_layout(request: BatchLayoutRequest, ctx: Context) -> List[Dict[str, Any]]:
-    """Modify the layout of multiple nodes by setting their bounding boxes. Use this when moving many nodes at a time. Attempt to avoid overlaps."""
-    o = []
-    for rect in request.node_rects:
-        o.append(await _execute_tool(ctx, "set_node_rect", rect.model_dump()))
-    return o
+    """Modify the layout of multiple nodes by setting their bounding boxes. Use this to rearrange many nodes at a time. Attempt to avoid overlaps. Before calling this tool call `get_layout` to get the current workflow layout or for some set of nodes.
+    
+    When defining bounding boxes make sure to account for vertical and horizontal spacing between elements that are supposed to be close.
+    """
+    return await _execute_tool(ctx, "modify_layout", request.model_dump())
+    # o = []
+    # for rect in request.node_rects:
+    #     o.append(await _execute_tool(ctx, "set_node_rect", rect.model_dump()))
+    # return o
 
-@mcp.tool()
-async def position_node_left(request: PositionNodeLeftRequest, ctx: Context) -> Dict[str, Any]:
-    """Position a node to the left of another node."""
-    return await _execute_tool(ctx, "position_node_left", request.model_dump())
-
-
-@mcp.tool()
-async def position_node_right(request: PositionNodeRightRequest, ctx: Context) -> Dict[str, Any]:
-    """Position a node to the right of another node."""
-    return await _execute_tool(ctx, "position_node_right", request.model_dump())
+# @mcp.tool()
+# async def position_node_left(request: PositionNodeLeftRequest, ctx: Context) -> Dict[str, Any]:
+#     """Position a node to the left of another node."""
+#     return await _execute_tool(ctx, "position_node_left", request.model_dump())
 
 
-@mcp.tool()
-async def position_node_top(request: PositionNodeTopRequest, ctx: Context) -> Dict[str, Any]:
-    """Position a node above another node."""
-    return await _execute_tool(ctx, "position_node_top", request.model_dump())
+# @mcp.tool()
+# async def position_node_right(request: PositionNodeRightRequest, ctx: Context) -> Dict[str, Any]:
+#     """Position a node to the right of another node."""
+#     return await _execute_tool(ctx, "position_node_right", request.model_dump())
 
 
-@mcp.tool()
-async def position_node_bottom(request: PositionNodeBottomRequest, ctx: Context) -> Dict[str, Any]:
-    """Position a node below another node."""
-    return await _execute_tool(ctx, "position_node_bottom", request.model_dump())
+# @mcp.tool()
+# async def position_node_top(request: PositionNodeTopRequest, ctx: Context) -> Dict[str, Any]:
+#     """Position a node above another node."""
+#     return await _execute_tool(ctx, "position_node_top", request.model_dump())
 
 
-@mcp.tool()
-async def move_node_right(request: MoveNodeRightRequest, ctx: Context) -> Dict[str, Any]:
-    """Move a node to the right, avoiding collisions."""
-    return await _execute_tool(ctx, "move_node_right", request.model_dump())
+# @mcp.tool()
+# async def position_node_bottom(request: PositionNodeBottomRequest, ctx: Context) -> Dict[str, Any]:
+#     """Position a node below another node."""
+#     return await _execute_tool(ctx, "position_node_bottom", request.model_dump())
 
 
-@mcp.tool()
-async def move_node_bottom(request: MoveNodeBottomRequest, ctx: Context) -> Dict[str, Any]:
-    """Move a node downward, avoiding collisions."""
-    return await _execute_tool(ctx, "move_node_bottom", request.model_dump())
+# @mcp.tool()
+# async def move_node_right(request: MoveNodeRightRequest, ctx: Context) -> Dict[str, Any]:
+#     """Move a node to the right, avoiding collisions."""
+#     return await _execute_tool(ctx, "move_node_right", request.model_dump())
+
+
+# @mcp.tool()
+# async def move_node_bottom(request: MoveNodeBottomRequest, ctx: Context) -> Dict[str, Any]:
+#     """Move a node downward, avoiding collisions."""
+#     return await _execute_tool(ctx, "move_node_bottom", request.model_dump())
 
 
 # ============================================================================
@@ -647,7 +945,7 @@ async def move_node_bottom(request: MoveNodeBottomRequest, ctx: Context) -> Dict
 
 @mcp.tool()
 async def queue_workflow(request: QueueWorkflowRequest, ctx: Context) -> Dict[str, Any]:
-    """Queue the workflow for execution."""
+    """Queue the workflow for execution. User might say 'run' the workflow."""
     return await _execute_tool(ctx, "queue_workflow", request.model_dump())
 
 
@@ -748,7 +1046,7 @@ async def random_choice(request: RandomChoiceRequest, ctx: Context) -> Dict[str,
 # ============================================================================
 
 @mcp.tool()
-async def comfy_list_folders(request: ComfyListFoldersRequest, ctx: Context) -> ComfyListFoldersResponse:
+async def comfy_list_folders(request: ComfyListFoldersRequest, ctx: Context) -> Dict[str, Any]:
     """List contents of ComfyUI custom nodes, checkpoints, input, output and more with type-aware organization.
     
     This tool provides agents with deterministic access to ComfyUI directory structure.
@@ -760,25 +1058,19 @@ async def comfy_list_folders(request: ComfyListFoldersRequest, ctx: Context) -> 
     - Output Review: folder_type="output" → List recently generated images
     - Input Files: folder_type="input" → List available input files
     
-    AGENT WORKFLOW:
-    1. Start with "custom_nodes" to discover what's installed
-    2. Check "checkpoints" and "loras" for available models
-    3. Use "output" to see recent generation results
-    4. Check "input" for workflow source files
-    
     SECURITY: All paths are validated and sandboxed to ComfyUI installation.
     """
     try:
         tools = get_comfy_tools()
         items = tools.list_folders(request.folder_type)
         
-        return ComfyListFoldersResponse(
-            folder_type=request.folder_type.value,
-            folder_path=tools.folder_mappings[request.folder_type],
-            items=items,
-            total_items=len(items),
-            comfyui_root=str(tools.comfyui_root)
-        )
+        return {
+            "folder_type": request.folder_type.value,
+            "folder_path": tools.folder_mappings[request.folder_type],
+            "items": items,
+            "total_items": len(items),
+            "comfyui_root": str(tools.comfyui_root)
+        }
         
     except ComfyUINotFoundError as e:
         raise RuntimeError(f"ComfyUI installation not found: {e}")
@@ -790,7 +1082,7 @@ async def comfy_list_folders(request: ComfyListFoldersRequest, ctx: Context) -> 
 
 
 @mcp.tool()
-async def comfy_read_file(request: ComfyReadFileRequest, ctx: Context) -> ComfyReadFileResponse:
+async def comfy_read_file(request: ComfyReadFileRequest, ctx: Context) -> Dict[str, Any]:
     """Read files within ComfyUI for analysis and understanding.
     
     This tool enables agents to examine ComfyUI files to understand capabilities or debug node settings.
@@ -808,11 +1100,6 @@ async def comfy_read_file(request: ComfyReadFileRequest, ctx: Context) -> ComfyR
     - "custom_nodes/{pack}/README.md" → Documentation and examples
     - "custom_nodes/{pack}/requirements.txt" → Python dependencies
     
-    AGENT WORKFLOW:
-    1. List custom_nodes → Read __init__.py → Extract NODE_CLASS_MAPPINGS
-    2. Find node implementations → Read code → Understand interfaces
-    3. Read README files → Get usage examples and documentation
-    
     SECURITY: Files are sandboxed to ComfyUI directory, size limits enforced.
     """
     try:
@@ -823,14 +1110,14 @@ async def comfy_read_file(request: ComfyReadFileRequest, ctx: Context) -> ComfyR
         full_path = tools._validate_path(request.path)
         stat = full_path.stat()
         
-        return ComfyReadFileResponse(
-            path=request.path,
-            content=content,
-            size=stat.st_size,
-            encoding="utf-8",
-            extension=full_path.suffix,
-            comfyui_root=str(tools.comfyui_root)
-        )
+        return {
+            "path": request.path,
+            "content": content,
+            "size": stat.st_size,
+            "encoding": "utf-8",
+            "extension": full_path.suffix,
+            "comfyui_root": str(tools.comfyui_root)
+        }
         
     except ComfyUINotFoundError as e:
         raise RuntimeError(f"ComfyUI installation not found: {e}")
@@ -842,7 +1129,7 @@ async def comfy_read_file(request: ComfyReadFileRequest, ctx: Context) -> ComfyR
 
 
 @mcp.tool()
-async def comfy_search_resources(request: ComfySearchFilesRequest, ctx: Context) -> ComfySearchFilesResponse:
+async def comfy_search_resources(request: ComfySearchFilesRequest, ctx: Context) -> Dict[str, Any]:
     """Search for patterns in ComfyUI files to discover functionality.
     
     This tool enables agents to efficiently discover specific functionality.
@@ -859,17 +1146,6 @@ async def comfy_search_resources(request: ComfySearchFilesRequest, ctx: Context)
     - Documentation: pattern="example|tutorial" → Find usage examples
     - Dependencies: pattern="requirements" → Find dependency files
     
-    SEARCH EXAMPLES:
-    - pattern="NODE_CLASS_MAPPINGS", folder_type="custom_nodes" → All node definitions
-    - pattern="class.*Node", file_pattern="*.py" → All node class implementations
-    - pattern="INPUT_TYPES", file_pattern="*.py" → Node input specifications
-    - pattern="requirements", file_pattern="*.txt" → Dependency files
-    
-    AGENT WORKFLOW:
-    1. Search for functionality keywords → Find implementations
-    2. Search for "NODE_CLASS_MAPPINGS" → Discover all available nodes
-    3. Search for specific patterns → Understand codebase structure
-    
     PERFORMANCE: Results limited by max_results, provides context for understanding.
     """
     try:
@@ -882,15 +1158,15 @@ async def comfy_search_resources(request: ComfySearchFilesRequest, ctx: Context)
             context_lines=request.context_lines
         )
         
-        return ComfySearchFilesResponse(
-            pattern=request.pattern,
-            folder_type=request.folder_type.value,
-            results=results,
-            total_matches=len(results),
-            files_searched=0,  # Could track this if needed
-            truncated=len(results) >= request.max_results,
-            comfyui_root=str(tools.comfyui_root)
-        )
+        return {
+            "pattern": request.pattern,
+            "folder_type": request.folder_type.value,
+            "results": results,
+            "total_matches": len(results),
+            "files_searched": 0,  # Could track this if needed
+            "truncated": len(results) >= request.max_results,
+            "comfyui_root": str(tools.comfyui_root)
+        }
         
     except ComfyUINotFoundError as e:
         raise RuntimeError(f"ComfyUI installation not found: {e}")
@@ -899,6 +1175,280 @@ async def comfy_search_resources(request: ComfySearchFilesRequest, ctx: Context)
     except Exception as e:
         logger.error(f"Unexpected error in comfy_search_files: {e}")
         raise RuntimeError(f"Tool execution failed: {e}")
+
+
+# ============================================================================
+# COMFYUI NODE LIBRARY DISCOVERY TOOLS
+# ============================================================================
+
+@mcp.tool()
+async def node_library_search(request: NodeLibrarySearchRequest, ctx: Context) -> Dict[str, Any]:
+    """Search for available ComfyUI node types (not workflow nodes).
+    
+    This tool searches the library of installed node types that can be created
+    in workflows. Use this to discover what node types are available before
+    creating them with create_nodes().
+    
+    DISTINCTION FROM find_node():
+    - find_node() searches nodes already IN your workflow
+    - node_library_search() searches node TYPES available to create
+    
+    USE CASES:
+    - "What node types handle upscaling?" → output_type="IMAGE", query="upscale"
+    - "Show samplers" → category="sampling"
+    - "What accepts LATENT?" → input_type="LATENT"
+    - "Find LoRA loaders" → query="lora"
+    
+    RETURNS:
+    Array of matching node type definitions with inputs, outputs, categories.
+    Use node_library_get_details() for comprehensive info on a specific type.
+    """
+    try:
+        from config import settings
+        client = get_node_library_client(
+            server_url=settings.comfyui_server_url,
+            timeout=settings.comfyui_api_timeout
+        )
+        
+        results = await client.search_nodes(
+            query=request.query,
+            category=request.category,
+            input_type=request.input_type,
+            output_type=request.output_type,
+            max_results=request.max_results
+        )
+        
+        # Format results
+        formatted_results = [
+            {
+                "node_type": r.node_type,
+                "display_name": r.display_name,
+                "category": r.category,
+                "description": r.description,
+                "inputs": r.inputs,
+                "outputs": r.outputs,
+                "match_reason": r.match_reason
+            }
+            for r in results
+        ]
+        
+        return {
+            "query": request.model_dump(exclude_none=True),
+            "results": formatted_results,
+            "total_results": len(formatted_results),
+            "truncated": len(formatted_results) >= request.max_results
+        }
+        
+    except NodeLibraryConnectionError as e:
+        raise RuntimeError(f"ComfyUI server connection failed: {e}")
+    except NodeLibraryError as e:
+        raise RuntimeError(f"Node library search failed: {e}")
+    except Exception as e:
+        logger.error(f"Unexpected error in node_library_search: {e}")
+        raise RuntimeError(f"Tool execution failed: {e}")
+
+
+@mcp.tool()
+async def node_library_get_details(request: NodeLibraryGetDetailsRequest, ctx: Context) -> Dict[str, Any]:
+    """Get comprehensive details about a specific node type.
+    
+    This tool provides everything needed to understand and use a node type
+    before creating it in the workflow with create_nodes().
+    
+    DISTINCTION FROM get_node_values():
+    - get_node_values() gets parameter VALUES from a workflow node instance
+    - node_library_get_details() gets parameter DEFINITIONS for a node type
+    
+    USE CASES:
+    - Before creating a node: understand what parameters it needs
+    - When planning workflow: verify input/output compatibility
+    - When debugging: check valid parameter ranges and types
+    - Learning: understand what a node type does
+    
+    RETURNS:
+    Complete node type specification including:
+    - All input parameters with types, defaults, constraints (min/max/options)
+    - All output types and names
+    - Category and display information
+    - Parameter order (for UI layout)
+    """
+    try:
+        from config import settings
+        client = get_node_library_client(
+            server_url=settings.comfyui_server_url,
+            timeout=settings.comfyui_api_timeout
+        )
+        
+        node_info = await client.get_node_details(request.node_type)
+        
+        return {
+            "node_type": request.node_type,
+            "display_name": node_info.get('display_name', request.node_type),
+            "category": node_info.get('category', ''),
+            "description": node_info.get('description', ''),
+            "inputs": node_info.get('input', {}),
+            "outputs": node_info.get('output', []),
+            "output_names": node_info.get('output_name', []),
+            "input_order": node_info.get('input_order', [])
+        }
+        
+    except NodeTypeNotFoundError as e:
+        raise RuntimeError(str(e))
+    except NodeLibraryConnectionError as e:
+        raise RuntimeError(f"ComfyUI server connection failed: {e}")
+    except NodeLibraryError as e:
+        raise RuntimeError(f"Node library lookup failed: {e}")
+    except Exception as e:
+        logger.error(f"Unexpected error in node_library_get_details: {e}")
+        raise RuntimeError(f"Tool execution failed: {e}")
+
+
+@mcp.tool()
+async def node_library_find_compatible(request: NodeLibraryFindCompatibleRequest, ctx: Context) -> Dict[str, Any]:
+    """Find node types that can connect to/from a given node type.
+    
+    This tool helps discover what node types are compatible based on input/output
+    type matching. Use this when building workflows to find what comes next.
+    
+    DISTINCTION FROM connect_nodes():
+    - connect_nodes() connects EXISTING workflow nodes together
+    - node_library_find_compatible() finds compatible node TYPES to create
+    
+    USE CASES:
+    - Building workflow: "What can I connect after KSampler?" → downstream
+    - Understanding flow: "What feeds into VAEDecode?" → upstream
+    - Planning chain: "Build checkpoint → sampler → decode → save" → iterate downstream
+    - Type checking: "Can I connect this type to that?" → verify compatibility
+    
+    RETURNS:
+    Array of compatible node types with connection details:
+    - Which output/input slots are compatible
+    - What data types match
+    - Suggested connection patterns
+    """
+    try:
+        from config import settings
+        client = get_node_library_client(
+            server_url=settings.comfyui_server_url,
+            timeout=settings.comfyui_api_timeout
+        )
+        
+        compatible = await client.find_compatible_nodes(
+            node_type=request.node_type,
+            direction=request.direction,
+            output_slot=request.output_slot,
+            input_slot=request.input_slot,
+            max_results=request.max_results
+        )
+        
+        # Format results
+        formatted_compatible = [
+            {
+                "node_type": c.node_type,
+                "display_name": c.display_name,
+                "category": c.category,
+                "connection": c.connection,
+                "description": c.description
+            }
+            for c in compatible
+        ]
+        
+        return {
+            "source_node_type": request.node_type,
+            "direction": request.direction,
+            "compatible_nodes": formatted_compatible,
+            "total_compatible": len(formatted_compatible),
+            "truncated": len(formatted_compatible) >= request.max_results
+        }
+        
+    except NodeTypeNotFoundError as e:
+        raise RuntimeError(str(e))
+    except NodeLibraryConnectionError as e:
+        raise RuntimeError(f"ComfyUI server connection failed: {e}")
+    except NodeLibraryError as e:
+        raise RuntimeError(f"Node library compatibility search failed: {e}")
+    except Exception as e:
+        logger.error(f"Unexpected error in node_library_find_compatible: {e}")
+        raise RuntimeError(f"Tool execution failed: {e}")
+
+
+# ============================================================================
+# ERROR FEEDBACK & QUEUE STATUS TOOLS
+# ============================================================================
+
+@mcp.tool()
+async def get_recent_errors(request: GetRecentErrorsRequest, ctx: Context) -> Dict[str, Any]:
+    """Get recent execution errors from ComfyUI.
+    
+    Retrieves the N most recent errors that occurred during workflow execution.
+    Useful for debugging failed workflows and understanding error patterns.
+    """
+    limit = min(request.limit, 100)  # Cap at buffer size
+    errors = manager.error_buffer.get_recent_errors(limit)
+    return {
+        "errors": errors,
+        "count": len(errors),
+        "total_in_buffer": manager.error_buffer.get_count()
+    }
+
+@mcp.tool()
+async def get_errors_for_run(request: GetErrorsForRunRequest, ctx: Context) -> Dict[str, Any]:
+    """Get all errors for a specific workflow run.
+    
+    Retrieves all errors that occurred during a specific workflow execution,
+    identified by its prompt_id. Use this to debug why a particular run failed.
+    """
+    errors = manager.error_buffer.get_errors_for_prompt(request.prompt_id)
+    return {
+        "prompt_id": request.prompt_id,
+        "errors": errors,
+        "count": len(errors)
+    }
+
+@mcp.tool()
+async def get_queue_status_details(request: GetQueueStatusDetailsRequest, ctx: Context) -> Dict[str, Any]:
+    """Get current ComfyUI queue status and active executions.
+    
+    Returns information about currently running and queued workflows,
+    including execution progress and node tracking.
+    """
+    queue_status = manager.execution_tracker.get_queue_status()
+    active_executions = manager.execution_tracker.get_all_executions()
+    
+    return {
+        "queue": queue_status,
+        "active_executions": active_executions,
+        "execution_count": len(active_executions)
+    }
+
+@mcp.tool()
+async def get_execution_details(request: GetExecutionDetailsRequest, ctx: Context) -> Dict[str, Any]:
+    """Get detailed execution state for a specific workflow run.
+    
+    Provides comprehensive information about a workflow execution including
+    current node, executed nodes, cached nodes, and status.
+    """
+    execution = manager.execution_tracker.get_execution_state(request.prompt_id)
+    return {
+        "prompt_id": request.prompt_id,
+        "found": execution is not None,
+        "execution": execution
+    }
+
+@mcp.tool()
+async def clear_error_buffer(request: ClearErrorBufferRequest, ctx: Context) -> Dict[str, Any]:
+    """Clear the error buffer.
+    
+    Removes all stored errors from the buffer. Use this to start fresh
+    after fixing issues or when the buffer gets too cluttered.
+    """
+    previous_count = manager.error_buffer.get_count()
+    manager.error_buffer.clear()
+    return {
+        "cleared": True,
+        "previous_count": previous_count
+    }
+
     
 # Other Ideas
 #   (**DONE**) Meta-Awareness: Awareness of the full environment including installed plugins (this is through python I'm assuming!)

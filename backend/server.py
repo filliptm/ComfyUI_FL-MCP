@@ -14,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic_ai import UnexpectedModelBehavior
+from pydantic_ai import Agent, UnexpectedModelBehavior
 
 from backend.config import settings
 from manager import manager
@@ -136,6 +136,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     """
     session_id: str | None = None
     connection_type: str = 'frontend'  # Default to frontend
+    agent: Agent | None = None
     
     try:
         # Accept connection
@@ -199,62 +200,93 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
             f"{'reconnected' if is_reconnect else 'connected'}"
         )
         
-        # Message loop
-        while True:
-            # 🔍 TRACE: Log before receive
-            logger.info(f"[TRACE] 📥 Waiting for message on session {session_id} ({connection_type})")
+        # Get or create agent for frontend connections
+        # if connection_type == 'frontend':
+        agent = agent_manager.get_agent(session_id)
+        logger.info(f"Agent created/retrieved for session {session_id}")
+        
+        # Start MCP servers for frontend connections and wrap message loop
+        async with agent.run_mcp_servers(): # if agent else asynccontextmanager(lambda: (yield))():
+            if agent:
+                logger.info(f"MCP servers started for session {session_id}")
             
-            data = await websocket.receive_json()
-            
-            # 🔍 TRACE: Log what we received
-            logger.info(f"[TRACE] 📦 Received message on session {session_id} ({connection_type}): type={data.get('type')}")
-            
-            # Get message type and session_id for logging
-            msg_type = data.get("type")
-            msg_session_id = data.get("session_id")
-            
-            # Log all incoming messages with session_id info (changed from DEBUG to INFO)
-            logger.info(
-                f"[VALIDATION] Received {msg_type} | "
-                f"msg_session_id={msg_session_id} | "
-                f"connection_session_id={session_id} | "
-                f"connection_type={connection_type}"
-            )
-            
-            # Validate session_id in message
-            if msg_session_id != session_id:
-                logger.warning(
-                    f"[VALIDATION] Session mismatch! "
-                    f"msg_session_id={msg_session_id} != connection_session_id={session_id} | "
-                    f"msg_type={msg_type}"
+            # Message loop
+            while True:
+                # 🔍 TRACE: Log before receive
+                logger.info(f"[TRACE] 📥 Waiting for message on session {session_id} ({connection_type})")
+                
+                data = await websocket.receive_json()
+                
+                # 🔍 TRACE: Log what we received
+                logger.info(f"[TRACE] 📦 Received message on session {session_id} ({connection_type}): type={data.get('type')}")
+                
+                # Get message type and session_id for logging
+                msg_type = data.get("type")
+                msg_session_id = data.get("session_id")
+                
+                # Log all incoming messages with session_id info (changed from DEBUG to INFO)
+                logger.info(
+                    f"[VALIDATION] Received {msg_type} | "
+                    f"msg_session_id={msg_session_id} | "
+                    f"connection_session_id={session_id} | "
+                    f"connection_type={connection_type}"
                 )
-                await manager.send_error(
-                    session_id,
-                    "SESSION_MISMATCH",
-                    f"Message session_id '{msg_session_id}' does not match connection session_id '{session_id}'",
-                    target=connection_type
-                )
-                continue
-            
-            # Route message based on type
-            if msg_type == "user_message":
-                # await handle_user_message(session_id, data)
-                asyncio.create_task(handle_user_message(session_id, data, message_history=context.conversation_history))
-            
-            elif msg_type == "tool_result":
-                await handle_tool_result(session_id, data)
-            
-            elif msg_type == "tool_request":
-                # Tool request from MCP subprocess - route to frontend
-                await route_tool_request_to_frontend(session_id, data)
-            
-            else:
-                await manager.send_error(
-                    session_id,
-                    "UNKNOWN_MESSAGE_TYPE",
-                    f"Unknown message type: {msg_type}",
-                    target=connection_type
-                )
+                
+                # Validate session_id in message
+                if msg_session_id != session_id:
+                    logger.warning(
+                        f"[VALIDATION] Session mismatch! "
+                        f"msg_session_id={msg_session_id} != connection_session_id={session_id} | "
+                        f"msg_type={msg_type}"
+                    )
+                    await manager.send_error(
+                        session_id,
+                        "SESSION_MISMATCH",
+                        f"Message session_id '{msg_session_id}' does not match connection session_id '{session_id}'",
+                        target=connection_type
+                    )
+                    continue
+                
+                # Route message based on type
+                if msg_type == "user_message":
+                    if agent:
+                        asyncio.create_task(
+                            handle_user_message(
+                                session_id, 
+                                data, 
+                                message_history=context.conversation_history,
+                                agent=agent
+                            )
+                        )
+                    else:
+                        logger.warning(f"Received user_message on MCP connection for session {session_id}")
+                
+                elif msg_type == "tool_result":
+                    await handle_tool_result(session_id, data)
+                
+                elif msg_type == "tool_request":
+                    # Tool request from MCP subprocess - route to frontend
+                    await route_tool_request_to_frontend(session_id, data)
+                
+                elif msg_type == "comfy_error":
+                    await manager.handle_comfy_error(data.get("data", {}))
+                
+                elif msg_type == "queue_status":
+                    await manager.handle_queue_status(data.get("data", {}))
+                
+                elif msg_type == "execution_event":
+                    event = data.get("event")
+                    logger.debug(f"**execution_event**: {data}")
+                    event_data = data.get("data", {})
+                    await manager.handle_execution_event(event, event_data)
+                
+                else:
+                    await manager.send_error(
+                        session_id,
+                        "UNKNOWN_MESSAGE_TYPE",
+                        f"Unknown message type: {msg_type}",
+                        target=connection_type
+                    )
     
     except WebSocketDisconnect:
         if session_id:
@@ -262,6 +294,10 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
             # Cancel any pending callbacks for this session
             if callback_router:
                 callback_router.cancel_pending_callbacks(session_id)
+            # Cleanup agent for frontend connections
+            if connection_type == 'frontend':
+                agent_manager.remove_agent(session_id)
+                logger.info(f"Agent removed for session {session_id}")
             logger.info(f"Session {session_id} - {connection_type} disconnected")
     
     except Exception as e:
@@ -271,6 +307,10 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
             # Cancel any pending callbacks for this session
             if callback_router:
                 callback_router.cancel_pending_callbacks(session_id)
+            # Cleanup agent for frontend connections
+            if connection_type == 'frontend':
+                agent_manager.remove_agent(session_id)
+                logger.info(f"Agent removed for session {session_id} (error cleanup)")
             await manager.send_error(
                 session_id,
                 "INTERNAL_ERROR",
@@ -334,10 +374,10 @@ def filtered_message_history(
     # messages: list[ModelMessage] = result.all_messages()
     
     # Extract system message (always the first one with role="system")
-    system_message = next((msg for msg in messages if type(msg.parts[0]) == SystemPromptPart), None)
+    system_message = next((msg for msg in messages if len(msg.parts) > 0 and type(msg.parts[0]) == SystemPromptPart), None)
     
     # Filter non-system messages
-    non_system_messages = [msg for msg in messages if type(msg.parts[0]) != SystemPromptPart]
+    non_system_messages = [msg for msg in messages if len(msg.parts) > 0 and  type(msg.parts[0]) != SystemPromptPart]
     
     # Apply tool message filtering if requested
     if not include_tool_messages:
@@ -542,12 +582,19 @@ def filtered_message_history(
 
 # Message handlers
 
-async def handle_user_message(session_id: str, data: dict[str, Any], message_history:List[ModelMessage]) -> None:
+async def handle_user_message(
+    session_id: str, 
+    data: dict[str, Any], 
+    message_history: List[ModelMessage],
+    agent: Agent
+) -> None:
     """Handle user message.
 
     Args:
         session_id: Session ID
         data: Message data
+        message_history: Conversation history for this session
+        agent: Agent instance for this session
     """
     try:
         message = UserMessage(**data)
@@ -563,13 +610,11 @@ async def handle_user_message(session_id: str, data: dict[str, Any], message_his
             "is_typing": True,
         })
         
-        # Get or create agent for this session
-        agent = agent_manager.get_agent(session_id)
-        
-        response = None
-        async with agent.run_mcp_servers(): 
-            # Process message with agent
-            response = await agent.run(message.message, message_history=filtered_message_history(message_history, include_tool_messages=True)) # TODO set this to use message history for this session
+        # Process message with agent (MCP servers already running from outer context)
+        response = await agent.run(
+            message.message, 
+            message_history=filtered_message_history(message_history, include_tool_messages=True)
+        )
         
         if response is not None:
             # Set History (Mutable)

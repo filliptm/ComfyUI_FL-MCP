@@ -53,10 +53,15 @@ export class ToolExecutor {
             "get_node_values": this._handleGetNodeValues.bind(this),
             "set_node_values": this._handleSetNodeValues.bind(this),
             "connect_nodes": this._handleConnectNodes.bind(this),
+            "get_node_slots": this._handleGetNodeSlots.bind(this),
+            "connect_nodes_batch": this._handleConnectNodesBatch.bind(this),
+            "auto_connect_workflow": this._handleAutoConnectWorkflow.bind(this),
             
             // Layout Management
             "get_node_rect": this._handleGetNodeRect.bind(this),
+            "get_layout": this._handleGetLayout.bind(this),
             "set_node_rect": this._handleSetNodeRect.bind(this),
+            "modify_layout": this._handleModifyLayout.bind(this),
             "position_node_left": this._handlePositionNodeLeft.bind(this),
             "position_node_right": this._handlePositionNodeRight.bind(this),
             "position_node_top": this._handlePositionNodeTop.bind(this),
@@ -299,7 +304,7 @@ export class ToolExecutor {
 
     async _handleSelectNodes(params) {
         const { node_ids } = params;
-        const count = this.flApi.select(node_ids);
+        const count = this.flApi.selectNodes(node_ids);
         return { selected_count: count };
     }
 
@@ -323,14 +328,53 @@ export class ToolExecutor {
     }
 
     async _handleConnectNodes(params) {
-        const { source_node_id, source_slot, target_node_id, target_slot } = params;
-        const success = this.flApi.connect(
+        const { 
+            source_node_id, 
+            source_slot, 
+            target_node_id, 
+            target_slot,
+            auto_match,
+            match_strategy
+        } = params;
+        
+        const options = {
+            auto_match: auto_match !== false,  // Default true
+            match_strategy: match_strategy || "type"
+        };
+        
+        const result = this.flApi.connect(
             source_node_id,
-            source_slot,
+            source_slot !== undefined ? source_slot : null,
             target_node_id,
-            target_slot || null
+            target_slot !== undefined ? target_slot : null,
+            options
         );
-        return { connected: success };
+        
+        return { 
+            connected: true,
+            connection: result
+        };
+    }
+
+    async _handleGetNodeSlots(params) {
+        const { node_id } = params;
+        return this.flApi.getNodeSlots(node_id);
+    }
+
+    async _handleConnectNodesBatch(params) {
+        const { connections, auto_match, stop_on_error } = params;
+        
+        const options = {
+            auto_match: auto_match !== false,
+            stop_on_error: stop_on_error || false
+        };
+        
+        return this.flApi.connectBatch(connections, options);
+    }
+
+    async _handleAutoConnectWorkflow(params) {
+        const { node_ids, strategy } = params;
+        return this.flApi.autoConnectWorkflow(node_ids, strategy || "sequential");
     }
 
     // ==================== LAYOUT MANAGEMENT HANDLERS ====================
@@ -339,6 +383,12 @@ export class ToolExecutor {
         const { node_id } = params;
         const rect = this.flApi.getRect(node_id);
         return { node_id, rect };
+    }
+
+    async _handleGetLayout(params) {
+        const { node_ids } = params;
+        const layout = this.flApi.getLayout(node_ids);
+        return { layout };
     }
 
     async _handleSetNodeRect(params) {
@@ -353,39 +403,50 @@ export class ToolExecutor {
         return { node_id, rect };
     }
 
+    async _handleModifyLayout(params) {
+        const { node_rects } = params;
+        const results = this.flApi.modifyLayout(node_rects);
+        return { 
+            results,
+            total_processed: results.length,
+            successful: results.filter(r => r.success).length,
+            failed: results.filter(r => !r.success).length
+        };
+    }
+
     async _handlePositionNodeLeft(params) {
         const { target_node_id, anchor_node_id, margin } = params;
-        this.flApi.putOnLeft(target_node_id, anchor_node_id, margin || 32);
+        this.flApi.positionLeft(target_node_id, anchor_node_id, margin || 32);
         return { positioned: true };
     }
 
     async _handlePositionNodeRight(params) {
         const { target_node_id, anchor_node_id, margin } = params;
-        this.flApi.putOnRight(target_node_id, anchor_node_id, margin || 32);
+        this.flApi.positionRight(target_node_id, anchor_node_id, margin || 32);
         return { positioned: true };
     }
 
     async _handlePositionNodeTop(params) {
         const { target_node_id, anchor_node_id, margin } = params;
-        this.flApi.putOnTop(target_node_id, anchor_node_id, margin || 64);
+        this.flApi.positionTop(target_node_id, anchor_node_id, margin || 64);
         return { positioned: true };
     }
 
     async _handlePositionNodeBottom(params) {
         const { target_node_id, anchor_node_id, margin } = params;
-        this.flApi.putOnBottom(target_node_id, anchor_node_id, margin || 64);
+        this.flApi.positionBottom(target_node_id, anchor_node_id, margin || 64);
         return { positioned: true };
     }
 
     async _handleMoveNodeRight(params) {
         const { node_id, margin } = params;
-        this.flApi.moveToRight(node_id, margin || 32);
+        this.flApi.moveRight(node_id, margin || 32);
         return { moved: true };
     }
 
     async _handleMoveNodeBottom(params) {
         const { node_id, margin } = params;
-        this.flApi.moveToBottom(node_id, margin || 64);
+        this.flApi.moveBottom(node_id, margin || 64);
         return { moved: true };
     }
 

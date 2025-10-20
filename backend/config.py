@@ -47,6 +47,10 @@ class Settings(BaseSettings):
     tool_timeout: int = 30000  # milliseconds
     max_tool_retries: int = 3
 
+    # ComfyUI Server Configuration
+    comfyui_server_url: str = "http://127.0.0.1:8188"
+    comfyui_api_timeout: int = 10  # seconds
+
     # Conversation
     conversation_max_history: int = 50
 

@@ -58,6 +58,9 @@ class WSClient extends EventEmitter {
         this.reconnectTimeout = null;
         this.messageQueue = [];
         
+        // ComfyUI API reference
+        this.comfyApi = null;
+        
         console.log('[WSClient] Initialized with session:', this.sessionId);
     }
 
@@ -69,9 +72,8 @@ class WSClient extends EventEmitter {
             console.log('[WSClient] Already connected');
             return;
         }
-
-        console.log('[WSClient] Connecting to:', this.config.url);
-        this.emit('connecting');
+        
+        console.log(`[WSClient] Connecting to ${this.config.url}...`);
         
         try {
             this.ws = new WebSocket(this.config.url);
@@ -80,9 +82,10 @@ class WSClient extends EventEmitter {
             this.ws.onclose = (event) => this.handleClose(event);
             this.ws.onerror = (error) => this.handleError(error);
             this.ws.onmessage = (event) => this.handleMessage(event);
+            
         } catch (error) {
             console.error('[WSClient] Connection error:', error);
-            this.attemptReconnect();
+            this.scheduleReconnect();
         }
     }
 
@@ -92,8 +95,6 @@ class WSClient extends EventEmitter {
     handleOpen() {
         console.log('[WSClient] WebSocket connected');
         this.connected = true;
-        this.reconnectAttempts = 0;
-        this.reconnectDelay = this.config.initialReconnectDelay;
         
         // Send handshake
         this.sendHandshake();
@@ -102,21 +103,37 @@ class WSClient extends EventEmitter {
     }
 
     /**
+     * Send handshake message
+     */
+    sendHandshake() {
+        const handshake = {
+            type: 'handshake',
+            session_id: this.sessionId,
+            client_version: this.config.clientVersion,
+        };
+        
+        console.log('[WSClient] Sending handshake:', handshake);
+        this.ws.send(JSON.stringify(handshake));
+    }
+
+    /**
      * Handle WebSocket close event
      */
     handleClose(event) {
-        console.log('[WSClient] WebSocket disconnected:', event.code, event.reason);
+        console.log('[WSClient] WebSocket closed:', event.code, event.reason);
         this.connected = false;
         this.handshakeComplete = false;
         
         this.emit('disconnected', event);
         
-        // Attempt reconnection
-        this.attemptReconnect();
+        // Attempt reconnection if not a clean close
+        if (event.code !== 1000) {
+            this.scheduleReconnect();
+        }
     }
 
     /**
-     * Handle WebSocket error event
+     * Handle WebSocket error
      */
     handleError(error) {
         console.error('[WSClient] WebSocket error:', error);
@@ -131,56 +148,35 @@ class WSClient extends EventEmitter {
             const message = JSON.parse(event.data);
             console.log('[WSClient] Received message:', message.type);
             
-            // Validate session_id
-            if (message.session_id !== this.sessionId) {
-                console.warn('[WSClient] Session ID mismatch:', message.session_id, 'vs', this.sessionId);
-                return;
-            }
-            
             // Route message based on type
             switch (message.type) {
                 case 'handshake_ack':
                     this.handleHandshakeAck(message);
                     break;
-                
+                    
                 case 'agent_response':
                     this.emit('agent_response', message);
                     break;
-                
+                    
                 case 'tool_request':
-                    console.log('[WSClient] 🔧 Tool request received:', message.tool_name, 'request_id:', message.request_id);
-                    console.log('[WSClient] 🔧 Tool parameters:', message.parameters);
                     this.emit('tool_request', message);
-                    console.log('[WSClient] 🔧 Tool request event emitted');
                     break;
-                
+                    
                 case 'typing_indicator':
                     this.emit('typing_indicator', message);
                     break;
-                
+                    
                 case 'error':
-                    console.error('[WSClient] Server error:', message.error_code, message.message);
                     this.emit('error', message);
                     break;
-                
+                    
                 default:
                     console.warn('[WSClient] Unknown message type:', message.type);
             }
+            
         } catch (error) {
             console.error('[WSClient] Error parsing message:', error);
         }
-    }
-
-    /**
-     * Send handshake message
-     */
-    sendHandshake() {
-        console.log('[WSClient] Sending handshake');
-        this.send({
-            type: 'handshake',
-            session_id: this.sessionId,
-            client_version: this.config.clientVersion,
-        });
     }
 
     /**
@@ -189,82 +185,36 @@ class WSClient extends EventEmitter {
     handleHandshakeAck(message) {
         console.log('[WSClient] Handshake acknowledged:', message.status);
         this.handshakeComplete = true;
+        this.reconnectAttempts = 0;
+        this.reconnectDelay = this.config.initialReconnectDelay;
         
-        // Process queued messages
+        // Flush queued messages
         this.flushMessageQueue();
         
         this.emit('handshake_ack', message);
     }
 
     /**
-     * Attempt to reconnect with exponential backoff
-     */
-    attemptReconnect() {
-        // Clear any existing reconnect timeout
-        if (this.reconnectTimeout) {
-            clearTimeout(this.reconnectTimeout);
-        }
-        
-        // Check if max attempts reached
-        if (this.reconnectAttempts >= this.config.maxReconnectAttempts) {
-            console.error('[WSClient] Max reconnection attempts reached');
-            this.emit('max_reconnect_reached');
-            return;
-        }
-        
-        this.reconnectAttempts++;
-        console.log(`[WSClient] Reconnecting in ${this.reconnectDelay}ms (attempt ${this.reconnectAttempts}/${this.config.maxReconnectAttempts})`);
-        
-        this.reconnectTimeout = setTimeout(() => {
-            this.connect();
-        }, this.reconnectDelay);
-        
-        // Exponential backoff
-        this.reconnectDelay = Math.min(
-            this.reconnectDelay * 2,
-            this.config.maxReconnectDelay
-        );
-    }
-
-    /**
-     * Send message to server
+     * Send a message to the server
      */
     send(message) {
-        // Ensure session_id is set
+        // Add session_id if not present
         if (!message.session_id) {
             message.session_id = this.sessionId;
         }
         
-        // Add timestamp if not present
-        if (!message.timestamp) {
-            message.timestamp = new Date().toISOString();
+        // Queue message if not connected or handshake not complete
+        if (!this.connected || !this.handshakeComplete) {
+            console.log('[WSClient] Queueing message:', message.type);
+            this.messageQueue.push(message);
+            return;
         }
         
-        // ✅ FIX #1: Allow handshake messages to bypass handshakeComplete check
-        const isHandshake = message.type === 'handshake';
-        const canSend = this.ws && 
-                        this.ws.readyState === WebSocket.OPEN && 
-                        (this.handshakeComplete || isHandshake);
-        
-        if (canSend) {
-            try {
-                // DEBUG: Log session_id before sending
-                console.log('[WSClient] 📤 About to send:', message.type, 'session_id:', message.session_id);
-                
-                this.ws.send(JSON.stringify(message));
-                console.log('[WSClient] Sent message:', message.type);
-                
-                // Extra logging for tool_result messages
-                if (message.type === 'tool_result') {
-                    console.log('[WSClient] 📤 Tool result sent:', message.request_id, 'success:', message.success);
-                }
-            } catch (error) {
-                console.error('[WSClient] Error sending message:', error);
-                this.messageQueue.push(message);
-            }
-        } else {
-            // Queue message for later
-            console.log('[WSClient] Queueing message (not ready):', message.type);
+        try {
+            this.ws.send(JSON.stringify(message));
+            console.log('[WSClient] Sent message:', message.type);
+        } catch (error) {
+            console.error('[WSClient] Error sending message:', error);
             this.messageQueue.push(message);
         }
     }
@@ -279,54 +229,51 @@ class WSClient extends EventEmitter {
         
         console.log(`[WSClient] Flushing ${this.messageQueue.length} queued messages`);
         
-        const queue = [...this.messageQueue];
-        this.messageQueue = [];
-        
-        queue.forEach(message => {
+        while (this.messageQueue.length > 0) {
+            const message = this.messageQueue.shift();
             this.send(message);
-        });
+        }
     }
 
     /**
-     * Send user message to agent
+     * Schedule reconnection attempt
      */
-    sendUserMessage(content) {
-        this.send({
-            type: 'user_message',
-            content: content,
-        });
-    }
-
-    /**
-     * Send tool execution result
-     */
-    sendToolResult(requestId, success, data, error, executionTimeMs) {
-        console.log('[WSClient] 📤 Sending tool result:', requestId, 'session_id:', this.sessionId);
-        this.send({
-            type: 'tool_result',
-            request_id: requestId,
-            success: success,
-            data: data || null,
-            error: error || null,
-            execution_time_ms: executionTimeMs,
-        });
+    scheduleReconnect() {
+        if (this.reconnectAttempts >= this.config.maxReconnectAttempts) {
+            console.error('[WSClient] Max reconnection attempts reached');
+            this.emit('max_reconnect_reached');
+            return;
+        }
+        
+        this.reconnectAttempts++;
+        
+        console.log(
+            `[WSClient] Scheduling reconnect attempt ${this.reconnectAttempts}/${this.config.maxReconnectAttempts} ` +
+            `in ${this.reconnectDelay}ms`
+        );
+        
+        this.reconnectTimeout = setTimeout(() => {
+            this.connect();
+        }, this.reconnectDelay);
+        
+        // Exponential backoff
+        this.reconnectDelay = Math.min(
+            this.reconnectDelay * 2,
+            this.config.maxReconnectDelay
+        );
     }
 
     /**
      * Disconnect from server
      */
     disconnect() {
-        console.log('[WSClient] Disconnecting');
-        
-        // Clear reconnect timeout
         if (this.reconnectTimeout) {
             clearTimeout(this.reconnectTimeout);
             this.reconnectTimeout = null;
         }
         
-        // Close WebSocket
         if (this.ws) {
-            this.ws.close();
+            this.ws.close(1000, 'Client disconnect');
             this.ws = null;
         }
         
@@ -335,14 +282,7 @@ class WSClient extends EventEmitter {
     }
 
     /**
-     * Check if client is connected and ready
-     */
-    isReady() {
-        return this.connected && this.handshakeComplete;
-    }
-
-    /**
-     * Get connection state
+     * Get client state
      */
     getState() {
         return {
@@ -350,10 +290,88 @@ class WSClient extends EventEmitter {
             handshakeComplete: this.handshakeComplete,
             reconnectAttempts: this.reconnectAttempts,
             queuedMessages: this.messageQueue.length,
-            readyState: this.ws ? this.ws.readyState : null,
         };
+    }
+    
+    /**
+     * Setup listeners for ComfyUI API events
+     * Call this after ComfyUI's API is initialized
+     */
+    setupComfyListeners(comfyApi) {
+        this.comfyApi = comfyApi;
+        console.log('[WSClient] Setting up ComfyUI event listeners');
+        
+        // Error events
+        this.comfyApi.addEventListener("execution_error", (event) => {
+            console.error('[WSClient] ComfyUI execution error:', event.detail);
+            this.send({
+                type: "comfy_error",
+                data: {
+                    error_type: "execution_error",
+                    ...event.detail,
+                    timestamp: Date.now()
+                }
+            });
+        });
+        
+        this.comfyApi.addEventListener("execution_interrupted", (event) => {
+            console.warn('[WSClient] ComfyUI execution interrupted:', event.detail);
+            this.send({
+                type: "comfy_error",
+                data: {
+                    error_type: "execution_interrupted",
+                    ...event.detail,
+                    timestamp: Date.now()
+                }
+            });
+        });
+        
+        // Queue status
+        this.comfyApi.addEventListener("status", (event) => {
+            this.send({
+                type: "queue_status",
+                data: event.detail
+            });
+        });
+        
+        // Execution tracking
+        this.comfyApi.addEventListener("execution_start", (event) => {
+            console.log('[WSClient] Execution started:', event.detail.prompt_id);
+            this.send({
+                type: "execution_event",
+                event: "start",
+                data: event.detail
+            });
+        });
+        
+        this.comfyApi.addEventListener("executing", (event) => {
+            this.send({
+                type: "execution_event",
+                event: "executing",
+                data: {run_id: event.detail}
+            });
+        });
+        
+        this.comfyApi.addEventListener("execution_cached", (event) => {
+            console.log('[WSClient] Execution cached:', event.detail);
+            this.send({
+                type: "execution_event",
+                event: "cached",
+                data: event.detail
+            });
+        });
+        
+        this.comfyApi.addEventListener("execution_success", (event) => {
+            console.log('[WSClient] Execution succeeded:', event.detail.prompt_id);
+            this.send({
+                type: "execution_event",
+                event: "success",
+                data: event.detail
+            });
+        });
+        
+        console.log('[WSClient] ComfyUI event listeners registered');
     }
 }
 
-// Export as ES6 module for ComfyUI
 export default WSClient;
