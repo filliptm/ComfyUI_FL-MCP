@@ -391,6 +391,15 @@ class ComfyManagerClient:
     ) -> Dict[str, NodeMapping]:
         """Get node type to node pack mappings.
         
+        API returns data in format:
+        {
+            "extension-id": [
+                ["NodeClass1", "NodeClass2", ...],  # List of node types
+                {"author": "...", "description": "..."}  # Metadata
+            ],
+            ...
+        }
+        
         Args:
             mode: Mapping source mode
             
@@ -402,14 +411,21 @@ class ComfyManagerClient:
         data = await self._get("/customnode/getmappings", params={"mode": mode})
         
         mappings = {}
-        for node_type, pack_info in data.items():
-            if isinstance(pack_info, list) and len(pack_info) > 0:
-                pack_id = pack_info[0]
-                mappings[node_type] = NodeMapping(
-                    node_type=node_type,
-                    node_pack_id=pack_id,
-                    node_pack_name=pack_id  # Could enhance with actual name lookup
-                )
+        # Iterate over extension-id (pack_id) -> pack_data
+        for pack_id, pack_data in data.items():
+            # pack_data is [node_list, metadata_dict]
+            if isinstance(pack_data, list) and len(pack_data) > 0:
+                node_list = pack_data[0]  # First element is list of node types
+                
+                # Ensure node_list is actually a list
+                if isinstance(node_list, list):
+                    # Map each node type to this pack
+                    for node_type in node_list:
+                        mappings[node_type] = NodeMapping(
+                            node_type=node_type,
+                            node_pack_id=pack_id,
+                            node_pack_name=pack_id  # Could enhance with actual name lookup
+                        )
         
         logger.info(f"[Manager] Fetched {len(mappings)} node mappings")
         return mappings
