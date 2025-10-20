@@ -122,34 +122,37 @@ def get_llm_model():
     Raises:
         ValueError: If provider is unknown
     """
+    # Use resolved model (with fallback to default)
+    model_name = settings.resolved_model
+    
+    logger.info(f"Loading model: {model_name} (provider: {settings.llm_provider})")
+    
     if settings.llm_provider == "openai":
-        return OpenAIModel(
-            settings.llm_model,
-            # api_key=settings.openai_api_key
-        )
+        return OpenAIModel(model_name)
+    
     elif settings.llm_provider == "openrouter":
         # OpenRouter uses OpenAI-compatible API
         return OpenAIModel(
-            settings.llm_model,
+            model_name,
             provider=OpenAIProvider(
                 base_url='https://openrouter.ai/api/v1',
                 api_key=settings.openrouter_api_key
             )
         )
+    
     elif settings.llm_provider == "anthropic":
-        # Import here to avoid dependency if not used
         from pydantic_ai.models.anthropic import AnthropicModel
-        return AnthropicModel(
-            settings.llm_model,
-            # api_key=settings.anthropic_api_key
-        )
+        return AnthropicModel(model_name)
+    
     elif settings.llm_provider == "gemini":
-        # Import here to avoid dependency if not used
-        from pydantic_ai.models.gemini import GeminiModel
-        return GeminiModel(
-            settings.llm_model,
-            # api_key=settings.google_api_key
-        )
+        # UPDATED: Use improved pattern with explicit provider
+        from pydantic_ai.models.google import GoogleModel
+        from pydantic_ai.providers.google import GoogleProvider
+        
+        # Create provider with explicit API key
+        provider = GoogleProvider(api_key=settings.google_api_key)
+        return GoogleModel(model_name, provider=provider)
+    
     else:
         raise ValueError(f"Unknown LLM provider: {settings.llm_provider}")
 

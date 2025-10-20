@@ -1,8 +1,17 @@
 """Configuration management for FL_JS backend."""
 
-from typing import Literal
+from typing import Dict, Literal, Optional
 from pathlib import Path
 from pydantic_settings import BaseSettings, SettingsConfigDict
+import logging
+
+from backend.model_defaults import (
+    get_default_model,
+    validate_provider_model,
+    get_provider_tuning
+)
+
+logger = logging.getLogger(__name__)
 
 
 class Settings(BaseSettings):
@@ -21,8 +30,8 @@ class Settings(BaseSettings):
     log_backend_to_file: bool = True
 
     # LLM Provider Configuration
-    llm_provider: Literal["openai", "anthropic", "gemini", "openrouter"] = "openrouter"
-    llm_model: str = "deepseek/deepseek-chat"
+    llm_provider: Literal["openai", "anthropic", "gemini", "openrouter"] = "gemini"
+    llm_model: Optional[str] = None  # If None, uses provider default
     llm_temperature: float = 0.7
     llm_max_tokens: int = 32000
 
@@ -57,6 +66,36 @@ class Settings(BaseSettings):
     # Logging
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
     log_format: Literal["json", "text"] = "json"
+
+    @property
+    def resolved_model(self) -> str:
+        """Get the model to use, falling back to provider default if not specified.
+        
+        Returns:
+            Model string to use
+        """
+        if self.llm_model:
+            # Validate explicit model against provider
+            if not validate_provider_model(self.llm_provider, self.llm_model):
+                logger.warning(
+                    f"Model '{self.llm_model}' may not be compatible with "
+                    f"provider '{self.llm_provider}'. Proceeding anyway."
+                )
+            return self.llm_model
+        
+        # Use default for provider
+        default_model = get_default_model(self.llm_provider)
+        logger.info(f"Using default model '{default_model}' for provider '{self.llm_provider}'")
+        return default_model
+    
+    @property
+    def provider_tuning(self) -> Dict[str, int]:
+        """Get tuning parameters for current provider.
+        
+        Returns:
+            Dict with history_limit and max_chars
+        """
+        return get_provider_tuning(self.llm_provider)
 
     def get_api_key(self) -> str:
         """Get the API key for the configured LLM provider.

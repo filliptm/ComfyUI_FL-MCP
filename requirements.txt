@@ -15,7 +15,8 @@ pydantic-settings==2.1.0
 # LLM Providers (install the ones you need)
 openai==1.3.0
 anthropicai==0.8.0
-google-generativeai==0.3.0
+# Gemini support through PydanticAI's built-in integration
+google-generativeai>=0.3.0
 
 # Utilities
 python-dotenv==1.0.0

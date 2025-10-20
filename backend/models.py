@@ -126,18 +126,19 @@ class FilterCondition(BaseModel):
 
 
 class LogicalFilter(BaseModel):
-    """Logical combination of filters."""
+    """Logical combination of filters.
+    
+    Note: For LLM compatibility, this uses a flattened structure instead of
+    recursive nesting. All filters are at the same level with the operator applied.
+    This improves JSON generation reliability at the cost of some expressiveness.
+    """
 
     operator: Literal["and", "or", "not"] = Field(
-        ..., description="Logical operator"
+        ..., description="Logical operator to apply to all filters"
     )
-    filters: List[Union["LogicalFilter", FilterCondition]] = Field(
-        ..., description="Nested filters"
+    filters: List[FilterCondition] = Field(
+        ..., description="List of filter conditions"
     )
-
-
-# Enable forward references
-LogicalFilter.model_rebuild()
 
 
 class TraversalConfig(BaseModel):

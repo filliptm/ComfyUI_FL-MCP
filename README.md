@@ -27,7 +27,7 @@
 - **Context-aware** - Remembers conversation history and workflow state
 - **Proactive suggestions** - Warns about disconnected nodes, suggests improvements
 - **Best practices** - Knows ComfyUI patterns and common workflow structures
-- **Multi-LLM support** - Works with OpenAI, Anthropic Claude, or Google Gemini
+- **Multi-LLM support** - Works with OpenAI, Anthropic Claude, Google Gemini, or OpenRouter
 
 ### 🎨 Native ComfyUI Integration
 - **Sidebar panel** - Seamlessly integrated into ComfyUI's left drawer
@@ -43,7 +43,7 @@
 ### Prerequisites
 - **ComfyUI** installed and working
 - **Python 3.11+** for the backend server
-- **API Key** for your chosen LLM provider (OpenAI, Anthropic, or Google)
+- **API Key** for your chosen LLM provider (OpenAI, Anthropic, Google, or OpenRouter)
 
 ### Installation
 
@@ -73,20 +73,18 @@ cp .env.example .env
 Edit `.env` with your settings:
 
 ```bash
-# Choose your provider: openai, anthropic, or gemini
-LLM_PROVIDER=openai
+# Choose your provider: openai, anthropic, gemini, or openrouter
+LLM_PROVIDER=gemini
 
-# Add your API key
-OPENAI_API_KEY=sk-your-key-here
-# Or for Anthropic:
-# ANTHROPIC_API_KEY=sk-ant-your-key-here
-# Or for Google:
-# GOOGLE_API_KEY=your-key-here
+# Add your API key for the chosen provider
+GOOGLE_API_KEY=your-key-here
 
-# Choose your model
-LLM_MODEL=gpt-4-turbo-preview
-# Or: claude-3-opus-20240229, gemini-pro, etc.
+# Model name is OPTIONAL - intelligent defaults are used
+# Leave blank to use the recommended default for your provider
+LLM_MODEL=
 ```
+
+> **💡 Smart Defaults:** If you don't specify `LLM_MODEL`, the system automatically uses the best model for your provider. See [Provider Configuration](#-provider-configuration) below for details.
 
 #### 4. Start ComfyUI
 
@@ -128,6 +126,121 @@ Open ComfyUI in your browser and check the **browser console** (F12):
 ```
 
 If you see these messages, **you're ready to go!** 🎉
+
+---
+
+## 🔌 Provider Configuration
+
+### Intelligent Provider Defaults
+
+FL_JS uses **smart defaults** for each provider. You only need to set `LLM_PROVIDER` and the corresponding API key - the best model is chosen automatically:
+
+| Provider | Default Model | API Key Required |
+|----------|---------------|------------------|
+| **OpenAI** | `gpt-4-turbo-preview` | `OPENAI_API_KEY` |
+| **Anthropic** | `claude-3-5-sonnet-20241022` | `ANTHROPIC_API_KEY` |
+| **Gemini** | `gemini-2.0-flash-exp` | `GOOGLE_API_KEY` |
+| **OpenRouter** | `deepseek/deepseek-chat` | `OPENROUTER_API_KEY` |
+
+### Quick Provider Switch
+
+Switching providers is as simple as changing two lines in `.env`:
+
+```bash
+# Switch to Gemini
+LLM_PROVIDER=gemini
+GOOGLE_API_KEY=your-google-key
+
+# Switch to Claude
+LLM_PROVIDER=anthropic
+ANTHROPIC_API_KEY=your-anthropic-key
+
+# Switch to OpenAI
+LLM_PROVIDER=openai
+OPENAI_API_KEY=your-openai-key
+
+# Switch to OpenRouter (access 100+ models)
+LLM_PROVIDER=openrouter
+OPENROUTER_API_KEY=your-openrouter-key
+```
+
+Restart ComfyUI and you're using the new provider! 🚀
+
+### Model Override (Optional)
+
+Want to use a specific model? Just set `LLM_MODEL` in `.env`:
+
+```bash
+# Use GPT-4 instead of default
+LLM_PROVIDER=openai
+LLM_MODEL=gpt-4
+
+# Use Claude Opus instead of Sonnet
+LLM_PROVIDER=anthropic
+LLM_MODEL=claude-3-opus-20240229
+
+# Use Gemini 1.5 Pro instead of 2.0 Flash
+LLM_PROVIDER=gemini
+LLM_MODEL=gemini-1.5-pro
+
+# Use any model through OpenRouter
+LLM_PROVIDER=openrouter
+LLM_MODEL=anthropic/claude-3.5-sonnet
+```
+
+### Provider-Specific Optimizations
+
+FL_JS automatically tunes behavior for each provider:
+
+- **Gemini**: Reduced message history (16 vs 36), compressed tool results for better JSON generation
+- **Anthropic**: Extended context window (50 messages, 4000 chars per result)
+- **OpenAI**: Balanced settings (36 messages, 2000 chars per result)
+- **OpenRouter**: Same as OpenAI defaults
+
+These optimizations happen **automatically** - no configuration needed!
+
+### Validation & Safety
+
+The system validates your provider/model combination:
+
+```python
+# ✅ Valid combinations
+LLM_PROVIDER=openai + LLM_MODEL=gpt-4
+LLM_PROVIDER=anthropic + LLM_MODEL=claude-3-sonnet-20240229
+LLM_PROVIDER=gemini + LLM_MODEL=gemini-2.0-flash-exp
+
+# ❌ Invalid combinations (caught at startup)
+LLM_PROVIDER=openai + LLM_MODEL=claude-3-opus  # Wrong model for provider
+LLM_PROVIDER=gemini + LLM_MODEL=gpt-4  # Wrong model for provider
+```
+
+Invalid combinations are caught immediately with helpful error messages.
+
+### Supported Models
+
+#### OpenAI
+- `gpt-4-turbo-preview` ⭐ (Default)
+- `gpt-4`
+- `gpt-3.5-turbo`
+- `o1-preview`, `o1-mini`
+
+#### Anthropic
+- `claude-3-5-sonnet-20241022` ⭐ (Default)
+- `claude-3-opus-20240229`
+- `claude-3-sonnet-20240229`
+- `claude-3-haiku-20240307`
+
+#### Google Gemini
+- `gemini-2.0-flash-exp` ⭐ (Default)
+- `gemini-1.5-pro`
+- `gemini-1.5-flash`
+- `models/gemini-pro` (legacy format)
+
+#### OpenRouter
+- `deepseek/deepseek-chat` ⭐ (Default)
+- Access to 100+ models from multiple providers
+- Use format: `provider/model-name`
+- Examples: `anthropic/claude-3.5-sonnet`, `google/gemini-pro-1.5`, `meta-llama/llama-3.1-70b`
 
 ---
 
@@ -230,7 +343,7 @@ Agent: [Generates Mermaid diagram]
 ┌─────────────────────────────────────────────────────────────┐
 │                     ComfyUI Browser                         │
 │  ┌────────────────┐              ┌────────────────────┐    │
-│  │  Chat Sidebar  │◄─────────────┤   FL_JS Legacy     │    │
+│  │  Chat Sidebar  │◄──────────────┤   FL_JS Legacy     │    │
 │  │  (extension.js)│  Tool Calls  │   (fl_js.js)       │    │
 │  └────────┬───────┘              └────────────────────┘    │
 │           │ WebSocket                                       │
@@ -276,6 +389,7 @@ Agent: [Generates Mermaid diagram]
 - **`backend/server_runner.py`** - 🆕 Subprocess manager for auto-start
 - **`backend/websocket.py`** - Connection manager, session routing
 - **`backend/config.py`** - Configuration and settings
+- **`backend/model_defaults.py`** - 🆕 Provider defaults and validation
 - **`backend/models.py`** - Pydantic models for messages and queries
 - **`backend/agent.py`** - PydanticAI agent (Phase 3)
 - **`backend/mcp_server.py`** - FastMCP tool definitions (Phase 2)
@@ -297,15 +411,16 @@ AUTO_RESTART_BACKEND=true        # Auto-restart on crash
 LOG_BACKEND_TO_FILE=true         # Log to backend/logs/server.log
 
 # === LLM Provider ===
-LLM_PROVIDER=openai              # openai, anthropic, or gemini
-LLM_MODEL=gpt-4-turbo-preview    # Model name
+LLM_PROVIDER=gemini              # openai, anthropic, gemini, or openrouter
+LLM_MODEL=                       # Optional - uses smart defaults if blank
 LLM_TEMPERATURE=0.7              # Creativity (0.0-1.0)
-LLM_MAX_TOKENS=4000              # Max response length
+LLM_MAX_TOKENS=32000             # Max response length
 
 # === API Keys ===
 OPENAI_API_KEY=sk-...
 ANTHROPIC_API_KEY=sk-ant-...
 GOOGLE_API_KEY=...
+OPENROUTER_API_KEY=sk-or-...
 
 # === WebSocket Settings ===
 WS_HOST=0.0.0.0                  # Server host
@@ -326,22 +441,6 @@ LOG_LEVEL=INFO                   # DEBUG, INFO, WARNING, ERROR
 LOG_FORMAT=json                  # json or text
 ```
 
-### Supported LLM Models
-
-#### OpenAI
-- `gpt-4-turbo-preview` (Recommended)
-- `gpt-4`
-- `gpt-3.5-turbo`
-
-#### Anthropic
-- `claude-3-opus-20240229` (Recommended)
-- `claude-3-sonnet-20240229`
-- `claude-3-haiku-20240307`
-
-#### Google
-- `gemini-pro`
-- `gemini-pro-vision`
-
 ---
 
 ## 🧪 Development
@@ -357,6 +456,7 @@ FL_JS/
 │   ├── server_runner.py  # 🆕 Subprocess manager
 │   ├── websocket.py      # WebSocket connection manager
 │   ├── config.py         # Configuration
+│   ├── model_defaults.py # 🆕 Provider defaults
 │   ├── models.py         # Pydantic models
 │   ├── agent.py          # PydanticAI agent (Phase 3)
 │   ├── mcp_server.py     # FastMCP tools (Phase 2)

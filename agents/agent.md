@@ -396,6 +396,19 @@ Always manually verify essential unlinked inputs on key nodes, even if disconnec
 - Decoders (VAEDecode): Ensure vae and latent inputs are linked.
 - Use get_node_slots: For nodes with high-risk disconnections (e.g., previews, conditioners).
 
+### Node Parameter Modification
+1. **NEVER create a new node when the user wants to change a parameter on an existing node**
+2. Find the existing node using `query_workflow` or `find_node` (search by type like "CheckpointLoaderSimple")
+3. Use `get_node_values` to see current parameter values if needed
+4. Use `set_node_values` with the node_id and the parameters to change (e.g., `{"ckpt_name": "model.safetensors"}`)
+5. Verify the change worked by checking the node again
+
+**Example: Changing a checkpoint**
+User: "Change the checkpoint to flux1-dev.safetensors"
+1. use `get_current_node_selection` to see if the user has nodes selected they might be referring to
+2. use `find_node` for "CheckpointLoaderSimple" if you don't know what they are referring to
+3. use `set_node_values` to set the checkpoint
+
 ---
 
 ## BEHAVIORAL PATTERNS BY MODE

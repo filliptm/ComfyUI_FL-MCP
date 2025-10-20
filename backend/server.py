@@ -55,7 +55,8 @@ async def lifespan(app: FastAPI):  # type: ignore
     # Startup
     logger.info("Starting FL_JS backend server")
     logger.info(f"LLM Provider: {settings.llm_provider}")
-    logger.info(f"LLM Model: {settings.llm_model}")
+    logger.info(f"LLM Model: {settings.resolved_model}")
+    logger.info(f"Provider Tuning: {settings.provider_tuning}")
     
     # Initialize callback router
     callback_router = CallbackRouter(manager, default_timeout=30.0)
@@ -351,27 +352,29 @@ def truncate_nested_strings(obj: Any, max_chars: int) -> Any:
 
 def filtered_message_history(
     messages: List[ModelMessage], 
-    limit: Optional[int] = 36, 
+    limit: Optional[int] = None, 
     include_tool_messages: bool = False,
-    max_chars: int = 2000
+    max_chars: Optional[int] = None
 ) -> Optional[List[Dict[str, Any]]]:
     """
     Filter and limit the message history from an AgentRunResult.
     
     Args:
-        result: The AgentRunResult object with message history
-        limit: Optional int, if provided returns only system message + last N messages
+        messages: The message history
+        limit: Optional int, if provided returns only system message + last N messages.
+               If None, uses provider-specific default from settings.
         include_tool_messages: Whether to include tool messages in the history
-        max_chars: Maximum number of characters for string values in tool calls and returns (default: 2000)
+        max_chars: Maximum number of characters for string values in tool calls and returns.
+                  If None, uses provider-specific default from settings.
         
     Returns:
         Filtered list of messages in the format expected by the agent
     """
-    # if result is None:
-    #     return None
-        
-    # # Get all messages
-    # messages: list[ModelMessage] = result.all_messages()
+    # Use provider-specific defaults if not specified
+    if limit is None:
+        limit = settings.provider_tuning["history_limit"]
+    if max_chars is None:
+        max_chars = settings.provider_tuning["max_chars"]
     
     # Extract system message (always the first one with role="system")
     system_message = next((msg for msg in messages if len(msg.parts) > 0 and type(msg.parts[0]) == SystemPromptPart), None)
@@ -610,11 +613,35 @@ async def handle_user_message(
             "is_typing": True,
         })
         
-        # Process message with agent (MCP servers already running from outer context)
-        response = await agent.run(
-            message.message, 
-            message_history=filtered_message_history(message_history, include_tool_messages=True)
-        )
+        # Process message with agent with retry logic for flaky providers
+        max_retries = 2
+        last_error = None
+        response = None
+        
+        for attempt in range(max_retries + 1):
+            try:
+                response = await agent.run(
+                    message.message, 
+                    message_history=filtered_message_history(
+                        message_history,
+                        include_tool_messages=True
+                        # limit and max_chars will use provider-specific defaults
+                    )
+                )
+                break  # Success - exit retry loop
+                
+            except UnexpectedModelBehavior as e:
+                last_error = e
+                if attempt < max_retries:
+                    logger.warning(
+                        f"Model generation failed (attempt {attempt + 1}/{max_retries + 1}): "
+                        f"{str(e)[:100]}... Retrying..."
+                    )
+                    continue
+                else:
+                    # Final attempt failed
+                    logger.error(f"Model generation failed after {max_retries + 1} attempts")
+                    raise last_error
         
         if response is not None:
             # Set History (Mutable)
@@ -631,6 +658,7 @@ async def handle_user_message(
             })
             
             logger.info(f"Agent response sent to {session_id}")
+            
     except UnexpectedModelBehavior as ue:
         # Happens mainly when a model can't get a tool call right after so many tries
 
