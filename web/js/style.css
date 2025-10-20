@@ -581,10 +581,9 @@
     display: inline-flex;
     align-items: center;
     gap: 6px;
-    padding: 8px 14px;
+    padding: 2px 11px;
     border-radius: 16px;
     background: rgba(255, 255, 255, 0.05);
-    border: 1px solid rgba(200, 162, 200, 0.3);
     transition: all 0.3s ease;
     font-size: 13px;
 }

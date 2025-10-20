@@ -385,14 +385,21 @@ app.registerExtension({
                 type: "custom",
                 render: (el) => {
                     console.log("[FL_JS] Rendering sidebar tab...");
-                    
-                    // Initialize chat UI on first render
-                    if (!chatUI) {
+
+                    // Check if we need to reinitialize (container is empty or chatUI was destroyed)
+                    if (!chatUI || !el.children.length) {
+                        // Clean up existing instance if it exists but container is empty
+                        if (chatUI && !el.children.length) {
+                            console.log("[FL_JS] Container empty, reinitializing chat UI...");
+                            chatUI = null;
+                        }
+
+                        // Create new chat UI instance
                         chatUI = new ChatUI(el, wsClient);
                         window.FL_JS.chatUI = chatUI;
                         console.log("[FL_JS] Chat UI initialized with tool activity and breadcrumb chain");
                     }
-                    
+
                     return el;
                 },
                 destroy: () => {
