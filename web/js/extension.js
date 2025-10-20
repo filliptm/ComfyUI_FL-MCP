@@ -21,6 +21,171 @@ let wsClient = null;
 let toolExecutor = null;
 let diagramGenerator = null;
 
+/**
+ * Get tool configuration for display (breadcrumb and chat bubbles)
+ * @param {string} toolName - Name of the tool
+ * @returns {object} - Icon, label, and description for the tool
+ */
+function getToolConfig(toolName) {
+    const toolConfigs = {
+        // Query & Understanding
+        "workflow_overview": {
+            icon: "🔍",
+            label: "Overview",
+            description: "Observing the essence of the workflow"
+        },
+        "query_workflow": {
+            icon: "🔎",
+            label: "Query",
+            description: "Tracing patterns in the graph"
+        },
+        "workflow_diagram": {
+            icon: "📐",
+            label: "Diagram",
+            description: "Sketching the architecture of thought"
+        },
+
+        // Node Creation & Modification
+        "create_node": {
+            icon: "✨",
+            label: "Create",
+            description: "Manifesting new possibilities"
+        },
+        "remove_nodes": {
+            icon: "🗑️",
+            label: "Remove",
+            description: "Clearing the path"
+        },
+        "connect_nodes": {
+            icon: "🔗",
+            label: "Connect",
+            description: "Weaving connections"
+        },
+
+        // Selection & Focus
+        "select_nodes": {
+            icon: "👁️",
+            label: "Select",
+            description: "Focusing attention on the essential"
+        },
+        "find_node": {
+            icon: "🎯",
+            label: "Find",
+            description: "Seeking the heart of the matter"
+        },
+
+        // Layout & Organization
+        "modify_layout": {
+            icon: "🏗️",
+            label: "Layout",
+            description: "Arranging the flow"
+        },
+        "position_node_left": {
+            icon: "⬅️",
+            label: "Position",
+            description: "Guiding elements into place"
+        },
+        "position_node_right": {
+            icon: "➡️",
+            label: "Position",
+            description: "Guiding elements into place"
+        },
+        "position_node_top": {
+            icon: "⬆️",
+            label: "Position",
+            description: "Guiding elements into place"
+        },
+        "position_node_bottom": {
+            icon: "⬇️",
+            label: "Position",
+            description: "Guiding elements into place"
+        },
+
+        // Workflow Execution
+        "queue_workflow": {
+            icon: "🚀",
+            label: "Queue",
+            description: "Setting creation in motion"
+        },
+        "cancel_workflow": {
+            icon: "⏹️",
+            label: "Cancel",
+            description: "Gently pausing the process"
+        },
+        "get_queue_status": {
+            icon: "📊",
+            label: "Status",
+            description: "Checking the pulse of creation"
+        },
+
+        // Value Manipulation
+        "set_node_values": {
+            icon: "⚙️",
+            label: "Set",
+            description: "Tuning the harmonics"
+        },
+        "get_node_values": {
+            icon: "📊",
+            label: "Get",
+            description: "Reading the current state"
+        },
+
+        // Utilities & Generation
+        "generate_seed": {
+            icon: "🌱",
+            label: "Seed",
+            description: "Planting seeds of randomness"
+        },
+        "generate_float": {
+            icon: "🎲",
+            label: "Random",
+            description: "Weaving chance into the pattern"
+        },
+        "random_choice": {
+            icon: "🎯",
+            label: "Choice",
+            description: "Choosing from the field of possibilities"
+        },
+
+        // File & Directory Operations
+        "list_directory": {
+            icon: "📁",
+            label: "List",
+            description: "Exploring the paths available"
+        },
+        "read_file": {
+            icon: "📜",
+            label: "Read",
+            description: "Reading the written wisdom"
+        },
+        "write_file": {
+            icon: "✍️",
+            label: "Write",
+            description: "Inscribing new knowledge"
+        },
+
+        // ComfyUI Integration
+        "get_extensions": {
+            icon: "🧩",
+            label: "Extensions",
+            description: "Gathering the available tools"
+        },
+        "get_node_types": {
+            icon: "📋",
+            label: "Types",
+            description: "Cataloging the building blocks"
+        },
+
+        // Generic fallback
+        "*": {
+            icon: "⚡",
+            label: "Tool",
+            description: "Working with the flow"
+        }
+    };
+    return toolConfigs[toolName] || toolConfigs["*"];
+}
+
 app.registerExtension({
     name: "fl_js.agentic_system",
     
@@ -56,12 +221,12 @@ app.registerExtension({
             
             wsClient.on('disconnected', (event) => {
                 console.log("[FL_JS] Disconnected from backend server:", event.code);
-                
-                // Cleanup tool activity on disconnect
+
+                // Clear active tool chain on disconnect
                 try {
-                    window.FL_JS?.chatUI?.toolActivity?.cleanup();
+                    window.FL_JS?.chatUI?.clearToolChain();
                 } catch (error) {
-                    console.warn('[FL_JS] Could not cleanup tool activity on disconnect:', error);
+                    console.warn('[FL_JS] Could not clear tool chain on disconnect:', error);
                 }
             });
             
@@ -88,32 +253,37 @@ app.registerExtension({
             
             wsClient.on('agent_response', (message) => {
                 console.log("[FL_JS] Agent response received:", message.content);
-                
-                // Hide all tool activity cards on agent response
-                try {
-                    window.FL_JS?.chatUI?.toolActivity?.hideAllTools();
-                } catch (error) {
-                    console.warn('[FL_JS] Could not hide tool activity on agent response:', error);
-                }
+
+                // Tool executions stay in chat history - no need to hide them
             });
             
             wsClient.on('tool_request', async (message) => {
                 console.log("[FL_JS] ⚡ TOOL REQUEST EVENT FIRED:", message.tool_name, 'request_id:', message.request_id);
-                
-                // Show tool activity card
+
+                const toolConfig = getToolConfig(message.tool_name);
+
+                // Add tool to breadcrumb chain in chat
                 try {
-                    window.FL_JS?.chatUI?.toolActivity?.showTool(
-                        message.tool_name, 
-                        message.request_id || 'default'
+                    window.FL_JS?.chatUI?.startToolInChain(
+                        message.tool_name,
+                        toolConfig.icon,
+                        toolConfig.label
                     );
                 } catch (error) {
-                    console.warn('[FL_JS] Could not show tool activity:', error);
+                    console.warn('[FL_JS] Could not start tool in breadcrumb chain:', error);
                 }
-                
+
                 console.log("[FL_JS] ⚡ Calling toolExecutor.executeToolRequest...");
                 try {
                     await toolExecutor.executeToolRequest(message);
                     console.log("[FL_JS] ⚡ toolExecutor.executeToolRequest completed");
+
+                    // Mark tool as complete in breadcrumb chain
+                    try {
+                        window.FL_JS?.chatUI?.completeToolInChain(message.tool_name);
+                    } catch (error) {
+                        console.warn('[FL_JS] Could not complete tool in chain:', error);
+                    }
                 } catch (error) {
                     console.error("[FL_JS] ❌ Error in tool execution:", error);
                 }
@@ -125,23 +295,23 @@ app.registerExtension({
             
             wsClient.on('error', (error) => {
                 console.error("[FL_JS] Error:", error);
-                
-                // Cleanup tool activity on error
+
+                // Clear active tool chain on error
                 try {
-                    window.FL_JS?.chatUI?.toolActivity?.cleanup();
+                    window.FL_JS?.chatUI?.clearToolChain();
                 } catch (error) {
-                    console.warn('[FL_JS] Could not cleanup tool activity on error:', error);
+                    console.warn('[FL_JS] Could not clear tool chain on error:', error);
                 }
             });
-            
+
             wsClient.on('max_reconnect_reached', () => {
                 console.error("[FL_JS] Max reconnection attempts reached. Please check backend server.");
-                
-                // Cleanup tool activity on max reconnect
+
+                // Clear active tool chain on max reconnect
                 try {
-                    window.FL_JS?.chatUI?.toolActivity?.cleanup();
+                    window.FL_JS?.chatUI?.clearToolChain();
                 } catch (error) {
-                    console.warn('[FL_JS] Could not cleanup tool activity on max reconnect:', error);
+                    console.warn('[FL_JS] Could not clear tool chain on max reconnect:', error);
                 }
             });
             
@@ -220,7 +390,7 @@ app.registerExtension({
                     if (!chatUI) {
                         chatUI = new ChatUI(el, wsClient);
                         window.FL_JS.chatUI = chatUI;
-                        console.log("[FL_JS] Chat UI initialized in sidebar with tool activity");
+                        console.log("[FL_JS] Chat UI initialized with tool activity and breadcrumb chain");
                     }
                     
                     return el;

@@ -1,3 +1,589 @@
+/* ========================================
+   FL-Agent Chat UI Styles - Lavender Dreams Theme
+   ======================================== */
+
+/* Chat Layout */
+.fl-chat-layout {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    background: linear-gradient(180deg, #1f1825 0%, #1a1420 100%);
+    color: #E6D5E6;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    overflow: hidden;
+    position: relative;
+    min-height: 100px;
+}
+
+/* Header */
+.fl-chat-header {
+    padding: 16px 20px;
+    border-bottom: 1px solid rgba(200, 162, 200, 0.15);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    flex-shrink: 0;
+    background: linear-gradient(135deg, #3d2f4d 0%, #2d1f3d 100%);
+}
+
+.fl-chat-title {
+    font-weight: 600;
+    font-size: 18px;
+    color: #E6D5E6;
+}
+
+.fl-chat-status {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    color: rgba(230, 213, 230, 0.7);
+}
+
+.fl-status-indicator {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    background: rgba(200, 162, 200, 0.3);
+    transition: all 0.3s;
+}
+
+.fl-status-indicator.connected {
+    background: #B794F4;
+    box-shadow: 0 0 10px rgba(183, 148, 244, 0.5);
+}
+
+.fl-status-indicator.disconnected {
+    background: rgba(244, 67, 54, 0.6);
+}
+
+.fl-status-indicator.connecting {
+    background: rgba(255, 152, 0, 0.6);
+    animation: pulse 2s infinite ease-in-out;
+}
+
+@keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.5; }
+}
+
+/* Messages Container */
+.fl-chat-messages {
+    flex: 1;
+    overflow-y: auto;
+    overflow-x: hidden;
+    padding: 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    min-height: 0;
+}
+
+.fl-chat-messages::-webkit-scrollbar {
+    width: 8px;
+}
+
+.fl-chat-messages::-webkit-scrollbar-track {
+    background: rgba(200, 162, 200, 0.05);
+}
+
+.fl-chat-messages::-webkit-scrollbar-thumb {
+    background: rgba(200, 162, 200, 0.2);
+    border-radius: 4px;
+}
+
+.fl-chat-messages::-webkit-scrollbar-thumb:hover {
+    background: rgba(200, 162, 200, 0.3);
+}
+
 .fl-chat-messages img {
     width: 100%;
+}
+
+/* Message Bubble */
+.fl-message {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    max-width: 85%;
+    animation: slideIn 0.2s ease-out;
+}
+
+@keyframes slideIn {
+    from {
+        opacity: 0;
+        transform: translateY(10px);
+    }
+    to {
+        opacity: 1;
+        transform: translateY(0);
+    }
+}
+
+.fl-message.user {
+    align-self: flex-end;
+}
+
+.fl-message.assistant {
+    align-self: flex-start;
+}
+
+.fl-message.system {
+    align-self: center;
+    max-width: 95%;
+}
+
+.fl-message-header {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    padding: 0 4px;
+    margin-bottom: 6px;
+}
+
+.fl-message-role {
+    font-weight: 600;
+    color: #C8A2C8;
+}
+
+.fl-message-time {
+    font-size: 11px;
+    color: rgba(230, 213, 230, 0.4);
+}
+
+.fl-message-content {
+    padding: 16px 20px;
+    border-radius: 8px;
+    line-height: 1.6;
+    font-size: 14px;
+    word-wrap: break-word;
+    background: rgba(255, 255, 255, 0.03);
+}
+
+.fl-message.user .fl-message-content {
+    border-top: 2px solid rgba(200, 162, 200, 0.6);
+    border-bottom: 2px solid rgba(200, 162, 200, 0.6);
+    color: #E6D5E6;
+    box-shadow:
+        0 2px 4px rgba(0, 0, 0, 0.3),
+        0 4px 8px rgba(0, 0, 0, 0.25),
+        0 8px 16px rgba(0, 0, 0, 0.2);
+}
+
+.fl-message.assistant .fl-message-content {
+    border-top: 2px solid rgba(183, 148, 244, 0.6);
+    border-bottom: 2px solid rgba(183, 148, 244, 0.6);
+    color: #D5C8F4;
+    box-shadow:
+        0 2px 4px rgba(0, 0, 0, 0.3),
+        0 4px 8px rgba(0, 0, 0, 0.25),
+        0 8px 16px rgba(0, 0, 0, 0.2);
+}
+
+.fl-message.error .fl-message-content {
+    background: rgba(244, 67, 54, 0.12);
+    border-left: 3px solid rgba(244, 67, 54, 0.5);
+    color: #ff6b6b;
+}
+
+.fl-message.system .fl-message-content {
+    background: rgba(200, 162, 200, 0.08);
+    border-left: 2px solid rgba(200, 162, 200, 0.3);
+    color: rgba(230, 213, 230, 0.7);
+    text-align: center;
+    font-size: 13px;
+}
+
+/* Ren Welcome Message */
+.fl-message.ren-welcome .fl-message-content {
+    background: linear-gradient(135deg, #C8A2C8 0%, #B794F4 100%);
+    border: none;
+    color: #2d1f3d;
+    text-align: left;
+    font-size: 14px;
+    padding: 16px;
+}
+
+.fl-message.ren-welcome .fl-message-header {
+    display: none;
+}
+
+/* Starter Questions */
+.fl-starter-questions {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    margin-top: 12px;
+}
+
+.fl-starter-question {
+    background: rgba(61, 47, 77, 0.3);
+    border: 1px solid rgba(200, 162, 200, 0.3);
+    border-radius: 8px;
+    padding: 10px 12px;
+    cursor: pointer;
+    transition: all 0.2s;
+    color: #E6D5E6;
+    font-size: 13px;
+    line-height: 1.4;
+}
+
+.fl-starter-question:hover {
+    background: rgba(61, 47, 77, 0.5);
+    border-color: rgba(200, 162, 200, 0.5);
+    transform: translateX(2px);
+}
+
+/* Markdown Styles */
+.fl-message-content p {
+    margin: 0 0 8px 0;
+}
+
+.fl-message-content p:last-child {
+    margin-bottom: 0;
+}
+
+.fl-message-content code {
+    background: rgba(0, 0, 0, 0.3);
+    padding: 2px 6px;
+    border-radius: 3px;
+    font-family: 'Courier New', monospace;
+    font-size: 12px;
+}
+
+.fl-message-content pre {
+    background: rgba(0, 0, 0, 0.3);
+    padding: 12px;
+    border-radius: 6px;
+    overflow-x: auto;
+    margin: 8px 0;
+}
+
+.fl-message-content pre code {
+    background: transparent;
+    padding: 0;
+}
+
+.fl-message-content ul, .fl-message-content ol {
+    margin: 8px 0;
+    padding-left: 24px;
+}
+
+.fl-message-content li {
+    margin: 4px 0;
+}
+
+.fl-message-content a {
+    color: #64b5f6;
+    text-decoration: none;
+}
+
+.fl-message-content a:hover {
+    text-decoration: underline;
+}
+
+.fl-message-content blockquote {
+    border-left: 3px solid var(--border-color, #333);
+    padding-left: 12px;
+    margin: 8px 0;
+    opacity: 0.8;
+}
+
+/* Mermaid Diagram */
+.fl-mermaid-container {
+    background: rgba(0, 0, 0, 0.2);
+    padding: 16px;
+    border-radius: 8px;
+    margin: 8px 0;
+    overflow-x: auto;
+}
+
+.fl-mermaid-container svg {
+    max-width: 100%;
+    height: auto;
+}
+
+/* Typing Indicator */
+.fl-chat-typing {
+    padding: 8px 16px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 12px;
+    opacity: 0.7;
+    flex-shrink: 0;
+    background: linear-gradient(135deg, #3d2f4d 0%, #2d1f3d 100%);
+    border-top: 1px solid rgba(200, 162, 200, 0.15);
+    color: rgba(230, 213, 230, 0.7);
+}
+
+.fl-typing-indicator {
+    display: flex;
+    gap: 4px;
+}
+
+.fl-typing-indicator span {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: rgba(183, 148, 244, 0.6);
+    animation: bounce 1.4s infinite ease-in-out;
+}
+
+.fl-typing-indicator span:nth-child(1) {
+    animation-delay: -0.32s;
+}
+
+.fl-typing-indicator span:nth-child(2) {
+    animation-delay: -0.16s;
+}
+
+@keyframes bounce {
+    0%, 80%, 100% {
+        transform: scale(0.8);
+        opacity: 0.5;
+    }
+    40% {
+        transform: scale(1.2);
+        opacity: 1;
+    }
+}
+
+/* Input Container */
+.fl-chat-input-container {
+    padding: 16px 20px;
+    border-top: 1px solid rgba(200, 162, 200, 0.15);
+    display: flex;
+    gap: 12px;
+    align-items: flex-end;
+    flex-shrink: 0;
+    background: linear-gradient(135deg, #3d2f4d 0%, #2d1f3d 100%);
+    position: relative;
+}
+
+.fl-chat-input {
+    flex: 1;
+    background: rgba(200, 162, 200, 0.08);
+    border: 1px solid rgba(200, 162, 200, 0.2);
+    border-radius: 12px;
+    padding: 12px 16px;
+    color: #E6D5E6;
+    font-size: 14px;
+    font-family: inherit;
+    resize: none;
+    max-height: 120px;
+    overflow-y: auto;
+    transition: all 0.3s ease;
+}
+
+.fl-chat-input:focus {
+    outline: none;
+    background: rgba(200, 162, 200, 0.12);
+    border-color: rgba(200, 162, 200, 0.4);
+    box-shadow: 0 0 0 3px rgba(200, 162, 200, 0.1);
+}
+
+.fl-chat-input::placeholder {
+    color: rgba(230, 213, 230, 0.4);
+}
+
+.fl-chat-send {
+    background: linear-gradient(135deg, #C8A2C8 0%, #B794F4 100%);
+    border: none;
+    border-radius: 10px;
+    width: auto;
+    height: 40px;
+    padding: 0 20px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    color: #2d1f3d;
+    font-weight: 600;
+    transition: all 0.3s ease;
+    flex-shrink: 0;
+    box-shadow: 0 4px 12px rgba(200, 162, 200, 0.2);
+}
+
+.fl-chat-send:hover {
+    background: linear-gradient(135deg, #B794F4 0%, #C8A2C8 100%);
+    box-shadow: 0 6px 16px rgba(200, 162, 200, 0.3);
+    transform: translateY(-1px);
+}
+
+.fl-chat-send:active {
+    transform: translateY(0);
+}
+
+.fl-chat-send:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+.fl-chat-send svg {
+    stroke: #2d1f3d;
+}
+
+/* Tool Activity Overlay */
+.fl-tool-activity-overlay {
+    position: absolute;
+    bottom: 8em;
+    left: 0;
+    right: 0;
+    pointer-events: none;
+    z-index: 100;
+    padding: 8px 16px 0 16px;
+    display: flex;
+    flex-direction: column-reverse;
+    gap: 6px;
+    max-height: 60vh;
+    overflow: hidden;
+}
+
+.fl-tool-card {
+    background: linear-gradient(135deg, #2a2a2a 0%, #1e1e1e 100%);
+    border: 1px solid rgba(255, 107, 53, 0.3);
+    border-radius: 8px;
+    padding: 8px 12px;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.4);
+    backdrop-filter: blur(4px);
+    opacity: 0;
+    transform: translateY(10px);
+    transition: all 0.2s ease-out;
+    max-width: 280px;
+    font-size: 11px;
+    pointer-events: none;
+}
+
+.fl-tool-card.exiting {
+    opacity: 0 !important;
+    transform: translateY(10px) !important;
+    transition: all 0.3s ease-in !important;
+}
+
+.fl-tool-header {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-weight: 600;
+    font-size: 10px;
+    color: #ff6b35;
+    margin-bottom: 2px;
+}
+
+.fl-tool-icon {
+    font-size: 12px;
+}
+
+.fl-tool-label {
+    opacity: 0.8;
+}
+
+.fl-tool-text {
+    color: #e0e0e0;
+    line-height: 1.2;
+    opacity: 0.9;
+    margin-bottom: 4px;
+}
+
+.fl-tool-activity {
+    display: flex;
+    align-items: center;
+    gap: 2px;
+}
+
+.fl-activity-dot {
+    width: 3px;
+    height: 3px;
+    background: #ff6b35;
+    border-radius: 50%;
+    animation: toolPulse 1.4s ease-in-out infinite;
+}
+
+.fl-activity-dot:nth-child(2) {
+    animation-delay: 0.2s;
+}
+
+.fl-activity-dot:nth-child(3) {
+    animation-delay: 0.4s;
+}
+
+@keyframes toolPulse {
+    0%, 80%, 100% { opacity: 0.3; }
+    40% { opacity: 1; }
+}
+
+/* Tool Chain Breadcrumb in Chat History */
+.fl-message.tool-chain {
+    background: transparent;
+    border-left: none;
+}
+
+.fl-toolchain-breadcrumb {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    padding: 8px 0;
+    align-items: center;
+}
+
+.fl-toolchain-crumb {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 8px 14px;
+    border-radius: 16px;
+    background: rgba(255, 255, 255, 0.05);
+    border: 1px solid rgba(200, 162, 200, 0.3);
+    transition: all 0.3s ease;
+    font-size: 13px;
+}
+
+.fl-toolchain-crumb.loading {
+    background: rgba(200, 162, 200, 0.15);
+    border-color: rgba(200, 162, 200, 0.5);
+    color: #E6D5E6;
+    animation: fl-breadcrumb-pulse 1.5s ease-in-out infinite;
+}
+
+.fl-toolchain-crumb.completed {
+    background: rgba(183, 148, 244, 0.15);
+    border-color: rgba(183, 148, 244, 0.5);
+    color: #D5C8F4;
+}
+
+@keyframes fl-breadcrumb-pulse {
+    0%, 100% {
+        box-shadow: 0 0 0 rgba(200, 162, 200, 0);
+        border-color: rgba(200, 162, 200, 0.4);
+    }
+    50% {
+        box-shadow: 0 0 15px rgba(200, 162, 200, 0.3);
+        border-color: rgba(200, 162, 200, 0.7);
+    }
+}
+
+.fl-crumb-icon {
+    font-size: 16px;
+    line-height: 1;
+}
+
+.fl-crumb-label {
+    font-weight: 500;
+}
+
+.fl-message-fade-out {
+    animation: fl-fade-out 0.3s ease-out forwards;
+}
+
+@keyframes fl-fade-out {
+    from {
+        opacity: 1;
+        transform: translateY(0);
+    }
+    to {
+        opacity: 0;
+        transform: translateY(-10px);
+    }
 }
