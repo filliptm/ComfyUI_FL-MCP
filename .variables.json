@@ -1,7 +1,7 @@
 {
-  "current_mode": "implementation",
+  "current_mode": "research",
   "project": "fl_js",
-  "task": "add get_system_info to tool_activity.js",
+  "task": "creating implementation plan for PWA",
   "architecture": "FastAPI+WS backend with PydanticAI + FastMCP, JS chat sidebar client, realtime tool callbacks",
   "project_status": "new project inspired by legacy FL_JS/FL_WF_Agent",
   "focus": "code review then UI update",
@@ -65,7 +65,7 @@
   "next_diagnostic": "user may not have restarted backend server after fix",
   "diagnostic_question": "what does the client send in the user_message payload?",
   "status": "4_of_5_perfect_1_critical_api_bug",
-  "main_focus": "fl_api.js function to expose selected nodes to MCP server tool",
+  "main_focus": "PWA for mobile Ren interaction with ComfyUI",
   "investigation_complete": true,
   "phase_1_complete": "true",
   "phase_2_complete": true,
