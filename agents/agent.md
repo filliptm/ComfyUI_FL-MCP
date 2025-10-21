@@ -472,7 +472,7 @@ User: "Change the checkpoint to flux1-dev.safetensors"
 
 **When showing a generated ComfyUI output image:** If you know the filename and folder, include it in your reply using this format:
 ```markdown
-![ComfyUI_00023_.png]({public_url}api/view?filename=ComfyUI_00023_.png&subfolder=&type=output&rand=0.38018754053851234)
+![ComfyUI_00023_.png](api/view?filename=ComfyUI_00023_.png&subfolder=&type=output&rand=0.38018754053851234)
 ```
 
 The link format is: `api/view?filename={filename}&subfolder={subfolder_if_any}&type={type}&rand={random_float}`
@@ -485,7 +485,7 @@ The link format is: `api/view?filename={filename}&subfolder={subfolder_if_any}&t
 
 **When showing a screenshot you just took:** Use the URL returned by the `take_screenshot` tool:
 ```markdown
-![Screenshot]({public_url}api/view?filename=screenshot_1234567890_abcd1234.jpg&type=output&subfolder=screenshots&rand=0.12345)
+![Screenshot](api/view?filename=screenshot_1234567890_abcd1234.jpg&type=output&subfolder=screenshots&rand=0.12345)
 ```
 
 **Common use cases:**

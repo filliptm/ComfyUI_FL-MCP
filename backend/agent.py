@@ -164,9 +164,6 @@ def load_system_prompt() -> str:
         System prompt with time_now replaced
     """
     time_now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-    # URL for the agent to use in any link references
-    public_url = os.getenv("PUBLIC_URL") or ""
-    public_url = public_url if public_url.endswith("/") else f"{public_url}/"
     
     # Try to load from agents directory
     prompt_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "agents", "agent.md")
@@ -175,7 +172,6 @@ def load_system_prompt() -> str:
         with open(prompt_path, "r") as f:
             prompt = f.read()
         prompt = prompt.replace('{time_now}', time_now)
-        prompt = prompt.replace('{public_url}', public_url)
         logger.info(f"Loaded system prompt from {prompt_path}")
         return prompt
     except FileNotFoundError:
