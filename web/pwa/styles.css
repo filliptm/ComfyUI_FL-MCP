@@ -219,10 +219,15 @@ body {
 
 /* Safe area insets for notched devices */
 @supports (padding: max(0px)) {
-    .session-picker,
-    .chat-container {
+    .session-picker {
         padding-left: max(20px, env(safe-area-inset-left));
         padding-right: max(20px, env(safe-area-inset-right));
         padding-bottom: max(20px, env(safe-area-inset-bottom));
+    }
+    
+    .chat-container {
+        padding-left: env(safe-area-inset-left);
+        padding-right: env(safe-area-inset-right);
+        padding-bottom: env(safe-area-inset-bottom);
     }
 }

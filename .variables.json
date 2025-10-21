@@ -1,10 +1,10 @@
 {
   "current_mode": "implementation",
   "project": "fl_js",
-  "task": "make marked renderer prepend PUBLIC_URL to api/ links",
+  "task": "fix PWA gutters and add theme-color meta tags",
   "architecture": "FastAPI+WS backend with PydanticAI + FastMCP, JS chat sidebar client, realtime tool callbacks",
   "project_status": "new project inspired by legacy FL_JS/FL_WF_Agent",
-  "focus": "modify marked renderer in chat_ui.js to handle relative api/ URLs",
+  "focus": "web/pwa/styles.css and web/pwa/index.html",
   "plans_created": "6 detailed implementation plans + summary",
   "next_step": "Create placeholder icons",
   "ui_integration": "app.extensionManager.registerSidebarTab",
