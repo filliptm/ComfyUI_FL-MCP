@@ -1,10 +1,10 @@
 {
-  "current_mode": "implementation",
+  "current_mode": "debugging",
   "project": "fl_js",
-  "task": "add PUBLIC_URL env var for ngrok image serving",
+  "task": "found the bug - ToolActivity class deleted but ChatUI still tries to use it",
   "architecture": "FastAPI+WS backend with PydanticAI + FastMCP, JS chat sidebar client, realtime tool callbacks",
   "project_status": "new project inspired by legacy FL_JS/FL_WF_Agent",
-  "focus": "make image URLs work on both localhost and ngrok",
+  "focus": "ChatUI constructor expects ToolActivity",
   "plans_created": "6 detailed implementation plans + summary",
   "next_step": "Create placeholder icons",
   "ui_integration": "app.extensionManager.registerSidebarTab",
@@ -61,7 +61,7 @@
     "notes/sysinfo/implementation.md"
   ],
   "root_cause_hypothesis": "model name gemini-2.0-flash-exp may not be valid or available",
-  "root_cause": "agent subprocess not restarted",
+  "root_cause": "web/js/tool_activity.js ToolActivity class removed but ChatUI still references it",
   "confidence": "low",
   "root_cause_1": "send() requires handshakeComplete for ALL messages including handshake itself",
   "root_cause_2": "messagesContainer is null when _addWelcomeMessage runs - DOM timing issue",

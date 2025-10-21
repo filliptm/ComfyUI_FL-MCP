@@ -9,7 +9,7 @@
  */
 
 import { MessageBubble } from './_components/MessageBubble.js';
-import { ToolActivity } from './tool_activity.js';
+
 
 /**
  * ChatUI class - Manages chat interface and message rendering
@@ -99,10 +99,6 @@ export class ChatUI {
         this.typingIndicator = this.container.querySelector('#fl-chat-typing');
         this.statusIndicator = this.container.querySelector('#fl-status-indicator');
         this.statusText = this.container.querySelector('#fl-status-text');
-
-        // Initialize tool activity floating cards now that messagesContainer exists
-        this.toolActivity = new ToolActivity(this.messagesContainer);
-        console.log('[ChatUI] Tool activity floating cards initialized');
 
         // Add debug styles for tool activity
         const debugStyle = document.createElement('style');
