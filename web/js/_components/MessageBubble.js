@@ -19,6 +19,7 @@ export class MessageBubble {
         renderer.link = function(href, title, text) {
             const safeTitle = title ? ` title="${title}"` : "";
             
+            // Handle ren:// protocol links
             if (href.startsWith("ren://")) {
                 const protocol = href.substring(6); // Remove "ren://"
                 
@@ -30,9 +31,31 @@ export class MessageBubble {
                 return `<a href="#" class="ren-link" data-protocol="${protocol}">${text}</a>`;
             }
             
+            // Handle api/ links - prepend the backend URL
+            if (href.startsWith("api/")) {
+                // If on localhost, use the ws client's configured URL
+                if (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1') {
+                    // Extract protocol and host from ws client config (e.g., ws://localhost:8000/ws -> http://localhost:8000)
+                    if (window.wsClient && window.wsClient.config && window.wsClient.config.url) {
+                        const wsUrl = window.wsClient.config.url;
+                        const wsProtocol = wsUrl.startsWith('wss://') ? 'https://' : 'http://';
+                        const wsHost = wsUrl.replace(/^wss?:\/\//, '').split('/')[0]; // Extract host:port
+                        href = `${wsProtocol}${wsHost}/${href}`;
+                    } else {
+                        // Fallback to window location if ws client not available
+                        const backendUrl = `${window.location.protocol}//${window.location.host}`;
+                        href = `${backendUrl}/${href}`;
+                    }
+                } else {
+                    // For non-localhost (like ngrok), use the current browser location
+                    const backendUrl = `${window.location.protocol}//${window.location.host}`;
+                    href = `${backendUrl}/${href}`;
+                }
+            }
+            
             return `<a href="${href}"${safeTitle} target="_blank" rel="noopener noreferrer">${text}</a>`;
         };
-        
+
         marked.setOptions({
             breaks: true,
             gfm: true,

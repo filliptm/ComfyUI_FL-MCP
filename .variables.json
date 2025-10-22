@@ -1,10 +1,10 @@
 {
   "current_mode": "implementation",
   "project": "fl_js",
-  "task": "fix PWA gutters and add theme-color meta tags",
+  "task": "Fix api/ link handling in MessageBubble.js",
   "architecture": "FastAPI+WS backend with PydanticAI + FastMCP, JS chat sidebar client, realtime tool callbacks",
   "project_status": "new project inspired by legacy FL_JS/FL_WF_Agent",
-  "focus": "web/pwa/styles.css and web/pwa/index.html",
+  "focus": "Use ws_client config.url for localhost api links",
   "plans_created": "6 detailed implementation plans + summary",
   "next_step": "Create placeholder icons",
   "ui_integration": "app.extensionManager.registerSidebarTab",
