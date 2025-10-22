@@ -1,6 +1,6 @@
-# FL_JS Agentic System 🤖
+# Ren - ComfyUI Assistant 🌸
 
-> **AI-Powered ComfyUI Workflow Assistant** - Create, modify, and understand ComfyUI workflows through natural language conversation.
+> **Your AI companion for ComfyUI workflows** - Create, modify, and understand workflows through natural conversation. Available on desktop and mobile.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
@@ -16,14 +16,28 @@
 - **Query your graph** - "Show me all nodes connected to the checkpoint loader"
 - **Visual feedback** - Get Mermaid diagrams of your workflow structure
 
-### 🛠️ Comprehensive Tool Suite (40+ Tools)
+### 📱 Ren Go - Mobile PWA
+- **Mobile access** - Control ComfyUI from your phone
+- **Session picker** - Connect to any active ComfyUI session
+- **Smart notifications** - Get notified when workflows complete or fail
+- **Ren links** - One-tap actions like "Show me the output"
+- **Offline support** - PWA works offline, reconnects automatically
+- **Multi-device** - Use desktop and mobile simultaneously
+
+📖 **[Complete PWA Setup Guide](web/pwa/README.md)**
+
+### 🛠️ Comprehensive Tool Suite (45+ Tools)
 - **Node Management** - Create, find, remove, bypass, pin, and select nodes
 - **Node Manipulation** - Get/set parameters, connect nodes intelligently
 - **Layout Control** - Auto-arrange workflows, position nodes relative to each other
 - **Workflow Execution** - Queue, cancel, batch processing, monitor status
 - **Advanced Queries** - Filter nodes, traverse connections, aggregate data
+- **ComfyUI Filesystem** - Browse custom nodes, models, search files securely
+- **Node Pack Discovery** - Search and discover custom node packs via Manager
+- **System Information** - OS, Python, and environment detection for help
+- **Canvas Control** - Focus on nodes, take screenshots for visual debugging
 
-### 🧠 Intelligent Agent
+### 🧠 Intelligent Agent (Ren)
 - **Context-aware** - Remembers conversation history and workflow state
 - **Proactive suggestions** - Warns about disconnected nodes, suggests improvements
 - **Best practices** - Knows ComfyUI patterns and common workflow structures
@@ -35,6 +49,95 @@
 - **Real-time updates** - WebSocket-based instant communication
 - **Multi-session** - Each browser tab gets its own isolated agent
 - **🆕 Auto-start backend** - No manual server startup required!
+
+---
+
+## Meet Ren 🌸
+
+**Ren** (連 - "connection" in Japanese) is your AI assistant for ComfyUI workflows. The name reflects the core purpose: connecting you to your creative workflow through natural conversation.
+
+### What makes Ren special?
+
+- **Conversational**: Talk naturally, no commands to memorize
+- **Proactive**: Suggests improvements and catches potential issues
+- **Educational**: Explains concepts and teaches best practices
+- **Adaptive**: Matches your skill level and workflow style
+- **Multi-device**: Available on desktop and mobile (Ren Go)
+- **Always learning**: Understands context from your conversation history
+
+### Example Conversations
+
+**Creating Workflows:**
+```
+You: "Create a simple text-to-image workflow"
+
+Ren: "I'll create a basic txt2img workflow for you."
+     [Creates and connects nodes: CheckpointLoader → CLIPTextEncode 
+      → EmptyLatentImage → KSampler → VAEDecode → SaveImage]
+     "Done! I've created a complete workflow with 7 nodes."
+```
+
+**Modifying Workflows:**
+```
+You: "Change the sampler to use 40 steps with euler_ancestral"
+
+Ren: "I'll update the KSampler settings."
+     [Finds KSampler node, sets steps=40, sampler_name="euler_ancestral"]
+     "Updated! The sampler now uses 40 steps with euler_ancestral."
+```
+
+**Understanding Workflows:**
+```
+You: "Show me all LoRA nodes and their weights"
+
+Ren: [Queries workflow, finds LoRA loaders]
+     "Found 2 LoRA nodes:
+      - Node #5: 'detail_enhancer.safetensors' (weight: 0.8)
+      - Node #12: 'style_helper.safetensors' (weight: 0.6)"
+```
+
+**Debugging:**
+```
+You: "The generation failed, what went wrong?"
+
+Ren: [Analyzes recent errors]
+     "I found the issue - node #7 (KSampler) has a disconnected 'model' input.
+      Let me connect it to your checkpoint loader."
+     [Fixes connection]
+     "Fixed! Try queuing it again."
+```
+
+**Discovery:**
+```
+You: "What node packs have video processing?"
+
+Ren: [Searches ComfyUI Manager]
+     "I found 3 popular video node packs:
+      1. ComfyUI-VideoHelperSuite (⭐ 892)
+      2. ComfyUI-Advanced-ControlNet (⭐ 1.2k) 
+      3. ComfyUI-Frame-Interpolation (⭐ 456)
+      
+      Would you like details on any of these?"
+```
+
+**System Help:**
+```
+You: "How do I install this custom node?"
+
+Ren: [Checks system info]
+     "You're on Windows with Python 3.11 in a conda environment.
+      
+      To install, run:
+      ```bash
+      conda activate comfy
+      cd ComfyUI/custom_nodes
+      git clone <repo_url>
+      cd <node_folder>
+      pip install -r requirements.txt
+      ```
+      
+      Then restart ComfyUI."
+```
 
 ---
 
@@ -109,7 +212,32 @@ You should see:
 ================================================================================
 ```
 
-> **Note:** Backend logs are saved to `backend/logs/server.log`
+**How the Server Starts:**
+
+Ren's backend can start in two ways:
+
+1. **Automatic (Default)** - ComfyUI starts and stops the server automatically
+   - Server starts when ComfyUI loads
+   - Server stops when ComfyUI exits
+   - Logs to `backend/logs/server.log`
+   - Perfect for normal use
+
+2. **Manual (For Debugging)** - You start the server separately
+   - Better visibility of logs in separate terminal
+   - Easier to debug server issues
+   - Server runs independently of ComfyUI
+   
+   To use manual mode:
+   ```bash
+   # In .env, set:
+   AUTO_START_BACKEND=false
+   
+   # Then start server manually in separate terminal:
+   cd backend
+   python server.py
+   ```
+
+> **💡 Tip:** Use manual mode when debugging server issues. The separate terminal shows all logs clearly without ComfyUI's output mixed in.
 
 #### 5. Verify installation
 
@@ -126,6 +254,22 @@ Open ComfyUI in your browser and check the **browser console** (F12):
 ```
 
 If you see these messages, **you're ready to go!** 🎉
+
+#### 6. Access from Mobile (Optional)
+
+Ren Go is a Progressive Web App that lets you control ComfyUI from your phone.
+
+📖 **[Complete Setup Guide](web/pwa/README.md)** - Local network, ngrok, and Cloudflare options
+
+**Quick Local Network Setup:**
+1. Find your computer's IP address:
+   - Windows: `ipconfig` (look for IPv4)
+   - Mac/Linux: `ifconfig` or `ip addr`
+2. On your phone, navigate to: `http://[YOUR-IP]:8000/pwa`
+3. Select your ComfyUI session from the picker
+4. Add to home screen for app-like experience
+
+**For remote access** (cellular data, different networks), see the [PWA Setup Guide](web/pwa/README.md) for ngrok and Cloudflare tunnel options.
 
 ---
 
@@ -199,337 +343,229 @@ FL_JS automatically tunes behavior for each provider:
 
 These optimizations happen **automatically** - no configuration needed!
 
-### Validation & Safety
-
-The system validates your provider/model combination:
-
-```python
-# ✅ Valid combinations
-LLM_PROVIDER=openai + LLM_MODEL=gpt-4
-LLM_PROVIDER=anthropic + LLM_MODEL=claude-3-sonnet-20240229
-LLM_PROVIDER=gemini + LLM_MODEL=gemini-2.0-flash-exp
-
-# ❌ Invalid combinations (caught at startup)
-LLM_PROVIDER=openai + LLM_MODEL=claude-3-opus  # Wrong model for provider
-LLM_PROVIDER=gemini + LLM_MODEL=gpt-4  # Wrong model for provider
-```
-
-Invalid combinations are caught immediately with helpful error messages.
-
-### Supported Models
-
-#### OpenAI
-- `gpt-4-turbo-preview` ⭐ (Default)
-- `gpt-4`
-- `gpt-3.5-turbo`
-- `o1-preview`, `o1-mini`
-
-#### Anthropic
-- `claude-3-5-sonnet-20241022` ⭐ (Default)
-- `claude-3-opus-20240229`
-- `claude-3-sonnet-20240229`
-- `claude-3-haiku-20240307`
-
-#### Google Gemini
-- `gemini-2.0-flash-exp` ⭐ (Default)
-- `gemini-1.5-pro`
-- `gemini-1.5-flash`
-- `models/gemini-pro` (legacy format)
-
-#### OpenRouter
-- `deepseek/deepseek-chat` ⭐ (Default)
-- Access to 100+ models from multiple providers
-- Use format: `provider/model-name`
-- Examples: `anthropic/claude-3.5-sonnet`, `google/gemini-pro-1.5`, `meta-llama/llama-3.1-70b`
-
----
-
-## ⚙️ Backend Configuration
-
-### Auto-Start Settings
-
-The backend automatically starts when ComfyUI loads. You can customize this behavior in `.env`:
-
-```bash
-# === Backend Auto-Start ===
-AUTO_START_BACKEND=true          # Enable/disable auto-start
-AUTO_RESTART_BACKEND=true        # Auto-restart if backend crashes
-LOG_BACKEND_TO_FILE=true         # Log to backend/logs/server.log
-WS_PORT=8000                     # Backend server port
-```
-
-### Manual Backend Start (Optional)
-
-If you prefer to start the backend manually:
-
-1. **Disable auto-start** in `.env`:
-   ```bash
-   AUTO_START_BACKEND=false
-   ```
-
-2. **Start manually** in a separate terminal:
-   ```bash
-   cd backend
-   python server.py
-   ```
-
-3. **Restart ComfyUI** to load the extension
-
-### Port Configuration
-
-If port 8000 is already in use:
-
-1. **Change the port** in `.env`:
-   ```bash
-   WS_PORT=8001
-   ```
-
-2. **Restart ComfyUI** (backend will use new port)
-
----
-
-## 💬 Usage Examples
-
-### Creating Workflows
-```
-You: "Create a simple text-to-image workflow"
-
-Agent: "I'll create a basic txt2img workflow for you."
-       [Creates and connects: CheckpointLoader → CLIPTextEncode (positive/negative) 
-        → EmptyLatentImage → KSampler → VAEDecode → SaveImage]
-       "Done! I've created a complete workflow with 7 nodes."
-```
-
-### Modifying Workflows
-```
-You: "Change the sampler to use 40 steps with euler_ancestral"
-
-Agent: "I'll update the KSampler settings."
-       [Finds KSampler node, sets steps=40, sampler_name="euler_ancestral"]
-       "Updated! The sampler now uses 40 steps with euler_ancestral."
-```
-
-### Querying Workflows
-```
-You: "Show me all LoRA nodes and their weights"
-
-Agent: [Queries workflow, finds LoRA loaders]
-       "Found 2 LoRA nodes:
-        - Node #5: 'detail_enhancer.safetensors' (weight: 0.8)
-        - Node #12: 'style_helper.safetensors' (weight: 0.6)"
-```
-
-### Visual Diagrams
-```
-You: "Show me the workflow structure"
-
-Agent: [Generates Mermaid diagram]
-       ```mermaid
-       graph LR
-         N1[CheckpointLoader] --> N2[CLIPTextEncode]
-         N1 --> N3[KSampler]
-         N2 --> N3
-         ...
-       ```
-```
-
 ---
 
 ## 🏗️ Architecture
 
 ### System Overview
 
+```mermaid
+graph TB
+    subgraph "ComfyUI Browser"
+        UI["🖥️ Chat Sidebar<br/>(extension.js)"]
+        FL["🔧 FL_JS Legacy<br/>(fl_js.js)"]
+    end
+    
+    subgraph "Mobile Device"
+        PWA["📱 Ren Go PWA<br/>(Mobile Interface)"]
+    end
+    
+    subgraph "Backend Server (Python)"
+        WS["🔌 WebSocket Manager<br/>(Multi-client routing)"]
+        AGENT["🌸 Ren Agent<br/>(PydanticAI)"]
+        MCP["🛠️ FastMCP Tools<br/>(45+ tools)"]
+        SESSION["📋 Session Manager<br/>(Isolated per tab)"]
+        RUNNER["⚙️ ServerRunner<br/>(Auto-start)"]
+    end
+    
+    UI -->|"WebSocket<br/>(frontend)"| WS
+    PWA -->|"WebSocket<br/>(pwa)"| WS
+    WS --> SESSION
+    SESSION --> AGENT
+    AGENT --> MCP
+    MCP -->|"Tool Callbacks"| FL
+    FL -->|"Results"| MCP
+    
+    style UI fill:#2d3748,stroke:#4a5568,color:#e2e8f0
+    style PWA fill:#2d3748,stroke:#4a5568,color:#e2e8f0
+    style AGENT fill:#805ad5,stroke:#6b46c1,color:#fff
+    style MCP fill:#38b2ac,stroke:#319795,color:#fff
+    style WS fill:#3182ce,stroke:#2c5282,color:#fff
+    style SESSION fill:#ed8936,stroke:#c05621,color:#fff
+    style RUNNER fill:#48bb78,stroke:#38a169,color:#fff
+    style FL fill:#718096,stroke:#4a5568,color:#fff
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                     ComfyUI Browser                         │
-│  ┌────────────────┐              ┌────────────────────┐    │
-│  │  Chat Sidebar  │◄──────────────┤   FL_JS Legacy     │    │
-│  │  (extension.js)│  Tool Calls  │   (fl_js.js)       │    │
-│  └────────┬───────┘              └────────────────────┘    │
-│           │ WebSocket                                       │
-└───────────┼─────────────────────────────────────────────────┘
-            │
-            │ ws://localhost:8000/ws
-            │
-┌───────────▼─────────────────────────────────────────────────┐
-│                    Backend Server (Python)                  │
-│  ┌──────────────┐  ┌──────────────┐  ┌─────────────────┐  │
-│  │  WebSocket   │  │  PydanticAI  │  │   FastMCP       │  │
-│  │  Manager     │──┤    Agent     │──┤   Tools (40+)   │  │
-│  └──────────────┘  └──────────────┘  └─────────────────┘  │
-│         │                  │                    │           │
-│         └──────────────────┴────────────────────┘           │
-│                     Session Management                      │
-│              (Isolated per browser tab)                     │
-│                                                             │
-│  ┌──────────────────────────────────────────────────────┐  │
-│  │              ServerRunner (Auto-Start)               │  │
-│  │  • Subprocess management                             │  │
-│  │  • Port conflict detection                           │  │
-│  │  • Auto-restart on crash                             │  │
-│  │  • Dual logging (file + stdout)                      │  │
-│  └──────────────────────────────────────────────────────┘  │
-└─────────────────────────────────────────────────────────────┘
-```
 
-### Key Components
+**How It Works:**
 
-#### Frontend (JavaScript)
-- **`web/js/extension.js`** - ComfyUI extension entry point
-- **`web/js/session_manager.js`** - Session management with localStorage
-- **`web/js/ws_client.js`** - WebSocket client with auto-reconnection
-- **`web/js/chat_ui.js`** - Chat interface (Phase 4)
-- **`web/js/tool_executor.js`** - Tool execution (Phase 2)
-- **`web/js/fl_api.js`** - FL_JS API wrapper (Phase 2)
-- **`web/js/query_executor.js`** - Query DSL executor (Phase 3)
-- **`web/js/diagram_generator.js`** - Mermaid diagrams (Phase 4)
+1. **Frontend** (ComfyUI sidebar) and **PWA** (mobile) connect via WebSocket
+2. **Session Manager** keeps conversations isolated per browser tab
+3. **Ren Agent** processes messages using PydanticAI framework
+4. **FastMCP Tools** provide 45+ capabilities for workflow control
+5. **Tool Callbacks** execute in ComfyUI via FL_JS legacy functions
+6. **ServerRunner** manages backend lifecycle automatically
 
-#### Backend (Python)
-- **`backend/server.py`** - FastAPI application with WebSocket endpoint
-- **`backend/server_runner.py`** - 🆕 Subprocess manager for auto-start
-- **`backend/websocket.py`** - Connection manager, session routing
-- **`backend/config.py`** - Configuration and settings
-- **`backend/model_defaults.py`** - 🆕 Provider defaults and validation
-- **`backend/models.py`** - Pydantic models for messages and queries
-- **`backend/agent.py`** - PydanticAI agent (Phase 3)
-- **`backend/mcp_server.py`** - FastMCP tool definitions (Phase 2)
-- **`backend/callback_router.py`** - Tool callback routing (Phase 2)
-- **`backend/utils.py`** - Utility functions (Phase 3)
+**Multi-Client Support:**
+- Desktop ComfyUI + Mobile PWA can connect to same session
+- Both see same conversation history
+- Tool execution happens on desktop ComfyUI
+- Results broadcast to all connected clients
 
 ---
 
-## 🔧 Configuration
-
-### Environment Variables
-
-All configuration is in `.env` (copy from `.env.example`):
-
-```bash
-# === Backend Auto-Start ===
-AUTO_START_BACKEND=true          # Auto-start backend when ComfyUI loads
-AUTO_RESTART_BACKEND=true        # Auto-restart on crash
-LOG_BACKEND_TO_FILE=true         # Log to backend/logs/server.log
-
-# === LLM Provider ===
-LLM_PROVIDER=gemini              # openai, anthropic, gemini, or openrouter
-LLM_MODEL=                       # Optional - uses smart defaults if blank
-LLM_TEMPERATURE=0.7              # Creativity (0.0-1.0)
-LLM_MAX_TOKENS=32000             # Max response length
-
-# === API Keys ===
-OPENAI_API_KEY=sk-...
-ANTHROPIC_API_KEY=sk-ant-...
-GOOGLE_API_KEY=...
-OPENROUTER_API_KEY=sk-or-...
-
-# === WebSocket Settings ===
-WS_HOST=0.0.0.0                  # Server host
-WS_PORT=8000                     # Server port
-WS_HEARTBEAT_INTERVAL=30         # Seconds between heartbeats
-WS_SESSION_TIMEOUT=300           # Session timeout (seconds)
-WS_MAX_RECONNECT_ATTEMPTS=5      # Max reconnection attempts
-
-# === Tool Execution ===
-TOOL_TIMEOUT=30000               # Tool timeout (milliseconds)
-MAX_TOOL_RETRIES=3               # Max retries on tool failure
-
-# === Conversation ===
-CONVERSATION_MAX_HISTORY=50      # Max messages to remember
-
-# === Logging ===
-LOG_LEVEL=INFO                   # DEBUG, INFO, WARNING, ERROR
-LOG_FORMAT=json                  # json or text
-```
-
----
-
-## 🧪 Development
-
-### Project Structure
+## 📁 Project Structure
 
 ```
 FL_JS/
-├── __init__.py           # ComfyUI custom node registration + auto-start
-├── backend/              # Python FastAPI server
-│   ├── __init__.py
-│   ├── server.py         # Main FastAPI app
-│   ├── server_runner.py  # 🆕 Subprocess manager
-│   ├── websocket.py      # WebSocket connection manager
-│   ├── config.py         # Configuration
-│   ├── model_defaults.py # 🆕 Provider defaults
-│   ├── models.py         # Pydantic models
-│   ├── agent.py          # PydanticAI agent (Phase 3)
-│   ├── mcp_server.py     # FastMCP tools (Phase 2)
-│   ├── callback_router.py # Tool callbacks (Phase 2)
-│   ├── utils.py          # Utilities (Phase 3)
-│   └── logs/             # 🆕 Backend logs
-│       └── server.log    # Auto-generated
+├── __init__.py              # ComfyUI node registration + auto-start
+├── .env.example             # Configuration template
+├── requirements.txt         # Python dependencies
+├── pyproject.toml          # Python project config
+├── README.md               # This file
 │
-├── web/                  # JavaScript extensions
-│   └── js/
-│       ├── extension.js      # ComfyUI extension entry
-│       ├── session_manager.js # Session management
-│       ├── ws_client.js      # WebSocket client
-│       ├── chat_ui.js        # Chat UI (Phase 4)
-│       ├── tool_executor.js  # Tool execution (Phase 2)
-│       ├── query_executor.js # Query DSL (Phase 3)
-│       ├── fl_api.js         # FL_JS wrapper (Phase 2)
-│       └── diagram_generator.js # Mermaid (Phase 4)
+├── backend/                # 🐍 Python FastAPI server
+│   ├── server.py          # Main application entry
+│   ├── server_runner.py   # Auto-start subprocess manager
+│   ├── websocket.py       # WebSocket connection handling
+│   ├── manager.py         # Session & execution tracking
+│   ├── agent.py           # Ren AI agent (PydanticAI)
+│   ├── mcp_server.py      # Tool definitions (45+ tools)
+│   ├── model_defaults.py  # Provider-specific settings
+│   ├── config.py          # Configuration management
+│   ├── models.py          # Pydantic data models
+│   ├── comfy_tools.py     # ComfyUI filesystem access
+│   ├── comfy_manager.py   # Manager API client
+│   ├── node_library.py    # Node discovery client
+│   ├── sysinfo.py         # System information detection
+│   ├── calc.py            # Math expression calculator
+│   └── logs/              # Server logs (auto-generated)
 │
-├── legacy/               # Original FL_JS code
-│   ├── FL_JS.py          # Original node
-│   ├── fl_js.js          # Original functions
-│   └── NodePackLoader_SideBar.js # Reference
+├── web/                    # 🌐 JavaScript frontend
+│   ├── js/                # Extension code
+│   │   ├── extension.js   # ComfyUI extension entry
+│   │   ├── session_manager.js  # Session handling
+│   │   ├── ws_client.js        # WebSocket client
+│   │   ├── chat_ui.js          # Chat interface
+│   │   ├── tool_executor.js    # Tool execution
+│   │   ├── tool_activity.js    # Tool visualization
+│   │   ├── query_executor.js   # Query DSL
+│   │   ├── fl_api.js           # FL_JS wrapper
+│   │   ├── diagram_generator.js # Mermaid diagrams
+│   │   ├── style.css           # Styling
+│   │   └── _components/        # Reusable UI components
+│   │
+│   └── pwa/               # 📱 Progressive Web App (Ren Go)
+│       ├── index.html     # PWA entry point
+│       ├── app.js         # Session picker & chat
+│       ├── styles.css     # Mobile-optimized styles
+│       ├── service-worker.js   # Offline support
+│       ├── manifest.json       # PWA metadata
+│       ├── README.md           # Setup guide
+│       └── icons/              # App icons
 │
-├── tests/                # Test suites
-│   ├── backend/          # Backend tests
-│   ├── frontend/         # Frontend tests
-│   └── integration/      # E2E tests
+├── agents/                 # 🤖 AI agent configuration
+│   └── agent.md           # Ren's system prompt
 │
-├── notes/                # Documentation & plans
-│   ├── implementation/   # Implementation plans
-│   └── comfy_init/       # 🆕 Auto-start research
+├── legacy/                 # 📦 Original FL_JS code
+│   ├── FL_JS.py           # Original ComfyUI node
+│   ├── fl_js.js           # Core workflow functions
+│   └── NodePackLoader_SideBar.js  # Reference implementation
 │
-├── .env.example          # Environment template
-├── requirements.txt      # Python dependencies
-├── pyproject.toml        # Python project config
-└── README.md             # This file
+├── tests/                  # 🧪 Test suites
+│   ├── backend/           # Backend unit tests
+│   ├── frontend/          # Frontend tests
+│   └── integration/       # End-to-end tests
+│
+└── notes/                  # 📝 Documentation & plans
+    ├── implementation/    # Implementation guides
+    ├── pwa/              # PWA development docs
+    ├── fill_merge/       # Provider abstraction merge
+    └── readme_update/    # This proposal
 ```
 
-### Running Tests
+**Key Folders Explained:**
 
-```bash
-# Backend tests
-cd backend
-pytest tests/backend/ -v --cov=backend
-
-# Integration tests
-pytest tests/integration/ -v
-
-# With coverage report
-pytest --cov=backend --cov-report=html
-```
-
-### Code Quality
-
-```bash
-# Linting
-ruff check backend/
-
-# Type checking
-mypy backend/
-
-# Formatting
-ruff format backend/
-```
+- **`backend/`** - Python server handling AI, WebSocket, and tool orchestration
+- **`web/js/`** - ComfyUI sidebar extension with chat UI and tool execution
+- **`web/pwa/`** - Mobile Progressive Web App for remote access
+- **`agents/`** - Ren's personality, capabilities, and behavior configuration
+- **`legacy/`** - Original FL_JS implementation (still used for tool execution)
+- **`tests/`** - Automated testing for reliability
+- **`notes/`** - Development documentation and architectural decisions
 
 ---
 
 ## 📚 Advanced Topics
 
+### Tool Categories
+
+Ren has 45+ tools organized into categories:
+
+**Workflow Analysis & Queries**
+- `query_workflow` - Filter, traverse, and aggregate workflow data with structured queries
+- `workflow_overview` - Get comprehensive workflow summary with statistics
+- `workflow_diagram` - Generate Mermaid diagrams of workflow structure
+- `get_current_node_selection` - Understand what user is currently examining
+
+**Node Management**
+- `create_nodes` - Batch create nodes with validation and positioning
+- `find_node` - Search by ID, type, or title
+- `remove_nodes`, `bypass_nodes`, `pin_nodes` - Workflow organization
+- `select_nodes` - Programmatic node selection for user focus
+
+**Node Discovery (Library)**
+- `node_library_search` - Find available node types before creating
+- `node_library_get_details` - Get parameter definitions and constraints
+- `node_library_find_compatible` - Discover connection possibilities
+
+**Node Pack Discovery (Manager)**
+- `manager_search_nodes` - Search ComfyUI Manager for custom node packs
+- `manager_get_node_mappings` - Find which pack provides a node type
+- `manager_check_updates` - Check for available updates
+
+**Node Manipulation**
+- `get_node_values`, `set_node_values` - Parameter reading and modification
+- `connect_nodes` - Smart connection with auto-matching by type
+- `connect_nodes_batch` - Efficient batch connection operations
+- `auto_connect_workflow` - Automatic sequential or type-based connections
+- `get_node_slots` - Discover available inputs/outputs for connections
+
+**Layout Management**
+- `get_layout` - Retrieve spatial organization of nodes
+- `modify_layout` - Batch position/size modifications with collision avoidance
+- `focus_on_nodes` - Zoom canvas to specific nodes
+- `take_screenshot` - Capture canvas for visual debugging
+
+**Workflow Execution**
+- `queue_workflow` - Execute with batch count control
+- `cancel_workflow` - Stop running workflows
+- `get_queue_status` - Monitor execution state
+- `enable_auto_queue`, `disable_auto_queue` - Auto-execution mode
+
+**Error Feedback & Debugging**
+- `get_recent_errors` - Retrieve recent execution failures
+- `get_errors_for_run` - Get all errors for specific workflow run
+- `get_queue_status_details` - Active executions and progress
+- `get_execution_details` - Comprehensive execution state
+- `clear_error_buffer` - Reset error tracking
+
+**ComfyUI Filesystem**
+- `comfy_list_folders` - Browse custom_nodes, models, checkpoints, etc.
+- `comfy_read_file` - Examine node implementations and configs
+- `comfy_search_resources` - Find patterns in files (node registrations, etc.)
+- `extract_workflow_from_image` - Extract workflow from PNG metadata
+
+**System Information**
+- `get_system_info` - OS, Python, environment detection for platform-specific help
+
+**Utilities**
+- `calculate_expressions` - Math AST evaluation for layout calculations
+- `wait` - Delay execution for timing control
+- `generate_seed`, `generate_int`, `generate_float` - Random value generation
+- `random_choice` - Random selection from lists
+
+### Multi-Session Architecture
+
+Each browser tab gets isolated session:
+- Unique `session_id` stored in localStorage
+- Separate Ren instance with independent conversation history
+- No message mixing between tabs
+- Automatic cleanup after timeout
+- PWA can connect to any active session
+
 ### Query DSL
 
-The agent uses a JSON-based query language to find and analyze nodes:
+Ren uses JSON-based queries for complex workflow analysis:
 
 ```javascript
 // Find all KSampler nodes
@@ -542,119 +578,28 @@ The agent uses a JSON-based query language to find and analyze nodes:
   }
 }
 
-// Find checkpoint loaders with specific model
+// Traverse downstream from node
 {
-  "filters": {
-    "operator": "and",
-    "filters": [
-      {"field": "type", "operator": "equals", "value": "CheckpointLoaderSimple"},
-      {"field": "parameters.ckpt_name", "operator": "contains", "value": "sdxl"}
-    ]
-  }
-}
-
-// Traverse downstream from a node
-{
-  "filters": {
-    "operator": "and",
-    "filters": [{"field": "id", "operator": "equals", "value": 5}]
-  },
+  "filters": {...},
   "traversal": {
     "direction": "downstream",
-    "max_depth": null  // unlimited
+    "max_depth": null
   }
 }
 ```
 
 See `notes/implementation/02_query_dsl.md` for complete documentation.
 
-### Multi-Session Support
-
-Each browser tab gets its own isolated session:
-- Unique `session_id` stored in localStorage
-- Separate agent instance with independent conversation history
-- No message mixing between tabs
-- Automatic session cleanup after timeout
-
 ### Tool Callback Flow
 
-1. Agent decides to use a tool (e.g., "create_node")
-2. Backend sends tool request to frontend via WebSocket
+1. Ren decides to use a tool (e.g., "create_node")
+2. Backend sends tool request via WebSocket
 3. Frontend executes FL_JS function
-4. Frontend sends result back via WebSocket
-5. Backend returns result to agent
-6. Agent continues with response
+4. Frontend returns result via WebSocket
+5. Backend provides result to Ren
+6. Ren continues with response
 
 All async, all non-blocking! ⚡
-
----
-
-## 🤝 Contributing
-
-Contributions are welcome! Please:
-
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
-
-### Development Workflow
-
-1. Read the implementation plans in `notes/implementation/`
-2. Check `notes/implementation/progress.md` for current status
-3. Pick a task from the roadmap
-4. Write tests first (TDD)
-5. Implement the feature
-6. Update documentation
-7. Submit PR
-
----
-
-## 📝 License
-
-MIT License - see [LICENSE](LICENSE) file for details.
-
----
-
-## 🙏 Acknowledgments
-
-- **ComfyUI** - The amazing node-based UI for Stable Diffusion
-- **PydanticAI** - Modern Python agent framework
-- **FastMCP** - Model Context Protocol implementation
-- **Mermaid.js** - Beautiful diagram rendering
-- Original **FL_JS** - The foundation this builds upon
-- **ComfyUI-NODEJS** - Inspiration for auto-start implementation
-
----
-
-## 📞 Support
-
-- **Issues**: [GitHub Issues](https://github.com/yourusername/fl_js/issues)
-- **Discussions**: [GitHub Discussions](https://github.com/yourusername/fl_js/discussions)
-- **Documentation**: See `notes/implementation/` for detailed docs
-
----
-
-## 🗺️ Roadmap
-
-See `notes/implementation/progress.md` for current status. Highlights:
-
-- ✅ **Phase 1**: Backend & frontend foundation (COMPLETE)
-- ✅ **Phase 1.5**: ComfyUI integration (COMPLETE)
-- ✅ **Phase 1.75**: Backend auto-start (COMPLETE)
-- 🚧 **Phase 2**: Tool system (40+ MCP tools)
-- 📋 **Phase 3**: Query DSL & agent
-- 📋 **Phase 4**: Chat UI & integration
-- 📋 **Phase 5**: Polish & testing
-
-### Future Features
-- 🚧 Streaming responses
-- 📋 Workflow templates library
-- 📋 Execution monitoring & feedback loop
-- 📋 Plugin system for custom tools
-- 📋 Workflow version control
-- 📋 Collaborative editing
 
 ---
 
@@ -723,15 +668,6 @@ netstat -ano | findstr :8000  # Windows
 - Default: `ws://localhost:8000/ws`
 - Check `web/js/extension.js` line 23
 
-### Session ID mismatch
-
-**Clear localStorage:**
-```javascript
-// In browser console:
-localStorage.removeItem('fl_js_session_id');
-location.reload();
-```
-
 ### Manual backend control
 
 **Stop auto-start:**
@@ -755,6 +691,75 @@ taskkill /PID <PID> /F
 ```bash
 tail -f backend/logs/server.log
 ```
+
+---
+
+## 🗺️ Roadmap
+
+See `notes/implementation/progress.md` for current status. Highlights:
+
+- ✅ **Phase 1**: Backend & frontend foundation (COMPLETE)
+- ✅ **Phase 1.5**: ComfyUI integration (COMPLETE)
+- ✅ **Phase 1.75**: Backend auto-start (COMPLETE)
+- ✅ **Phase 2**: Tool system (45+ MCP tools) (COMPLETE)
+- ✅ **Phase 3**: Query DSL & agent (COMPLETE)
+- ✅ **Phase 4**: Chat UI & integration (COMPLETE)
+- ✅ **Ren Go PWA**: Mobile interface with notifications (COMPLETE)
+- 🚧 **Phase 5**: Polish & testing (IN PROGRESS)
+
+### Future Features
+- 📋 Workflow templates library
+- 📋 Execution monitoring & feedback loop
+- 📋 Plugin system for custom tools
+- 📋 Workflow version control
+- 📋 Collaborative editing
+
+---
+
+## 🤝 Contributing
+
+Contributions are welcome! Please:
+
+1. Fork the repository
+2. Create a feature branch (`git checkout -b feature/amazing-feature`)
+3. Commit your changes (`git commit -m 'Add amazing feature'`)
+4. Push to the branch (`git push origin feature/amazing-feature`)
+5. Open a Pull Request
+
+### Development Workflow
+
+1. Read the implementation plans in `notes/implementation/`
+2. Check `notes/implementation/progress.md` for current status
+3. Pick a task from the roadmap
+4. Write tests first (TDD)
+5. Implement the feature
+6. Update documentation
+7. Submit PR
+
+---
+
+## 📝 License
+
+MIT License - see [LICENSE](LICENSE) file for details.
+
+---
+
+## 🙏 Acknowledgments
+
+- **ComfyUI** - The amazing node-based UI for Stable Diffusion
+- **PydanticAI** - Modern Python agent framework
+- **FastMCP** - Model Context Protocol implementation
+- **Mermaid.js** - Beautiful diagram rendering
+- Original **FL_JS** - The foundation this builds upon
+- **ComfyUI-NODEJS** - Inspiration for auto-start implementation
+
+---
+
+## 📞 Support
+
+- **Issues**: [GitHub Issues](https://github.com/yourusername/fl_js/issues)
+- **Discussions**: [GitHub Discussions](https://github.com/yourusername/fl_js/discussions)
+- **Documentation**: See `notes/implementation/` for detailed docs
 
 ---
 
