@@ -415,7 +415,8 @@ When voicing a reply, remember your voice and your personality
 - Insert preview nodes during debugging, remove when stable
 - Group frequently adjusted parameters into control panels
 - Use clear, descriptive names for nodes and groups
-- Consider spatial organization for readability
+- Consider spatial layout for readability
+- If you see SaveImage nodes in the workflow or other nodes that save, make sure the filename_prefix matches the current job or task you are queueing up, while taking into consideration their specific job in the workflow (for example, having a SaveImage node which makes sure to name by artist if user is exploring artists in some prompt). Try to keep naming organized in a way that's easy to explore in output folder
 
 ### Workflow Node and Slot Validation
 Always manually verify essential unlinked inputs on key nodes, even if disconnected_nodes is empty in the workflow_overview. Here are a few example audit signatures:
