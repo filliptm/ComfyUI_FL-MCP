@@ -16,15 +16,15 @@
 - **Query your graph** - "Show me all nodes connected to the checkpoint loader"
 - **Visual feedback** - Get Mermaid diagrams of your workflow structure
 
-### 📱 Ren Go - Mobile PWA
+### 📱 Ren Go - Mobile App
 - **Mobile access** - Control ComfyUI from your phone
 - **Session picker** - Connect to any active ComfyUI session
 - **Smart notifications** - Get notified when workflows complete or fail
 - **Ren links** - One-tap actions like "Show me the output"
-- **Offline support** - PWA works offline, reconnects automatically
+- **Offline support** - App works offline, reconnects automatically
 - **Multi-device** - Use desktop and mobile simultaneously
 
-📖 **[Complete PWA Setup Guide](web/pwa/README.md)**
+📖 **[Complete Ren Go Setup Guide](web/pwa/README.md)**
 
 ### 🛠️ Comprehensive Tool Suite (45+ Tools)
 - **Node Management** - Create, find, remove, bypass, pin, and select nodes
@@ -353,11 +353,11 @@ These optimizations happen **automatically** - no configuration needed!
 graph TB
     subgraph "ComfyUI Browser"
         UI["🖥️ Chat Sidebar<br/>(extension.js)"]
-        FL["🔧 FL_JS Legacy<br/>(fl_js.js)"]
+        FL["🔧 Javascript FL API<br/>(fl_api.js)"]
     end
     
     subgraph "Mobile Device"
-        PWA["📱 Ren Go PWA<br/>(Mobile Interface)"]
+        PWA["📱 Ren Go App<br/>(Mobile Interface)"]
     end
     
     subgraph "Backend Server (Python)"
@@ -693,9 +693,32 @@ Contributions are welcome! Please:
 
 ---
 
-## 📝 License
+## 📜 License
 
-MIT License - see [LICENSE](LICENSE) file for details.
+Ren is licensed under the **GNU Affero General Public License v3.0 (AGPL-3.0)**.
+
+### What does this mean?
+
+- ✅ **Free for personal use** - Use Ren however you want on your own computer
+- ✅ **Free for education** - Students and researchers can use freely
+- ✅ **Free for internal business use** - Companies can use internally
+- ✅ **Open source contributions welcome** - Fork, modify, and contribute back
+- ⚠️ **Network copyleft** - If you run Ren as a public service, you must open-source your modifications
+
+### Commercial Licensing
+
+If you want to:
+- Provide Ren as a hosted SaaS service without open-sourcing your code
+- Embed Ren in a proprietary product
+- Use Ren in ways not permitted by AGPL-3.0
+
+Please contact us for a commercial license: **clippyorg@proton.me**
+
+We offer flexible commercial licensing options for businesses.
+
+---
+
+**TL;DR**: Use Ren freely for yourself. Want to make money with it? Let's talk. 🤝
 
 ---
 
