@@ -1,10 +1,10 @@
 {
-  "current_mode": "implementation",
+  "current_mode": "research",
   "project": "fl_js",
-  "task": "Fix api/ link handling in MessageBubble.js",
+  "task": "Research ComfyUI pnginfo workflow embedding and extraction",
   "architecture": "FastAPI+WS backend with PydanticAI + FastMCP, JS chat sidebar client, realtime tool callbacks",
   "project_status": "new project inspired by legacy FL_JS/FL_WF_Agent",
-  "focus": "Use ws_client config.url for localhost api links",
+  "focus": "How to give agent awareness of workflow data in PNG metadata",
   "plans_created": "6 detailed implementation plans + summary",
   "next_step": "Create placeholder icons",
   "ui_integration": "app.extensionManager.registerSidebarTab",

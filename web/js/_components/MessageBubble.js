@@ -23,7 +23,7 @@ export class MessageBubble {
             if (href.startsWith("ren://")) {
                 const protocol = href.substring(6); // Remove "ren://"
                 
-                if (protocol === "message") {
+                if (protocol.startsWith("message")) {
                     return `<a href="#" class="ren-link" data-protocol="message" data-text="${text.replace(/"/g, '&quot;')}">${text}</a>`;
                 }
                 
