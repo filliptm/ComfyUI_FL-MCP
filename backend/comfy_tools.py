@@ -348,6 +348,77 @@ class ComfyUITools:
         except Exception as e:
             raise ComfyUIError(f"Error searching files: {e}")
 
+    def extract_workflow_from_image(self, image_path: str) -> Optional[Dict[str, Any]]:
+        """Extract ComfyUI workflow from PNG metadata.
+        
+        Args:
+            image_path: Path to PNG file relative to ComfyUI root
+            
+        Returns:
+            Workflow dictionary if found, None if no metadata
+            
+        Raises:
+            ComfyUIError: If file access fails or is invalid
+        """
+        try:
+            from PIL import Image
+            import json
+            
+            # Validate and resolve path
+            full_path = self._validate_path(image_path)
+            
+            if not full_path.exists():
+                raise ComfyUIError(f"Image file does not exist: {image_path}")
+            
+            if not full_path.is_file():
+                raise ComfyUIError(f"Path is not a file: {image_path}")
+            
+            # Check file extension
+            if full_path.suffix.lower() not in ['.png', '.webp']:
+                raise ComfyUIError(
+                    f"Unsupported file format: {full_path.suffix}. "
+                    "Only PNG and WebP files contain workflow metadata."
+                )
+            
+            # Open image and extract metadata
+            img = Image.open(full_path)
+            
+            # Try to get workflow from metadata
+            workflow_json = None
+            
+            # Method 1: Check img.text attribute (PNG tEXt chunks)
+            if hasattr(img, 'text') and 'workflow' in img.text:
+                workflow_json = img.text['workflow']
+            
+            # Method 2: Check img.info dictionary (fallback)
+            elif 'workflow' in img.info:
+                workflow_json = img.info['workflow']
+            
+            # No workflow found
+            if not workflow_json:
+                logger.info(f"No workflow metadata found in: {image_path}")
+                return None
+            
+            # Parse JSON
+            try:
+                workflow = json.loads(workflow_json)
+                logger.info(
+                    f"Extracted workflow from {image_path}: "
+                    f"{len(workflow.get('nodes', []))} nodes, "
+                    f"version {workflow.get('version', 'unknown')}"
+                )
+                return workflow
+            except json.JSONDecodeError as e:
+                raise ComfyUIError(f"Invalid workflow JSON in image metadata: {e}")
+            
+        except ComfyUIError:
+            raise
+        except ImportError:
+            raise ComfyUIError(
+                "PIL (Pillow) not available. Install with: pip install pillow"
+            )
+        except Exception as e:
+            raise ComfyUIError(f"Error extracting workflow from image: {e}")
 
 # Global instance
 _comfy_tools: Optional[ComfyUITools] = None
