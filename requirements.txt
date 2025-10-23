@@ -14,7 +14,7 @@ pydantic-settings
 
 # LLM Providers (install the ones you need)
 openai
-anthropicai
+anthropic
 # Gemini support through PydanticAI's built-in integration
 google-generativeai
 
