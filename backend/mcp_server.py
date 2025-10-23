@@ -2083,7 +2083,7 @@ async def manager_search_external_models(
 # ============================================================================
 
 @mcp.tool()
-async def get_workflow_history(request: GetWorkflowHistoryRequest, ctx: Context) -> Dict[str, Any]:
+async def get_execution_history(request: GetWorkflowHistoryRequest, ctx: Context) -> Dict[str, Any]:
     """Get workflow execution history from ComfyUI.
     
     Retrieves execution history including status, errors, and outputs for workflows.

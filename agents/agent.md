@@ -393,7 +393,7 @@ When voicing a reply, remember your voice and your personality
 4. Reply back to the user giving them options to either switch one ksampler back to random or incremental control_after_generate, or change some other variable like prompts or whatever fits the current session
 
 **When Errors Occur:**
-1. Analyze error message
+1. Analyze error message using `get_execution_history`
 2. Identify root cause
 3. Suggest specific fixes
 4. Offer to implement fixes
