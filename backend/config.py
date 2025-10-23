@@ -42,7 +42,7 @@ class Settings(BaseSettings):
     openrouter_api_key: str = ""
 
     # WebSocket Settings
-    ws_host: str = "0.0.0.0"
+    ws_host: str = "127.0.0.1"
     ws_port: int = 8000
     ws_heartbeat_interval: int = 30
     ws_session_timeout: int = 300
