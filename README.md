@@ -741,4 +741,4 @@ We offer flexible commercial licensing options for businesses.
 
 ---
 
-**Built with ❤️ for the ComfyUI community**
+**Built with ❤️🍆 for the ComfyUI community**
