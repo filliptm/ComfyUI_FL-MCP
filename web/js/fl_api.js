@@ -340,10 +340,10 @@ export class FL_API {
             }
             
             // FIT NODES USING CORRECT API
-            if (nodes.length === 1) {
-                // Single node: just center on it
-                canvas.centerOnNode(nodes[0]);
-            } else if (nodes.length > 1) {
+            if (nodes.length > 0){
+                if (nodes.length === 1) // Single node: just center on it
+                    canvas.centerOnNode(nodes[0]);
+            
                 // Multiple nodes: calculate bounding box and fit to view
                 let minX = Infinity, minY = Infinity;
                 let maxX = -Infinity, maxY = -Infinity;

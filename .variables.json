@@ -1,7 +1,7 @@
 {
   "current_mode": "research",
   "project": "fl_js",
-  "task": "investigate fastmcp tool patterns and manager endpoint",
+  "task": "investigation complete",
   "architecture": "FastAPI+WS backend with PydanticAI + FastMCP, JS chat sidebar client, realtime tool callbacks",
   "project_status": "new project inspired by legacy FL_JS/FL_WF_Agent",
   "focus": "understanding actual tool implementation patterns",
@@ -45,7 +45,7 @@
   ],
   "files_modified": "backend/comfy_manager.py, backend/mcp_server.py",
   "phase_2_step": "Complete - All notification features implemented",
-  "analysis_complete": "false",
+  "analysis_complete": "true",
   "files_completed": [
     "backend/callback_router.py",
     "web/js/fl_api.js",
@@ -165,7 +165,7 @@
   "minor_issue": "simplified_docstring",
   "confidence_level": "high",
   "plan_loaded": true,
-  "document_location": "notes/manager_model_tool/implementation_fix.md",
+  "document_location": "notes/manager_model_tool/investigation.md",
   "understanding_complete": false,
   "investigation_started": true,
   "recommended_approach": "Create provider-model mapping abstraction before merge",
@@ -173,9 +173,7 @@
   "expected_performance_gain": "90% reduction in multi-message overhead",
   "implementation_doc_complete": "true",
   "ready_for_implementation": "true",
-  "files_to_modify": [
-    "backend/comfy_tools.py"
-  ],
+  "files_to_modify": "backend/comfy_manager.py, backend/mcp_server.py",
   "modifications_count": 3,
   "verification_complete": true,
   "user_feedback": "nullcontext approach unnecessary - MCP server always present",
@@ -183,12 +181,7 @@
   "ideas_document": "notes/expressing_tools/ideas.md",
   "investigation_document": "notes/error_feedback/new_approach/deep_investigation.md",
   "refined_ideas_document": "notes/expressing_tools/ideas.md",
-  "key_findings": [
-    "error buffer architecture is sound",
-    "WebSocket events don't contain expected fields",
-    "/history endpoint returns 200 and likely has error details",
-    "/logs endpoints don't exist (404)"
-  ],
+  "key_findings": "FastMCP tool pattern uses Pydantic BaseModel + @mcp.tool() decorator, existing manager_search_models searches installed files only, need to add search_external_models method to ComfyManagerClient",
   "implementation_document": "notes/expressing_tools/implementation.md",
   "key_components": "ToolActivity class, ChatUI integration, extension event handlers",
   "primary_suspects": "CSS positioning, tool execution speed, DOM insertion",
@@ -331,5 +324,6 @@
   "endpoint": "/externalmodel/getlist",
   "data_source": "model-list.json from channel URL",
   "search_method": "fetch full list and filter client-side",
-  "endpoint_status": "500_error"
+  "endpoint_status": "500_error",
+  "estimated_loc": "~150 lines total"
 }
