@@ -153,8 +153,8 @@ Ren: [Checks system info]
 #### 1. Clone into ComfyUI custom_nodes directory
 ```bash
 cd /path/to/ComfyUI/custom_nodes
-git clone https://github.com/yourusername/fl_js.git FL_JS
-cd FL_JS
+git clone https://github.com/CLIP-py/ComfyUI-RenAgent.git
+cd ComfyUI-RenAgent
 ```
 
 > **Important:** The directory must be named `FL_JS` (or your preferred name) inside `custom_nodes/`
@@ -282,7 +282,7 @@ FL_JS uses **smart defaults** for each provider. You only need to set `LLM_PROVI
 | Provider | Default Model | API Key Required |
 |----------|---------------|------------------|
 | **OpenAI** | `gpt-4-turbo-preview` | `OPENAI_API_KEY` |
-| **Anthropic** | `claude-3-5-sonnet-20241022` | `ANTHROPIC_API_KEY` |
+| **Anthropic** | `claude-sonnet-4` | `ANTHROPIC_API_KEY` |
 | **Gemini** | `gemini-2.0-flash-exp` | `GOOGLE_API_KEY` |
 | **OpenRouter** | `deepseek/deepseek-chat` | `OPENROUTER_API_KEY` |
 
@@ -406,7 +406,7 @@ graph TB
 ## 📁 Project Structure
 
 ```
-FL_JS/
+ComfyUI-RenAgent/
 ├── __init__.py              # ComfyUI node registration + auto-start
 ├── .env.example             # Configuration template
 ├── requirements.txt         # Python dependencies
@@ -550,7 +550,7 @@ See `notes/implementation/02_query_dsl.md` for complete documentation.
 
 1. Ren decides to use a tool (e.g., "create_node")
 2. Backend sends tool request via WebSocket
-3. Frontend executes FL_JS function
+3. Frontend executes FL_API function
 4. Frontend returns result via WebSocket
 5. Backend provides result to Ren
 6. Ren continues with response
@@ -621,7 +621,7 @@ netstat -ano | findstr :8000  # Windows
 - `[WSClient] Max reconnection attempts reached` - Backend unreachable
 
 **Verify WebSocket URL:**
-- Default: `ws://localhost:8000/ws`
+- Default: `ws://127.0.0.1:8000/ws`
 - Check `web/js/extension.js` line 23
 
 ### Manual backend control
@@ -735,8 +735,8 @@ We offer flexible commercial licensing options for businesses.
 
 ## 📞 Support
 
-- **Issues**: [GitHub Issues](https://github.com/yourusername/fl_js/issues)
-- **Discussions**: [GitHub Discussions](https://github.com/yourusername/fl_js/discussions)
+- **Issues**: [GitHub Issues](https://github.com/CLIP-py/ComfyUI-RenAgent/issues)
+- **Discussions**: [GitHub Discussions](https://github.com/CLIP-py/ComfyUI-RenAgent/discussions)
 - **Documentation**: See `notes/implementation/` for detailed docs
 
 ---
