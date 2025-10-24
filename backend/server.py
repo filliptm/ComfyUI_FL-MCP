@@ -1004,7 +1004,7 @@ async def route_tool_request_to_frontend(session_id: str, data: dict) -> None:
         
         # Check if frontend is connected
         if not manager.has_connection(session_id, 'frontend'):
-            error_msg = f"No frontend connection for session {session_id}"
+            error_msg = f"No frontend connection for session {session_id}.\n\n**What to do**\n- Ask the user to make sure they have ComfyUI open in their browser\- If they do not see your reply in the ComfyUI Ren side drawer it means they are connected to the wrong session.\n- Tell them if they are on the Ren Go app they can refresh the page to choose a session"
             logger.error(error_msg)
             
             # Send error back to MCP subprocess
