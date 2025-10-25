@@ -444,11 +444,11 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     await handle_tool_result(session_id, data)
                 
                 elif msg_type == "tool_request":
-                    # Tool request from MCP subprocess - route to frontend
+                    # Tool request from MCP subprocess - route to display clients
                     await route_tool_request_to_frontend(session_id, data)
                                 
                 elif msg_type == "tool_report":
-                    # Tool activity report from MCP subprocess - route to frontend
+                    # Tool activity report from MCP subprocess - route to display clients
                     await route_tool_report_to_frontend(session_id, data)
                 
                 elif msg_type == "screenshot":
@@ -990,7 +990,10 @@ async def handle_screenshot(session_id: str, data: dict) -> None:
 
 
 async def route_tool_request_to_frontend(session_id: str, data: dict) -> None:
-    """Route tool request from MCP subprocess to frontend.
+    """Route tool request from MCP subprocess to all display clients.
+    
+    Broadcasts to both frontend (which can execute) and PWA (which displays only).
+    Only frontend is expected to send back tool_result.
     
     Args:
         session_id: Session ID
@@ -998,13 +1001,16 @@ async def route_tool_request_to_frontend(session_id: str, data: dict) -> None:
     """
     try:
         logger.info(
-            f"Routing tool request to frontend: session={session_id}, "
+            f"Routing tool request to display clients: session={session_id}, "
             f"tool={data.get('tool_name')}, request_id={data.get('request_id')}"
         )
         
-        # Check if frontend is connected
-        if not manager.has_connection(session_id, 'frontend'):
-            error_msg = f"No frontend connection for session {session_id}.\n\n**What to do**\n- Ask the user to make sure they have ComfyUI open in their browser\- If they do not see your reply in the ComfyUI Ren side drawer it means they are connected to the wrong session.\n- Tell them if they are on the Ren Go app they can refresh the page to choose a session"
+        # Check if ANY display client is connected
+        has_frontend = manager.has_connection(session_id, 'frontend')
+        has_pwa = manager.has_connection(session_id, 'pwa')
+        
+        if not has_frontend and not has_pwa:
+            error_msg = f"No display clients connected for session {session_id}.\n\n**What to do**\n- Ask the user to make sure they have ComfyUI open in their browser\- If they do not see your reply in the ComfyUI Ren side drawer it means they are connected to the wrong session.\n- Tell them if they are on the Ren Go app they can refresh the page to choose a session"
             logger.error(error_msg)
             
             # Send error back to MCP subprocess
@@ -1018,13 +1024,20 @@ async def route_tool_request_to_frontend(session_id: str, data: dict) -> None:
             }, target='mcp')
             return
         
-        # Forward the message to frontend and check result
-        result = await manager.send_message(session_id, data, target='frontend')
+        # Broadcast to all connected display clients
+        if has_frontend:
+            result = await manager.send_message(session_id, data, target='frontend')
+            if result:
+                logger.info(f"Tool request forwarded to frontend for session {session_id}")
+            else:
+                logger.error(f"Failed to forward tool request to frontend for session {session_id}")
         
-        if result:
-            logger.info(f"Tool request successfully forwarded to frontend for session {session_id}")
-        else:
-            logger.error(f"FAILED to forward tool request to frontend for session {session_id}")
+        if has_pwa:
+            result = await manager.send_message(session_id, data, target='pwa')
+            if result:
+                logger.info(f"Tool request forwarded to PWA for session {session_id}")
+            else:
+                logger.error(f"Failed to forward tool request to PWA for session {session_id}")
         
     except Exception as e:
         logger.error(f"Error routing tool request: {e}", exc_info=True)
@@ -1042,11 +1055,12 @@ async def route_tool_request_to_frontend(session_id: str, data: dict) -> None:
         except Exception as send_error:
             logger.error(f"Failed to send error response: {send_error}")
 
+
 async def route_tool_report_to_frontend(session_id: str, data: dict) -> None:
-    """Route tool activity report from MCP subprocess to frontend.
+    """Route tool activity report from MCP subprocess to all display clients.
     
     Tool reports are lightweight notifications that a Python-executed tool
-    is running. They don't require a response like tool_request does.
+    is running. They are broadcast to all display clients for visual feedback.
     
     Args:
         session_id: Session ID
@@ -1054,22 +1068,32 @@ async def route_tool_report_to_frontend(session_id: str, data: dict) -> None:
     """
     try:
         logger.debug(
-            f"Routing tool report to frontend: session={session_id}, "
+            f"Routing tool report to display clients: session={session_id}, "
             f"tool={data.get('tool_name')}"
         )
         
-        # Check if frontend is connected
-        if not manager.has_connection(session_id, 'frontend'):
-            logger.debug(f"No frontend connection for session {session_id}, skipping tool report")
+        # Check if ANY display client is connected
+        has_frontend = manager.has_connection(session_id, 'frontend')
+        has_pwa = manager.has_connection(session_id, 'pwa')
+        
+        if not has_frontend and not has_pwa:
+            logger.debug(f"No display clients for session {session_id}, skipping tool report")
             return
         
-        # Forward the message to frontend
-        result = await manager.send_message(session_id, data, target='frontend')
+        # Broadcast to all connected display clients
+        if has_frontend:
+            result = await manager.send_message(session_id, data, target='frontend')
+            if result:
+                logger.debug(f"Tool report forwarded to frontend for session {session_id}")
+            else:
+                logger.warning(f"Failed to forward tool report to frontend for session {session_id}")
         
-        if result:
-            logger.debug(f"Tool report successfully forwarded to frontend for session {session_id}")
-        else:
-            logger.warning(f"Failed to forward tool report to frontend for session {session_id}")
+        if has_pwa:
+            result = await manager.send_message(session_id, data, target='pwa')
+            if result:
+                logger.debug(f"Tool report forwarded to PWA for session {session_id}")
+            else:
+                logger.warning(f"Failed to forward tool report to PWA for session {session_id}")
         
     except Exception as e:
         logger.error(f"Error routing tool report: {e}", exc_info=True)
