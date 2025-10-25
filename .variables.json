@@ -1,10 +1,10 @@
 {
-  "current_mode": "research",
+  "current_mode": "implementation",
   "project": "fl_js",
-  "task": "Research ELK integration for browser-based auto-layout",
+  "task": "Complete TODO in queue_workflow function",
   "architecture": "FastAPI+WS backend with PydanticAI + FastMCP, JS chat sidebar client, realtime tool callbacks",
   "project_status": "new project inspired by legacy FL_JS/FL_WF_Agent",
-  "focus": "Minimal browser-compatible ELK integration without Node.js dependencies",
+  "focus": "queue_workflow return value verification",
   "plans_created": "6 detailed implementation plans + summary",
   "next_step": "create testing guide for beta testers",
   "ui_integration": "app.extensionManager.registerSidebarTab",
@@ -137,7 +137,7 @@
   "agent_name_change": "FL_JS -> Ren",
   "target_file": "web/js/fl_api.js",
   "notes_location": "notes/ws_port/implementation.md",
-  "implementation_ready": true,
+  "implementation_ready": "true",
   "root_cause_confirmed": "true",
   "ready_for_fix": true,
   "bug_found": true,
@@ -351,7 +351,7 @@
   "root_cause_found": "true",
   "ready_to_code": "true",
   "current_investigation": "elk_layout_integration",
-  "investigation_depth": "implementation",
+  "investigation_depth": "complete",
   "ready_for_design": true,
   "key_constraints": [
     "Per-resource-instance granularity",
@@ -374,5 +374,8 @@
     "Minimal codebase changes - use existing error flow"
   ],
   "design_approach": "Tool-level hooks + error-based coordination",
-  "estimated_effort": "4 hours for MVP"
+  "estimated_effort": "4 hours for MVP",
+  "file": "backend/mcp_server.py",
+  "todo_location": "line 1236-1239",
+  "todo_description": "Check history after queuing to verify workflow actually entered queue, raise error if nothing queued due to caching"
 }

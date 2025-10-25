@@ -538,7 +538,8 @@ class MoveNodeBottomRequest(BaseModel):
 # Workflow Control
 class QueueWorkflowRequest(BaseModel):
     """Request to queue workflow for execution."""
-    batch_count: Optional[int] = Field(None, description="Number of times to execute (default: current batch count)")
+    # batch_count: Optional[int] = Field(None, description="Number of times to execute (default: current batch count)")
+    pass
 
 class CancelWorkflowRequest(BaseModel):
     """Request to cancel workflow execution."""
@@ -1227,8 +1228,124 @@ async def modify_layout(request: BatchLayoutRequest, ctx: Context) -> List[Dict[
 
 @mcp.tool()
 async def queue_workflow(request: QueueWorkflowRequest, ctx: Context) -> Dict[str, Any]:
-    """Queue the workflow for execution. User might say 'run' the workflow. Before calling this tool, call `workflow_overview` to double check for disconnected nodes and any missing slot connections"""
-    return await _execute_tool(ctx, "queue_workflow", request.model_dump())
+    """Queue the workflow for execution.
+    
+    Before calling this tool, call `workflow_overview` to double check for 
+    disconnected nodes and any missing slot connections.
+    
+    This tool verifies that the workflow actually made it into ComfyUI's queue
+    and provides detailed feedback on any validation errors or queue failures.
+    
+    Returns:
+        Success case:
+        {
+            "success": True,
+            "prompt_id": str,
+            "queue_number": int,
+            "batch_count": int,
+            "status": "queued" | "running",
+            "message": str
+        }
+        
+        Validation error case:
+        {
+            "success": False,
+            "error": "Workflow validation failed",
+            "node_errors": {...},
+            "suggestion": str
+        }
+        
+        Queue failure case:
+        {
+            "success": False,
+            "error": str,
+            "prompt_id": str,
+            "suggestion": str
+        }
+    """
+    # Queue the workflow via frontend
+    r = await _execute_tool(ctx, "queue_workflow", request.model_dump())
+    logger.debug(f"Queue result: {r}")
+    
+    # Extract queue information from frontend response
+    prompt_id = r.get('prompt_id')
+    node_errors = r.get('node_errors', {})
+    queue_number = r.get('queue_number')
+    batch_count = r.get('batch_count')
+    
+    # Check for node validation errors first
+    if node_errors:
+        logger.warning(f"Workflow validation failed: {node_errors}")
+        return {
+            "success": False,
+            "error": "Workflow validation failed",
+            "node_errors": node_errors,
+            "suggestion": (
+                "The workflow has node configuration errors. "
+                "Use workflow_overview to identify disconnected nodes or missing inputs. "
+                "Fix the errors and try queueing again."
+            )
+        }
+    
+    # Verify the workflow actually made it into the queue
+    if prompt_id:
+        try:
+            # Check if prompt appears in history (it should appear immediately when queued)
+            history_result = await get_execution_history(
+                GetWorkflowHistoryRequest(prompt_id=prompt_id),
+                ctx
+            )
+            
+            # If status is 'unknown', the prompt never made it to the queue
+            if history_result.get('status') == 'unknown':
+                logger.error(f"Prompt {prompt_id} not found in queue or history")
+                return {
+                    "success": False,
+                    "error": "Workflow failed to queue",
+                    "prompt_id": prompt_id,
+                    "suggestion": (
+                        "ComfyUI did not accept the workflow. This can happen when:\n"
+                        "1. No parameter in the workflow has changed and ComfyUI is returning cached results (example: you're running on a fixed seed in all ksamplers and trying to queue without changing prompts or setting any other values in any node)\n"
+                        "2. ComfyUI rejected the workflow for internal reasons\n\n"
+                        "Give the user ren links with options to modify different parameters (like seed, steps, or strength) and queue again or try some other next thing they might do."
+                        "Use get_execution_history to check for further errors using the prompt_id."
+                    )
+                }
+            
+            # Success - workflow is queued or already running
+            status = history_result.get('status', 'queued')
+            logger.info(f"Workflow queued successfully: {prompt_id} (position {queue_number}, status: {status})")
+            
+            return {
+                "success": True,
+                "prompt_id": prompt_id,
+                "queue_number": queue_number,
+                "batch_count": batch_count,
+                "status": status,
+                "message": f"Workflow queued successfully at position {queue_number} (status: {status})"
+            }
+            
+        except Exception as e:
+            # History check failed - log but don't fail the queue operation
+            logger.warning(f"Could not verify queue status: {e}")
+            return {
+                "success": True,
+                "prompt_id": prompt_id,
+                "queue_number": queue_number,
+                "batch_count": batch_count,
+                "status": "queued",
+                "message": f"Workflow queued at position {queue_number} (verification skipped)",
+                "warning": "Could not verify queue status"
+            }
+    else:
+        # No prompt_id returned - unexpected error
+        logger.error(f"No prompt_id in queue result: {r}")
+        return {
+            "success": False,
+            "error": "No prompt_id returned from queue operation",
+            "raw_result": r,
+            "suggestion": "This is unexpected. Check that ComfyUI is running and the frontend is connected."
+        }
 
 
 @mcp.tool()
@@ -2161,7 +2278,7 @@ async def manager_search_external_models(
 
 @mcp.tool()
 async def get_execution_history(request: GetWorkflowHistoryRequest, ctx: Context) -> Dict[str, Any]:
-    """Get workflow execution history from ComfyUI.
+    """Get workflow currently processing queue and history from ComfyUI.
     
     Retrieves execution history including status, errors, and outputs for workflows.
     Can fetch a specific workflow by prompt_id or recent history.

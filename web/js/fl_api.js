@@ -1305,22 +1305,33 @@ export class FL_API {
     /**
      * Queue workflow for execution
      * @param {number|null} batchCount - Batch count (null for current)
-     * @returns {object} Queue result
+     * @returns {object} Queue result with prompt_id, queue_number, and node_errors
      */
     queueWorkflow(batchCount = null) {
         try {
             if (batchCount !== null) {
                 app.ui.batchCount.value = batchCount;
             }
-            app.queuePrompt();
+            
+            // Call ComfyUI's queuePrompt and capture the result
+            const queueResult = app.queuePrompt();
+            
             console.log(`[FL_API] Queued workflow (batch: ${app.ui.batchCount.value})`);
-            return { queued: true, batch_count: parseInt(app.ui.batchCount.value) };
+            console.log(`[FL_API] Queue result:`, queueResult);
+            
+            // Return comprehensive queue information
+            return { 
+                queued: true, 
+                batch_count: parseInt(app.ui.batchCount.value),
+                prompt_id: queueResult.prompt_id,
+                queue_number: queueResult.number,
+                node_errors: queueResult.node_errors || {}
+            };
         } catch (error) {
             console.error("[FL_API] queueWorkflow error:", error);
             throw error;
         }
     }
-
     /**
      * Cancel workflow execution
      * @returns {object} Cancel result
