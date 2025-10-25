@@ -193,7 +193,125 @@ class ComfyUITools:
         except Exception as e:
             logger.error(f"Failed to fetch history: {e}")
             raise ComfyUIError(f"Failed to fetch history: {e}")    
-    
+
+    async def delete_queue_items(
+        self,
+        clear_all: bool = False,
+        prompt_ids: Optional[List[str]] = None,
+        interrupt_running: bool = False
+    ) -> Dict[str, Any]:
+        """Delete items from the ComfyUI queue.
+        
+        Args:
+            clear_all: If True, clear all pending items from queue
+            prompt_ids: List of specific prompt IDs to delete
+            interrupt_running: If True, also interrupt currently running workflow
+            
+        Returns:
+            Dict with operation results:
+            {
+                "success": bool,
+                "cleared_all": bool,
+                "deleted_ids": List[str],
+                "interrupted": bool,
+                "message": str
+            }
+            
+        Raises:
+            ComfyUIError: If operation fails or parameters are invalid
+        """
+        # Validation: must provide at least one operation
+        if not clear_all and not prompt_ids and not interrupt_running:
+            raise ComfyUIError(
+                "Must specify at least one operation: clear_all, prompt_ids, or interrupt_running"
+            )
+        
+        # Validation: cannot specify both clear_all and prompt_ids
+        if clear_all and prompt_ids:
+            raise ComfyUIError(
+                "Cannot specify both clear_all=True and prompt_ids. Choose one."
+            )
+        
+        results = {
+            "success": True,
+            "cleared_all": False,
+            "deleted_ids": [],
+            "interrupted": False,
+            "message": ""
+        }
+        
+        messages = []
+        
+        try:
+            async with httpx.AsyncClient() as client:
+                # Operation 1: Clear all pending items
+                if clear_all:
+                    try:
+                        response = await client.post(
+                            f"{self.comfy_url}/queue",
+                            json={"clear": True},
+                            timeout=10.0
+                        )
+                        response.raise_for_status()
+                        results["cleared_all"] = True
+                        messages.append("Cleared all pending queue items")
+                        logger.info("Queue cleared successfully")
+                    except httpx.HTTPStatusError as e:
+                        logger.error(f"Failed to clear queue: {e}")
+                        results["success"] = False
+                        messages.append(f"Failed to clear queue: {e.response.status_code}")
+                
+                # Operation 2: Delete specific prompt IDs
+                if prompt_ids:
+                    try:
+                        response = await client.post(
+                            f"{self.comfy_url}/queue",
+                            json={"delete": prompt_ids},
+                            timeout=10.0
+                        )
+                        response.raise_for_status()
+                        results["deleted_ids"] = prompt_ids
+                        messages.append(f"Deleted {len(prompt_ids)} queue item(s): {', '.join(prompt_ids)}")
+                        logger.info(f"Deleted queue items: {prompt_ids}")
+                    except httpx.HTTPStatusError as e:
+                        logger.error(f"Failed to delete queue items: {e}")
+                        results["success"] = False
+                        messages.append(f"Failed to delete items: {e.response.status_code}")
+                
+                # Operation 3: Interrupt running workflow
+                if interrupt_running:
+                    try:
+                        response = await client.post(
+                            f"{self.comfy_url}/interrupt",
+                            json={},
+                            timeout=10.0
+                        )
+                        response.raise_for_status()
+                        results["interrupted"] = True
+                        messages.append("Interrupted currently running workflow")
+                        logger.info("Workflow interrupted successfully")
+                    except httpx.HTTPStatusError as e:
+                        logger.error(f"Failed to interrupt workflow: {e}")
+                        # Don't fail the entire operation if interrupt fails
+                        # (might not have anything running)
+                        messages.append(f"Interrupt failed (nothing running?): {e.response.status_code}")
+                
+                results["message"] = "; ".join(messages)
+                return results
+                
+        except httpx.TimeoutException:
+            raise ComfyUIError(
+                f"ComfyUI server timeout. Is ComfyUI running at {self.comfy_url}?"
+            )
+        except httpx.RequestError as e:
+            raise ComfyUIError(
+                f"Failed to connect to ComfyUI at {self.comfy_url}: {e}"
+            )
+        except Exception as e:
+            logger.error(f"Failed to delete queue items: {e}")
+            raise ComfyUIError(f"Failed to delete queue items: {e}")
+
+
     def list_folders(
         self,
         folder_type: Union[str, ComfyFolderType],

@@ -561,6 +561,22 @@ class GetQueueStatusRequest(BaseModel):
     """Request to get queue status."""
     pass
 
+class DeleteQueueItemsRequest(BaseModel):
+    """Request to delete items from the queue."""
+    clear_all: Optional[bool] = Field(
+        None,
+        description="If True, clear all pending items from queue (cannot be used with prompt_ids)"
+    )
+    prompt_ids: Optional[List[str]] = Field(
+        None,
+        description="List of specific prompt IDs to delete from queue (cannot be used with clear_all)"
+    )
+    interrupt_running: Optional[bool] = Field(
+        False,
+        description="If True, also interrupt the currently running workflow"
+    )
+
+
 # System Control
 class DisableSleepRequest(BaseModel):
     """Request to disable system sleep."""
@@ -1382,6 +1398,61 @@ async def set_batch_count(request: SetBatchCountRequest, ctx: Context) -> Dict[s
 async def get_queue_status(request: GetQueueStatusRequest, ctx: Context) -> Dict[str, Any]:
     """Get current queue status and settings."""
     return await _execute_tool(ctx, "get_queue_status", {})
+
+@mcp.tool()
+async def delete_queue_items(request: DeleteQueueItemsRequest, ctx: Context) -> Dict[str, Any]:
+    """Delete items from the ComfyUI execution queue.
+    
+    Can clear all pending items, delete specific items by prompt_id, or interrupt
+    the currently running workflow. Operations can be combined except clear_all
+    and prompt_ids which are mutually exclusive.
+    
+    USE CASES:
+    - Clear all pending: clear_all=True
+    - Delete specific items: prompt_ids=["id1", "id2"] (get IDs from get_queue_status)
+    - Stop everything: clear_all=True, interrupt_running=True
+    - Just stop current: interrupt_running=True
+    
+    RETURNS:
+    Dict with:
+    - success: bool - overall operation success
+    - cleared_all: bool - whether queue was cleared
+    - deleted_ids: List[str] - IDs that were deleted
+    - interrupted: bool - whether running workflow was interrupted
+    - message: str - human-readable summary
+    """
+    await _report_tool_activity(ctx, "delete_queue_items")
+    
+    try:
+        comfy_tools = get_comfy_tools()
+        
+        # Convert None to False for clear_all to match method signature
+        clear_all_value = request.clear_all if request.clear_all is not None else False
+        interrupt_value = request.interrupt_running if request.interrupt_running is not None else False
+        
+        result = await comfy_tools.delete_queue_items(
+            clear_all=clear_all_value,
+            prompt_ids=request.prompt_ids,
+            interrupt_running=interrupt_value
+        )
+        
+        return result
+        
+    except ComfyUIError as e:
+        error_result = {
+            "success": False,
+            "error": str(e),
+            "error_type": "ComfyUIError"
+        }
+        return error_result
+    except Exception as e:
+        logger.error(f"delete_queue_items failed: {e}")
+        error_result = {
+            "success": False,
+            "error": str(e),
+            "error_type": type(e).__name__
+        }
+        return error_result
 
 
 # ============================================================================

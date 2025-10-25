@@ -1,6 +1,6 @@
 {
-  "current_mode": "research",
-  "task": "architecture mapping for fl_js project",
+  "current_mode": "debugging",
+  "task": "verify user's delete_queue_items implementation",
   "project_name": "fl_js",
   "architecture": {
     "summary": "Ren - A ComfyUI AI assistant that provides natural language control over workflows. Multi-tier architecture: Python backend (FastAPI + PydanticAI) communicates via WebSocket with JavaScript frontend (ComfyUI extension). MCP subprocess handles tool execution, frontend executes workflow manipulation tools, PWA provides mobile access.",
@@ -381,5 +381,8 @@
         "relationship": "CallbackRouter (legacy) provides alternative tool execution path, still used by some MCP tools"
       }
     ]
-  }
+  },
+  "focus": "checking backend/comfy_tools.py and backend/mcp_server.py",
+  "last_investigation": "queue_delete",
+  "investigation_depth": "implementation"
 }
