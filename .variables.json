@@ -1,381 +1,385 @@
 {
-  "current_mode": "implementation",
-  "project": "fl_js",
-  "task": "Complete TODO in queue_workflow function",
-  "architecture": "FastAPI+WS backend with PydanticAI + FastMCP, JS chat sidebar client, realtime tool callbacks",
-  "project_status": "new project inspired by legacy FL_JS/FL_WF_Agent",
-  "focus": "queue_workflow return value verification",
-  "plans_created": "6 detailed implementation plans + summary",
-  "next_step": "create testing guide for beta testers",
-  "ui_integration": "app.extensionManager.registerSidebarTab",
-  "reference_file": "legacy/NodePackLoader_SideBar.js",
-  "progress_file": "notes/implementation/progress.md",
-  "phase": "complete",
-  "phase_progress": "100%",
-  "next_files": [
-    "frontend/session_manager.js",
-    "frontend/ws_client.js"
-  ],
-  "next_phase": "Phase 3: Polish & Testing",
-  "files_created": [
-    "backend/server.py (modified)",
-    "web/pwa/index.html",
-    "web/pwa/manifest.json",
-    "web/pwa/app.js",
-    "web/pwa/styles.css",
-    "web/pwa/service-worker.js"
-  ],
-  "blocker": "endpoint returns HTTP 500",
-  "next_action": "test /history endpoint with failed workflow",
-  "overall_progress": "66%",
-  "research_complete": true,
-  "decisions": {
-    "auto_start_default": true,
-    "log_output": "file + stdout",
-    "auto_restart": true
-  },
-  "implementation_phase": "phase_2_in_progress",
-  "auto_start_features": [
-    "subprocess management",
-    "port conflict detection",
-    "health check",
-    "auto-restart on crash",
-    "dual logging (file + stdout)",
-    "graceful shutdown"
-  ],
-  "files_modified": [
-    "backend/server.py",
-    "web/js/extension.js",
-    "web/js/ws_client.js"
-  ],
-  "phase_2_step": "Complete - All notification features implemented",
-  "analysis_complete": "true",
-  "files_completed": [
-    "backend/callback_router.py",
-    "web/js/fl_api.js",
-    "web/js/tool_executor.js",
-    "backend/mcp_server.py",
-    "backend/server.py",
-    "web/js/extension.js"
-  ],
-  "features_designed": "start_button, settings_tab",
-  "issue_location": "__init__.py line 33 and server.py line 373",
-  "notes_created": "notes/focus/zoom_research.md",
-  "root_cause_hypothesis": "model name gemini-2.0-flash-exp may not be valid or available",
-  "root_cause": "canvas.ds.scale direct assignment doesn't trigger zoom - need canvas.setZoom() method",
-  "confidence": "HIGH",
-  "root_cause_1": "send() requires handshakeComplete for ALL messages including handshake itself",
-  "root_cause_2": "messagesContainer is null when _addWelcomeMessage runs - DOM timing issue",
-  "root_cause_3": "heartbeat adds unnecessary complexity and noise",
-  "implementation_plan": "1. Add _report_tool_activity helper in mcp_server.py 2. Add tool_report event handler in extension.js 3. Wrap Python-only tools with reporting",
-  "fixes_applied": "1. Circular dependency fix in ws_client.js, 2. ChatUI race condition fix, 3. Heartbeat removal (frontend + backend)",
-  "fix_needed": "add tool_report case to both server.py and ws_client.js",
-  "next_diagnostic": "check ComfyUI logs and verify endpoint existence",
-  "diagnostic_question": "what does the client send in the user_message payload?",
-  "status": "all features implemented successfully",
-  "main_focus": "enable agent voice responses with proper UI rendering",
-  "investigation_complete": true,
-  "phase_1_complete": true,
-  "phase_2_complete": true,
-  "phase_3_complete": "true",
-  "last_note": "notes/get_selected_nodes_feature/research_findings.md",
-  "fix_status": "user already implemented",
-  "problem": "Need to find how to search online/uninstalled models from manager's index",
-  "evidence": "rgthree-comfy implementation uses setZoom() successfully",
-  "hypothesis": "_sendMessage needs parameter support",
-  "key_finding": "model-list.json is the index file",
-  "missing_log": "no [SEND] debug logs from manager.send_message",
-  "fix_applied": true,
-  "analysis_checkpoint": "MUST confirm routing logic before proposing solution",
-  "fix": "add session_id: this.sessionId to sendToolResult message",
-  "awaiting_user_confirmation": false,
-  "hypothesis_revised": "session_id auto-injection exists but might have mismatch or not working",
-  "changes": "added message loop entry/exit logging, changed DEBUG to INFO",
-  "discovery": "frontend loop blocks in handle_user_message awaiting agent.run()",
-  "problem_location": "between WebSocket receive and message routing",
-  "question": "are frontend and MCP using same connection or separate?",
-  "solution": "Use canvas.centerOnNode() for single nodes, calculate bounding box + set ds.offset/scale for multiple nodes",
-  "analysis_stage": "deep_dive",
-  "confusion": "thought we found deadlock but logs show MCP loop IS waiting",
-  "need": "clear determination of what the actual problem is",
-  "critical_finding": "ToolActivity class never instantiated in ChatUI",
-  "need_to_check": "actual API response structure",
-  "working_status": "backend fixed - tools working",
-  "new_issue": "zoom not working in fitView",
-  "investigation_area": "legacy/ code for UI refresh patterns",
-  "expected_result": "batch layout operations now update UI immediately",
-  "deliverables": [
-    "investigation.md",
-    "merge_plan.md",
-    "provider mapping implementation"
-  ],
-  "recommendation": "implement hybrid auto-discovery with /config endpoint and port scanning",
-  "key_insight": "dont trust catalogs trust code let agents inspect directly",
-  "implementation_time": "1-2 weeks vs 4-8 weeks for traditional",
-  "deliverable": "comprehensive MCP server tool definitions with extensive docstrings",
-  "feedback": "remove quality assessment complexity, show full code implementations",
-  "files_analyzed": [
-    "backend/mcp_server.py",
-    "notes/backend.log"
-  ],
-  "next_investigation": "backend/server.py - UnexpectedModelBehavior handling",
-  "proposal_ready": true,
-  "implementation_started": true,
-  "implementation_complete": "true",
-  "user_satisfaction": "golden",
-  "ready_for_testing": true,
-  "research_topic": "zoom functionality in fitView",
-  "next_steps": [
-    "Design reservation protocol",
-    "Design resource registry",
-    "Design deadlock prevention",
-    "Design history merge strategy"
-  ],
-  "document_written": true,
-  "ready_to_implement": true,
-  "readme_last_modified": "2025-10-14",
-  "agent_name_change": "FL_JS -> Ren",
-  "target_file": "web/js/fl_api.js",
-  "notes_location": "notes/ws_port/implementation.md",
-  "implementation_ready": "true",
-  "root_cause_confirmed": "true",
-  "ready_for_fix": true,
-  "bug_found": true,
-  "bug_location": "web/js/fl_api.js - getLayout() method missing entirely",
-  "finding": "Categories are returned in each pack's 'category' field from API",
-  "investigation_type": "manager_api_research",
-  "implementation_status": "complete",
-  "components_verified": 5,
-  "components_correct": 4,
-  "components_incorrect": 1,
-  "bug_description": "getLayout() method not implemented in fl_api.js despite plan calling for it",
-  "user_confirmed": true,
-  "missing_component": "web/js/fl_api.js getLayout() method (Modification 2.1)",
-  "components_checked": 5,
-  "missing_implementation": "web/js/fl_api.js - getLayout() method",
-  "secondary_bug": "web/js/tool_executor.js - _handleGetLayout wraps return incorrectly",
-  "critical_bug": "api_wrapper_issue",
-  "minor_issues": 0,
-  "findings": "session_manager generates/stores session_id in localStorage, ren://message links handled in MessageBubble.js and chat_ui.js, Agent per session in backend/agent.py via agent_manager, SessionContext in manager.py",
-  "analysis_in_progress": true,
-  "components_perfect": 3,
-  "critical_api_bug": "tool_executor_wraps_return",
-  "docstring_discrepancy": "backend docstring simplified vs plan's comprehensive version",
-  "plan_file": "notes/fill_merge/merge_plan.md",
-  "components_to_check": 5,
-  "docstring_issue": "simplified_vs_comprehensive",
-  "docstring_simplified": true,
-  "implementation_components": 5,
-  "analysis_status": "complete",
-  "minor_issue": "simplified_docstring",
-  "confidence_level": "HIGH",
-  "plan_loaded": true,
-  "document_location": "notes/manager_model_tool/investigation.md",
-  "understanding_complete": false,
-  "investigation_started": true,
-  "recommended_approach": "Create provider-model mapping abstraction before merge",
-  "estimated_loc_change": 15,
-  "expected_performance_gain": "90% reduction in multi-message overhead",
-  "implementation_doc_complete": "true",
-  "ready_for_implementation": true,
-  "files_to_modify": [
-    "backend/comfy_models.py",
-    "backend/comfy_tools.py",
-    "backend/mcp_server.py"
-  ],
-  "modifications_count": 3,
-  "verification_complete": true,
-  "user_feedback": "nullcontext approach unnecessary - MCP server always present",
-  "changes_made": "moved MCP context from handle_user_message to websocket message loop",
-  "ideas_document": "notes/expressing_tools/ideas.md",
-  "investigation_document": "notes/error_feedback/new_approach/deep_investigation.md",
-  "refined_ideas_document": "notes/expressing_tools/ideas.md",
-  "key_findings": [
-    "Error-based coordination via ResourceBusyError exception",
-    "Reservation system lives in ConnectionManager (manager.py)",
-    "Helper function with_reservation() wraps tool logic",
-    "FastMCP catches exceptions and returns as tool errors",
-    "Agent sees structured error with reservation metadata",
-    "Minimal changes: add ReservationManager + wrap tools",
-    "Shard ID passed via WebSocket tool_request messages",
-    "Timeout-based expiry prevents deadlocks"
-  ],
-  "implementation_document": "notes/expressing_tools/implementation.md",
-  "key_components": "ToolActivity class, ChatUI integration, extension event handlers",
-  "primary_suspects": "CSS positioning, tool execution speed, DOM insertion",
-  "documents_written": [
-    "idea.md",
-    "investigation.md",
-    "README.md"
-  ],
-  "key_decisions": [
-    "Use Method 2 for detection (/manager/version endpoint)",
-    "Create backend/comfy_manager.py (avoid collision with backend/manager.py)",
-    "Follow node_library.py pattern with httpx client",
-    "Conditional tool registration in FastMCP on init",
-    "Raise ManagerAPIError from client to mcp_server.py",
-    "Log errors, don't crash"
-  ],
-  "implementation_pattern": "Follow backend/node_library.py structure",
-  "documents_created": [
-    "notes/manager/research.md",
-    "notes/manager/investigation.md",
-    "notes/manager/implementation.md",
-    "notes/manager/final_implementation.md"
-  ],
-  "files_to_create": [
-    "backend/comfy_manager.py"
-  ],
-  "total_loc": "~650 lines",
-  "tools_count": 6,
-  "tools_removed": [
-    "manager_check_installed",
-    "manager_list_installed",
-    "manager_get_pack_details"
-  ],
-  "rationale": [
-    "manager_check_installed -> handled in lifespan, accessible via ctx",
-    "manager_list_installed -> covered by comfy_list_folders and manager_search_nodes with installed_only filter",
-    "manager_get_pack_details -> redundant with search"
-  ],
-  "manager_client_in_lifespan": true,
-  "docstring_style": "agent-focused, when-to-use, not code examples",
-  "final_tools": [
-    "manager_search_nodes",
-    "manager_get_node_mappings",
-    "manager_check_updates"
-  ],
-  "ready_for_review": true,
-  "merge_conflict_risk": "HIGH on backend/config.py and backend/agent.py",
-  "goal": "discover how to search uninstalled models via Manager API",
-  "deliverables_complete": [
-    "investigation.md",
-    "merge_plan.md",
-    "branch_comparison.md",
-    "progress.md"
-  ],
-  "merge_strategy": "create fill_merge branch, implement all improvements, verify no conflicts with Fill",
-  "risk_assessment": "Low risk - incremental changes with backward compatibility",
-  "analysis_needed": true,
-  "document": "notes/manager/refinement.md",
-  "changes_needed": "~60 lines across 2 files",
-  "error": "WinError 1214 Das Format des angegebenen Netzwerknamens ist ung\u00fcltig",
-  "error_location": "search_node_packs around line 324-332",
-  "tools_needing_report": [
-    "calculate_expressions",
-    "wait",
-    "comfy_list_folders",
-    "comfy_read_file",
-    "comfy_search_resources",
-    "node_library_search",
-    "node_library_get_details",
-    "node_library_find_compatible",
-    "manager_search_nodes",
-    "manager_get_node_mappings",
-    "manager_check_updates",
-    "get_recent_errors",
-    "get_errors_for_run",
-    "get_queue_status_details",
-    "get_execution_details",
-    "clear_error_buffer"
-  ],
-  "showing_example": true,
-  "tools_updated": 16,
-  "file_modified": "backend/comfy_manager.py",
-  "lines_changed": "~15 lines in get_node_mappings method",
-  "issue": "history returns large prompt data we don't need",
-  "branch_comparison_complete": true,
-  "error_type": "404 Not Found from Gemini API",
-  "workaround": "use openrouter provider",
-  "analysis_file": "notes/fill_merge/analysis.md",
-  "notes_path": "notes/manager_model_tool",
-  "investigation_notes": "notes/model_search/investigation.md",
-  "implementation_doc": "notes/error_feedback/new_approach/implementation.md",
-  "implementation_verified": true,
-  "pwa_approach": "minimal chat-focused with smart notifications and ren links",
-  "pwa_name": "Ren Go",
-  "phase_1_step": "Complete",
-  "progress_documented": true,
-  "features_ready": "image_serving, focus_tool, screenshot_tool",
-  "estimated_implementation_time": "60 minutes",
-  "lines_of_code_ready": "450",
-  "user_approved": "true",
-  "features_implemented": "image_serving, focus_tool, screenshot_tool",
-  "key_changes": [
-    "system overview as mermaid diagram",
-    "project structure folder-level only",
-    "advanced topics list format",
-    "mention server start methods",
-    "examples in natural conversation format",
-    "pull tool examples from mcp_server.py docstrings",
-    "link to pwa readme for install instructions",
-    "ensure pwa readme has architecture diagram"
-  ],
-  "key_accomplishments": [
-    "renamed to Ren with lotus icon",
-    "added Meet Ren section with conversation examples",
-    "updated to 45+ tools",
-    "added Ren Go PWA section with link",
-    "added mermaid architecture diagram",
-    "folder-level project structure",
-    "organized advanced topics by category",
-    "explained server start methods",
-    "maintained all accurate sections"
-  ],
-  "primary_hypothesis": "invalid WS_HOST value (localhost vs 127.0.0.1 on Windows)",
-  "alternative_approaches": "enhanced queue_workflow, fix error buffer, or hybrid",
-  "lines_added": "~180",
-  "solution_found": "Use canvas.setZoom(targetZoom, [centerX, centerY]) instead of setting ds.scale directly",
-  "key_discovery": "ComfyUI /history endpoint contains complete error details with traceback",
-  "error_fields_available": [
-    "node_id",
-    "node_type",
-    "exception_message",
-    "exception_type",
-    "traceback",
-    "executed_nodes",
-    "current_inputs",
-    "timestamp"
-  ],
-  "lines_to_add": 60,
-  "estimated_time": "40 minutes",
-  "endpoint": "/externalmodel/getlist",
-  "data_source": "model-list.json from channel URL",
-  "search_method": "fetch full list and filter client-side",
-  "endpoint_status": "500_error",
-  "estimated_loc": "~150 lines total",
-  "issue_found": "naming mismatch with implementation",
-  "approach": "use history endpoint for all error/status queries",
-  "platform": "Windows",
-  "needs_info": "ws_url value, .env contents, backend server status",
-  "root_cause_found": "true",
-  "ready_to_code": "true",
-  "current_investigation": "elk_layout_integration",
-  "investigation_depth": "complete",
-  "ready_for_design": true,
-  "key_constraints": [
-    "Per-resource-instance granularity",
-    "Fixed 30s timeout",
-    "Must work with PydanticAI's message history system",
-    "Respect async (ws_manager) vs sequential (agent.run) boundary"
-  ],
-  "design_decisions_needed": [
-    "Reservation hook points in agent.run sequential flow",
-    "How to integrate with filter_message_history",
-    "Event notification mechanism for queued reservations",
-    "Resource instance identification strategy"
-  ],
-  "key_insights": [
-    "Tools declare resource usage via helper",
-    "Reservation system lives in session manager",
-    "MCP error returns become graceful wait messages",
-    "Errors contain reservation metadata (who, why, how long)",
-    "Agent receives structured error with wait instructions",
-    "Minimal codebase changes - use existing error flow"
-  ],
-  "design_approach": "Tool-level hooks + error-based coordination",
-  "estimated_effort": "4 hours for MVP",
-  "file": "backend/mcp_server.py",
-  "todo_location": "line 1236-1239",
-  "todo_description": "Check history after queuing to verify workflow actually entered queue, raise error if nothing queued due to caching"
+  "current_mode": "research",
+  "task": "architecture mapping for fl_js project",
+  "project_name": "fl_js",
+  "architecture": {
+    "summary": "Ren - A ComfyUI AI assistant that provides natural language control over workflows. Multi-tier architecture: Python backend (FastAPI + PydanticAI) communicates via WebSocket with JavaScript frontend (ComfyUI extension). MCP subprocess handles tool execution, frontend executes workflow manipulation tools, PWA provides mobile access.",
+    "components": {
+      "backend_server": {
+        "description": "FastAPI server managing WebSocket connections, agent orchestration, and session management",
+        "files": [
+          "backend/server.py"
+        ],
+        "key_classes": [
+          "FastAPI app"
+        ],
+        "key_functions": [
+          "websocket_endpoint",
+          "handle_user_message",
+          "handle_tool_result",
+          "filtered_message_history"
+        ]
+      },
+      "agent_system": {
+        "description": "PydanticAI-based agent with conversation management and MCP server integration",
+        "files": [
+          "backend/agent.py"
+        ],
+        "key_classes": [
+          "AgentManager",
+          "ConversationManager"
+        ],
+        "key_functions": [
+          "create_agent",
+          "get_llm_model",
+          "load_system_prompt"
+        ]
+      },
+      "mcp_server": {
+        "description": "FastMCP tool server running as subprocess, provides 45+ tools for workflow control",
+        "files": [
+          "backend/mcp_server.py"
+        ],
+        "key_classes": [
+          "MCPWebSocketClient",
+          "FastMCP"
+        ],
+        "key_functions": [
+          "mcp_lifespan",
+          "_execute_tool",
+          "_report_tool_activity",
+          "main"
+        ]
+      },
+      "session_manager": {
+        "description": "Multi-client session management with connection tracking per type (frontend/pwa/mcp)",
+        "files": [
+          "backend/manager.py"
+        ],
+        "key_classes": [
+          "ConnectionManager",
+          "SessionContext"
+        ],
+        "key_functions": [
+          "connect",
+          "disconnect",
+          "send_message",
+          "cleanup_stale_sessions"
+        ]
+      },
+      "callback_router": {
+        "description": "Routes tool execution callbacks between backend and frontend (legacy support)",
+        "files": [
+          "backend/callback_router.py"
+        ],
+        "key_classes": [
+          "CallbackRouter"
+        ],
+        "key_functions": [
+          "request_tool_execution",
+          "handle_tool_result"
+        ]
+      },
+      "comfy_tools": {
+        "description": "ComfyUI filesystem access tools for browsing custom nodes, models, and resources",
+        "files": [
+          "backend/comfy_tools.py"
+        ],
+        "key_classes": [
+          "ComfyUITools"
+        ],
+        "key_functions": [
+          "list_folders",
+          "read_file",
+          "search_files",
+          "extract_workflow_from_image"
+        ]
+      },
+      "node_library": {
+        "description": "ComfyUI node type discovery and compatibility checking via API",
+        "files": [
+          "backend/node_library.py"
+        ],
+        "key_classes": [
+          "NodeLibraryClient"
+        ],
+        "key_functions": [
+          "search_nodes",
+          "get_node_details",
+          "find_compatible_nodes"
+        ]
+      },
+      "comfy_manager": {
+        "description": "ComfyUI Manager integration for node pack and model discovery",
+        "files": [
+          "backend/comfy_manager.py"
+        ],
+        "key_classes": [
+          "ComfyManagerClient"
+        ],
+        "key_functions": [
+          "search_node_packs",
+          "get_node_mappings",
+          "search_external_models"
+        ]
+      },
+      "config_system": {
+        "description": "Settings management with provider-specific tuning (Gemini/Claude/OpenAI/OpenRouter)",
+        "files": [
+          "backend/config.py"
+        ],
+        "key_classes": [
+          "Settings"
+        ],
+        "key_functions": []
+      },
+      "server_runner": {
+        "description": "Auto-start backend server when ComfyUI loads with monitoring and restart",
+        "files": [
+          "backend/server_runner.py"
+        ],
+        "key_classes": [
+          "ServerRunner"
+        ],
+        "key_functions": [
+          "start",
+          "stop",
+          "_monitor_process"
+        ]
+      },
+      "comfyui_extension": {
+        "description": "ComfyUI extension entry point that auto-starts backend and registers web directory",
+        "files": [
+          "__init__.py"
+        ],
+        "key_classes": [],
+        "key_functions": []
+      },
+      "frontend_extension": {
+        "description": "Main JavaScript extension coordinating WebSocket, tools, and UI",
+        "files": [
+          "web/js/extension.js"
+        ],
+        "key_classes": [],
+        "key_functions": [
+          "setup",
+          "fetchClientConfig"
+        ]
+      },
+      "websocket_client": {
+        "description": "Frontend WebSocket client with event emitter pattern and reconnection logic",
+        "files": [
+          "web/js/ws_client.js"
+        ],
+        "key_classes": [
+          "WSClient"
+        ],
+        "key_functions": [
+          "connect",
+          "send",
+          "on",
+          "setupComfyListeners"
+        ]
+      },
+      "fl_api": {
+        "description": "Clean wrapper around legacy FL_JS functions for workflow manipulation",
+        "files": [
+          "web/js/fl_api.js"
+        ],
+        "key_classes": [
+          "FL_API"
+        ],
+        "key_functions": [
+          "create",
+          "connect",
+          "setValues",
+          "queueWorkflow",
+          "getLayout",
+          "modifyLayout"
+        ]
+      },
+      "tool_executor": {
+        "description": "Executes tool requests from backend using FL_API, routes results back",
+        "files": [
+          "web/js/tool_executor.js"
+        ],
+        "key_classes": [
+          "ToolExecutor"
+        ],
+        "key_functions": [
+          "executeToolRequest",
+          "execute"
+        ]
+      },
+      "chat_ui": {
+        "description": "Chat interface with markdown rendering, tool activity breadcrumbs, and Ren links",
+        "files": [
+          "web/js/chat_ui.js"
+        ],
+        "key_classes": [
+          "ChatUI"
+        ],
+        "key_functions": [
+          "sendMessage",
+          "addMessage",
+          "startToolInChain",
+          "completeToolInChain"
+        ]
+      },
+      "session_manager_frontend": {
+        "description": "Frontend session ID management using localStorage",
+        "files": [
+          "web/js/session_manager.js"
+        ],
+        "key_classes": [
+          "SessionManager"
+        ],
+        "key_functions": [
+          "getSessionId",
+          "generateSessionId"
+        ]
+      },
+      "query_executor": {
+        "description": "Client-side query DSL execution for workflow analysis",
+        "files": [
+          "web/js/query_executor.js"
+        ],
+        "key_classes": [
+          "QueryExecutor"
+        ],
+        "key_functions": [
+          "execute",
+          "filter",
+          "traverse"
+        ]
+      },
+      "diagram_generator": {
+        "description": "Mermaid diagram generation from workflow structure",
+        "files": [
+          "web/js/diagram_generator.js"
+        ],
+        "key_classes": [
+          "DiagramGenerator"
+        ],
+        "key_functions": [
+          "generate"
+        ]
+      },
+      "pwa_app": {
+        "description": "Progressive Web App for mobile access with session picker",
+        "files": [
+          "web/pwa/index.html",
+          "web/pwa/app.js",
+          "web/pwa/service-worker.js"
+        ],
+        "key_classes": [],
+        "key_functions": []
+      },
+      "legacy_fl_js": {
+        "description": "Original FL_JS implementation (still used for some tool execution)",
+        "files": [
+          "legacy/FL_JS.py",
+          "legacy/fl_js.js"
+        ],
+        "key_classes": [],
+        "key_functions": []
+      }
+    },
+    "relationships": [
+      {
+        "hyperedge": [
+          "backend_server",
+          "agent_system",
+          "session_manager"
+        ],
+        "relationship": "Backend server creates agent instances per session via AgentManager, manages connections via ConnectionManager"
+      },
+      {
+        "hyperedge": [
+          "agent_system",
+          "mcp_server"
+        ],
+        "relationship": "Agent spawns MCP server as subprocess, communicates via WebSocket for tool execution"
+      },
+      {
+        "hyperedge": [
+          "mcp_server",
+          "backend_server",
+          "frontend_extension"
+        ],
+        "relationship": "MCP subprocess sends tool_request to backend, backend routes to frontend via WebSocket"
+      },
+      {
+        "hyperedge": [
+          "frontend_extension",
+          "websocket_client",
+          "backend_server"
+        ],
+        "relationship": "Frontend extension initializes WSClient which connects to backend WebSocket endpoint"
+      },
+      {
+        "hyperedge": [
+          "tool_executor",
+          "fl_api",
+          "websocket_client"
+        ],
+        "relationship": "ToolExecutor receives tool_request events, executes via FL_API, sends results back via WSClient"
+      },
+      {
+        "hyperedge": [
+          "chat_ui",
+          "websocket_client",
+          "frontend_extension"
+        ],
+        "relationship": "ChatUI sends user messages via WSClient, receives agent_response and tool_report events"
+      },
+      {
+        "hyperedge": [
+          "mcp_server",
+          "comfy_tools",
+          "node_library",
+          "comfy_manager"
+        ],
+        "relationship": "MCP tools use ComfyUITools for filesystem, NodeLibraryClient for node discovery, ComfyManagerClient for pack search"
+      },
+      {
+        "hyperedge": [
+          "backend_server",
+          "config_system"
+        ],
+        "relationship": "Server loads Settings on startup, applies provider-specific tuning for LLM interactions"
+      },
+      {
+        "hyperedge": [
+          "comfyui_extension",
+          "server_runner",
+          "backend_server"
+        ],
+        "relationship": "ComfyUI __init__.py uses ServerRunner to auto-start backend server on load"
+      },
+      {
+        "hyperedge": [
+          "pwa_app",
+          "backend_server",
+          "session_manager"
+        ],
+        "relationship": "PWA connects to backend via WebSocket, can join existing frontend sessions"
+      },
+      {
+        "hyperedge": [
+          "query_executor",
+          "fl_api"
+        ],
+        "relationship": "QueryExecutor uses FL_API to access workflow graph for filtering and traversal"
+      },
+      {
+        "hyperedge": [
+          "callback_router",
+          "session_manager",
+          "mcp_server"
+        ],
+        "relationship": "CallbackRouter (legacy) provides alternative tool execution path, still used by some MCP tools"
+      }
+    ]
+  }
 }
