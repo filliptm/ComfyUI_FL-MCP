@@ -21,6 +21,7 @@ google-generativeai
 # Utilities
 python-dotenv
 Pillow
+PyYAML>=6.0  # For extra_model_paths.yaml parsing
 
 # Testing
 httpx  # For testing FastAPI

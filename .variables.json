@@ -1,77 +1,147 @@
 {
-  "current_mode": "research",
+  "current_mode": "implementation",
   "task": "implementation plan complete",
   "project_name": "fl_js",
   "architecture": {
-    "summary": "ComfyUI chat interface with markdown rendering",
+    "summary": "FL_JS: ComfyUI chat interface with MCP server backend, now with extra_model_paths.yaml support",
     "components": {
-      "message_bubble": {
-        "description": "Markdown renderer with custom link and image handlers",
+      "comfy_tools": {
+        "description": "Core ComfyUI filesystem utilities with multi-path support from extra_model_paths.yaml",
         "files": [
-          "web/js/_components/MessageBubble.js"
+          "backend/comfy_tools.py"
         ],
         "key_classes": [
-          "MessageBubble"
+          "ComfyUITools"
         ],
         "key_functions": [
-          "create",
-          "_createContent",
-          "_renderMermaidDiagram"
+          "list_folders",
+          "search_files",
+          "read_file",
+          "extract_workflow_from_image",
+          "_iter_all_paths"
         ]
       },
-      "chat_ui": {
-        "description": "Main chat interface managing messages and user input",
+      "comfy_models": {
+        "description": "Pydantic models for ComfyUI tool requests and responses",
         "files": [
-          "web/js/chat_ui.js"
+          "backend/comfy_models.py"
         ],
         "key_classes": [
-          "ChatUI"
+          "ComfyFolderType",
+          "ComfyFileInfo",
+          "ComfySearchResult"
+        ]
+      },
+      "mcp_server": {
+        "description": "FastMCP server exposing ComfyUI tools via MCP protocol",
+        "files": [
+          "backend/mcp_server.py"
         ],
         "key_functions": [
-          "addMessage",
-          "_renderMessage",
-          "_sendMessage"
+          "comfy_list_folders",
+          "comfy_read_file",
+          "comfy_search_resources"
         ]
       },
-      "styling": {
-        "description": "Lavender Dreams theme CSS for chat interface",
+      "extra_model_paths_loader": {
+        "description": "Loader for extra_model_paths.yaml configuration - finds and parses YAML",
         "files": [
-          "web/js/style.css"
+          "backend/extra_model_paths_loader.py"
         ],
         "key_classes": [
-          "N/A"
+          "ExtraModelPathsLoader",
+          "ExtraModelPathsConfig"
+        ],
+        "key_functions": [
+          "find_yaml_file",
+          "load",
+          "_parse_yaml"
+        ]
+      },
+      "path_resolver": {
+        "description": "Path resolution and merging for model paths - handles base_path, pipes, validation",
+        "files": [
+          "backend/path_resolver.py"
+        ],
+        "key_classes": [
+          "PathResolver"
+        ],
+        "key_functions": [
+          "get_default_mappings",
+          "merge_with_extra_paths",
+          "_resolve_path_value",
+          "_validate_path"
         ]
       }
     },
     "relationships": [
       {
         "hyperedge": [
-          "chat_ui",
-          "message_bubble"
+          "mcp_server",
+          "comfy_tools"
         ],
-        "relationship": "ChatUI uses MessageBubble to render individual messages with markdown"
+        "relationship": "mcp_server calls comfy_tools methods to implement tool endpoints"
       },
       {
         "hyperedge": [
-          "message_bubble",
-          "styling"
+          "comfy_tools",
+          "comfy_models"
         ],
-        "relationship": "MessageBubble creates HTML elements styled by CSS classes"
+        "relationship": "comfy_tools uses comfy_models for type definitions and validation"
+      },
+      {
+        "hyperedge": [
+          "comfy_tools",
+          "extra_model_paths_loader",
+          "path_resolver"
+        ],
+        "relationship": "comfy_tools uses loader and resolver during __init__ to build folder_mappings with extra paths"
+      },
+      {
+        "hyperedge": [
+          "extra_model_paths_loader",
+          "path_resolver"
+        ],
+        "relationship": "loader provides parsed configs to resolver for path resolution and merging"
+      },
+      {
+        "hyperedge": [
+          "comfy_tools",
+          "path_resolver"
+        ],
+        "relationship": "comfy_tools stores resolved folder_mappings as Dict[ComfyFolderType, List[Path]] from resolver"
       }
     ]
   },
-  "focus": "media embedding implementation documented",
+  "focus": "Updating mcp_server.py tool descriptions to mention extra_model_paths support",
   "last_investigation": "queue_delete",
-  "investigation_depth": "implementation",
-  "current_investigation": "tool_breadcrumbs_pwa",
+  "investigation_depth": "design_complete",
+  "current_investigation": "extra_model_paths",
   "analysis_complete": "true",
   "ready_to_implement": "true",
   "last_change": "added tool_request and tool_report handlers to web/pwa/app.js",
-  "confidence": "100%",
-  "recommendation": "simple broadcast approach",
-  "files_modified": "backend/server.py",
+  "confidence": "HIGH",
+  "recommendation": "Proceed with implementation - clear path forward with medium complexity",
+  "files_modified": [
+    "backend/comfy_tools.py",
+    "requirements.txt"
+  ],
   "lines_changed": 50,
   "status": "ready for testing",
   "main_focus": "markdown renderer media handling",
-  "investigation_complete": true
+  "investigation_complete": true,
+  "design_complete": true,
+  "implementation_phase": "complete",
+  "implementation_complete": true,
+  "files_created": [
+    "backend/extra_model_paths_loader.py",
+    "backend/path_resolver.py"
+  ],
+  "next_steps": [
+    "Update tool descriptions in mcp_server.py",
+    "Write unit tests",
+    "Write integration tests",
+    "Test with real YAML",
+    "Update documentation"
+  ]
 }

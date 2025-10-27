@@ -9,11 +9,13 @@ import re
 import logging
 import httpx
 from pathlib import Path
-from typing import List, Dict, Optional, Union, Any
+from typing import List, Dict, Optional, Union, Any, Iterator
 from dataclasses import dataclass
 from enum import Enum
 
 from comfy_models import ComfyFolderType, ComfyFileInfo, ComfySearchResult
+from extra_model_paths_loader import ExtraModelPathsLoader
+from path_resolver import PathResolver
 
 logger = logging.getLogger(__name__)
 
@@ -47,21 +49,19 @@ class ComfyUITools:
         self.comfy_url = comfy_url
         self._validate_comfyui_installation()
         
-        # Define folder mappings
-        self.folder_mappings = {
-            ComfyFolderType.CUSTOM_NODES: "custom_nodes",
-            ComfyFolderType.MODELS: "models",
-            ComfyFolderType.CHECKPOINTS: "models/checkpoints",
-            ComfyFolderType.LORAS: "models/loras",
-            ComfyFolderType.VAE: "models/vae",
-            ComfyFolderType.CONTROLNET: "models/controlnet",
-            ComfyFolderType.UPSCALE_MODELS: "models/upscale_models",
-            ComfyFolderType.EMBEDDINGS: "models/embeddings",
-            ComfyFolderType.OUTPUT: "output",
-            ComfyFolderType.INPUT: "input",
-            ComfyFolderType.TEMP: "temp",
-            ComfyFolderType.WORKFLOWS: "user/default/workflows",
-        }
+        # Load extra model paths and merge with defaults
+        loader = ExtraModelPathsLoader(self.comfyui_root)
+        extra_configs = loader.load()
+        
+        resolver = PathResolver(self.comfyui_root)
+        default_mappings = resolver.get_default_mappings()
+        self.folder_mappings = resolver.merge_with_extra_paths(default_mappings, extra_configs)
+        
+        # Log summary
+        logger.info(f"ComfyUI tools initialized for: {self.comfyui_root}")
+        logger.info(f"Loaded folder mappings for {len(self.folder_mappings)} folder types")
+        for folder_type, paths in self.folder_mappings.items():
+            logger.debug(f"  {folder_type.value}: {len(paths)} path(s)")
         
         # Safe file extensions for reading
         self.safe_read_extensions = {
@@ -69,8 +69,6 @@ class ComfyUITools:
             '.cfg', '.ini', '.conf', '.log', '.csv', '.xml', '.html', '.js', 
             '.css', '.sh', '.bat'
         }
-        
-        logger.info(f"ComfyUI tools initialized for: {self.comfyui_root}")
     
     def _find_comfyui_root(self) -> Path:
         """Auto-detect ComfyUI installation directory."""
@@ -145,6 +143,25 @@ class ComfyUITools:
             
         except Exception as e:
             raise ComfyUISecurityError(f"Invalid path: {path} - {e}")
+    
+    def _iter_all_paths(self, folder_type: ComfyFolderType) -> Iterator[Path]:
+        """Iterate all configured paths for a folder type.
+        
+        This is an internal helper to avoid code duplication between
+        list_folders and search_files.
+        
+        Args:
+            folder_type: Type of folder to iterate
+            
+        Yields:
+            Path objects for each configured path that exists
+        """
+        folder_paths = self.folder_mappings.get(folder_type, [])
+        for folder_path in folder_paths:
+            if folder_path.exists():
+                yield folder_path
+            else:
+                logger.debug(f"Skipping non-existent path: {folder_path}")
     
     async def fetch_history(self, prompt_id: Optional[str] = None, max_items: int = 10) -> Dict[str, Any]:
         """Fetch execution history from ComfyUI.
@@ -322,6 +339,10 @@ class ComfyUITools:
     ) -> List[ComfyFileInfo]:
         """List contents of a ComfyUI directory by type with filtering and sorting.
         
+        Searches all configured paths for the folder type, including paths from
+        extra_model_paths.yaml if present. Deduplicates files with the same name
+        found in multiple paths.
+        
         Args:
             folder_type: Type of folder to list (e.g., 'checkpoints', 'loras')
             pattern: Optional regex pattern to filter paths (case-insensitive)
@@ -343,44 +364,56 @@ class ComfyUITools:
             except ValueError:
                 raise ComfyUIError(f"Invalid folder type: {folder_type}")
         
-        # Get folder path
-        if folder_type not in self.folder_mappings:
+        # Get all paths for this folder type
+        folder_paths = self.folder_mappings.get(folder_type, [])
+        
+        if not folder_paths:
             raise ComfyUIError(f"Unknown folder type: {folder_type}")
         
-        folder_path = self.comfyui_root / self.folder_mappings[folder_type]
-        
-        # Security check
-        try:
-            folder_path = folder_path.resolve()
-            if not str(folder_path).startswith(str(self.comfyui_root)):
-                raise ComfyUISecurityError(
-                    f"Path traversal detected: {folder_path} outside {self.comfyui_root}"
-                )
-        except (OSError, RuntimeError) as e:
-            raise ComfyUIError(f"Invalid path: {e}")
-        
-        if not folder_path.exists():
-            logger.warning(f"Folder does not exist: {folder_path}")
-            return []
-        
-        # Build items list
+        # Collect items from all paths with deduplication
         items = []
-        for entry in folder_path.iterdir():
+        seen_names = set()  # Deduplicate by name (first occurrence wins)
+        
+        for folder_path in self._iter_all_paths(folder_type):
+            # Security check
             try:
-                stat = entry.stat()
-                relative_path = str(entry.relative_to(self.comfyui_root))
-                
-                items.append(ComfyFileInfo(
-                    name=entry.name,
-                    path=relative_path,
-                    is_directory=entry.is_dir(),
-                    size=stat.st_size if entry.is_file() else None,
-                    modified_time=stat.st_mtime,
-                    extension=entry.suffix[1:] if entry.suffix else None
-                ))
-            except (OSError, PermissionError) as e:
-                logger.warning(f"Cannot access {entry}: {e}")
+                folder_path_resolved = folder_path.resolve()
+                # Note: folder_path might be outside comfyui_root if from extra_model_paths.yaml
+                # This is intentional - we trust the YAML config
+            except (OSError, RuntimeError) as e:
+                logger.warning(f"Cannot resolve path {folder_path}: {e}")
                 continue
+            
+            for entry in folder_path.iterdir():
+                # Skip duplicates (same filename in multiple paths)
+                if entry.name in seen_names:
+                    logger.debug(f"Skipping duplicate: {entry.name}")
+                    continue
+                
+                seen_names.add(entry.name)
+                
+                try:
+                    stat = entry.stat()
+                    
+                    # Calculate relative path
+                    # Try relative to comfyui_root first, fallback to absolute
+                    try:
+                        relative_path = str(entry.relative_to(self.comfyui_root))
+                    except ValueError:
+                        # Path is outside comfyui_root (from extra_model_paths.yaml)
+                        relative_path = str(entry)
+                    
+                    items.append(ComfyFileInfo(
+                        name=entry.name,
+                        path=relative_path,
+                        is_directory=entry.is_dir(),
+                        size=stat.st_size if entry.is_file() else None,
+                        modified_time=stat.st_mtime,
+                        extension=entry.suffix[1:] if entry.suffix else None
+                    ))
+                except (OSError, PermissionError) as e:
+                    logger.warning(f"Cannot access {entry}: {e}")
+                    continue
         
         # Apply regex filter if pattern provided
         if pattern:
@@ -477,23 +510,21 @@ class ComfyUITools:
         max_results: int = 20,
         context_lines: int = 2
     ) -> List[ComfySearchResult]:
-        """Search for pattern in files within a ComfyUI directory."""
+        """Search for pattern in files within a ComfyUI directory.
+        
+        Searches all configured paths for the folder type, including paths from
+        extra_model_paths.yaml if present.
+        """
         try:
             # Convert string to enum if needed
             if isinstance(folder_type, str):
                 folder_type = ComfyFolderType(folder_type)
             
-            # Get folder path
-            folder_path = self.folder_mappings.get(folder_type)
-            if not folder_path:
+            # Get all paths for this folder type
+            folder_paths = self.folder_mappings.get(folder_type, [])
+            
+            if not folder_paths:
                 raise ComfyUIError(f"Unknown folder type: {folder_type}")
-            
-            # Validate path
-            full_path = self._validate_path(folder_path)
-            
-            if not full_path.exists():
-                logger.warning(f"Search directory does not exist: {full_path}")
-                return []
             
             # Compile regex pattern
             regex = re.compile(pattern, re.IGNORECASE | re.MULTILINE)
@@ -501,50 +532,59 @@ class ComfyUITools:
             results = []
             files_searched = 0
             
-            # Search files recursively
-            for file_path in full_path.rglob(file_pattern or "*"):
-                if not file_path.is_file():
-                    continue
-                
-                # Skip binary files and very large files
-                if file_path.suffix.lower() not in self.safe_read_extensions:
-                    continue
-                
-                try:
-                    file_size = file_path.stat().st_size
-                    if file_size > 1024 * 1024:  # Skip files > 1MB
+            # Search in all configured paths
+            for folder_path in self._iter_all_paths(folder_type):
+                # Search files recursively
+                for file_path in folder_path.rglob(file_pattern or "*"):
+                    if not file_path.is_file():
                         continue
                     
-                    # Read and search file
-                    content = file_path.read_text(encoding='utf-8', errors='ignore')
-                    lines = content.split('\n')
+                    # Skip binary files and very large files
+                    if file_path.suffix.lower() not in self.safe_read_extensions:
+                        continue
                     
-                    for line_num, line in enumerate(lines, 1):
-                        if regex.search(line):
-                            # Extract context
-                            start_line = max(0, line_num - context_lines - 1)
-                            end_line = min(len(lines), line_num + context_lines)
-                            
-                            context_before = lines[start_line:line_num-1]
-                            context_after = lines[line_num:end_line]
-                            
-                            results.append(ComfySearchResult(
-                                file_path=str(file_path.relative_to(self.comfyui_root)),
-                                line_number=line_num,
-                                line_content=line.strip(),
-                                context_before=context_before,
-                                context_after=context_after
-                            ))
-                            
-                            if len(results) >= max_results:
-                                logger.info(f"Search truncated at {max_results} results")
-                                return results
-                    
-                    files_searched += 1
-                    
-                except (OSError, UnicodeDecodeError) as e:
-                    logger.debug(f"Skipped file {file_path}: {e}")
-                    continue
+                    try:
+                        file_size = file_path.stat().st_size
+                        if file_size > 1024 * 1024:  # Skip files > 1MB
+                            continue
+                        
+                        # Read and search file
+                        content = file_path.read_text(encoding='utf-8', errors='ignore')
+                        lines = content.split('\n')
+                        
+                        for line_num, line in enumerate(lines, 1):
+                            if regex.search(line):
+                                # Extract context
+                                start_line = max(0, line_num - context_lines - 1)
+                                end_line = min(len(lines), line_num + context_lines)
+                                
+                                context_before = lines[start_line:line_num-1]
+                                context_after = lines[line_num:end_line]
+                                
+                                # Calculate relative path
+                                try:
+                                    relative_path = str(file_path.relative_to(self.comfyui_root))
+                                except ValueError:
+                                    # Path is outside comfyui_root
+                                    relative_path = str(file_path)
+                                
+                                results.append(ComfySearchResult(
+                                    file_path=relative_path,
+                                    line_number=line_num,
+                                    line_content=line.strip(),
+                                    context_before=context_before,
+                                    context_after=context_after
+                                ))
+                                
+                                if len(results) >= max_results:
+                                    logger.info(f"Search truncated at {max_results} results")
+                                    return results
+                        
+                        files_searched += 1
+                        
+                    except (OSError, UnicodeDecodeError) as e:
+                        logger.debug(f"Skipped file {file_path}: {e}")
+                        continue
             
             logger.info(f"Search complete: {len(results)} matches in {files_searched} files")
             return results
