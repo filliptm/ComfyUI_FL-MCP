@@ -504,25 +504,73 @@ export class ToolExecutor {
     }
 
     async _handleModifyLayout(params) {
-        const { node_rects } = params;
-
-        // Convert flattened List[NodeRect] to Dict[int, NodeRect] for fl_api
-        // Backend sends: [{node_id: 1, x: 10, y: 20}, {node_id: 2, x: 30, y: 40}]
-        // fl_api expects: {1: {x: 10, y: 20}, 2: {x: 30, y: 40}}
-        const rectsDict = {};
-        for (const rect of node_rects) {
-            const { node_id, ...rectData } = rect;
-            rectsDict[node_id] = rectData;
+        try {
+            // Detect mode
+            const isAutoLayout = params.auto_layout === true;
+            const hasManualLayout = params.node_rects != null;
+            
+            // CASE: Neither mode specified
+            if (!isAutoLayout && !hasManualLayout) {
+                console.warn('[ToolExecutor] modify_layout: No layout mode specified');
+                return [];
+            }
+            
+            // MODE 1: Auto-layout
+            if (isAutoLayout) {
+                const options = {
+                    auto_layout: true,
+                    node_ids: params.node_ids || null,
+                    strategy: params.strategy || null,
+                    spacing_multiplier: params.spacing_multiplier || null
+                };
+                
+                const results = await this.flApi.modifyLayout(null, options);
+                
+                const successful = results.filter(r => r.success).length;
+                const failed = results.filter(r => !r.success).length;
+                console.log(`[ToolExecutor] Auto-layout complete: ${results.length} nodes (${successful} success, ${failed} failed)`);
+                
+                return results;
+            }
+            
+            // MODE 2: Manual layout
+            if (hasManualLayout) {
+                // Safely handle empty array
+                if (!Array.isArray(params.node_rects) || params.node_rects.length === 0) {
+                    console.warn('[ToolExecutor] modify_layout: Empty node_rects array');
+                    return [];
+                }
+                
+                // Convert flattened List[NodeRect] to Dict[int, NodeRect] for fl_api
+                // Backend sends: [{node_id: 1, x: 10, y: 20}, {node_id: 2, x: 30, y: 40}]
+                // fl_api expects: {1: {x: 10, y: 20}, 2: {x: 30, y: 40}}
+                const rectsDict = {};
+                for (const rect of params.node_rects) {
+                    if (rect && rect.node_id != null) {
+                        const { node_id, ...rectData } = rect;
+                        rectsDict[node_id] = rectData;
+                    }
+                }
+                
+                const results = await this.flApi.modifyLayout(rectsDict, {});
+                
+                const successful = results.filter(r => r.success).length;
+                const failed = results.filter(r => !r.success).length;
+                console.log(`[ToolExecutor] Modified layout: ${results.length} nodes (${successful} success, ${failed} failed)`);
+                
+                return results;
+            }
+            
+        } catch (error) {
+            console.error('[ToolExecutor] modify_layout error:', error);
+            // Return structured error instead of throwing
+            return [
+                {
+                    success: false,
+                    error: error.message || String(error)
+                }
+            ];
         }
-
-        const results = this.flApi.modifyLayout(rectsDict);
-
-        // Log stats but return just the array to match backend expectation
-        const successful = results.filter(r => r.success).length;
-        const failed = results.filter(r => !r.success).length;
-        console.log(`[ToolExecutor] Modified layout: ${results.length} nodes (${successful} success, ${failed} failed)`);
-
-        return results;
     }
 
     async _handlePositionNodeLeft(params) {

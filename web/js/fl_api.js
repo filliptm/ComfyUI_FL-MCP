@@ -18,6 +18,7 @@ export class FL_API {
     constructor() {
         console.log("[FL_API] Initialized");
         this.sessionId = null;  // Will be set by extension
+        this.layoutEngine = null;  // Lazy loaded when auto-layout is used
     }
 
     /**
@@ -1012,13 +1013,69 @@ export class FL_API {
     }
 
     /**
-     * Modify layout for multiple nodes by setting their rectangles
+     * Modify layout for multiple nodes by setting their rectangles or using auto-layout
      * @param {object} nodeRects - rect objects mapped by nodeId {nodeId: {x, y, width, height}}
+     * @param {object} options - Optional auto-layout parameters {auto_layout, node_ids, strategy, spacing_multiplier}
      * @returns {Array<object>} Array of results with updated rectangles or errors
      */
-    modifyLayout(nodeRects = null) {
+    async modifyLayout(nodeRects = null, options = {}) {
         try {
-            // Input validation
+            // MODE 1: Auto-layout
+            if (options.auto_layout === true) {
+                console.log(`[FL_API] Auto-layout requested with strategy: ${options.strategy || 'flow_horizontal'}`);
+                
+                // Lazy load LayoutEngine
+                if (!this.layoutEngine) {
+                    const { LayoutEngine } = await import('./layout_engine.js');
+                    this.layoutEngine = new LayoutEngine();
+                    console.log("[FL_API] LayoutEngine loaded");
+                }
+
+                // Configure spacing
+                if (options.spacing_multiplier !== undefined && options.spacing_multiplier !== null) {
+                    this.layoutEngine.setSpacingMultiplier(options.spacing_multiplier);
+                } else {
+                    // Reset to default if not specified
+                    this.layoutEngine.setSpacingMultiplier(1.0);
+                }
+
+                // Run layout engine
+                const layout = this.layoutEngine.arrangeNodes(
+                    options.node_ids || null,
+                    options.strategy || "flow_horizontal",
+                    {}
+                );
+
+                // Apply calculated positions using setRect
+                const results = [];
+                for (const item of layout) {
+                    try {
+                        const updatedRect = this.setRect(item.node_id, {
+                            x: item.x,
+                            y: item.y,
+                            width: item.width,
+                            height: item.height
+                        });
+                        results.push({
+                            node_id: item.node_id,
+                            rect: updatedRect,
+                            success: true
+                        });
+                    } catch (error) {
+                        console.error(`[FL_API] Auto-layout: Error setting rect for node ${item.node_id}:`, error);
+                        results.push({
+                            node_id: item.node_id,
+                            success: false,
+                            error: error.message
+                        });
+                    }
+                }
+
+                console.log(`[FL_API] Auto-layout complete: ${results.length} nodes arranged`);
+                return results;
+            }
+
+            // MODE 2: Manual layout (existing behavior)
             if (!nodeRects || typeof nodeRects !== 'object') {
                 console.log('[FL_API] modifyLayout: No node rects provided');
                 return [];

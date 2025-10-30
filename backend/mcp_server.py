@@ -14,7 +14,7 @@ from typing import Any, AsyncIterator, Dict, List, Optional, Union, Literal
 
 import websockets
 from fastmcp import FastMCP, Context
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from models import WorkflowQuery
 from comfy_models import (
@@ -147,7 +147,7 @@ class MCPWebSocketClient:
                 fut.set_exception(exc)
             self.pending_requests.pop(rid, None)
 
-    async def execute_tool(self, tool_name: str, parameters: dict, timeout_ms: int = 30000) -> dict:
+    async def execute_tool(self, tool_name: str, parameters: Dict[str, Any], timeout_ms: int = 30000) -> dict:
         """Execute a tool via WebSocket callback."""
         if not self.connected or not self.ws:
             raise RuntimeError("WebSocket not connected")
@@ -495,11 +495,51 @@ class NodeRect(BaseModel):
     height: Optional[float] = Field(None, description="Height (omit to keep current)")
 
 class BatchLayoutRequest(BaseModel):
-    """Modify layout of multiple nodes.
-
-    Simplified schema - changed from Dict[int, NodeRect] to List[NodeRect].
+    """Modify layout of multiple nodes with optional auto-layout.
+    
+    Can be used in two modes:
+    1. Manual layout: Provide node_rects with explicit positions
+    2. Auto-layout: Provide auto_layout params, optionally with node_ids filter
+    
+    Auto-layout and manual layout are mutually exclusive.
     """
-    node_rects: List[NodeRect] = Field(..., description="List of node rectangles to update")
+    # Manual layout fields
+    node_rects: Optional[List[NodeRect]] = Field(
+        None,
+        description="List of node rectangles to update (for manual layout)"
+    )
+    
+    # Auto-layout fields
+    auto_layout: Optional[bool] = Field(
+        None,
+        description="Enable automatic layout calculation"
+    )
+    node_ids: Optional[List[Union[int, str]]] = Field(
+        None,
+        description="Node IDs to auto-arrange (None = all nodes). Only used with auto_layout=True"
+    )
+    strategy: Optional[Literal["flow_horizontal", "flow_vertical", "grid"]] = Field(
+        None,
+        description="Auto-layout strategy. Only used with auto_layout=True"
+    )
+    spacing_multiplier: Optional[float] = Field(
+        None,
+        description="Spacing multiplier for auto-layout (1.0 = default, 1.5 = 50% more space). Only used with auto_layout=True"
+    )
+
+    @model_validator(mode='after')
+    def validate_layout_mode(self):
+        """Ensure either manual or auto-layout is specified, not both."""
+        has_manual = self.node_rects is not None
+        has_auto = self.auto_layout is True
+        
+        if not has_manual and not has_auto:
+            raise ValueError("Must specify either node_rects (manual) or auto_layout=True (auto)")
+        
+        if has_manual and has_auto:
+            raise ValueError("Cannot use both node_rects and auto_layout in the same request")
+        
+        return self
 
 class PositionNodeLeftRequest(BaseModel):
     """Request to position node to the left of another."""
@@ -1192,15 +1232,33 @@ async def get_layout(request: GetLayoutRequest, ctx: Context) -> Dict[str, Any]:
 
 @mcp.tool()
 async def modify_layout(request: BatchLayoutRequest, ctx: Context) -> List[Dict[str, Any]]:
-    """Modify the layout of multiple nodes by setting their bounding boxes. Use this to rearrange many nodes at a time. Attempt to avoid overlaps. Before calling this tool call `get_layout` to get the current workflow layout or for some set of nodes.
+    """Modify node layout using manual positioning or intelligent auto-layout.
     
-    When defining bounding boxes make sure to account for vertical and horizontal spacing between elements that are supposed to be close.
+    TWO MODES:
+    
+    1. MANUAL LAYOUT:
+       Provide node_rects with explicit x/y/width/height for each node.
+       Use get_layout first to see current positions.
+    
+    2. AUTO-LAYOUT:
+       Set auto_layout=True and optionally specify strategy, node_ids, spacing.
+       The layout engine analyzes connections and calculates optimal positions.
+       
+       Examples:
+       - Arrange all nodes: {"auto_layout": true}
+       - Horizontal flow: {"auto_layout": true, "strategy": "flow_horizontal"}
+       - Specific nodes: {"auto_layout": true, "node_ids": [1, 2, 3]}
+       - More spacing: {"auto_layout": true, "spacing_multiplier": 2.0}
+    
+    AUTO-LAYOUT STRATEGIES:
+    - "flow_horizontal" (default): Left-to-right dataflow, ideal for standard pipelines
+    - "flow_vertical": Top-to-bottom dataflow, good for ControlNet stacks
+    - "grid": Simple grid layout for unconnected nodes
+    
+    RETURNS:
+    Array of layout results for each modified node with success status.
     """
     return await _execute_tool(ctx, "modify_layout", request.model_dump())
-    # o = []
-    # for rect in request.node_rects:
-    #     o.append(await _execute_tool(ctx, "set_node_rect", rect.model_dump()))
-    # return o
 
 # @mcp.tool()
 # async def position_node_left(request: PositionNodeLeftRequest, ctx: Context) -> Dict[str, Any]:
