@@ -12,6 +12,7 @@
 import { app } from "../../scripts/app.js";
 import SessionManager from "./session_manager.js";
 import WSClient from "./ws_client.js";
+import ChatClient from "./chat_client.js";
 import { ToolExecutor } from "./tool_executor.js";
 import { ChatUI } from "./chat_ui.js";
 import { DiagramGenerator } from "./diagram_generator.js";
@@ -19,6 +20,7 @@ import { getToolConfig } from "./tool_activity.js";
 
 let chatUI = null;
 let wsClient = null;
+let chatClient = null;
 let toolExecutor = null;
 let diagramGenerator = null;
 
@@ -67,6 +69,10 @@ app.registerExtension({
                 url: config.ws_url,
                 heartbeatInterval: 30000,
                 maxReconnectAttempts: 5,
+            });
+
+            chatClient = new ChatClient(sessionId, {
+                wsUrl: config.ws_url,
             });
             
             // Initialize diagram generator
@@ -202,6 +208,7 @@ app.registerExtension({
             window.FL_JS = {
                 sessionManager,
                 wsClient,
+                chatClient,
                 toolExecutor,
                 diagramGenerator,
                 chatUI: null, // Will be set when sidebar is rendered
@@ -278,7 +285,7 @@ app.registerExtension({
                         }
 
                         // Create new chat UI instance
-                        chatUI = new ChatUI(el, wsClient);
+                        chatUI = new ChatUI(el, chatClient, wsClient);
                         window.FL_JS.chatUI = chatUI;
                         console.log("[FL_JS] Chat UI initialized with tool activity and breadcrumb chain");
                     }

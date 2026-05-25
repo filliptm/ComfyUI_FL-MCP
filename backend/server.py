@@ -3,29 +3,34 @@
 import asyncio
 import base64
 import copy
+import json
 import logging
 from contextlib import asynccontextmanager
 import traceback
-from typing import Any, Dict, List, Optional, Set
+from datetime import datetime
+from typing import Any, AsyncIterator, Dict, List, Optional, Set
 import sys
 import os
+import uuid
 from pathlib import Path
 
 # Add parent directory to path to allow 'backend' imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse, JSONResponse, Response
 from pydantic_ai import Agent, UnexpectedModelBehavior
 
 from config import settings
 from manager import manager
 from callback_router import CallbackRouter, current_session_id
 from agent import agent_manager
+from chat_broadcaster import ChatBroadcaster, StreamHandle, SubscribeResult
 from models import (
     Handshake,
+    SessionContext,
     UserMessage,
     ToolResult,
 )
@@ -55,6 +60,7 @@ logger.info(f"Logger initialized with level: {log_level_name}")
 
 # Global callback router instance
 callback_router: CallbackRouter | None = None
+chat_broadcaster = ChatBroadcaster()
 
 # Background tasks
 async def cleanup_task() -> None:
@@ -64,6 +70,22 @@ async def cleanup_task() -> None:
         cleaned = manager.cleanup_stale_sessions()
         if cleaned > 0:
             logger.info(f"Cleaned up {cleaned} stale sessions")
+
+
+async def parent_watchdog_task(parent_pid: int) -> None:
+    """Exit this hidden backend if the ComfyUI parent process disappears."""
+    logger.info(f"Parent watchdog enabled for PID {parent_pid}")
+    while True:
+        await asyncio.sleep(2)
+        try:
+            os.kill(parent_pid, 0)
+        except PermissionError:
+            continue
+        except ProcessLookupError:
+            logger.warning("ComfyUI parent process exited; stopping managed backend")
+            os._exit(0)
+        except Exception as e:
+            logger.warning(f"Parent watchdog check failed: {e}")
 
 
 @asynccontextmanager
@@ -88,16 +110,32 @@ async def lifespan(app: FastAPI):  # type: ignore
     
     # Start background tasks
     cleanup_task_handle = asyncio.create_task(cleanup_task())
+    parent_watchdog_handle: Optional[asyncio.Task[None]] = None
+    parent_pid_raw = os.getenv("FL_JS_PARENT_PID")
+    if parent_pid_raw:
+        try:
+            parent_pid = int(parent_pid_raw)
+            if parent_pid > 0:
+                parent_watchdog_handle = asyncio.create_task(parent_watchdog_task(parent_pid))
+        except ValueError:
+            logger.warning(f"Ignoring invalid FL_JS_PARENT_PID={parent_pid_raw!r}")
     
     yield
     
     # Shutdown
     logger.info("Shutting down FL_JS backend server")
+    if parent_watchdog_handle:
+        parent_watchdog_handle.cancel()
     cleanup_task_handle.cancel()
     try:
         await cleanup_task_handle
     except asyncio.CancelledError:
         pass
+    if parent_watchdog_handle:
+        try:
+            await parent_watchdog_handle
+        except asyncio.CancelledError:
+            pass
 
 
 # Create FastAPI app
@@ -292,6 +330,201 @@ async def view_image(
     except Exception as e:
         logger.error(f"Error serving image: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal server error")
+
+
+def _ensure_session_context(session_id: str) -> SessionContext:
+    """Return an existing Ren session context or create one for REST/SSE chat."""
+    context = manager.session_contexts.get(session_id)
+    if context is None:
+        context = SessionContext(session_id=session_id)
+        manager.session_contexts[session_id] = context
+        logger.info(f"Created REST/SSE chat session context: {session_id}")
+    context.last_activity = datetime.now()
+    return context
+
+
+def _sse(event: Dict[str, Any]) -> str:
+    return f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+
+
+async def _sse_event_generator(
+    request: Request,
+    subscription: SubscribeResult,
+) -> AsyncIterator[str]:
+    """Yield replayed and live chat events as SSE frames."""
+    try:
+        for event in subscription.replay:
+            yield _sse(event)
+
+        while True:
+            if await request.is_disconnected():
+                break
+            event = await subscription.queue.get()
+            if event is None:
+                break
+            yield _sse(event)
+    finally:
+        subscription.unsubscribe()
+
+
+async def _run_agent_for_sse(
+    handle: StreamHandle,
+    user_message: str,
+) -> None:
+    """Run Ren's existing PydanticAI agent and publish Cypher-style chat events."""
+    session_id = handle.session_id
+    context = _ensure_session_context(session_id)
+    token = current_session_id.set(session_id)
+    block_index = 0
+
+    try:
+        await handle.publish({
+            "type": "conversation_id",
+            "id": handle.conversation_id,
+            "sessionId": session_id,
+        })
+        await handle.publish({
+            "type": "block_start",
+            "blockIndex": block_index,
+            "blockType": "text",
+        })
+
+        agent = agent_manager.get_agent(session_id)
+
+        async with agent.run_mcp_servers():
+            response = await agent.run(
+                user_message,
+                message_history=filtered_message_history(
+                    context.conversation_history,
+                    include_tool_messages=True,
+                ),
+            )
+
+        context.conversation_history.clear()
+        context.conversation_history.extend(response.all_messages())
+        context.last_activity = datetime.now()
+
+        output = response.output or ""
+        if output:
+            await handle.publish({
+                "type": "text_delta",
+                "blockIndex": block_index,
+                "text": output,
+            })
+
+        await handle.publish({
+            "type": "block_stop",
+            "blockIndex": block_index,
+        })
+        await handle.publish({
+            "type": "done",
+            "inputTokens": 0,
+            "outputTokens": 0,
+        })
+    except asyncio.CancelledError:
+        await handle.publish({"type": "error", "message": "Cancelled"})
+        await handle.publish({"type": "done", "inputTokens": 0, "outputTokens": 0})
+        raise
+    except UnexpectedModelBehavior as ue:
+        root_cause = ue.__cause__ if ue.__cause__ else ue
+        logger.error(f"Model generation failed for SSE chat: {root_cause}", exc_info=True)
+        await handle.publish({"type": "error", "message": str(root_cause)})
+        await handle.publish({"type": "done", "inputTokens": 0, "outputTokens": 0})
+    except Exception as e:
+        logger.error(f"Error in SSE chat run: {e}", exc_info=True)
+        await handle.publish({"type": "error", "message": str(e)})
+        await handle.publish({"type": "done", "inputTokens": 0, "outputTokens": 0})
+    finally:
+        current_session_id.reset(token)
+        await handle.end()
+
+
+@app.post("/api/chat/send")
+async def send_chat_message(request: Request) -> Response:
+    """Start a Ren chat turn and attach this HTTP response to its SSE stream."""
+    data = await request.json()
+    message = str(data.get("message") or "").strip()
+    session_id = str(
+        data.get("sessionId")
+        or data.get("session_id")
+        or data.get("conversationId")
+        or uuid.uuid4()
+    )
+    conversation_id = str(data.get("conversationId") or session_id)
+
+    if not message:
+        return JSONResponse(
+            {"error": "message is required"},
+            status_code=400,
+        )
+
+    if chat_broadcaster.is_active(conversation_id):
+        return JSONResponse(
+            {"error": "Agent already running for this conversation"},
+            status_code=409,
+        )
+
+    _ensure_session_context(session_id)
+    handle = await chat_broadcaster.start(conversation_id, session_id)
+    task = asyncio.create_task(_run_agent_for_sse(handle, message))
+    handle.set_task(task)
+
+    subscription = await chat_broadcaster.subscribe(conversation_id)
+    if subscription is None:
+        return JSONResponse(
+            {"error": "Failed to attach to chat stream"},
+            status_code=500,
+        )
+
+    return StreamingResponse(
+        _sse_event_generator(request, subscription),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@app.get("/api/chat/stream/{conversation_id}")
+async def attach_chat_stream(
+    conversation_id: str,
+    request: Request,
+) -> Response:
+    """Reattach to an active Ren chat stream."""
+    subscription = await chat_broadcaster.subscribe(conversation_id)
+    if subscription is None:
+        return JSONResponse(
+            {"error": "No active stream for this conversation"},
+            status_code=404,
+        )
+
+    return StreamingResponse(
+        _sse_event_generator(request, subscription),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@app.get("/api/chat/active")
+async def list_active_chats() -> Dict[str, Any]:
+    return {"active": chat_broadcaster.list()}
+
+
+@app.post("/api/chat/cancel")
+async def cancel_chat(request: Request) -> JSONResponse:
+    data = await request.json()
+    conversation_id = str(data.get("conversationId") or data.get("sessionId") or "")
+    if not conversation_id:
+        return JSONResponse({"error": "conversationId is required"}, status_code=400)
+    if not chat_broadcaster.cancel(conversation_id):
+        return JSONResponse({"error": "No active stream for this conversation"}, status_code=404)
+    return JSONResponse({"success": True})
 
 
 @app.websocket("/ws")

@@ -144,8 +144,9 @@ class ServerRunner:
             return self._launch_as_subprocess()
         
         elif self.launch_mode == "auto":
-            # Try terminal first, fallback to subprocess
-            return self._launch_in_terminal(fallback=True)
+            # Default to hidden subprocess mode. Terminal popups are now an
+            # explicit opt-in via BACKEND_LAUNCH_MODE=terminal.
+            return self._launch_as_subprocess()
         
         else:
             print(f"[FL_JS] Unknown launch mode: {self.launch_mode}")
@@ -240,9 +241,14 @@ class ServerRunner:
                 stderr_dest = None
             
             # Start subprocess
+            child_env = os.environ.copy()
+            child_env["FL_JS_PARENT_PID"] = str(os.getpid())
+            child_env["FL_JS_MANAGED_BACKEND"] = "1"
+
             self.process = subprocess.Popen(
                 [python_exe, "-u", str(server_script)],  # -u for unbuffered output
                 cwd=str(self.backend_dir),
+                env=child_env,
                 stdout=stdout_dest,
                 stderr=stderr_dest,
                 bufsize=1,  # Line buffered

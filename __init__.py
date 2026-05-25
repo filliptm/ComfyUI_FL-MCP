@@ -28,7 +28,7 @@ from pathlib import Path
 BACKEND_DIR = Path(__file__).parent / "backend"
 
 # Add backend to Python path for imports
-# sys.path.insert(0, str(BACKEND_DIR))
+sys.path.insert(0, str(BACKEND_DIR))
 sys.path.insert(0, str(Path(__file__).parent))
 
 # Import configuration

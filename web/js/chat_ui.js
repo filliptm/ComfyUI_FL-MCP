@@ -15,11 +15,21 @@ import { MessageBubble } from './_components/MessageBubble.js';
  * ChatUI class - Manages chat interface and message rendering
  */
 export class ChatUI {
-    constructor(container, wsClient) {
+    constructor(container, chatClient, wsClient = null) {
         this.container = container;
+        if (wsClient === null && chatClient && typeof chatClient.send === 'function') {
+            wsClient = chatClient;
+            chatClient = null;
+        }
+        this.chatClient = chatClient;
         this.wsClient = wsClient;
         this.messages = [];
         this.isTyping = false;
+        this.isStreaming = false;
+        this.activeConversationId = chatClient?.conversationId || null;
+        this.streamingAssistantEl = null;
+        this.streamingAssistantContentEl = null;
+        this.streamingAssistantText = '';
 
         // Initialize message bubble renderer
         this.messageBubble = new MessageBubble();
@@ -87,6 +97,11 @@ export class ChatUI {
                         <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
                     </svg>
                 </button>
+                <button class="fl-chat-stop" id="fl-chat-stop" title="Stop response" style="display: none;">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
+                        <rect x="6" y="6" width="12" height="12"></rect>
+                    </svg>
+                </button>
             </div>
         `;
 
@@ -96,6 +111,7 @@ export class ChatUI {
         this.messagesContainer = this.container.querySelector('#fl-chat-messages');
         this.inputField = this.container.querySelector('#fl-chat-input');
         this.sendButton = this.container.querySelector('#fl-chat-send');
+        this.stopButton = this.container.querySelector('#fl-chat-stop');
         this.typingIndicator = this.container.querySelector('#fl-chat-typing');
         this.statusIndicator = this.container.querySelector('#fl-status-indicator');
         this.statusText = this.container.querySelector('#fl-status-text');
@@ -141,6 +157,7 @@ export class ChatUI {
     _attachEventHandlers() {
         // Send button click
         this.sendButton.addEventListener('click', () => this._sendMessage());
+        this.stopButton.addEventListener('click', () => this._cancelStream());
         
         // Enter to send (Shift+Enter for newline)
         this.inputField.addEventListener('keydown', (e) => {
@@ -318,7 +335,7 @@ export class ChatUI {
      */
     async _sendMessage(messageText = null) {
         const message = messageText || this.inputField.value.trim();
-        if (!message) return;
+        if (!message || this.isStreaming) return;
         
         // Add user message to UI
         this.addMessage('user', message);
@@ -329,19 +346,80 @@ export class ChatUI {
             this.inputField.style.height = 'auto';
         }
         
-        // Show typing indicator
+        this._setStreaming(true);
         this.setTyping(true);
         
         // Send to backend
         try {
-            await this.wsClient.send({
-                type: 'user_message',
-                message: message
-            });
+            if (this.chatClient) {
+                await this.chatClient.sendMessage(message, (event) => this._handleChatEvent(event));
+            } else {
+                await this.wsClient.send({
+                    type: 'user_message',
+                    message: message
+                });
+            }
         } catch (error) {
             console.error('[ChatUI] Error sending message:', error);
             this.addMessage('error', `Failed to send message: ${error.message}`);
             this.setTyping(false);
+            this._setStreaming(false);
+            this._finishAssistantStream();
+        }
+    }
+
+    /**
+     * Handle REST/SSE chat event from the backend.
+     * @private
+     */
+    _handleChatEvent(data) {
+        switch (data.type) {
+            case 'conversation_id':
+                this.activeConversationId = data.id;
+                break;
+            case 'block_start':
+                if (data.blockType === 'text') {
+                    this.setTyping(false);
+                    this._startAssistantStream();
+                }
+                break;
+            case 'text_delta':
+                this.setTyping(false);
+                this._appendAssistantStream(data.text || '');
+                break;
+            case 'block_stop':
+                break;
+            case 'done':
+                this.setTyping(false);
+                this._setStreaming(false);
+                this._finishAssistantStream();
+                break;
+            case 'error':
+                this.setTyping(false);
+                this._setStreaming(false);
+                this._finishAssistantStream();
+                this.addMessage('error', data.message || 'An error occurred');
+                break;
+            default:
+                break;
+        }
+    }
+
+    /**
+     * Cancel the active REST/SSE response.
+     * @private
+     */
+    async _cancelStream() {
+        if (!this.chatClient || !this.isStreaming) return;
+        try {
+            await this.chatClient.cancel(this.activeConversationId);
+        } catch (error) {
+            console.error('[ChatUI] Error cancelling stream:', error);
+            this.addMessage('error', `Failed to cancel response: ${error.message}`);
+        } finally {
+            this.setTyping(false);
+            this._setStreaming(false);
+            this._finishAssistantStream();
         }
     }
 
@@ -351,6 +429,7 @@ export class ChatUI {
      */
     _handleAgentResponse(data) {
         this.setTyping(false);
+        this._setStreaming(false);
         
         if (data.message) {
             this.addMessage('assistant', data.message);
@@ -363,7 +442,72 @@ export class ChatUI {
      */
     _handleError(data) {
         this.setTyping(false);
+        this._setStreaming(false);
         this.addMessage('error', data.error || 'An error occurred');
+    }
+
+    /**
+     * Create a streaming assistant message if one is not active.
+     * @private
+     */
+    _startAssistantStream() {
+        if (this.streamingAssistantEl) return;
+
+        this.streamingAssistantText = '';
+        const messageEl = document.createElement('div');
+        messageEl.className = 'fl-message assistant streaming';
+
+        const headerEl = document.createElement('div');
+        headerEl.className = 'fl-message-header';
+        headerEl.innerHTML = `
+            <span class="fl-message-role">Ren</span>
+            <span class="fl-message-time">now</span>
+        `;
+
+        const contentEl = document.createElement('div');
+        contentEl.className = 'fl-message-content';
+
+        messageEl.appendChild(headerEl);
+        messageEl.appendChild(contentEl);
+        this.messagesContainer.appendChild(messageEl);
+
+        this.streamingAssistantEl = messageEl;
+        this.streamingAssistantContentEl = contentEl;
+        this._scrollToBottom();
+    }
+
+    /**
+     * Append streamed assistant text.
+     * @private
+     */
+    _appendAssistantStream(text) {
+        if (!text) return;
+        this._startAssistantStream();
+        this.streamingAssistantText += text;
+        this.streamingAssistantContentEl.innerHTML = this._renderMarkdown(this.streamingAssistantText);
+        this._scrollToBottom();
+    }
+
+    /**
+     * Finalize the active streaming assistant message.
+     * @private
+     */
+    _finishAssistantStream() {
+        if (!this.streamingAssistantEl) return;
+        if (this.streamingAssistantText.trim()) {
+            this.messages.push({
+                role: 'assistant',
+                content: this.streamingAssistantText,
+                timestamp: new Date(),
+                displayRole: 'assistant'
+            });
+        } else if (this.streamingAssistantEl.parentNode) {
+            this.streamingAssistantEl.parentNode.removeChild(this.streamingAssistantEl);
+        }
+        this.streamingAssistantEl.classList.remove('streaming');
+        this.streamingAssistantEl = null;
+        this.streamingAssistantContentEl = null;
+        this.streamingAssistantText = '';
     }
 
     /**
@@ -433,7 +577,14 @@ export class ChatUI {
      * @private
      */
     _renderMarkdown(text) {
-        return text
+        const escaped = String(text)
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#39;');
+
+        return escaped
             .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
             .replace(/\*(.+?)\*/g, '<em>$1</em>')
             .replace(/\n/g, '<br>');
@@ -589,6 +740,24 @@ export class ChatUI {
         this.typingIndicator.style.display = isTyping ? 'flex' : 'none';
         if (isTyping) {
             this._scrollToBottom();
+        }
+    }
+
+    /**
+     * Toggle stream controls.
+     * @private
+     */
+    _setStreaming(isStreaming) {
+        this.isStreaming = isStreaming;
+        if (this.sendButton) {
+            this.sendButton.style.display = isStreaming ? 'none' : 'flex';
+            this.sendButton.disabled = isStreaming;
+        }
+        if (this.stopButton) {
+            this.stopButton.style.display = isStreaming ? 'flex' : 'none';
+        }
+        if (this.inputField) {
+            this.inputField.disabled = isStreaming;
         }
     }
 
