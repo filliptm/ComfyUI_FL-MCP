@@ -652,6 +652,104 @@
     border-bottom: 1px solid rgba(255, 255, 255, 0.08);
 }
 
+.fl-provider-bar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 12px;
+    background: #16161a;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+    flex-shrink: 0;
+}
+
+.fl-provider-toggle {
+    display: flex;
+    gap: 2px;
+    padding: 2px;
+    background: rgba(255, 255, 255, 0.04);
+    border-radius: 6px;
+    overflow-x: auto;
+}
+
+.fl-provider-button {
+    background: transparent;
+    color: #9a9aa0;
+    border: none;
+    border-radius: 4px;
+    padding: 4px 8px;
+    font-size: 11px;
+    font-weight: 500;
+    cursor: pointer;
+    white-space: nowrap;
+}
+
+.fl-provider-button.active {
+    background: #9966D9;
+    color: #ffffff;
+    font-weight: 650;
+}
+
+.fl-provider-model {
+    flex: 1;
+    min-width: 0;
+    background: #26262a;
+    color: #f2f2f2;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 4px;
+    padding: 4px 6px;
+    font-size: 11px;
+    outline: none;
+}
+
+.fl-provider-setup {
+    flex-direction: column;
+    gap: 7px;
+    padding: 8px 12px;
+    background: #1f1f23;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+    flex-shrink: 0;
+}
+
+.fl-provider-row {
+    display: flex;
+    gap: 7px;
+    align-items: center;
+}
+
+.fl-provider-input {
+    min-width: 0;
+    flex: 1;
+    height: 30px;
+    padding: 0 9px;
+    background: #111116;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 6px;
+    color: #f2f2f2;
+    font-size: 12px;
+    outline: none;
+}
+
+.fl-provider-input:focus {
+    border-color: rgba(153, 102, 217, 0.7);
+}
+
+.fl-provider-action {
+    height: 30px;
+    padding: 0 10px;
+    background: rgba(255, 255, 255, 0.06);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 6px;
+    color: #d8d8de;
+    font-size: 12px;
+    cursor: pointer;
+}
+
+.fl-provider-action.primary {
+    background: #9966D9;
+    border-color: #9966D9;
+    color: #ffffff;
+}
+
 .fl-chat-title {
     color: #f2f2f2;
     font-size: 14px;

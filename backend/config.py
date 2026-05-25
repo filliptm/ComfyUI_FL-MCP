@@ -31,7 +31,7 @@ class Settings(BaseSettings):
     log_backend_to_file: bool = True   # Only applies to subprocess mode
 
     # LLM Provider Configuration
-    llm_provider: Literal["openai", "anthropic", "gemini", "openrouter"] = "gemini"
+    llm_provider: Literal["openai", "anthropic", "gemini", "openrouter", "local"] = "gemini"
     local_llm_url: Optional[str] = None # For use with local hosting like ollama or vllm
     llm_model: Optional[str] = None  # If None, uses provider default
     llm_temperature: float = 0.7

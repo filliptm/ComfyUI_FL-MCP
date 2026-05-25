@@ -129,7 +129,10 @@ def get_llm_model():
     logger.info(f"Loading model: {model_name} (provider: {settings.llm_provider})")
     
     if settings.llm_provider == "openai":
-        return OpenAIModel(model_name)
+        return OpenAIModel(
+            model_name,
+            provider=OpenAIProvider(api_key=settings.openai_api_key or None)
+        )
     
     elif settings.llm_provider == "openrouter":
         # OpenRouter uses OpenAI-compatible API
@@ -142,18 +145,23 @@ def get_llm_model():
         )
     
     elif settings.llm_provider == "local":
-        # OpenRouter uses OpenAI-compatible API
+        if not settings.local_llm_url:
+            raise ValueError("LOCAL_LLM_URL not configured")
         return OpenAIModel(
             model_name,
             provider=OpenAIProvider(
                 base_url=settings.local_llm_url,
-                api_key=settings.local_api_key
+                api_key=settings.local_api_key or "local"
             )
         )
 
     elif settings.llm_provider == "anthropic":
         from pydantic_ai.models.anthropic import AnthropicModel
-        return AnthropicModel(model_name)
+        from pydantic_ai.providers.anthropic import AnthropicProvider
+        return AnthropicModel(
+            model_name,
+            provider=AnthropicProvider(api_key=settings.anthropic_api_key or None)
+        )
     
     elif settings.llm_provider == "gemini":
         # UPDATED: Use improved pattern with explicit provider

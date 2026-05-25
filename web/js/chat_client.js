@@ -132,6 +132,89 @@ export class ChatClient {
         const data = await response.json();
         return data.active || [];
     }
+
+    async providerStatus() {
+        const response = await fetch(`${this.baseUrl}/api/providers/status`);
+        if (!response.ok) {
+            throw new Error(`Provider status failed: ${response.status}`);
+        }
+        return response.json();
+    }
+
+    async selectProvider(provider, model = null) {
+        const response = await fetch(`${this.baseUrl}/api/providers/select`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ provider, model }),
+        });
+        const data = await response.json();
+        if (!response.ok) {
+            throw new Error(data.error || `Provider select failed: ${response.status}`);
+        }
+        return data.status;
+    }
+
+    async setProviderKey(provider, apiKey) {
+        const response = await fetch(`${this.baseUrl}/api/providers/key`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ provider, apiKey }),
+        });
+        const data = await response.json();
+        if (!response.ok) {
+            throw new Error(data.error || `Provider key save failed: ${response.status}`);
+        }
+        return data.status;
+    }
+
+    async clearProviderKey(provider) {
+        const response = await fetch(`${this.baseUrl}/api/providers/key/${encodeURIComponent(provider)}`, {
+            method: 'DELETE',
+        });
+        const data = await response.json();
+        if (!response.ok) {
+            throw new Error(data.error || `Provider key clear failed: ${response.status}`);
+        }
+        return data.status;
+    }
+
+    async setLocalConfig(baseURL, model, apiKey = null) {
+        const response = await fetch(`${this.baseUrl}/api/local-llm/config`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ baseURL, model, apiKey }),
+        });
+        const data = await response.json();
+        if (!response.ok) {
+            throw new Error(data.message || data.error || `Local config failed: ${response.status}`);
+        }
+        return data.status;
+    }
+
+    async clearLocalConfig() {
+        const response = await fetch(`${this.baseUrl}/api/local-llm/config`, {
+            method: 'DELETE',
+        });
+        if (!response.ok) {
+            throw new Error(`Local config clear failed: ${response.status}`);
+        }
+    }
+
+    async listLocalModels(baseURL) {
+        const url = new URL(`${this.baseUrl}/api/local-llm/models`);
+        if (baseURL) {
+            url.searchParams.set('baseURL', baseURL);
+        }
+        const response = await fetch(url);
+        const data = await response.json();
+        if (!response.ok) {
+            throw new Error(data.message || data.error || `Local models failed: ${response.status}`);
+        }
+        const items = Array.isArray(data?.data) ? data.data : [];
+        return items
+            .map((model) => ({ id: String(model?.id || ''), label: String(model?.id || '') }))
+            .filter((model) => model.id);
+    }
 }
 
 export default ChatClient;

@@ -12,6 +12,8 @@ from typing import Any, AsyncIterator, Dict, List, Optional, Set
 import sys
 import os
 import uuid
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 # Add parent directory to path to allow 'backend' imports
@@ -27,6 +29,7 @@ from config import settings
 from manager import manager
 from callback_router import CallbackRouter, current_session_id
 from agent import agent_manager
+import provider_config
 from chat_broadcaster import ChatBroadcaster, StreamHandle, SubscribeResult
 from models import (
     Handshake,
@@ -56,6 +59,8 @@ logging.basicConfig(
 
 logger = logging.getLogger("ren_server")
 logger.info(f"Logger initialized with level: {log_level_name}")
+
+provider_config.apply_to_settings()
 
 
 # Global callback router instance
@@ -92,22 +97,22 @@ async def parent_watchdog_task(parent_pid: int) -> None:
 async def lifespan(app: FastAPI):  # type: ignore
     """Application lifespan manager."""
     global callback_router
-    
+
     # Startup
     logger.info("Starting FL_JS backend server")
     logger.info(f"LLM Provider: {settings.llm_provider}")
     logger.info(f"LLM Model: {settings.resolved_model}")
     logger.info(f"Provider Tuning: {settings.provider_tuning}")
-    
+
     # Initialize callback router
     callback_router = CallbackRouter(manager, default_timeout=30.0)
     logger.info("Callback router initialized")
-    
+
     # Initialize MCP server with callback router
     from mcp_server import set_callback_router
     set_callback_router(callback_router)
     logger.info("MCP server configured with callback router")
-    
+
     # Start background tasks
     cleanup_task_handle = asyncio.create_task(cleanup_task())
     parent_watchdog_handle: Optional[asyncio.Task[None]] = None
@@ -119,9 +124,9 @@ async def lifespan(app: FastAPI):  # type: ignore
                 parent_watchdog_handle = asyncio.create_task(parent_watchdog_task(parent_pid))
         except ValueError:
             logger.warning(f"Ignoring invalid FL_JS_PARENT_PID={parent_pid_raw!r}")
-    
+
     yield
-    
+
     # Shutdown
     logger.info("Shutting down FL_JS backend server")
     if parent_watchdog_handle:
@@ -192,29 +197,153 @@ async def health() -> dict[str, Any]:
 @app.get("/api/config")
 async def get_client_config() -> dict[str, Any]:
     """Return client configuration including WebSocket URL.
-    
+
     This endpoint allows the frontend to dynamically discover the WebSocket URL
     based on the actual port the backend is running on, enabling users to set
     custom ports via WS_PORT in .env.
-    
+
     Returns:
         Dict with ws_url and other client configuration
     """
     # Build WebSocket URL based on current server configuration
     # Use settings.ngrok_url if available (production mode)
-    if settings.ngrok_url:
-        ws_url = settings.ngrok_url.replace("https://", "wss://").replace("http://", "ws://")
+    public_ws_source = getattr(settings, "ngrok_url", None) or ""
+    if public_ws_source:
+        ws_url = public_ws_source.replace("https://", "wss://").replace("http://", "ws://")
         if not ws_url.endswith("/ws"):
             ws_url = f"{ws_url}/ws"
     else:
         # Local mode - use configured host and port
         ws_url = f"ws://{settings.ws_host}:{settings.ws_port}/ws"
-    
+
     return {
         "ws_url": ws_url,
         "version": "0.3.0",
-        "ngrok_mode": bool(settings.ngrok_url),
+        "ngrok_mode": bool(public_ws_source),
     }
+
+
+@app.get("/api/providers/status")
+async def get_provider_status() -> Dict[str, Any]:
+    return provider_config.status()
+
+
+@app.post("/api/providers/select")
+async def select_provider(request: Request) -> JSONResponse:
+    data = await request.json()
+    provider = str(data.get("provider") or "")
+    model = data.get("model")
+    try:
+        provider_config.select_provider(provider, str(model) if model else None)
+        agent_manager.clear_all()
+        return JSONResponse({"success": True, "status": provider_config.status()})
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+
+
+@app.post("/api/providers/key")
+async def set_provider_key(request: Request) -> JSONResponse:
+    data = await request.json()
+    provider = str(data.get("provider") or "")
+    api_key = str(data.get("apiKey") or "").strip()
+    if not api_key:
+        return JSONResponse({"error": "apiKey is required"}, status_code=400)
+    try:
+        provider_config.set_api_key(provider, api_key)
+        agent_manager.clear_all()
+        return JSONResponse({"success": True, "status": provider_config.status()})
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+
+
+@app.delete("/api/providers/key/{provider}")
+async def clear_provider_key(provider: str) -> JSONResponse:
+    try:
+        provider_config.clear_api_key(provider)
+        agent_manager.clear_all()
+        return JSONResponse({"success": True, "status": provider_config.status()})
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+
+
+@app.get("/api/openrouter/status")
+async def get_openrouter_status() -> Dict[str, Any]:
+    status = provider_config.status()["providers"]["openrouter"]
+    return status
+
+
+@app.post("/api/openrouter/key")
+async def set_openrouter_key(request: Request) -> JSONResponse:
+    data = await request.json()
+    api_key = str(data.get("apiKey") or "").strip()
+    if not api_key:
+        return JSONResponse({"error": "apiKey is required"}, status_code=400)
+    provider_config.set_api_key("openrouter", api_key)
+    agent_manager.clear_all()
+    return JSONResponse({"success": True, "status": provider_config.status()["providers"]["openrouter"]})
+
+
+@app.delete("/api/openrouter/key")
+async def clear_openrouter_key() -> JSONResponse:
+    provider_config.clear_api_key("openrouter")
+    agent_manager.clear_all()
+    return JSONResponse({"success": True})
+
+
+@app.get("/api/local-llm/status")
+async def get_local_llm_status() -> Dict[str, Any]:
+    return provider_config.status()["providers"]["local"]
+
+
+@app.post("/api/local-llm/config")
+async def set_local_llm_config(request: Request) -> JSONResponse:
+    data = await request.json()
+    base_url = str(data.get("baseURL") or "").strip()
+    model = str(data.get("model") or "").strip()
+    api_key = str(data.get("apiKey") or "").strip() or None
+    if not base_url:
+        return JSONResponse({"error": "baseURL is required"}, status_code=400)
+    if not model:
+        return JSONResponse({"error": "model is required"}, status_code=400)
+    provider_config.set_local_config(base_url, model, api_key)
+    agent_manager.clear_all()
+    return JSONResponse({"success": True, "status": provider_config.status()["providers"]["local"]})
+
+
+@app.delete("/api/local-llm/config")
+async def clear_local_llm_config() -> JSONResponse:
+    provider_config.clear_local_config()
+    agent_manager.clear_all()
+    return JSONResponse({"success": True})
+
+
+def _fetch_local_models(base_url: str) -> Dict[str, Any]:
+    url = f"{base_url.rstrip('/')}/models"
+    request = urllib.request.Request(
+        url,
+        headers={"Authorization": "Bearer local"},
+    )
+    with urllib.request.urlopen(request, timeout=10) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+@app.get("/api/local-llm/models")
+async def list_local_llm_models(baseURL: Optional[str] = None) -> JSONResponse:
+    local_status = provider_config.status()["providers"]["local"]
+    base_url = baseURL or local_status.get("baseURL") or "http://127.0.0.1:1234/v1"
+    try:
+        data = await asyncio.to_thread(_fetch_local_models, base_url)
+        return JSONResponse(data)
+    except urllib.error.URLError as e:
+        return JSONResponse(
+            {"error": "Failed to fetch local models", "message": str(e)},
+            status_code=502,
+        )
+    except Exception as e:
+        return JSONResponse(
+            {"error": "Failed to fetch local models", "message": str(e)},
+            status_code=500,
+        )
 
 
 @app.get("/pwa")
@@ -227,7 +356,7 @@ async def serve_pwa() -> FileResponse:
 @app.get("/api/sessions")
 async def list_sessions() -> dict[str, Any]:
     """List active sessions for PWA session picker.
-    
+
     Returns:
         Dict with sessions list containing session_id, connections, and last_activity
     """
@@ -240,7 +369,7 @@ async def list_sessions() -> dict[str, Any]:
             "has_frontend": manager.has_connection(session_id, 'frontend'),
             "has_pwa": manager.has_connection(session_id, 'pwa'),
         })
-    
+
     return {
         "sessions": sessions,
         "total": len(sessions),
@@ -255,19 +384,19 @@ async def view_image(
     rand: float = 0.0  # Cache busting
 ) -> FileResponse:
     """Serve ComfyUI images to all clients (frontend and PWA).
-    
+
     This endpoint proxies ComfyUI's image serving, making it accessible
     to both embedded frontend and standalone PWA clients.
-    
+
     Args:
         filename: Image filename
         subfolder: Optional subfolder path
         type: Image type ('output', 'input', 'temp')
         rand: Cache busting parameter
-        
+
     Returns:
         FileResponse with appropriate media type
-        
+
     Raises:
         HTTPException: 400 for invalid type, 403 for security violation, 404 for not found
     """
@@ -275,11 +404,11 @@ async def view_image(
         # Import ComfyUI tools
         from comfy_tools import get_comfy_tools
         comfy_tools = get_comfy_tools()
-        
+
         # Validate type
         if type not in ["output", "input", "temp"]:
             raise HTTPException(status_code=400, detail=f"Invalid type: {type}")
-        
+
         # Build path based on type
         if type == "output":
             base_path = comfy_tools.comfyui_root / "output"
@@ -287,24 +416,24 @@ async def view_image(
             base_path = comfy_tools.comfyui_root / "input"
         elif type == "temp":
             base_path = comfy_tools.comfyui_root / "temp"
-        
+
         # Handle subfolder
         if subfolder:
             file_path = base_path / subfolder / filename
         else:
             file_path = base_path / filename
-        
+
         # Validate path is within allowed directory (security)
         file_path = file_path.resolve()
         base_path_resolved = base_path.resolve()
         if not str(file_path).startswith(str(base_path_resolved)):
             logger.warning(f"Path traversal attempt blocked: {file_path}")
             raise HTTPException(status_code=403, detail="Access denied")
-        
+
         # Check file exists
         if not file_path.exists() or not file_path.is_file():
             raise HTTPException(status_code=404, detail=f"File not found: {filename}")
-        
+
         # Determine media type
         media_types = {
             ".png": "image/png",
@@ -315,7 +444,7 @@ async def view_image(
             ".bmp": "image/bmp",
         }
         media_type = media_types.get(file_path.suffix.lower(), "application/octet-stream")
-        
+
         # Return file
         return FileResponse(
             path=str(file_path),
@@ -324,7 +453,7 @@ async def view_image(
                 "Cache-Control": "no-cache",  # Respect rand parameter
             }
         )
-        
+
     except HTTPException:
         raise
     except Exception as e:
@@ -544,15 +673,15 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     session_id: str | None = None
     connection_type: str = 'frontend'  # Default to frontend
     agent: Agent | None = None
-    
+
     try:
         # Accept connection
         await websocket.accept()
         logger.info("WebSocket connection accepted, waiting for handshake")
-        
+
         # Wait for handshake
         handshake_data = await websocket.receive_json()
-        
+
         # Validate handshake
         if handshake_data.get("type") != "handshake":
             await websocket.send_json({
@@ -562,12 +691,12 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
             })
             await websocket.close()
             return
-        
+
         # Parse handshake
         try:
             handshake = Handshake(**handshake_data)
             session_id = handshake.session_id
-            
+
             # Detect connection type from client_version
             if handshake.client_version:
                 version_lower = handshake.client_version.lower()
@@ -579,9 +708,9 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     connection_type = 'frontend'
             else:
                 connection_type = 'frontend'
-            
+
             logger.info(f"Detected connection type: {connection_type}")
-            
+
         except Exception as e:
             await websocket.send_json({
                 "type": "error",
@@ -590,7 +719,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
             })
             await websocket.close()
             return
-        
+
         if not session_id:
             await websocket.send_json({
                 "type": "error",
@@ -599,115 +728,99 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
             })
             await websocket.close()
             return
-        
+
         # Register connection with type
         is_reconnect = manager.has_connection(session_id, connection_type)
         context = await manager.connect(websocket, session_id, connection_type)
-        
+
         # Send handshake acknowledgment
         await manager.send_handshake_ack(session_id, is_reconnect, connection_type)
-        
+
         logger.info(
             f"Session {session_id} - {connection_type} "
             f"{'reconnected' if is_reconnect else 'connected'}"
         )
-        
-        # Get or create agent for frontend connections
-        # if connection_type == 'frontend':
-        agent = agent_manager.get_agent(session_id)
-        logger.info(f"Agent created/retrieved for session {session_id}")
-        
-        # Start MCP servers for frontend connections and wrap message loop
-        async with agent.run_mcp_servers(): # if agent else asynccontextmanager(lambda: (yield))():
-            if agent:
-                logger.info(f"MCP servers started for session {session_id}")
-            
-            # Message loop
-            while True:
-                # 🔍 TRACE: Log before receive
-                logger.info(f"[TRACE] Waiting for message on session {session_id} ({connection_type})")
-                
-                data = await websocket.receive_json()
-                
-                # 🔍 TRACE: Log what we received
-                logger.info(f"[TRACE] Received message on session {session_id} ({connection_type}): type={data.get('type')}")
-                
-                # Get message type and session_id for logging
-                msg_type = data.get("type")
-                msg_session_id = data.get("session_id")
-                
-                # Log all incoming messages with session_id info (changed from DEBUG to INFO)
-                logger.info(
-                    f"[VALIDATION] Received {msg_type} | "
-                    f"msg_session_id={msg_session_id} | "
-                    f"connection_session_id={session_id} | "
-                    f"connection_type={connection_type}"
-                )
-                
-                # Validate session_id in message
-                if msg_session_id != session_id:
-                    logger.warning(
-                        f"[VALIDATION] Session mismatch! "
-                        f"msg_session_id={msg_session_id} != connection_session_id={session_id} | "
-                        f"msg_type={msg_type}"
-                    )
-                    await manager.send_error(
-                        session_id,
-                        "SESSION_MISMATCH",
-                        f"Message session_id '{msg_session_id}' does not match connection session_id '{session_id}'",
-                        target=connection_type
-                    )
-                    continue
-                
-                # Route message based on type
-                if msg_type == "user_message":
-                    if agent:
-                        asyncio.create_task(
-                            handle_user_message(
-                                session_id, 
-                                data, 
-                                message_history=context.conversation_history,
-                                agent=agent
-                            )
-                        )
-                    else:
-                        logger.warning(f"Received user_message on MCP connection for session {session_id}")
-                
-                elif msg_type == "tool_result":
-                    await handle_tool_result(session_id, data)
-                
-                elif msg_type == "tool_request":
-                    # Tool request from MCP subprocess - route to display clients
-                    await route_tool_request_to_frontend(session_id, data)
-                                
-                elif msg_type == "tool_report":
-                    # Tool activity report from MCP subprocess - route to display clients
-                    await route_tool_report_to_frontend(session_id, data)
-                
-                elif msg_type == "screenshot":
-                    # Screenshot data from frontend
-                    await handle_screenshot(session_id, data)
 
-                elif msg_type == "comfy_error":
-                    await manager.handle_comfy_error(data.get("data", {}))
-                
-                elif msg_type == "queue_status":
-                    await manager.handle_queue_status(data.get("data", {}))
-                
-                elif msg_type == "execution_event":
-                    event = data.get("event")
-                    logger.debug(f"**execution_event**: {data}")
-                    event_data = data.get("data", {})
-                    await manager.handle_execution_event(event, event_data)
-                
-                else:
-                    await manager.send_error(
-                        session_id,
-                        "UNKNOWN_MESSAGE_TYPE",
-                        f"Unknown message type: {msg_type}",
-                        target=connection_type
-                    )
-    
+        logger.info(f"Session {session_id} websocket ready; agent will be created on chat run")
+
+        # Message loop. Chat now runs through REST/SSE, so the frontend socket
+        # should stay lightweight and available for tool callbacks even before
+        # a provider key is configured.
+        while True:
+            logger.info(f"[TRACE] Waiting for message on session {session_id} ({connection_type})")
+            data = await websocket.receive_json()
+            logger.info(f"[TRACE] Received message on session {session_id} ({connection_type}): type={data.get('type')}")
+
+            msg_type = data.get("type")
+            msg_session_id = data.get("session_id")
+
+            logger.info(
+                f"[VALIDATION] Received {msg_type} | "
+                f"msg_session_id={msg_session_id} | "
+                f"connection_session_id={session_id} | "
+                f"connection_type={connection_type}"
+            )
+
+            if msg_session_id != session_id:
+                logger.warning(
+                    f"[VALIDATION] Session mismatch! "
+                    f"msg_session_id={msg_session_id} != connection_session_id={session_id} | "
+                    f"msg_type={msg_type}"
+                )
+                await manager.send_error(
+                    session_id,
+                    "SESSION_MISMATCH",
+                    f"Message session_id '{msg_session_id}' does not match connection session_id '{session_id}'",
+                    target=connection_type
+                )
+                continue
+
+            if msg_type == "user_message":
+                legacy_agent = agent_manager.get_agent(session_id)
+
+                async def run_legacy_user_message() -> None:
+                    async with legacy_agent.run_mcp_servers():
+                        await handle_user_message(
+                            session_id,
+                            data,
+                            message_history=context.conversation_history,
+                            agent=legacy_agent,
+                        )
+
+                asyncio.create_task(run_legacy_user_message())
+
+            elif msg_type == "tool_result":
+                await handle_tool_result(session_id, data)
+
+            elif msg_type == "tool_request":
+                await route_tool_request_to_frontend(session_id, data)
+
+            elif msg_type == "tool_report":
+                await route_tool_report_to_frontend(session_id, data)
+
+            elif msg_type == "screenshot":
+                await handle_screenshot(session_id, data)
+
+            elif msg_type == "comfy_error":
+                await manager.handle_comfy_error(data.get("data", {}))
+
+            elif msg_type == "queue_status":
+                await manager.handle_queue_status(data.get("data", {}))
+
+            elif msg_type == "execution_event":
+                event = data.get("event")
+                logger.debug(f"**execution_event**: {data}")
+                event_data = data.get("data", {})
+                await manager.handle_execution_event(event, event_data)
+
+            else:
+                await manager.send_error(
+                    session_id,
+                    "UNKNOWN_MESSAGE_TYPE",
+                    f"Unknown message type: {msg_type}",
+                    target=connection_type
+                )
+
     except WebSocketDisconnect:
         if session_id:
             manager.disconnect(session_id, connection_type)
@@ -719,7 +832,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 agent_manager.remove_agent(session_id)
                 logger.info(f"Agent removed for session {session_id}")
             logger.info(f"Session {session_id} - {connection_type} disconnected")
-    
+
     except Exception as e:
         logger.error(f"Error in WebSocket connection: {e}", exc_info=True)
         if session_id:
@@ -753,7 +866,7 @@ def truncate_text(text: str, max_chars: int) -> str:
     """Truncate text to max_chars length with a truncation marker."""
     if not text or len(text) <= max_chars:
         return text
-    
+
     truncation_marker = "...<truncated>"
     return text[:max_chars - len(truncation_marker)] + truncation_marker
 
@@ -770,14 +883,14 @@ def truncate_nested_strings(obj: Any, max_chars: int) -> Any:
         return obj
 
 def filtered_message_history(
-    messages: List[ModelMessage], 
-    limit: Optional[int] = None, 
+    messages: List[ModelMessage],
+    limit: Optional[int] = None,
     include_tool_messages: bool = False,
     max_chars: Optional[int] = None
 ) -> Optional[List[Dict[str, Any]]]:
     """
     Filter and limit the message history from an AgentRunResult.
-    
+
     Args:
         messages: The message history
         limit: Optional int, if provided returns only system message + last N messages.
@@ -785,7 +898,7 @@ def filtered_message_history(
         include_tool_messages: Whether to include tool messages in the history
         max_chars: Maximum number of characters for string values in tool calls and returns.
                   If None, uses provider-specific default from settings.
-        
+
     Returns:
         Filtered list of messages in the format expected by the agent
     """
@@ -794,17 +907,17 @@ def filtered_message_history(
         limit = settings.provider_tuning["history_limit"]
     if max_chars is None:
         max_chars = settings.provider_tuning["max_chars"]
-    
+
     # Extract system message (always the first one with role="system")
     system_message = next((msg for msg in messages if len(msg.parts) > 0 and type(msg.parts[0]) == SystemPromptPart), None)
-    
+
     # Filter non-system messages
     non_system_messages = [msg for msg in messages if len(msg.parts) > 0 and  type(msg.parts[0]) != SystemPromptPart]
-    
+
     # Apply tool message filtering if requested
     if not include_tool_messages:
         non_system_messages = [msg for msg in non_system_messages if not any(isinstance(part, ToolCallPart) or isinstance(part, ToolReturnPart) for part in msg.parts)]
-    
+
     # Find the most recent UserPromptPart before applying limit
     latest_user_prompt_part = None
     latest_user_prompt_index = -1
@@ -813,13 +926,13 @@ def filtered_message_history(
             if isinstance(part, UserPromptPart):
                 latest_user_prompt_part = part
                 latest_user_prompt_index = i
-    
+
     # Apply limit if specified, but ensure paired tool calls and returns stay together
     if limit is not None and limit > 0:
         # Build comprehensive mapping of tool calls and returns
         tool_call_to_msg = {}  # tool_call_id -> message_index
         tool_return_to_msg = {}  # tool_call_id -> message_index
-        
+
         for i, msg in enumerate(non_system_messages):
             for part in msg.parts:
                 if isinstance(part, ToolCallPart):
@@ -829,30 +942,30 @@ def filtered_message_history(
                 elif isinstance(part, RetryPromptPart):
                     # RetryPromptPart acts like a ToolReturnPart for mapping purposes
                     tool_return_to_msg[part.tool_call_id] = i
-        
+
         # Take the last 'limit' messages but ensure we include paired messages
         if len(non_system_messages) > limit:
             # Start with the basic window
             included_indices = set(range(len(non_system_messages) - limit, len(non_system_messages)))
-            
+
             # BIDIRECTIONAL pairing: ensure both calls and returns are included together
             # We iterate until no new indices are added to guarantee completeness
             changes_made = True
             iteration_count = 0
             max_iterations = len(non_system_messages)  # Safety limit
-            
+
             while changes_made and iteration_count < max_iterations:
                 changes_made = False
                 original_size = len(included_indices)
                 iteration_count += 1
-                
+
                 # Create a copy to iterate over (avoid modifying set during iteration)
                 current_indices = set(included_indices)
-                
+
                 for msg_idx in current_indices:
                     if msg_idx >= len(non_system_messages):  # Safety check
                         continue
-                        
+
                     msg = non_system_messages[msg_idx]
                     for part in msg.parts:
                         if isinstance(part, ToolCallPart):
@@ -861,7 +974,7 @@ def filtered_message_history(
                                 return_msg_idx = tool_return_to_msg[part.tool_call_id]
                                 if return_msg_idx not in included_indices:
                                     included_indices.add(return_msg_idx)
-                                    
+
                         elif isinstance(part, ToolReturnPart):
                             # If we have a tool return, ensure its call is included
                             if part.tool_call_id in tool_call_to_msg:
@@ -874,28 +987,28 @@ def filtered_message_history(
                                 call_msg_idx = tool_call_to_msg[part.tool_call_id]
                                 if call_msg_idx not in included_indices:
                                     included_indices.add(call_msg_idx)
-                
+
                 # Check if we added any new indices
                 if len(included_indices) > original_size:
                     changes_made = True
-            
+
             # Safety check: if we hit max iterations, log a warning
             if iteration_count >= max_iterations:
                 logger.warning(f"Tool pairing reached max iterations ({max_iterations}). Some tool calls/returns may be unpaired.")
-            
+
             # VALIDATION STEP: After the bidirectional pairing loop, validate completeness
             # Remove any orphaned tool calls or returns from the included messages
             validated_indices: Set[int] = set()
             orphaned_calls: Set[str] = set()
             orphaned_returns: Set[str] = set()
-            
+
             for msg_idx in sorted(included_indices):
                 if msg_idx >= len(non_system_messages):  # Safety check
                     continue
-                    
+
                 msg = non_system_messages[msg_idx]
                 has_orphaned_parts = False
-                
+
                 for part in msg.parts:
                     if isinstance(part, ToolCallPart):
                         # Check if return exists in included messages
@@ -908,7 +1021,7 @@ def filtered_message_history(
                             # If we don't have a return at all for this call
                             has_orphaned_parts = True
                             orphaned_calls.add(part.tool_call_id)
-                            
+
                     elif isinstance(part, ToolReturnPart) or isinstance(part, RetryPromptPart):
                         # Check if call exists in included messages
                         if part.tool_call_id in tool_call_to_msg:
@@ -920,42 +1033,42 @@ def filtered_message_history(
                             # If we don't have a call at all for this return
                             has_orphaned_parts = True
                             orphaned_returns.add(part.tool_call_id)
-                
+
                 # Only include message if no orphaned parts
                 if not has_orphaned_parts:
                     validated_indices.add(msg_idx)
-            
+
             # Log any orphaned tool calls for debugging
             if orphaned_calls or orphaned_returns:
                 logger.warning(f"Excluded messages with orphaned tool calls: {orphaned_calls}, returns: {orphaned_returns}")
-            
+
             # Use validated indices instead of included_indices
             # IMPORTANT: Sort indices to maintain chronological order
             sorted_indices = sorted(validated_indices)
             non_system_messages = [non_system_messages[i] for i in sorted_indices]
-            
+
             # Handle the latest user prompt preservation logic
-            if (latest_user_prompt_index >= 0 and 
-                latest_user_prompt_index not in validated_indices and 
-                latest_user_prompt_part is not None and 
+            if (latest_user_prompt_index >= 0 and
+                latest_user_prompt_index not in validated_indices and
+                latest_user_prompt_part is not None and
                 system_message is not None):
                 # Find if system_message already has a UserPromptPart
-                user_prompt_index = next((i for i, part in enumerate(system_message.parts) 
+                user_prompt_index = next((i for i, part in enumerate(system_message.parts)
                                        if isinstance(part, UserPromptPart)), None)
-                
+
                 if user_prompt_index is not None:
                     # Replace existing UserPromptPart
                     system_message.parts[user_prompt_index] = latest_user_prompt_part
                 else:
                     # Add new UserPromptPart to system message
                     system_message.parts.append(latest_user_prompt_part)
-    
+
     # Apply string truncation to tool calls and returns
     if max_chars > 0:
         # Create deep copies to avoid modifying original messages
         truncated_system_message = copy.deepcopy(system_message) if system_message else None
         truncated_non_system_messages = [copy.deepcopy(msg) for msg in non_system_messages]
-        
+
         # Process system message if it exists
         if truncated_system_message:
             for part in truncated_system_message.parts:
@@ -968,7 +1081,7 @@ def filtered_message_history(
                     # Truncate content in tool returns
                     if hasattr(part, 'content') and part.content:
                         part.content = truncate_nested_strings(part.content, max_chars)
-        
+
         # Process non-system messages
         for msg in truncated_non_system_messages:
             for part in msg.parts:
@@ -988,25 +1101,25 @@ def filtered_message_history(
                     # Also truncate retry prompts content
                     if hasattr(part, 'content') and part.content:
                         part.content = truncate_nested_strings(part.content, max_chars)
-        
+
         # Use the truncated messages for result
         system_message = truncated_system_message
         non_system_messages = truncated_non_system_messages
-    
+
     # Combine system message with other messages
     result_messages = []
     if system_message:
         result_messages.append(system_message)
     result_messages.extend(non_system_messages)
-        
+
     return result_messages
 
 
 # Message handlers
 
 async def handle_user_message(
-    session_id: str, 
-    data: dict[str, Any], 
+    session_id: str,
+    data: dict[str, Any],
     message_history: List[ModelMessage],
     agent: Agent
 ) -> None:
@@ -1021,26 +1134,26 @@ async def handle_user_message(
     try:
         message = UserMessage(**data)
         logger.info(f"User message from {session_id}: {message.message[:50]}...")
-        
+
         # Set session context for tool callbacks
         current_session_id.set(session_id)
-        
+
         # Send typing indicator
         await manager.send_message(session_id, {
             "type": "typing_indicator",
             "session_id": session_id,
             "is_typing": True,
         })
-        
+
         # Process message with agent with retry logic for flaky providers
         max_retries = 2
         last_error = None
         response = None
-        
+
         for attempt in range(max_retries + 1):
             try:
                 response = await agent.run(
-                    message.message, 
+                    message.message,
                     message_history=filtered_message_history(
                         message_history,
                         include_tool_messages=True
@@ -1048,7 +1161,7 @@ async def handle_user_message(
                     )
                 )
                 break  # Success - exit retry loop
-                
+
             except UnexpectedModelBehavior as e:
                 last_error = e
                 if attempt < max_retries:
@@ -1061,7 +1174,7 @@ async def handle_user_message(
                     # Final attempt failed
                     logger.error(f"Model generation failed after {max_retries + 1} attempts")
                     raise last_error
-        
+
         if response is not None:
             # Determine which connections should receive the response
             # PWA and frontend should both see agent responses
@@ -1070,11 +1183,11 @@ async def handle_user_message(
                 response_targets.append('pwa')
             if manager.has_connection(session_id, 'frontend'):
                 response_targets.append('frontend')
-            
+
             # Set History (Mutable)
             message_history.clear()
             message_history.extend(response.all_messages())
-            
+
             # Send response to all connected clients
             for target in response_targets:
                 await manager.send_message(session_id, {
@@ -1084,20 +1197,20 @@ async def handle_user_message(
                     "tool_calls": [], # TODO set this to use the proper message parts
                     "is_final": True,
                 }, target=target)
-            
+
             logger.info(f"Agent response sent to {session_id} (targets: {response_targets})")
-            
+
     except UnexpectedModelBehavior as ue:
         # Happens mainly when a model can't get a tool call right after so many tries
 
         # Extract root cause error
         root_cause = ue.__cause__ if ue.__cause__ else ue
         root_cause_msg = str(root_cause)
-        
+
         trback = traceback.format_exception(type(root_cause), root_cause, root_cause.__traceback__)
 
         logger.critical(f"Critical Tool Error: {root_cause_msg}\n\nTraceback:\n{trback}")
-    
+
     except Exception as e:
         logger.error(f"Error handling user message: {e}", exc_info=True)
         await manager.send_error(
@@ -1113,7 +1226,7 @@ async def handle_user_message(
 
 async def handle_tool_result(session_id: str, data: dict[str, Any]) -> None:
     """Handle tool execution result from frontend.
-    
+
     This result needs to be routed back to the MCP subprocess that requested it.
 
     Args:
@@ -1126,7 +1239,7 @@ async def handle_tool_result(session_id: str, data: dict[str, Any]) -> None:
             f"Tool result from {session_id}: request_id={result.request_id} "
             f"({'success' if result.success else 'failed'})"
         )
-        
+
         # Route result back to MCP subprocess
         if manager.has_connection(session_id, 'mcp'):
             await manager.send_message(session_id, data, target='mcp')
@@ -1135,7 +1248,7 @@ async def handle_tool_result(session_id: str, data: dict[str, Any]) -> None:
             logger.warning(
                 f"No MCP connection for session {session_id}, cannot route tool result"
             )
-        
+
         # Also route to callback router (legacy support)
         if callback_router:
             await callback_router.handle_tool_result(
@@ -1145,7 +1258,7 @@ async def handle_tool_result(session_id: str, data: dict[str, Any]) -> None:
                 error=result.error,
                 execution_time_ms=result.execution_time_ms
             )
-    
+
     except Exception as e:
         logger.error(f"Error handling tool result: {e}", exc_info=True)
         await manager.send_error(
@@ -1158,10 +1271,10 @@ async def handle_tool_result(session_id: str, data: dict[str, Any]) -> None:
 
 async def handle_screenshot(session_id: str, data: dict) -> None:
     """Handle screenshot data from frontend.
-    
+
     Receives base64-encoded screenshot, decodes it, and saves to
     output/screenshots/ directory.
-    
+
     Args:
         session_id: Session ID
         data: Screenshot message data
@@ -1169,40 +1282,40 @@ async def handle_screenshot(session_id: str, data: dict) -> None:
     try:
         from models import ScreenshotMessage
         from comfy_tools import get_comfy_tools
-        
+
         screenshot_msg = ScreenshotMessage(**data)
         logger.info(
             f"Screenshot from {session_id}: {screenshot_msg.screenshot_id} "
             f"({screenshot_msg.format}, {screenshot_msg.size_bytes} bytes)"
         )
-        
+
         # Get ComfyUI output directory
         comfy_tools = get_comfy_tools()
         screenshots_dir = comfy_tools.comfyui_root / "output" / "screenshots"
-        
+
         # Create screenshots directory if it doesn't exist
         screenshots_dir.mkdir(parents=True, exist_ok=True)
-        
+
         # Decode base64 data
         # Format: "data:image/jpeg;base64,/9j/4AAQ..."
         if ";base64," in screenshot_msg.base64_data:
             base64_str = screenshot_msg.base64_data.split(";base64,")[1]
         else:
             base64_str = screenshot_msg.base64_data
-        
+
         image_data = base64.b64decode(base64_str)
-        
+
         # Determine file extension
         ext = "jpg" if screenshot_msg.format == "jpeg" else "png"
         filename = f"{screenshot_msg.screenshot_id}.{ext}"
         file_path = screenshots_dir / filename
-        
+
         # Save to file
         with open(file_path, "wb") as f:
             f.write(image_data)
-        
+
         logger.info(f"Screenshot saved: {file_path}")
-        
+
         # Send confirmation back to frontend (optional)
         await manager.send_message(session_id, {
             "type": "screenshot_saved",
@@ -1211,7 +1324,7 @@ async def handle_screenshot(session_id: str, data: dict) -> None:
             "filename": filename,
             "path": str(file_path),
         }, target='frontend')
-        
+
     except Exception as e:
         logger.error(f"Error handling screenshot: {e}", exc_info=True)
         await manager.send_error(
@@ -1224,10 +1337,10 @@ async def handle_screenshot(session_id: str, data: dict) -> None:
 
 async def route_tool_request_to_frontend(session_id: str, data: dict) -> None:
     """Route tool request from MCP subprocess to all display clients.
-    
+
     Broadcasts to both frontend (which can execute) and PWA (which displays only).
     Only frontend is expected to send back tool_result.
-    
+
     Args:
         session_id: Session ID
         data: Tool request data
@@ -1237,15 +1350,15 @@ async def route_tool_request_to_frontend(session_id: str, data: dict) -> None:
             f"Routing tool request to display clients: session={session_id}, "
             f"tool={data.get('tool_name')}, request_id={data.get('request_id')}"
         )
-        
+
         # Check if ANY display client is connected
         has_frontend = manager.has_connection(session_id, 'frontend')
         has_pwa = manager.has_connection(session_id, 'pwa')
-        
+
         if not has_frontend and not has_pwa:
             error_msg = f"No display clients connected for session {session_id}.\n\n**What to do**\n- Ask the user to make sure they have ComfyUI open in their browser\n- If they do not see your reply in the ComfyUI Ren side drawer it means they are connected to the wrong session.\n- Tell them if they are on the Ren Go app they can refresh the page to choose a session"
             logger.error(error_msg)
-            
+
             # Send error back to MCP subprocess
             await manager.send_message(session_id, {
                 'type': 'tool_result',
@@ -1256,7 +1369,7 @@ async def route_tool_request_to_frontend(session_id: str, data: dict) -> None:
                 'execution_time_ms': 0,
             }, target='mcp')
             return
-        
+
         # Broadcast to all connected display clients
         if has_frontend:
             result = await manager.send_message(session_id, data, target='frontend')
@@ -1264,17 +1377,17 @@ async def route_tool_request_to_frontend(session_id: str, data: dict) -> None:
                 logger.info(f"Tool request forwarded to frontend for session {session_id}")
             else:
                 logger.error(f"Failed to forward tool request to frontend for session {session_id}")
-        
+
         if has_pwa:
             result = await manager.send_message(session_id, data, target='pwa')
             if result:
                 logger.info(f"Tool request forwarded to PWA for session {session_id}")
             else:
                 logger.error(f"Failed to forward tool request to PWA for session {session_id}")
-        
+
     except Exception as e:
         logger.error(f"Error routing tool request: {e}", exc_info=True)
-        
+
         # Send error back to MCP subprocess
         try:
             await manager.send_message(session_id, {
@@ -1291,10 +1404,10 @@ async def route_tool_request_to_frontend(session_id: str, data: dict) -> None:
 
 async def route_tool_report_to_frontend(session_id: str, data: dict) -> None:
     """Route tool activity report from MCP subprocess to all display clients.
-    
+
     Tool reports are lightweight notifications that a Python-executed tool
     is running. They are broadcast to all display clients for visual feedback.
-    
+
     Args:
         session_id: Session ID
         data: Tool report data containing tool_name and timestamp
@@ -1304,15 +1417,15 @@ async def route_tool_report_to_frontend(session_id: str, data: dict) -> None:
             f"Routing tool report to display clients: session={session_id}, "
             f"tool={data.get('tool_name')}"
         )
-        
+
         # Check if ANY display client is connected
         has_frontend = manager.has_connection(session_id, 'frontend')
         has_pwa = manager.has_connection(session_id, 'pwa')
-        
+
         if not has_frontend and not has_pwa:
             logger.debug(f"No display clients for session {session_id}, skipping tool report")
             return
-        
+
         # Broadcast to all connected display clients
         if has_frontend:
             result = await manager.send_message(session_id, data, target='frontend')
@@ -1320,20 +1433,20 @@ async def route_tool_report_to_frontend(session_id: str, data: dict) -> None:
                 logger.debug(f"Tool report forwarded to frontend for session {session_id}")
             else:
                 logger.warning(f"Failed to forward tool report to frontend for session {session_id}")
-        
+
         if has_pwa:
             result = await manager.send_message(session_id, data, target='pwa')
             if result:
                 logger.debug(f"Tool report forwarded to PWA for session {session_id}")
             else:
                 logger.warning(f"Failed to forward tool report to PWA for session {session_id}")
-        
+
     except Exception as e:
         logger.error(f"Error routing tool report: {e}", exc_info=True)
-        
+
 if __name__ == "__main__":
     import uvicorn
-    
+
     uvicorn.run(
         "backend.server:app",
         host=settings.ws_host,

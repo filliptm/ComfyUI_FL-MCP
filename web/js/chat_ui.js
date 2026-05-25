@@ -10,6 +10,14 @@
 
 import { MessageBubble } from './_components/MessageBubble.js';
 
+const PROVIDERS = [
+    { id: 'anthropic', label: 'Claude' },
+    { id: 'openrouter', label: 'Router' },
+    { id: 'local', label: 'Local' },
+    { id: 'gemini', label: 'Gemini' },
+    { id: 'openai', label: 'OpenAI' },
+];
+
 
 /**
  * ChatUI class - Manages chat interface and message rendering
@@ -30,6 +38,8 @@ export class ChatUI {
         this.streamingAssistantEl = null;
         this.streamingAssistantContentEl = null;
         this.streamingAssistantText = '';
+        this.providerStatus = null;
+        this.localModelOptions = [];
 
         // Initialize message bubble renderer
         this.messageBubble = new MessageBubble();
@@ -37,6 +47,7 @@ export class ChatUI {
         // Initialize UI
         this._initializeUI();
         this._attachEventHandlers();
+        this._loadProviderStatus();
 
         // Track active tool chain for breadcrumb display
         this.activeToolChain = null; // Current tool chain message element
@@ -77,6 +88,11 @@ export class ChatUI {
                     <span class="fl-status-text" id="fl-status-text">Connecting...</span>
                 </div>
             </div>
+            <div class="fl-provider-bar">
+                <div class="fl-provider-toggle" id="fl-provider-toggle"></div>
+                <select class="fl-provider-model" id="fl-provider-model" title="Model"></select>
+            </div>
+            <div class="fl-provider-setup" id="fl-provider-setup" style="display: none;"></div>
             <div class="fl-chat-messages" id="fl-chat-messages"></div>
             <div class="fl-chat-typing" id="fl-chat-typing" style="display: none;">
                 <span class="fl-typing-indicator">
@@ -115,6 +131,9 @@ export class ChatUI {
         this.typingIndicator = this.container.querySelector('#fl-chat-typing');
         this.statusIndicator = this.container.querySelector('#fl-status-indicator');
         this.statusText = this.container.querySelector('#fl-status-text');
+        this.providerToggle = this.container.querySelector('#fl-provider-toggle');
+        this.providerModelSelect = this.container.querySelector('#fl-provider-model');
+        this.providerSetup = this.container.querySelector('#fl-provider-setup');
 
         // Add debug styles for tool activity
         const debugStyle = document.createElement('style');
@@ -171,6 +190,17 @@ export class ChatUI {
         this.inputField.addEventListener('input', () => {
             this.inputField.style.height = 'auto';
             this.inputField.style.height = this.inputField.scrollHeight + 'px';
+        });
+
+        this.providerToggle.addEventListener('click', (e) => {
+            const button = e.target.closest('[data-provider]');
+            if (button) {
+                this._selectProvider(button.dataset.provider);
+            }
+        });
+
+        this.providerModelSelect.addEventListener('change', () => {
+            this._selectProviderModel(this.providerModelSelect.value);
         });
         
         // WebSocket event handlers
@@ -336,6 +366,11 @@ export class ChatUI {
     async _sendMessage(messageText = null) {
         const message = messageText || this.inputField.value.trim();
         if (!message || this.isStreaming) return;
+        if (this.chatClient && !this._isCurrentProviderReady()) {
+            this.addMessage('error', 'Configure the selected provider before sending a message.');
+            this._renderProviderSetup();
+            return;
+        }
         
         // Add user message to UI
         this.addMessage('user', message);
@@ -366,6 +401,170 @@ export class ChatUI {
             this._setStreaming(false);
             this._finishAssistantStream();
         }
+    }
+
+    async _loadProviderStatus() {
+        if (!this.chatClient?.providerStatus) return;
+        try {
+            this.providerStatus = await this.chatClient.providerStatus();
+            this._renderProviderControls();
+        } catch (error) {
+            console.warn('[ChatUI] Could not load provider status:', error);
+        }
+    }
+
+    _renderProviderControls() {
+        if (!this.providerStatus || !this.providerToggle) return;
+
+        const activeProvider = this.providerStatus.provider || 'anthropic';
+        this.providerToggle.innerHTML = PROVIDERS.map((provider) => `
+            <button
+                type="button"
+                class="fl-provider-button ${provider.id === activeProvider ? 'active' : ''}"
+                data-provider="${provider.id}"
+                title="${provider.label}"
+            >${provider.label}</button>
+        `).join('');
+
+        const modelOptions = this._getModelOptions(activeProvider);
+        const currentModel = this._currentModelForProvider(activeProvider);
+        this.providerModelSelect.innerHTML = modelOptions.map((model) => `
+            <option value="${this._escapeAttr(model.id)}" ${model.id === currentModel ? 'selected' : ''}>${model.label}</option>
+        `).join('');
+        this.providerModelSelect.style.display = modelOptions.length ? 'block' : 'none';
+        this._renderProviderSetup();
+    }
+
+    _getModelOptions(provider) {
+        if (provider === 'local') {
+            const current = this.providerStatus?.providers?.local?.model;
+            const options = [...this.localModelOptions];
+            if (current && !options.some((model) => model.id === current)) {
+                options.unshift({ id: current, label: current });
+            }
+            return options;
+        }
+        return this.providerStatus?.modelOptions?.[provider] || [];
+    }
+
+    _currentModelForProvider(provider) {
+        if (provider === 'local') {
+            return this.providerStatus?.providers?.local?.model || '';
+        }
+        return this.providerStatus?.models?.[provider] || this.providerStatus?.model || '';
+    }
+
+    _isCurrentProviderReady() {
+        if (!this.providerStatus) return true;
+        const provider = this.providerStatus.provider;
+        return Boolean(this.providerStatus.providers?.[provider]?.configured);
+    }
+
+    async _selectProvider(provider) {
+        if (!provider || provider === this.providerStatus?.provider) return;
+        try {
+            const model = provider === 'local' ? this.providerStatus?.providers?.local?.model : this._currentModelForProvider(provider);
+            this.providerStatus = await this.chatClient.selectProvider(provider, model || null);
+            this._renderProviderControls();
+        } catch (error) {
+            this.addMessage('error', `Failed to switch provider: ${error.message}`);
+        }
+    }
+
+    async _selectProviderModel(model) {
+        const provider = this.providerStatus?.provider;
+        if (!provider || provider === 'local' || !model) return;
+        try {
+            this.providerStatus = await this.chatClient.selectProvider(provider, model);
+            this._renderProviderControls();
+        } catch (error) {
+            this.addMessage('error', `Failed to change model: ${error.message}`);
+        }
+    }
+
+    _renderProviderSetup() {
+        if (!this.providerStatus || !this.providerSetup) return;
+
+        const provider = this.providerStatus.provider;
+        const status = this.providerStatus.providers?.[provider] || {};
+        const shouldShow = provider === 'local' || !status.configured;
+        this.providerSetup.style.display = shouldShow ? 'flex' : 'none';
+
+        if (!shouldShow) {
+            this.providerSetup.innerHTML = '';
+            return;
+        }
+
+        if (provider === 'local') {
+            this.providerSetup.innerHTML = `
+                <input class="fl-provider-input" id="fl-local-url" value="${this._escapeAttr(status.baseURL || 'http://127.0.0.1:1234/v1')}" placeholder="http://127.0.0.1:1234/v1" />
+                <div class="fl-provider-row">
+                    <input class="fl-provider-input" id="fl-local-model" value="${this._escapeAttr(status.model || '')}" placeholder="model" />
+                    <button class="fl-provider-action" id="fl-local-fetch" type="button">Models</button>
+                </div>
+                <button class="fl-provider-action primary" id="fl-local-save" type="button">Connect</button>
+            `;
+            this.providerSetup.querySelector('#fl-local-fetch').addEventListener('click', () => this._fetchLocalModels());
+            this.providerSetup.querySelector('#fl-local-save').addEventListener('click', () => this._saveLocalProvider());
+            return;
+        }
+
+        const label = PROVIDERS.find((item) => item.id === provider)?.label || provider;
+        this.providerSetup.innerHTML = `
+            <div class="fl-provider-row">
+                <input class="fl-provider-input" id="fl-provider-key" type="password" placeholder="${label} API key" />
+                <button class="fl-provider-action primary" id="fl-provider-save-key" type="button">Save</button>
+            </div>
+        `;
+        this.providerSetup.querySelector('#fl-provider-save-key').addEventListener('click', () => this._saveProviderKey());
+    }
+
+    async _saveProviderKey() {
+        const input = this.providerSetup.querySelector('#fl-provider-key');
+        const apiKey = input?.value?.trim();
+        if (!apiKey) return;
+        try {
+            this.providerStatus = await this.chatClient.setProviderKey(this.providerStatus.provider, apiKey);
+            this._renderProviderControls();
+        } catch (error) {
+            this.addMessage('error', `Failed to save provider key: ${error.message}`);
+        }
+    }
+
+    async _fetchLocalModels() {
+        const baseURL = this.providerSetup.querySelector('#fl-local-url')?.value?.trim();
+        if (!baseURL) return;
+        try {
+            this.localModelOptions = await this.chatClient.listLocalModels(baseURL);
+            const modelInput = this.providerSetup.querySelector('#fl-local-model');
+            if (modelInput && this.localModelOptions.length && !modelInput.value.trim()) {
+                modelInput.value = this.localModelOptions[0].id;
+            }
+            this._renderProviderControls();
+        } catch (error) {
+            this.addMessage('error', `Failed to fetch local models: ${error.message}`);
+        }
+    }
+
+    async _saveLocalProvider() {
+        const baseURL = this.providerSetup.querySelector('#fl-local-url')?.value?.trim();
+        const model = this.providerSetup.querySelector('#fl-local-model')?.value?.trim();
+        if (!baseURL || !model) return;
+        try {
+            await this.chatClient.setLocalConfig(baseURL, model);
+            this.providerStatus = await this.chatClient.selectProvider('local', model);
+            this._renderProviderControls();
+        } catch (error) {
+            this.addMessage('error', `Failed to connect local model: ${error.message}`);
+        }
+    }
+
+    _escapeAttr(value) {
+        return String(value ?? '')
+            .replace(/&/g, '&amp;')
+            .replace(/"/g, '&quot;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;');
     }
 
     /**

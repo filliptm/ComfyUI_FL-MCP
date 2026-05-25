@@ -10,7 +10,8 @@ DEFAULT_MODELS: Dict[str, str] = {
     "openai": "gpt-4-turbo-preview",
     "anthropic": "claude-3-5-sonnet-20241022",
     "gemini": "gemini-2.0-flash-exp",
-    "openrouter": "deepseek/deepseek-chat"
+    "openrouter": "anthropic/claude-sonnet-4.5",
+    "local": "local-model"
 }
 
 # Provider-specific tuning for message history and compression
@@ -30,6 +31,10 @@ PROVIDER_TUNING: Dict[str, Dict[str, int]] = {
     "openrouter": {
         "history_limit": 36,
         "max_chars": 2000
+    },
+    "local": {
+        "history_limit": 16,
+        "max_chars": 1000
     }
 }
 
@@ -65,7 +70,8 @@ def validate_provider_model(provider: str, model: str) -> bool:
         "openai": ["gpt-", "o1-", "o3-", "text-"],
         "anthropic": ["claude-"],
         "gemini": ["gemini-", "models/gemini-"],
-        "openrouter": ["*"]  # OpenRouter accepts any format
+        "openrouter": ["*"],  # OpenRouter accepts any format
+        "local": ["*"]
     }
     
     if provider not in patterns:
