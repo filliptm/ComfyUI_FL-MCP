@@ -16,10 +16,12 @@ export class LayoutEngine {
     constructor() {
         this.app = app;
 
-        // Default spacing values (can be modified via multiplier)
+        // Default spacing values (can be modified via multiplier).
+        // These are the GAPS between nodes, not including node width/height.
+        // Kept compact so auto-layout produces tight, readable results.
         this.baseSpacing = {
-            horizontal: 250,
-            vertical: 150
+            horizontal: 50,
+            vertical: 30
         };
 
         this.spacingMultiplier = 1.0;
@@ -100,8 +102,17 @@ export class LayoutEngine {
     }
 
     /**
-     * Pre-calculate positions for nodes that don't exist yet
-     * This allows creating nodes directly at their final positions
+     * Pre-calculate positions for nodes that don't exist yet.
+     * This allows creating nodes directly at their final positions.
+     *
+     * NOTE: Because the nodes don't exist yet there are no real edges to
+     * trace.  The old implementation passed an empty-edges mockGraph into
+     * _flowHorizontal which caused _assignColumns to give every node
+     * depth=0 — all nodes piled into column 0 and overlapped.
+     *
+     * Fix: when no edge hints are present we use a simple sequential
+     * horizontal layout instead, which is almost always correct for a
+     * freshly-created node chain.
      *
      * @param {Array} nodeSpecs - Array of node specifications with types
      * @param {string} strategy - Layout strategy
@@ -113,12 +124,27 @@ export class LayoutEngine {
 
             const spacing = this.getSpacing();
 
-            // For pre-calculation, we need to estimate node sizes
-            // We'll use typical ComfyUI node dimensions
-            const DEFAULT_NODE_WIDTH = 210;
-            const DEFAULT_NODE_HEIGHT = 150;
+            // Realistic default node dimensions for ComfyUI nodes.
+            // (actual sizes vary but these prevent gross overlap at creation time)
+            const DEFAULT_NODE_WIDTH = 315;
+            const DEFAULT_NODE_HEIGHT = 200;
 
-            // Build a mock graph with estimated dimensions
+            // When there are no edge hints, every node would get assigned
+            // depth=0 by _assignColumns (no inputs to trace), so they all
+            // overlap in the same column.  Fall back to a clean sequential
+            // horizontal row instead.
+            const hasEdgeHints = nodeSpecs.some(s => s.inputs && s.inputs.length > 0);
+            if (!hasEdgeHints) {
+                let xPos = 0;
+                return nodeSpecs.map(() => {
+                    const pos = { x: xPos, y: 0 };
+                    xPos += DEFAULT_NODE_WIDTH + spacing.horizontal;
+                    return pos;
+                });
+            }
+
+            // Build a mock graph with estimated dimensions (used when edge
+            // hints are available so we can do a proper topological layout)
             const mockGraph = {
                 nodes: nodeSpecs.map((spec, index) => ({
                     id: index,

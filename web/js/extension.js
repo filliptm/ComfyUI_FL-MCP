@@ -48,6 +48,19 @@ async function fetchClientConfig() {
     }
 }
 
+async function fetchLauncherStatus() {
+    try {
+        const response = await fetch('/fl_ren/launcher/status');
+        if (!response.ok) {
+            throw new Error(`Launcher status failed: ${response.status}`);
+        }
+        return await response.json();
+    } catch (error) {
+        console.warn('[FL_JS] Ren launcher status unavailable:', error);
+        return { backendReachable: false, wsUrl: 'ws://127.0.0.1:8000/ws' };
+    }
+}
+
 app.registerExtension({
     name: "fl_js.agentic_system",
     
@@ -61,18 +74,21 @@ app.registerExtension({
             
             console.log(`[FL_JS] Session ID: ${sessionId}`);
             
-            // Fetch configuration from backend
+            const launcherStatus = await fetchLauncherStatus();
+
+            // Fetch configuration from backend when available
             const config = await fetchClientConfig();
+            const wsUrl = launcherStatus.wsUrl || config.ws_url;
             
             // Initialize WebSocket client with dynamic URL
             wsClient = new WSClient(sessionId, {
-                url: config.ws_url,
+                url: wsUrl,
                 heartbeatInterval: 30000,
                 maxReconnectAttempts: 5,
             });
 
             chatClient = new ChatClient(sessionId, {
-                wsUrl: config.ws_url,
+                wsUrl,
             });
             
             // Initialize diagram generator
@@ -216,9 +232,14 @@ app.registerExtension({
                 version: '0.3.0',
             };
             
-            // Connect to backend
-            console.log("[FL_JS] Connecting to backend server...");
-            wsClient.connect();
+            // Connect only if the hidden Ren backend is already running. The
+            // sidebar can launch it later through Comfy's launcher route.
+            if (launcherStatus.backendReachable) {
+                console.log("[FL_JS] Connecting to backend server...");
+                wsClient.connect();
+            } else {
+                console.log("[FL_JS] Ren backend is stopped; waiting for user launch.");
+            }
             
             console.log("[FL_JS] Extension initialized successfully!");
             console.log("[FL_JS] Note: Backend server must be running (cd backend && python server.py)");

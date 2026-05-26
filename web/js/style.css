@@ -662,6 +662,37 @@
     border-bottom: 1px solid rgba(255, 255, 255, 0.08);
 }
 
+.fl-chat-header-right {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+}
+
+.fl-ren-launch {
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    background: #26262a;
+    color: #f2f2f2;
+    border-radius: 4px;
+    height: 24px;
+    padding: 0 8px;
+    font-size: 11px;
+    cursor: pointer;
+}
+
+.fl-ren-launch.running {
+    color: #73d391;
+}
+
+.fl-ren-launch:hover {
+    background: #323238;
+}
+
+.fl-ren-launch:disabled {
+    cursor: wait;
+    opacity: 0.65;
+}
+
 .fl-provider-bar {
     display: flex;
     align-items: center;
@@ -709,6 +740,65 @@
     padding: 4px 6px;
     font-size: 11px;
     outline: none;
+}
+
+.fl-conversation-bar,
+.fl-comfy-bar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 7px 12px;
+    background: #18181c;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+    flex-shrink: 0;
+}
+
+.fl-conversation-select {
+    flex: 1;
+    min-width: 0;
+    background: #26262a;
+    color: #f2f2f2;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 4px;
+    padding: 5px 6px;
+    font-size: 11px;
+    outline: none;
+}
+
+.fl-conversation-new,
+.fl-comfy-restart {
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    background: #26262a;
+    color: #f2f2f2;
+    border-radius: 4px;
+    min-width: 28px;
+    height: 26px;
+    padding: 0 8px;
+    font-size: 11px;
+    cursor: pointer;
+}
+
+.fl-conversation-new:hover,
+.fl-comfy-restart:hover {
+    background: #323238;
+}
+
+.fl-comfy-state {
+    flex: 1;
+    min-width: 0;
+    font-size: 11px;
+    color: #9a9aa0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.fl-comfy-state.online {
+    color: #73d391;
+}
+
+.fl-comfy-state.offline {
+    color: #ff9b8f;
 }
 
 .fl-provider-setup {

@@ -133,6 +133,87 @@ export class ChatClient {
         return data.active || [];
     }
 
+    async listConversations() {
+        const response = await fetch(`${this.baseUrl}/api/conversations`);
+        if (!response.ok) return [];
+        const data = await response.json();
+        return data.conversations || [];
+    }
+
+    async createConversation(title = 'New chat') {
+        const response = await fetch(`${this.baseUrl}/api/conversations`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ sessionId: this.sessionId, title }),
+        });
+        const data = await response.json();
+        if (!response.ok) {
+            throw new Error(data.error || `Create conversation failed: ${response.status}`);
+        }
+        this.conversationId = data.conversation.id;
+        return data.conversation;
+    }
+
+    async loadConversation(conversationId) {
+        const response = await fetch(`${this.baseUrl}/api/conversations/${encodeURIComponent(conversationId)}`);
+        const data = await response.json();
+        if (!response.ok) {
+            throw new Error(data.error || `Load conversation failed: ${response.status}`);
+        }
+        this.conversationId = conversationId;
+        return data;
+    }
+
+    async updateConversation(conversationId, updates) {
+        const response = await fetch(`${this.baseUrl}/api/conversations/${encodeURIComponent(conversationId)}`, {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(updates),
+        });
+        const data = await response.json();
+        if (!response.ok) {
+            throw new Error(data.error || `Update conversation failed: ${response.status}`);
+        }
+        return data.conversation;
+    }
+
+    async deleteConversation(conversationId) {
+        const response = await fetch(`${this.baseUrl}/api/conversations/${encodeURIComponent(conversationId)}`, {
+            method: 'DELETE',
+        });
+        if (!response.ok && response.status !== 404) {
+            throw new Error(`Delete conversation failed: ${response.status}`);
+        }
+        if (this.conversationId === conversationId) {
+            this.conversationId = this.sessionId;
+        }
+    }
+
+    async comfyStatus() {
+        const response = await fetch(`${this.baseUrl}/api/comfy/status`);
+        if (!response.ok) {
+            throw new Error(`Comfy status failed: ${response.status}`);
+        }
+        return response.json();
+    }
+
+    async restartComfy() {
+        const response = await fetch(`${this.baseUrl}/api/comfy/restart`, { method: 'POST' });
+        const data = await response.json();
+        if (!response.ok) {
+            throw new Error(data.error || `Comfy restart failed: ${response.status}`);
+        }
+        return data;
+    }
+
+    async comfyLogs(limit = 300) {
+        const response = await fetch(`${this.baseUrl}/api/comfy/logs?limit=${encodeURIComponent(limit)}`);
+        if (!response.ok) {
+            throw new Error(`Comfy logs failed: ${response.status}`);
+        }
+        return response.json();
+    }
+
     async providerStatus() {
         const response = await fetch(`${this.baseUrl}/api/providers/status`);
         if (!response.ok) {

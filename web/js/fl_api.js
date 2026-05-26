@@ -69,7 +69,7 @@ export class FL_API {
                 for (const [key, value] of Object.entries(parameters)) {
                     const widget = node.widgets.find(w => w.name === key);
                     if (widget) {
-                        widget.value = value;
+                        this._setWidgetValue(node, widget, value);
                     }
                 }
             }
@@ -81,6 +81,7 @@ export class FL_API {
 
             // Add to graph
             app.graph.add(node);
+            this._markGraphChanged();
 
             console.log(`[FL_API] Created node: ${nodeType} (id: ${node.id})`);
             return {
@@ -111,6 +112,9 @@ export class FL_API {
                     removed++;
                 }
             }
+            if (removed > 0) {
+                this._markGraphChanged();
+            }
             console.log(`[FL_API] Removed ${removed} node(s)`);
             return { removed };
         } catch (error) {
@@ -134,6 +138,9 @@ export class FL_API {
                     bypassed++;
                 }
             }
+            if (bypassed > 0) {
+                this._markGraphChanged();
+            }
             console.log(`[FL_API] Bypassed ${bypassed} node(s)`);
             return { bypassed };
         } catch (error) {
@@ -156,6 +163,9 @@ export class FL_API {
                     node.mode = 0;  // 0 = normal
                     unbypassed++;
                 }
+            }
+            if (unbypassed > 0) {
+                this._markGraphChanged();
             }
             console.log(`[FL_API] Unbypassed ${unbypassed} node(s)`);
             return { unbypassed };
@@ -181,6 +191,9 @@ export class FL_API {
                     pinned++;
                 }
             }
+            if (pinned > 0) {
+                this._markGraphChanged();
+            }
             console.log(`[FL_API] Pinned ${pinned} node(s)`);
             return { pinned };
         } catch (error) {
@@ -203,6 +216,9 @@ export class FL_API {
                     node.flags.pinned = false;
                     unpinned++;
                 }
+            }
+            if (unpinned > 0) {
+                this._markGraphChanged();
             }
             console.log(`[FL_API] Unpinned ${unpinned} node(s)`);
             return { unpinned };
@@ -234,6 +250,7 @@ export class FL_API {
             if (nodes.length > 0) {
                 app.canvas.selectNodes(nodes);
             }
+            this._markCanvasDirty();
 
             console.log(`[FL_API] Selected ${nodes.length} node(s)`);
             return { selected: nodes.length };
@@ -498,10 +515,13 @@ export class FL_API {
                 for (const [key, value] of Object.entries(values)) {
                     const widget = node.widgets.find(w => w.name === key);
                     if (widget) {
-                        widget.value = value;
+                        this._setWidgetValue(node, widget, value);
                         set++;
                     }
                 }
+            }
+            if (set > 0) {
+                this._markGraphChanged();
             }
 
             console.log(`[FL_API] Set ${set} value(s) on node ${node.id}`);
@@ -750,6 +770,7 @@ export class FL_API {
 
             // Make the connection
             sourceNode.connect(outputSlotIndex, targetNode, inputSlotIndex);
+            this._markGraphChanged();
             
             const connectionInfo = {
                 source_node_id: sourceNode.id,
@@ -1138,6 +1159,7 @@ export class FL_API {
             if (typeof rect.y === "number") node.pos[1] = rect.y;
             if (typeof rect.width === "number") node.size[0] = rect.width;
             if (typeof rect.height === "number") node.size[1] = rect.height;
+            this._markGraphChanged();
 
             const updated = {
                 x: node.pos[0],
@@ -1174,6 +1196,7 @@ export class FL_API {
             const y = anchorNode.pos[1];
 
             targetNode.pos = [x, y];
+            this._markGraphChanged();
 
             console.log(`[FL_API] Positioned node ${targetNode.id} left of ${anchorNode.id}`);
             return { x, y };
@@ -1203,6 +1226,7 @@ export class FL_API {
             const y = anchorNode.pos[1];
 
             targetNode.pos = [x, y];
+            this._markGraphChanged();
 
             console.log(`[FL_API] Positioned node ${targetNode.id} right of ${anchorNode.id}`);
             return { x, y };
@@ -1232,6 +1256,7 @@ export class FL_API {
             const y = anchorNode.pos[1] - targetNode.size[1] - margin;
 
             targetNode.pos = [x, y];
+            this._markGraphChanged();
 
             console.log(`[FL_API] Positioned node ${targetNode.id} above ${anchorNode.id}`);
             return { x, y };
@@ -1260,6 +1285,7 @@ export class FL_API {
             const y = anchorNode.pos[1] + anchorNode.size[1] + margin;
 
             targetNode.pos = [x, y];
+            this._markGraphChanged();
 
             console.log(`[FL_API] Positioned node ${targetNode.id} below ${anchorNode.id}`);
             return { x, y };
@@ -1304,6 +1330,7 @@ export class FL_API {
 
             const x = maxRight + margin;
             node.pos[0] = x;
+            this._markGraphChanged();
 
             console.log(`[FL_API] Moved node ${node.id} right to x=${x}`);
             return { x, y: node.pos[1] };
@@ -1348,6 +1375,7 @@ export class FL_API {
 
             const y = maxBottom + margin;
             node.pos[1] = y;
+            this._markGraphChanged();
 
             console.log(`[FL_API] Moved node ${node.id} down to y=${y}`);
             return { x: node.pos[0], y };
@@ -1359,27 +1387,182 @@ export class FL_API {
 
     // ==================== WORKFLOW CONTROL ====================
 
+    listCommands() {
+        const commandBridge = this._getCommandBridge();
+        const rawCommands = this._unwrap(commandBridge?.commands) || this._unwrap(app.extensionManager?.commands) || [];
+        const commands = Array.isArray(rawCommands)
+            ? rawCommands
+            : rawCommands.values
+                ? Array.from(rawCommands.values())
+                : Object.values(rawCommands);
+
+        return {
+            count: commands.length,
+            commands: commands.map((command) => this._serializeCommand(command)).filter(Boolean)
+        };
+    }
+
+    async executeCommand(commandId) {
+        const commandBridge = this._getCommandBridge();
+        if (!commandBridge?.execute) {
+            throw new Error("ComfyUI command bridge is not available");
+        }
+
+        await commandBridge.execute(commandId);
+        this._markCanvasDirty();
+        return { success: true, command_id: commandId };
+    }
+
+    listKeybindings() {
+        const commands = this.listCommands().commands;
+        return {
+            count: commands.length,
+            keybindings: commands.map((command) => ({
+                id: command.id,
+                label: command.label,
+                keybinding: command.keybinding
+            }))
+        };
+    }
+
+    async getCurrentWorkflowJSON(apiFormat = false) {
+        if (apiFormat) {
+            const prompt = await app.graphToPrompt();
+            return {
+                api_format: true,
+                output: prompt.output,
+                workflow: prompt.workflow
+            };
+        }
+
+        return {
+            api_format: false,
+            workflow: app.graph.serialize()
+        };
+    }
+
+    async loadWorkflowJSON(workflow, name = null, clean = true, restoreView = true) {
+        if (!workflow || typeof workflow !== "object") {
+            throw new Error("workflow must be a workflow JSON object");
+        }
+
+        await app.loadGraphData(workflow, clean, restoreView, name || null);
+        this._markGraphChanged();
+        return {
+            success: true,
+            name,
+            node_count: app.graph?._nodes?.length || 0
+        };
+    }
+
+    async getWorkflowTabs() {
+        const workflowStore = this._unwrap(app.extensionManager?.workflow);
+        const openWorkflows = this._unwrap(workflowStore?.openWorkflows) || [];
+        const activeWorkflow = this._unwrap(workflowStore?.activeWorkflow);
+
+        return {
+            active: activeWorkflow ? this._serializeWorkflowTab(activeWorkflow) : null,
+            tabs: Array.from(openWorkflows).map((workflow) => this._serializeWorkflowTab(workflow)).filter(Boolean)
+        };
+    }
+
+    async listWorkflowFiles() {
+        if (api.listUserDataFullInfo) {
+            return {
+                files: await api.listUserDataFullInfo("workflows")
+            };
+        }
+
+        const response = await api.fetchApi("/userdata?dir=workflows&recurse=true&split=false&full_info=true");
+        if (!response.ok && response.status !== 404) {
+            throw new Error(`Failed to list workflows: ${response.status} ${response.statusText}`);
+        }
+        return { files: response.status === 404 ? [] : await response.json() };
+    }
+
+    async readWorkflowFile(path) {
+        const normalizedPath = this._normalizeWorkflowPath(path);
+        const response = await api.getUserData(normalizedPath);
+        if (!response.ok) {
+            throw new Error(`Failed to read workflow '${normalizedPath}': ${response.status} ${response.statusText}`);
+        }
+        return {
+            path: normalizedPath,
+            workflow: await response.json()
+        };
+    }
+
+    async saveCurrentWorkflow(path, overwrite = true) {
+        const normalizedPath = this._normalizeWorkflowPath(path);
+        const workflow = app.graph.serialize();
+        const response = await api.storeUserData(normalizedPath, workflow, {
+            overwrite,
+            stringify: true,
+            throwOnError: false,
+            full_info: true
+        });
+        if (!response.ok) {
+            throw new Error(`Failed to save workflow '${normalizedPath}': ${response.status} ${response.statusText}`);
+        }
+        const data = response.headers.get("content-type")?.includes("application/json") ? await response.json() : null;
+        return { success: true, path: normalizedPath, file: data };
+    }
+
+    async renameWorkflowFile(path, dest, overwrite = true) {
+        const sourcePath = this._normalizeWorkflowPath(path);
+        const destPath = this._normalizeWorkflowPath(dest);
+        const response = await api.moveUserData(sourcePath, destPath, { overwrite });
+        if (!response.ok) {
+            throw new Error(`Failed to rename workflow '${sourcePath}' to '${destPath}': ${response.status} ${response.statusText}`);
+        }
+        const data = response.headers.get("content-type")?.includes("application/json") ? await response.json() : null;
+        return { success: true, path: sourcePath, dest: destPath, file: data };
+    }
+
+    async deleteWorkflowFile(path) {
+        const normalizedPath = this._normalizeWorkflowPath(path);
+        const response = await api.deleteUserData(normalizedPath);
+        if (!response.ok) {
+            throw new Error(`Failed to delete workflow '${normalizedPath}': ${response.status} ${response.statusText}`);
+        }
+        return { success: true, path: normalizedPath };
+    }
+
+    async closeCurrentWorkflow() {
+        return this.executeCommand("Workspace.CloseWorkflow");
+    }
+
+    async duplicateCurrentWorkflow() {
+        return this.executeCommand("Comfy.DuplicateWorkflow");
+    }
+
     /**
      * Queue workflow for execution
      * @param {number|null} batchCount - Batch count (null for current)
      * @returns {object} Queue result with prompt_id, queue_number, and node_errors
      */
-    queueWorkflow(batchCount = null) {
+    async queueWorkflow(batchCount = null) {
         try {
+            const queueSettings = this._getQueueSettings();
             if (batchCount !== null) {
-                app.ui.batchCount.value = batchCount;
+                this.setBatchCount(batchCount);
             }
-            
-            // Call ComfyUI's queuePrompt and capture the result
-            const queueResult = app.queuePrompt();
-            
-            console.log(`[FL_API] Queued workflow (batch: ${app.ui.batchCount.value})`);
+
+            const effectiveBatchCount = queueSettings?.batchCount || parseInt(app.ui?.batchCount?.value || "1", 10) || 1;
+            const prompt = await app.graphToPrompt();
+            let queueResult = null;
+
+            for (let i = 0; i < effectiveBatchCount; i++) {
+                queueResult = await api.queuePrompt(0, prompt);
+            }
+
+            console.log(`[FL_API] Queued workflow (batch: ${effectiveBatchCount})`);
             console.log(`[FL_API] Queue result:`, queueResult);
             
             // Return comprehensive queue information
             return { 
                 queued: true, 
-                batch_count: parseInt(app.ui.batchCount.value),
+                batch_count: effectiveBatchCount,
                 prompt_id: queueResult.prompt_id,
                 queue_number: queueResult.number,
                 node_errors: queueResult.node_errors || {}
@@ -1410,9 +1593,14 @@ export class FL_API {
      */
     enableAutoQueue() {
         try {
-            app.ui.autoQueueEnabled = true;
+            const queueSettings = this._getQueueSettings();
+            if (queueSettings) {
+                queueSettings.mode = "instant";
+            } else if (app.ui) {
+                app.ui.autoQueueEnabled = true;
+            }
             console.log("[FL_API] Enabled auto-queue");
-            return { enabled: true };
+            return { enabled: true, mode: queueSettings?.mode || "instant" };
         } catch (error) {
             console.error("[FL_API] enableAutoQueue error:", error);
             throw error;
@@ -1425,9 +1613,14 @@ export class FL_API {
      */
     disableAutoQueue() {
         try {
-            app.ui.autoQueueEnabled = false;
+            const queueSettings = this._getQueueSettings();
+            if (queueSettings) {
+                queueSettings.mode = "disabled";
+            } else if (app.ui) {
+                app.ui.autoQueueEnabled = false;
+            }
             console.log("[FL_API] Disabled auto-queue");
-            return { enabled: false };
+            return { enabled: false, mode: queueSettings?.mode || "disabled" };
         } catch (error) {
             console.error("[FL_API] disableAutoQueue error:", error);
             throw error;
@@ -1441,9 +1634,15 @@ export class FL_API {
      */
     setBatchCount(count) {
         try {
-            app.ui.batchCount.value = count;
+            const parsed = Math.max(1, parseInt(count, 10) || 1);
+            const queueSettings = this._getQueueSettings();
+            if (queueSettings) {
+                queueSettings.batchCount = parsed;
+            } else if (app.ui?.batchCount) {
+                app.ui.batchCount.value = parsed;
+            }
             console.log(`[FL_API] Set batch count to ${count}`);
-            return { count };
+            return { count: parsed };
         } catch (error) {
             console.error("[FL_API] setBatchCount error:", error);
             throw error;
@@ -1457,12 +1656,16 @@ export class FL_API {
     async getQueueStatus() {
         try {
             const queue = await api.getQueue();
+            const queueSettings = this._getQueueSettings();
+            const mode = queueSettings?.mode || (app.ui?.autoQueueEnabled ? "instant" : "disabled");
+            const batchCount = queueSettings?.batchCount || parseInt(app.ui?.batchCount?.value || "1", 10) || 1;
             console.log("[FL_API] Retrieved queue status");
             return {
                 running: queue.Running || [],
                 pending: queue.Pending || [],
-                auto_queue_enabled: app.ui.autoQueueEnabled || false,
-                batch_count: parseInt(app.ui.batchCount.value) || 1
+                auto_queue_enabled: mode !== "disabled",
+                auto_queue_mode: mode,
+                batch_count: batchCount
             };
         } catch (error) {
             console.error("[FL_API] getQueueStatus error:", error);
@@ -1539,6 +1742,126 @@ export class FL_API {
     }
 
     // ==================== INTERNAL HELPERS ====================
+
+    _unwrap(value) {
+        if (value && typeof value === "object" && "value" in value) {
+            return value.value;
+        }
+        return value;
+    }
+
+    _getCommandBridge() {
+        return this._unwrap(app.extensionManager?.command);
+    }
+
+    _getQueueSettings() {
+        return this._unwrap(app.extensionManager?.queueSettings) || null;
+    }
+
+    _markCanvasDirty() {
+        try {
+            app.canvas?.setDirty?.(true, true);
+        } catch (error) {
+            console.debug("[FL_API] Could not mark canvas dirty:", error);
+        }
+        try {
+            app.graph?.setDirtyCanvas?.(true, true);
+        } catch (error) {
+            console.debug("[FL_API] Could not mark graph canvas dirty:", error);
+        }
+    }
+
+    _markGraphChanged() {
+        this._markCanvasDirty();
+        try {
+            app.graph?.change?.();
+        } catch (error) {
+            console.debug("[FL_API] Could not notify graph change:", error);
+        }
+        try {
+            api?.dispatchCustomEvent?.("graphChanged");
+        } catch (error) {
+            console.debug("[FL_API] Could not dispatch graphChanged:", error);
+        }
+    }
+
+    _setWidgetValue(node, widget, value) {
+        const oldValue = widget.value;
+        widget.value = value;
+
+        try {
+            widget.callback?.call(widget, value, app.canvas, node, app.canvas?.graph_mouse, {});
+        } catch (error) {
+            console.debug(`[FL_API] Widget callback failed for ${widget.name}:`, error);
+        }
+
+        try {
+            node.onWidgetChanged?.(widget.name, value, oldValue, widget);
+        } catch (error) {
+            console.debug(`[FL_API] Node widget change hook failed for ${widget.name}:`, error);
+        }
+    }
+
+    _serializeCommand(command) {
+        if (!command) {
+            return null;
+        }
+
+        let keybinding = null;
+        try {
+            const rawKeybinding = this._unwrap(command.keybinding);
+            const combo = rawKeybinding?.combo || rawKeybinding;
+            keybinding = rawKeybinding ? {
+                key: combo?.key,
+                ctrl: Boolean(combo?.ctrl),
+                alt: Boolean(combo?.alt),
+                shift: Boolean(combo?.shift),
+                meta: Boolean(combo?.meta),
+                combo: combo?.toString?.() || rawKeybinding?.toString?.() || null
+            } : null;
+        } catch (error) {
+            console.debug(`[FL_API] Could not serialize keybinding for ${command.id}:`, error);
+        }
+
+        return {
+            id: command.id,
+            label: command.label || command.name || command.id,
+            tooltip: command.tooltip || null,
+            icon: command.icon || null,
+            source: command.source || null,
+            version_added: command.versionAdded || null,
+            keybinding
+        };
+    }
+
+    _serializeWorkflowTab(workflow) {
+        if (!workflow) {
+            return null;
+        }
+
+        return {
+            id: workflow.id || workflow.key || null,
+            name: workflow.name || workflow.path || workflow.filename || "Untitled",
+            path: workflow.path || null,
+            filename: workflow.filename || null,
+            is_modified: Boolean(workflow.isModified || workflow.modified || workflow.dirty)
+        };
+    }
+
+    _normalizeWorkflowPath(path) {
+        if (!path || typeof path !== "string") {
+            throw new Error("Workflow path is required");
+        }
+
+        let normalized = path.replace(/^\/+/, "");
+        if (!normalized.startsWith("workflows/")) {
+            normalized = `workflows/${normalized}`;
+        }
+        if (!normalized.endsWith(".json")) {
+            normalized = `${normalized}.json`;
+        }
+        return normalized;
+    }
 
     /**
      * Find node by various criteria

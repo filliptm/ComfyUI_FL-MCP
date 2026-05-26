@@ -127,9 +127,9 @@ class ServerRunner:
         # Check port availability
         if self.is_port_in_use():
             print(f"[FL_JS] Port {self.port} already in use.")
-            print(f"[FL_JS] If you're running the backend manually, this is OK.")
-            print(f"[FL_JS] Otherwise, change WS_PORT in .env or stop the conflicting service.")
-            return False
+            print(f"[FL_JS] Reusing existing Ren backend on port {self.port}.")
+            self.active_mode = "external"
+            return True
         
         # Determine launch method
         if self.launch_mode == "manual":

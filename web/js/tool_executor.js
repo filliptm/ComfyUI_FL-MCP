@@ -42,6 +42,9 @@ export class ToolExecutor {
             "query_workflow": this._handleQueryWorkflow.bind(this),
             "workflow_overview": this._handleWorkflowOverview.bind(this),
             "workflow_diagram": this._handleWorkflowDiagram.bind(this),
+            "frontend_list_commands": this._handleFrontendListCommands.bind(this),
+            "frontend_execute_command": this._handleFrontendExecuteCommand.bind(this),
+            "frontend_list_keybindings": this._handleFrontendListKeybindings.bind(this),
             
             // Node Management
             "find_node": this._handleFindNode.bind(this),
@@ -84,6 +87,16 @@ export class ToolExecutor {
             "disable_auto_queue": this._handleDisableAutoQueue.bind(this),
             "set_batch_count": this._handleSetBatchCount.bind(this),
             "get_queue_status": this._handleGetQueueStatus.bind(this),
+            "workflow_get_current_json": this._handleWorkflowGetCurrentJSON.bind(this),
+            "workflow_load_json": this._handleWorkflowLoadJSON.bind(this),
+            "workflow_get_tabs": this._handleWorkflowGetTabs.bind(this),
+            "workflow_list_files": this._handleWorkflowListFiles.bind(this),
+            "workflow_read_file": this._handleWorkflowReadFile.bind(this),
+            "workflow_save_current": this._handleWorkflowSaveCurrent.bind(this),
+            "workflow_rename_file": this._handleWorkflowRenameFile.bind(this),
+            "workflow_delete_file": this._handleWorkflowDeleteFile.bind(this),
+            "workflow_close_current": this._handleWorkflowCloseCurrent.bind(this),
+            "workflow_duplicate_current": this._handleWorkflowDuplicateCurrent.bind(this),
             
             // System Control
             "disable_sleep": this._handleDisableSleep.bind(this),
@@ -240,6 +253,19 @@ export class ToolExecutor {
         }
     }
 
+    async _handleFrontendListCommands(params) {
+        return this.flApi.listCommands();
+    }
+
+    async _handleFrontendExecuteCommand(params) {
+        const { command_id } = params;
+        return await this.flApi.executeCommand(command_id);
+    }
+
+    async _handleFrontendListKeybindings(params) {
+        return this.flApi.listKeybindings();
+    }
+
     // ==================== NODE MANAGEMENT HANDLERS ====================
 
     async _handleFindNode(params) {
@@ -306,7 +332,7 @@ export class ToolExecutor {
                 );
                 results.push({
                     success: true,
-                    node_id: result.node_id,
+                    node_id: result.id,
                     node_type: nodeSpec.node_type
                 });
             } catch (error) {
@@ -327,38 +353,38 @@ export class ToolExecutor {
 
     async _handleRemoveNodes(params) {
         const { node_ids } = params;
-        const count = this.flApi.remove(node_ids);
-        return { removed_count: count };
+        const result = this.flApi.remove(node_ids);
+        return { removed_count: result.removed };
     }
 
     async _handleBypassNodes(params) {
         const { node_ids } = params;
-        const count = this.flApi.bypass(node_ids);
-        return { bypassed_count: count };
+        const result = this.flApi.bypass(node_ids);
+        return { bypassed_count: result.bypassed };
     }
 
     async _handleUnbypassNodes(params) {
         const { node_ids } = params;
-        const count = this.flApi.unbypass(node_ids);
-        return { unbypassed_count: count };
+        const result = this.flApi.unbypass(node_ids);
+        return { unbypassed_count: result.unbypassed };
     }
 
     async _handlePinNodes(params) {
         const { node_ids } = params;
-        const count = this.flApi.pin(node_ids);
-        return { pinned_count: count };
+        const result = this.flApi.pin(node_ids);
+        return { pinned_count: result.pinned };
     }
 
     async _handleUnpinNodes(params) {
         const { node_ids } = params;
-        const count = this.flApi.unpin(node_ids);
-        return { unpinned_count: count };
+        const result = this.flApi.unpin(node_ids);
+        return { unpinned_count: result.unpinned };
     }
 
     async _handleSelectNodes(params) {
         const { node_ids } = params;
-        const count = this.flApi.selectNodes(node_ids);
-        return { selected_count: count };
+        const result = this.flApi.selectNodes(node_ids);
+        return { selected_count: result.selected };
     }
 
     async _handleGetSelectedNodes(params) {
@@ -635,6 +661,51 @@ export class ToolExecutor {
 
     async _handleGetQueueStatus(params) {
         return this.flApi.getQueueStatus();
+    }
+
+    async _handleWorkflowGetCurrentJSON(params) {
+        return await this.flApi.getCurrentWorkflowJSON(params?.api_format || false);
+    }
+
+    async _handleWorkflowLoadJSON(params) {
+        return await this.flApi.loadWorkflowJSON(
+            params.workflow,
+            params.name || null,
+            params.clean !== false,
+            params.restore_view !== false
+        );
+    }
+
+    async _handleWorkflowGetTabs(params) {
+        return await this.flApi.getWorkflowTabs();
+    }
+
+    async _handleWorkflowListFiles(params) {
+        return await this.flApi.listWorkflowFiles();
+    }
+
+    async _handleWorkflowReadFile(params) {
+        return await this.flApi.readWorkflowFile(params.path);
+    }
+
+    async _handleWorkflowSaveCurrent(params) {
+        return await this.flApi.saveCurrentWorkflow(params.path, params.overwrite !== false);
+    }
+
+    async _handleWorkflowRenameFile(params) {
+        return await this.flApi.renameWorkflowFile(params.path, params.dest, params.overwrite !== false);
+    }
+
+    async _handleWorkflowDeleteFile(params) {
+        return await this.flApi.deleteWorkflowFile(params.path);
+    }
+
+    async _handleWorkflowCloseCurrent(params) {
+        return await this.flApi.closeCurrentWorkflow();
+    }
+
+    async _handleWorkflowDuplicateCurrent(params) {
+        return await this.flApi.duplicateCurrentWorkflow();
     }
 
     // ==================== SYSTEM CONTROL HANDLERS ====================

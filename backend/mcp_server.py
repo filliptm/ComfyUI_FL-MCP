@@ -13,6 +13,7 @@ from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator, Dict, List, Optional, Union, Literal
 
 import websockets
+import httpx
 from fastmcp import FastMCP, Context
 from pydantic import BaseModel, Field, model_validator
 
@@ -41,6 +42,21 @@ from sysinfo import get_system_info as _get_system_info
 
 from manager import manager # This is the Connection Manager, not comfy manager :D
 from calc import acalc_batch, CalcBatchParams
+from coding_tools import (
+    CodingToolError,
+    apply_unified_patch,
+    create_pack as coding_create_pack,
+    git_commit as coding_git_commit,
+    git_diff as coding_git_diff,
+    git_push as coding_git_push,
+    git_status as coding_git_status,
+    list_packs as coding_list_packs,
+    read_file as coding_read_file,
+    search as coding_search,
+    validate_pack as coding_validate_pack,
+    write_file as coding_write_file,
+)
+from comfy_supervisor import comfy_supervisor
 
 # LOGGING
 
@@ -329,6 +345,39 @@ async def _report_tool_activity(ctx: Context, tool_name: str) -> None:
             logger.debug(f"Could not report tool activity: {e}")
 
 
+def _comfy_base_url() -> str:
+    try:
+        from config import settings
+        return settings.comfyui_server_url.rstrip("/")
+    except Exception:
+        return os.getenv("COMFYUI_SERVER_URL", "http://127.0.0.1:8188").rstrip("/")
+
+
+async def _comfy_request(
+    method: str,
+    path: str,
+    *,
+    json_data: Optional[Any] = None,
+    params: Optional[Dict[str, Any]] = None,
+    timeout: float = 30.0,
+) -> Dict[str, Any]:
+    """Small async wrapper around ComfyUI HTTP routes for backend-only tools."""
+    url = f"{_comfy_base_url()}{path}"
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        response = await client.request(method, url, json=json_data, params=params)
+
+    try:
+        data: Any = response.json()
+    except Exception:
+        data = response.text
+
+    return {
+        "success": 200 <= response.status_code < 300,
+        "status": response.status_code,
+        "data": data,
+    }
+
+
 # ============================================================================
 # REQUEST MODELS
 # ============================================================================
@@ -601,6 +650,77 @@ class GetQueueStatusRequest(BaseModel):
     """Request to get queue status."""
     pass
 
+class FrontendExecuteCommandRequest(BaseModel):
+    """Execute a registered ComfyUI frontend command by ID."""
+    command_id: str = Field(..., description="ComfyUI command ID, e.g. 'Comfy.SaveWorkflow' or 'Comfy.Canvas.FitView'")
+
+class WorkflowCurrentJsonRequest(BaseModel):
+    """Get the current workflow JSON."""
+    api_format: bool = Field(False, description="Return API prompt format instead of editable workflow JSON")
+
+class WorkflowLoadJsonRequest(BaseModel):
+    """Load workflow JSON into the active ComfyUI canvas."""
+    workflow: Dict[str, Any] = Field(..., description="Editable ComfyUI workflow JSON object")
+    name: Optional[str] = Field(None, description="Optional workflow tab/name")
+    clean: bool = Field(True, description="Mark the workflow clean after load")
+    restore_view: bool = Field(True, description="Restore saved canvas view if present")
+
+class WorkflowPathRequest(BaseModel):
+    """Workflow file path under userdata/workflows."""
+    path: str = Field(..., description="Workflow path, with or without the workflows/ prefix and .json suffix")
+
+class WorkflowSaveCurrentRequest(BaseModel):
+    """Save the current workflow to userdata/workflows."""
+    path: str = Field(..., description="Destination workflow path")
+    overwrite: bool = Field(True, description="Overwrite an existing file")
+
+class WorkflowRenameRequest(BaseModel):
+    """Rename or move a workflow file under userdata/workflows."""
+    path: str = Field(..., description="Source workflow path")
+    dest: str = Field(..., description="Destination workflow path")
+    overwrite: bool = Field(True, description="Overwrite an existing destination")
+
+class ComfyJobsListRequest(BaseModel):
+    """List ComfyUI job queue/history items."""
+    status: Optional[str] = Field(None, description="Optional status filter if supported by this ComfyUI version")
+    workflow_id: Optional[str] = Field(None, description="Optional workflow ID filter if supported")
+    limit: Optional[int] = Field(None, ge=1, le=200, description="Maximum number of jobs if supported")
+    offset: int = Field(0, ge=0, description="Offset if supported")
+
+class ComfyJobRequest(BaseModel):
+    """Get one ComfyUI job by ID."""
+    job_id: str = Field(..., description="ComfyUI job/prompt ID")
+
+class ComfyFreeMemoryRequest(BaseModel):
+    """Request ComfyUI to unload models and/or free memory."""
+    unload_models: bool = Field(False, description="Unload loaded models")
+    free_memory: bool = Field(False, description="Free model memory")
+
+class ComfyHistoryDeleteRequest(BaseModel):
+    """Delete ComfyUI history entries."""
+    clear_all: bool = Field(False, description="Clear all history")
+    prompt_ids: Optional[List[str]] = Field(None, description="Specific prompt IDs to remove from history")
+
+class ComfySettingsGetRequest(BaseModel):
+    """Read ComfyUI settings."""
+    id: Optional[str] = Field(None, description="Specific setting ID, or omit for all settings")
+
+class ComfySettingsSetRequest(BaseModel):
+    """Set one or more ComfyUI settings."""
+    id: Optional[str] = Field(None, description="Specific setting ID for a single setting update")
+    value: Optional[Any] = Field(None, description="Value for single setting update")
+    settings: Optional[Dict[str, Any]] = Field(None, description="Multiple setting values keyed by setting ID")
+
+class ManagerQueueActionRequest(BaseModel):
+    """Queue a ComfyUI Manager action. Requires explicit confirmation."""
+    endpoint: Literal[
+        "install", "update", "uninstall", "reinstall", "disable", "fix",
+        "install_model", "update_comfyui", "update_all"
+    ] = Field(..., description="Manager queue endpoint/action")
+    payload: Dict[str, Any] = Field(default_factory=dict, description="Raw Manager payload for that action")
+    confirmed: bool = Field(False, description="Must be true to perform install/update/uninstall/disable actions")
+    start_queue: bool = Field(True, description="Start the Manager worker queue after enqueueing")
+
 class DeleteQueueItemsRequest(BaseModel):
     """Request to delete items from the queue."""
     clear_all: Optional[bool] = Field(
@@ -699,6 +819,51 @@ class ClearErrorBufferRequest(BaseModel):
 
 class WaitRequest(BaseModel):
     delay: float = Field(..., description="Brief period of time to wait (keep between 5 and 20 seconds). Great for waiting a bit after the workflow is queued to show some result")
+
+
+class CustomNodesPathRequest(BaseModel):
+    path: str = Field(".", description="Path inside ComfyUI/custom_nodes")
+
+
+class CustomNodesReadFileRequest(BaseModel):
+    path: str = Field(..., description="File path inside ComfyUI/custom_nodes")
+    max_chars: int = Field(12000, ge=1, le=24000, description="Maximum characters to return")
+    start_line: int = Field(1, ge=1, description="First 1-based line number to return")
+    line_count: Optional[int] = Field(240, ge=1, le=800, description="Maximum number of lines to return")
+
+
+class CustomNodesSearchRequest(BaseModel):
+    query: str = Field(..., description="Search text or regex for ripgrep")
+    path: str = Field(".", description="Folder inside ComfyUI/custom_nodes")
+    glob: Optional[str] = Field(None, description="Optional glob such as '*.py'")
+    max_results: int = Field(80, ge=1, le=80, description="Maximum matches")
+
+
+class CustomNodesWriteFileRequest(BaseModel):
+    path: str = Field(..., description="File path inside ComfyUI/custom_nodes")
+    content: str = Field(..., description="Full file content to write")
+    overwrite: bool = Field(False, description="Allow replacing an existing file")
+
+
+class CustomNodesApplyPatchRequest(BaseModel):
+    patch: str = Field(..., description="Unified diff patch. All touched files must be under custom_nodes.")
+
+
+class CustomNodesCreatePackRequest(BaseModel):
+    name: str = Field(..., description="Folder/package name for the new custom node pack")
+    node_class: str = Field("RenExampleNode", description="Python class name for the initial node")
+    display_name: str = Field("Ren Example Node", description="Display name in ComfyUI")
+    category: str = Field("Ren", description="ComfyUI node category")
+    overwrite: bool = Field(False, description="Allow writing into an existing pack")
+
+
+class CustomNodesGitCommitRequest(BaseModel):
+    path: str = Field(".", description="Path inside custom_nodes to add/commit")
+    message: str = Field(..., description="Commit message")
+
+
+class ComfyLogsRequest(BaseModel):
+    limit: int = Field(300, ge=1, le=2000, description="Number of log lines")
 
 # ============================================================================
 # NODE LIBRARY REQUEST MODELS
@@ -904,6 +1069,84 @@ async def workflow_overview(request: WorkflowOverviewRequest, ctx: Context) -> D
 async def workflow_diagram(request: WorkflowDiagramRequest, ctx: Context) -> Dict[str, Any]:
     """Generate a Mermaid diagram of the workflow or subset of nodes."""
     return await _execute_tool(ctx, "workflow_diagram", request.model_dump())
+
+
+@mcp.tool()
+async def frontend_list_commands(request: GetSystemInfoRequest, ctx: Context) -> Dict[str, Any]:
+    """List registered ComfyUI frontend commands Ren can execute."""
+    return await _execute_tool(ctx, "frontend_list_commands", {})
+
+
+@mcp.tool()
+async def frontend_execute_command(request: FrontendExecuteCommandRequest, ctx: Context) -> Dict[str, Any]:
+    """Execute a ComfyUI frontend command by command ID."""
+    return await _execute_tool(ctx, "frontend_execute_command", request.model_dump())
+
+
+@mcp.tool()
+async def frontend_list_keybindings(request: GetSystemInfoRequest, ctx: Context) -> Dict[str, Any]:
+    """List ComfyUI commands and their current keybindings."""
+    return await _execute_tool(ctx, "frontend_list_keybindings", {})
+
+
+@mcp.tool()
+async def workflow_get_current_json(request: WorkflowCurrentJsonRequest, ctx: Context) -> Dict[str, Any]:
+    """Get the current workflow as editable JSON or API prompt JSON."""
+    return await _execute_tool(ctx, "workflow_get_current_json", request.model_dump())
+
+
+@mcp.tool()
+async def workflow_load_json(request: WorkflowLoadJsonRequest, ctx: Context) -> Dict[str, Any]:
+    """Load editable workflow JSON into the active ComfyUI canvas."""
+    return await _execute_tool(ctx, "workflow_load_json", request.model_dump(), timeout_ms=60000)
+
+
+@mcp.tool()
+async def workflow_get_tabs(request: GetSystemInfoRequest, ctx: Context) -> Dict[str, Any]:
+    """List open ComfyUI workflow tabs and the active tab."""
+    return await _execute_tool(ctx, "workflow_get_tabs", {})
+
+
+@mcp.tool()
+async def workflow_list_files(request: GetSystemInfoRequest, ctx: Context) -> Dict[str, Any]:
+    """List saved workflow files in ComfyUI user data."""
+    return await _execute_tool(ctx, "workflow_list_files", {})
+
+
+@mcp.tool()
+async def workflow_read_file(request: WorkflowPathRequest, ctx: Context) -> Dict[str, Any]:
+    """Read a saved workflow JSON file from ComfyUI user data."""
+    return await _execute_tool(ctx, "workflow_read_file", request.model_dump())
+
+
+@mcp.tool()
+async def workflow_save_current(request: WorkflowSaveCurrentRequest, ctx: Context) -> Dict[str, Any]:
+    """Save the current workflow to ComfyUI user data."""
+    return await _execute_tool(ctx, "workflow_save_current", request.model_dump())
+
+
+@mcp.tool()
+async def workflow_rename_file(request: WorkflowRenameRequest, ctx: Context) -> Dict[str, Any]:
+    """Rename or move a saved workflow file in ComfyUI user data."""
+    return await _execute_tool(ctx, "workflow_rename_file", request.model_dump())
+
+
+@mcp.tool()
+async def workflow_delete_file(request: WorkflowPathRequest, ctx: Context) -> Dict[str, Any]:
+    """Delete a saved workflow file from ComfyUI user data."""
+    return await _execute_tool(ctx, "workflow_delete_file", request.model_dump())
+
+
+@mcp.tool()
+async def workflow_close_current(request: GetSystemInfoRequest, ctx: Context) -> Dict[str, Any]:
+    """Close the active ComfyUI workflow tab via the native frontend command."""
+    return await _execute_tool(ctx, "workflow_close_current", {})
+
+
+@mcp.tool()
+async def workflow_duplicate_current(request: GetSystemInfoRequest, ctx: Context) -> Dict[str, Any]:
+    """Duplicate the active ComfyUI workflow tab via the native frontend command."""
+    return await _execute_tool(ctx, "workflow_duplicate_current", {})
 
 
 # ============================================================================
@@ -1458,6 +1701,102 @@ async def get_queue_status(request: GetQueueStatusRequest, ctx: Context) -> Dict
     return await _execute_tool(ctx, "get_queue_status", {})
 
 @mcp.tool()
+async def comfy_jobs_list(request: ComfyJobsListRequest, ctx: Context) -> Dict[str, Any]:
+    """List ComfyUI jobs using the native /api/jobs endpoint."""
+    await _report_tool_activity(ctx, "comfy_jobs_list")
+    params = {k: v for k, v in request.model_dump().items() if v is not None}
+    return await _comfy_request("GET", "/api/jobs", params=params)
+
+@mcp.tool()
+async def comfy_job_get(request: ComfyJobRequest, ctx: Context) -> Dict[str, Any]:
+    """Get one ComfyUI job by prompt/job ID using the native /api/jobs/{id} endpoint."""
+    await _report_tool_activity(ctx, "comfy_job_get")
+    return await _comfy_request("GET", f"/api/jobs/{request.job_id}")
+
+@mcp.tool()
+async def comfy_free_memory(request: ComfyFreeMemoryRequest, ctx: Context) -> Dict[str, Any]:
+    """Ask ComfyUI to unload models and/or free memory."""
+    await _report_tool_activity(ctx, "comfy_free_memory")
+    return await _comfy_request("POST", "/free", json_data=request.model_dump())
+
+@mcp.tool()
+async def comfy_history_delete(request: ComfyHistoryDeleteRequest, ctx: Context) -> Dict[str, Any]:
+    """Delete ComfyUI history entries or clear all history."""
+    await _report_tool_activity(ctx, "comfy_history_delete")
+    if request.clear_all and request.prompt_ids:
+        return {"success": False, "error": "clear_all and prompt_ids are mutually exclusive"}
+    payload: Dict[str, Any] = {}
+    if request.clear_all:
+        payload["clear"] = True
+    elif request.prompt_ids:
+        payload["delete"] = request.prompt_ids
+    else:
+        return {"success": False, "error": "Provide clear_all=True or prompt_ids"}
+    return await _comfy_request("POST", "/history", json_data=payload)
+
+@mcp.tool()
+async def comfy_settings_get(request: ComfySettingsGetRequest, ctx: Context) -> Dict[str, Any]:
+    """Read all ComfyUI settings or one setting by ID."""
+    await _report_tool_activity(ctx, "comfy_settings_get")
+    if request.id:
+        return await _comfy_request("GET", f"/settings/{request.id}")
+    return await _comfy_request("GET", "/settings")
+
+@mcp.tool()
+async def comfy_settings_set(request: ComfySettingsSetRequest, ctx: Context) -> Dict[str, Any]:
+    """Set one or more ComfyUI settings."""
+    await _report_tool_activity(ctx, "comfy_settings_set")
+    if request.id:
+        return await _comfy_request("POST", f"/settings/{request.id}", json_data=request.value)
+    if request.settings:
+        return await _comfy_request("POST", "/settings", json_data=request.settings)
+    return {"success": False, "error": "Provide either id/value or settings"}
+
+@mcp.tool()
+async def manager_queue_action(request: ManagerQueueActionRequest, ctx: Context) -> Dict[str, Any]:
+    """Queue a ComfyUI Manager action such as install/update/uninstall/disable.
+
+    This is intentionally confirmation-gated because Manager actions mutate the
+    local ComfyUI installation and often require a restart.
+    """
+    await _report_tool_activity(ctx, "manager_queue_action")
+    if not request.confirmed:
+        return {
+            "success": False,
+            "confirmation_required": True,
+            "message": (
+                "Set confirmed=True to perform this Manager action. "
+                "Install/update/uninstall/disable actions can change files and may require a ComfyUI restart."
+            ),
+            "endpoint": request.endpoint,
+            "payload": request.payload,
+        }
+
+    result = await _comfy_request("POST", f"/manager/queue/{request.endpoint}", json_data=request.payload)
+    if request.start_queue and result.get("success"):
+        start_result = await _comfy_request("POST", "/manager/queue/start", json_data={})
+        result["queue_start"] = start_result
+    return result
+
+@mcp.tool()
+async def manager_queue_status(request: GetSystemInfoRequest, ctx: Context) -> Dict[str, Any]:
+    """Get ComfyUI Manager queue status."""
+    await _report_tool_activity(ctx, "manager_queue_status")
+    return await _comfy_request("GET", "/manager/queue/status")
+
+@mcp.tool()
+async def manager_queue_start(request: GetSystemInfoRequest, ctx: Context) -> Dict[str, Any]:
+    """Start the ComfyUI Manager worker queue."""
+    await _report_tool_activity(ctx, "manager_queue_start")
+    return await _comfy_request("POST", "/manager/queue/start", json_data={})
+
+@mcp.tool()
+async def manager_queue_reset(request: GetSystemInfoRequest, ctx: Context) -> Dict[str, Any]:
+    """Reset the ComfyUI Manager queue."""
+    await _report_tool_activity(ctx, "manager_queue_reset")
+    return await _comfy_request("POST", "/manager/queue/reset", json_data={})
+
+@mcp.tool()
 async def delete_queue_items(request: DeleteQueueItemsRequest, ctx: Context) -> Dict[str, Any]:
     """Delete items from the ComfyUI execution queue.
     
@@ -1742,7 +2081,12 @@ async def comfy_read_file(request: ComfyReadFileRequest, ctx: Context) -> Dict[s
     
     try:
         tools = get_comfy_tools()
-        content = tools.read_file(request.path, request.max_size)
+        content = tools.read_file(
+            request.path,
+            request.max_size,
+            request.start_line,
+            request.line_count,
+        )
         
         # Get file info
         full_path = tools._validate_path(request.path)
@@ -1752,6 +2096,8 @@ async def comfy_read_file(request: ComfyReadFileRequest, ctx: Context) -> Dict[s
             "path": request.path,
             "content": content,
             "size": stat.st_size,
+            "start_line": request.start_line,
+            "line_count": request.line_count,
             "encoding": "utf-8",
             "extension": full_path.suffix,
             "comfyui_root": str(tools.comfyui_root)
@@ -2617,6 +2963,148 @@ async def clear_error_buffer(request: ClearErrorBufferRequest, ctx: Context) -> 
         "cleared": True,
         "previous_count": previous_count
     }
+
+
+# ============================================================================
+# REN CODING / CUSTOM NODE DEVELOPMENT TOOLS
+# ============================================================================
+
+def _coding_result(fn, *args, **kwargs) -> Dict[str, Any]:
+    try:
+        result = fn(*args, **kwargs)
+        if isinstance(result, dict):
+            result.setdefault("success", True)
+            return result
+        return {"success": True, "result": result}
+    except CodingToolError as e:
+        return {"success": False, "error": str(e)}
+    except Exception as e:
+        logger.error(f"Coding tool failed: {e}", exc_info=True)
+        return {"success": False, "error": f"Unexpected error: {e}"}
+
+
+@mcp.tool()
+async def custom_nodes_list_packs(request: GetSystemInfoRequest, ctx: Context) -> Dict[str, Any]:
+    """List installed ComfyUI custom node packs and basic metadata."""
+    await _report_tool_activity(ctx, "custom_nodes_list_packs")
+    return _coding_result(coding_list_packs)
+
+
+@mcp.tool()
+async def custom_nodes_read_file(request: CustomNodesReadFileRequest, ctx: Context) -> Dict[str, Any]:
+    """Read a bounded line range from a file under ComfyUI/custom_nodes. Paths outside custom_nodes are blocked."""
+    await _report_tool_activity(ctx, "custom_nodes_read_file")
+    return _coding_result(
+        coding_read_file,
+        request.path,
+        request.max_chars,
+        request.start_line,
+        request.line_count,
+    )
+
+
+@mcp.tool()
+async def custom_nodes_read_file_excerpt(request: CustomNodesReadFileRequest, ctx: Context) -> Dict[str, Any]:
+    """Read a bounded excerpt from a custom node file. Prefer this for large files and follow-up ranges."""
+    await _report_tool_activity(ctx, "custom_nodes_read_file_excerpt")
+    return _coding_result(
+        coding_read_file,
+        request.path,
+        request.max_chars,
+        request.start_line,
+        request.line_count,
+    )
+
+
+@mcp.tool()
+async def custom_nodes_search(request: CustomNodesSearchRequest, ctx: Context) -> Dict[str, Any]:
+    """Search text under ComfyUI/custom_nodes using ripgrep."""
+    await _report_tool_activity(ctx, "custom_nodes_search")
+    return _coding_result(coding_search, request.query, request.path, request.glob, request.max_results)
+
+
+@mcp.tool()
+async def custom_nodes_write_file(request: CustomNodesWriteFileRequest, ctx: Context) -> Dict[str, Any]:
+    """Write a full file under ComfyUI/custom_nodes. Use carefully; existing files require overwrite=true."""
+    await _report_tool_activity(ctx, "custom_nodes_write_file")
+    return _coding_result(coding_write_file, request.path, request.content, request.overwrite)
+
+
+@mcp.tool()
+async def custom_nodes_apply_patch(request: CustomNodesApplyPatchRequest, ctx: Context) -> Dict[str, Any]:
+    """Apply a unified diff. Every touched path must remain inside ComfyUI/custom_nodes."""
+    await _report_tool_activity(ctx, "custom_nodes_apply_patch")
+    return _coding_result(apply_unified_patch, request.patch)
+
+
+@mcp.tool()
+async def custom_nodes_create_pack(request: CustomNodesCreatePackRequest, ctx: Context) -> Dict[str, Any]:
+    """Create a new ComfyUI custom node pack with a working starter node."""
+    await _report_tool_activity(ctx, "custom_nodes_create_pack")
+    return _coding_result(
+        coding_create_pack,
+        request.name,
+        node_class=request.node_class,
+        display_name=request.display_name,
+        category=request.category,
+        overwrite=request.overwrite,
+    )
+
+
+@mcp.tool()
+async def custom_nodes_validate_pack(request: CustomNodesPathRequest, ctx: Context) -> Dict[str, Any]:
+    """Run Python compile validation for a custom node pack."""
+    await _report_tool_activity(ctx, "custom_nodes_validate_pack")
+    return _coding_result(coding_validate_pack, request.path)
+
+
+@mcp.tool()
+async def custom_nodes_git_status(request: CustomNodesPathRequest, ctx: Context) -> Dict[str, Any]:
+    """Show git status for a path under custom_nodes."""
+    await _report_tool_activity(ctx, "custom_nodes_git_status")
+    return _coding_result(coding_git_status, request.path)
+
+
+@mcp.tool()
+async def custom_nodes_git_diff(request: CustomNodesPathRequest, ctx: Context) -> Dict[str, Any]:
+    """Show git diff for a path under custom_nodes."""
+    await _report_tool_activity(ctx, "custom_nodes_git_diff")
+    return _coding_result(coding_git_diff, request.path)
+
+
+@mcp.tool()
+async def custom_nodes_git_commit(request: CustomNodesGitCommitRequest, ctx: Context) -> Dict[str, Any]:
+    """Commit changes for a path under custom_nodes."""
+    await _report_tool_activity(ctx, "custom_nodes_git_commit")
+    return _coding_result(coding_git_commit, request.path, request.message)
+
+
+@mcp.tool()
+async def custom_nodes_git_push(request: CustomNodesPathRequest, ctx: Context) -> Dict[str, Any]:
+    """Push the git repo containing a path under custom_nodes."""
+    await _report_tool_activity(ctx, "custom_nodes_git_push")
+    return _coding_result(coding_git_push, request.path)
+
+
+@mcp.tool()
+async def comfy_restart(request: GetSystemInfoRequest, ctx: Context) -> Dict[str, Any]:
+    """Restart a ComfyUI process managed by Ren daemon mode."""
+    await _report_tool_activity(ctx, "comfy_restart")
+    return comfy_supervisor.restart()
+
+
+@mcp.tool()
+async def comfy_get_logs(request: ComfyLogsRequest, ctx: Context) -> Dict[str, Any]:
+    """Read recent ComfyUI logs captured by Ren daemon mode."""
+    await _report_tool_activity(ctx, "comfy_get_logs")
+    return comfy_supervisor.logs(limit=request.limit)
+
+
+@mcp.tool()
+async def comfy_status(request: GetSystemInfoRequest, ctx: Context) -> Dict[str, Any]:
+    """Get ComfyUI process and HTTP reachability status."""
+    await _report_tool_activity(ctx, "comfy_status")
+    return comfy_supervisor.status()
 
     
 # Other Ideas

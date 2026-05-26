@@ -31,8 +31,10 @@ from callback_router import CallbackRouter, current_session_id
 from agent import agent_manager, load_system_prompt
 import provider_config
 from auth_service import auth_service
-from claude_code_runner import run_claude_code
+from claude_code_runner import ClaudeCodeRunError, run_claude_code
 from chat_broadcaster import ChatBroadcaster, StreamHandle, SubscribeResult
+from conversation_store import conversation_store
+from comfy_supervisor import comfy_supervisor
 from models import (
     Handshake,
     SessionContext,
@@ -68,6 +70,7 @@ provider_config.apply_to_settings()
 # Global callback router instance
 callback_router: CallbackRouter | None = None
 chat_broadcaster = ChatBroadcaster()
+chat_broadcaster.set_event_sink(lambda conversation_id, event: conversation_store.append_event(conversation_id, event))
 
 # Background tasks
 async def cleanup_task() -> None:
@@ -119,10 +122,11 @@ async def lifespan(app: FastAPI):  # type: ignore
     cleanup_task_handle = asyncio.create_task(cleanup_task())
     parent_watchdog_handle: Optional[asyncio.Task[None]] = None
     parent_pid_raw = os.getenv("FL_JS_PARENT_PID")
+    ren_mode = os.getenv("FL_REN_MODE", "embedded").lower()
     if parent_pid_raw:
         try:
             parent_pid = int(parent_pid_raw)
-            if parent_pid > 0:
+            if parent_pid > 0 and ren_mode != "daemon":
                 parent_watchdog_handle = asyncio.create_task(parent_watchdog_task(parent_pid))
         except ValueError:
             logger.warning(f"Ignoring invalid FL_JS_PARENT_PID={parent_pid_raw!r}")
@@ -196,6 +200,64 @@ async def health() -> dict[str, Any]:
     }
 
 
+@app.get("/api/ren/status")
+async def ren_status() -> Dict[str, Any]:
+    return {
+        "mode": os.getenv("FL_REN_MODE", "embedded"),
+        "pid": os.getpid(),
+        "port": settings.ws_port,
+        "healthy": True,
+    }
+
+
+@app.post("/api/ren/shutdown")
+async def ren_shutdown() -> JSONResponse:
+    mode = os.getenv("FL_REN_MODE", "embedded")
+    if mode != "daemon":
+        return JSONResponse(
+            {"success": False, "error": "Shutdown is only available in daemon mode.", "mode": mode},
+            status_code=409,
+        )
+
+    async def _shutdown_later() -> None:
+        await asyncio.sleep(0.25)
+        os._exit(0)
+
+    asyncio.create_task(_shutdown_later())
+    return JSONResponse({"success": True, "mode": mode})
+
+
+@app.get("/api/comfy/status")
+async def comfy_status() -> Dict[str, Any]:
+    return comfy_supervisor.status()
+
+
+@app.post("/api/comfy/start")
+async def comfy_start() -> Dict[str, Any]:
+    return comfy_supervisor.start()
+
+
+@app.post("/api/comfy/stop")
+async def comfy_stop() -> Dict[str, Any]:
+    return comfy_supervisor.stop()
+
+
+@app.post("/api/comfy/restart")
+async def comfy_restart() -> Dict[str, Any]:
+    return comfy_supervisor.restart()
+
+
+@app.get("/api/comfy/logs")
+async def comfy_logs(limit: int = 300) -> Dict[str, Any]:
+    return comfy_supervisor.logs(limit=limit)
+
+
+@app.patch("/api/comfy/config")
+async def comfy_config(request: Request) -> JSONResponse:
+    data = await request.json()
+    return JSONResponse({"config": comfy_supervisor.save_config(data)})
+
+
 @app.get("/api/config")
 async def get_client_config() -> dict[str, Any]:
     """Return client configuration including WebSocket URL.
@@ -223,6 +285,67 @@ async def get_client_config() -> dict[str, Any]:
         "version": "0.3.0",
         "ngrok_mode": bool(public_ws_source),
     }
+
+
+@app.get("/api/conversations")
+async def list_conversations(limit: int = 100) -> Dict[str, Any]:
+    return {"conversations": conversation_store.list_conversations(limit=limit)}
+
+
+@app.post("/api/conversations")
+async def create_conversation(request: Request) -> JSONResponse:
+    data = await request.json()
+    session_id = str(data.get("sessionId") or data.get("session_id") or uuid.uuid4())
+    status = provider_config.status()
+    conversation = conversation_store.ensure_conversation(
+        conversation_id=str(data["id"]) if data.get("id") else None,
+        session_id=session_id,
+        provider=status.get("provider"),
+        model=status.get("model"),
+        title=str(data.get("title") or "New chat"),
+    )
+    return JSONResponse({"conversation": conversation})
+
+
+@app.get("/api/conversations/{conversation_id}")
+async def get_conversation(conversation_id: str) -> JSONResponse:
+    conversation = conversation_store.get_conversation(conversation_id)
+    if not conversation:
+        return JSONResponse({"error": "Conversation not found"}, status_code=404)
+    return JSONResponse({
+        "conversation": conversation,
+        "messages": conversation_store.list_messages(conversation_id),
+    })
+
+
+@app.patch("/api/conversations/{conversation_id}")
+async def update_conversation(conversation_id: str, request: Request) -> JSONResponse:
+    data = await request.json()
+    conversation = conversation_store.update_conversation(
+        conversation_id,
+        title=str(data["title"]) if data.get("title") is not None else None,
+        provider=str(data["provider"]) if data.get("provider") is not None else None,
+        model=str(data["model"]) if data.get("model") is not None else None,
+        archived=bool(data["archived"]) if data.get("archived") is not None else None,
+    )
+    if not conversation:
+        return JSONResponse({"error": "Conversation not found"}, status_code=404)
+    return JSONResponse({"conversation": conversation})
+
+
+@app.delete("/api/conversations/{conversation_id}")
+async def delete_conversation(conversation_id: str) -> JSONResponse:
+    deleted = conversation_store.delete_conversation(conversation_id)
+    if not deleted:
+        return JSONResponse({"error": "Conversation not found"}, status_code=404)
+    return JSONResponse({"success": True})
+
+
+@app.get("/api/conversations/{conversation_id}/messages")
+async def list_conversation_messages(conversation_id: str, limit: int = 500) -> JSONResponse:
+    if not conversation_store.get_conversation(conversation_id):
+        return JSONResponse({"error": "Conversation not found"}, status_code=404)
+    return JSONResponse({"messages": conversation_store.list_messages(conversation_id, limit=limit)})
 
 
 @app.get("/api/providers/status")
@@ -527,6 +650,35 @@ def _sse(event: Dict[str, Any]) -> str:
     return f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
 
 
+def _prompt_with_persisted_context(conversation_id: str, current_message: str, limit: int = 30) -> str:
+    """Build a compact text transcript for providers without native session resume."""
+    messages = conversation_store.list_messages(conversation_id, limit=limit)
+    if len(messages) <= 1:
+        return current_message
+
+    previous = messages[:-1]
+    lines = []
+    for item in previous[-limit:]:
+        role = item.get("role")
+        if role not in {"user", "assistant", "system", "error"}:
+            continue
+        content = str(item.get("content") or "").strip()
+        if not content:
+            continue
+        label = "Ren" if role == "assistant" else role.title()
+        lines.append(f"{label}: {content}")
+
+    if not lines:
+        return current_message
+
+    return (
+        "Use this previous Ren conversation as context:\n\n"
+        + "\n\n".join(lines)
+        + "\n\nCurrent user request:\n"
+        + current_message
+    )
+
+
 async def _sse_event_generator(
     request: Request,
     subscription: SubscribeResult,
@@ -554,6 +706,8 @@ async def _run_agent_for_sse(
     """Run Ren's existing PydanticAI agent and publish Cypher-style chat events."""
     session_id = handle.session_id
     context = _ensure_session_context(session_id)
+    conversation = conversation_store.get_conversation(handle.conversation_id)
+    persisted_prompt = _prompt_with_persisted_context(handle.conversation_id, user_message)
     token = current_session_id.set(session_id)
     block_index = 0
 
@@ -572,14 +726,74 @@ async def _run_agent_for_sse(
         if provider_config.current_provider() == "cloud":
             await auth_service.get_valid_access_token()
             status = provider_config.status()
-            usage = await run_claude_code(
-                session_id=session_id,
-                prompt=user_message,
-                system_prompt=load_system_prompt(),
-                model=status.get("model") or "sonnet",
-                stream_handle=handle,
-                block_index=block_index,
-            )
+            claude_session_id = None
+            if conversation:
+                claude_session_id = conversation.get("claudeSessionId")
+            try:
+                usage = await run_claude_code(
+                    session_id=session_id,
+                    conversation_id=handle.conversation_id,
+                    claude_session_id=claude_session_id,
+                    prompt=user_message if claude_session_id else persisted_prompt,
+                    system_prompt=load_system_prompt(),
+                    model=status.get("model") or "sonnet",
+                    stream_handle=handle,
+                    block_index=block_index,
+                )
+            except ClaudeCodeRunError as exc:
+                if exc.partial_text:
+                    conversation_store.append_message(
+                        handle.conversation_id,
+                        role="assistant",
+                        content=exc.partial_text,
+                        status="interrupted",
+                        metadata={
+                            "provider": "cloud",
+                            "model": status.get("model"),
+                            "inputTokens": exc.input_tokens,
+                            "outputTokens": exc.output_tokens,
+                            "error": str(exc),
+                        },
+                    )
+                if exc.claude_session_id:
+                    conversation_store.update_conversation(
+                        handle.conversation_id,
+                        claude_session_id=str(exc.claude_session_id),
+                        provider="cloud",
+                        model=status.get("model"),
+                    )
+                context.last_activity = datetime.now()
+                logger.error(f"Claude Code run failed for SSE chat: {exc}", exc_info=True)
+                await handle.publish({
+                    "type": "block_stop",
+                    "blockIndex": block_index,
+                })
+                await handle.publish({"type": "error", "message": str(exc)})
+                await handle.publish({
+                    "type": "done",
+                    "inputTokens": exc.input_tokens,
+                    "outputTokens": exc.output_tokens,
+                })
+                return
+            if usage.get("text"):
+                conversation_store.append_message(
+                    handle.conversation_id,
+                    role="assistant",
+                    content=str(usage["text"]),
+                    metadata={
+                        "provider": "cloud",
+                        "model": status.get("model"),
+                        "inputTokens": usage.get("inputTokens", 0),
+                        "outputTokens": usage.get("outputTokens", 0),
+                    },
+                )
+            if usage.get("claudeSessionId"):
+                conversation_store.update_conversation(
+                    handle.conversation_id,
+                    claude_session_id=str(usage["claudeSessionId"]),
+                    provider="cloud",
+                    model=status.get("model"),
+                )
             context.last_activity = datetime.now()
             await handle.publish({
                 "type": "block_stop",
@@ -596,7 +810,7 @@ async def _run_agent_for_sse(
 
         async with agent.run_mcp_servers():
             response = await agent.run(
-                user_message,
+                persisted_prompt if not context.conversation_history else user_message,
                 message_history=filtered_message_history(
                     context.conversation_history,
                     include_tool_messages=True,
@@ -609,6 +823,15 @@ async def _run_agent_for_sse(
 
         output = response.output or ""
         if output:
+            conversation_store.append_message(
+                handle.conversation_id,
+                role="assistant",
+                content=output,
+                metadata={
+                    "provider": provider_config.current_provider(),
+                    "model": provider_config.status().get("model"),
+                },
+            )
             await handle.publish({
                 "type": "text_delta",
                 "blockIndex": block_index,
@@ -625,16 +848,19 @@ async def _run_agent_for_sse(
             "outputTokens": 0,
         })
     except asyncio.CancelledError:
+        await handle.publish({"type": "block_stop", "blockIndex": block_index})
         await handle.publish({"type": "error", "message": "Cancelled"})
         await handle.publish({"type": "done", "inputTokens": 0, "outputTokens": 0})
         raise
     except UnexpectedModelBehavior as ue:
         root_cause = ue.__cause__ if ue.__cause__ else ue
         logger.error(f"Model generation failed for SSE chat: {root_cause}", exc_info=True)
+        await handle.publish({"type": "block_stop", "blockIndex": block_index})
         await handle.publish({"type": "error", "message": str(root_cause)})
         await handle.publish({"type": "done", "inputTokens": 0, "outputTokens": 0})
     except Exception as e:
         logger.error(f"Error in SSE chat run: {e}", exc_info=True)
+        await handle.publish({"type": "block_stop", "blockIndex": block_index})
         await handle.publish({"type": "error", "message": str(e)})
         await handle.publish({"type": "done", "inputTokens": 0, "outputTokens": 0})
     finally:
@@ -668,6 +894,27 @@ async def send_chat_message(request: Request) -> Response:
         )
 
     _ensure_session_context(session_id)
+    provider_status = provider_config.status()
+    title = message[:54] + ("..." if len(message) > 54 else "")
+    existing_conversation = conversation_store.get_conversation(conversation_id)
+    conversation_store.ensure_conversation(
+        conversation_id=conversation_id,
+        session_id=session_id,
+        provider=provider_status.get("provider"),
+        model=provider_status.get("model"),
+        title=title or "New chat",
+    )
+    if existing_conversation and existing_conversation.get("title") == "New chat":
+        conversation_store.update_conversation(conversation_id, title=title or "New chat")
+    conversation_store.append_message(
+        conversation_id,
+        role="user",
+        content=message,
+        metadata={
+            "provider": provider_status.get("provider"),
+            "model": provider_status.get("model"),
+        },
+    )
     handle = await chat_broadcaster.start(conversation_id, session_id)
     task = asyncio.create_task(_run_agent_for_sse(handle, message))
     handle.set_task(task)

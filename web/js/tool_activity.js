@@ -24,6 +24,21 @@ export const TOOL_CONFIG = {
         label: "Diagram",
         description: "Generating visual workflow diagram"
     },
+    "frontend_list_commands": {
+        icon: "⌨️",
+        label: "Commands",
+        description: "Reading ComfyUI frontend commands"
+    },
+    "frontend_execute_command": {
+        icon: "▶️",
+        label: "Command",
+        description: "Running a ComfyUI frontend command"
+    },
+    "frontend_list_keybindings": {
+        icon: "⌘",
+        label: "Hotkeys",
+        description: "Reading ComfyUI keybindings"
+    },
 
     // Node Creation & Modification  
     "create_nodes": {
@@ -106,6 +121,26 @@ export const TOOL_CONFIG = {
         icon: "🔢",
         label: "Batch Count",
         description: "Setting number of batch iterations"
+    },
+    "workflow_get_current_json": {
+        icon: "🧾",
+        label: "Workflow JSON",
+        description: "Reading current workflow JSON"
+    },
+    "workflow_load_json": {
+        icon: "📥",
+        label: "Load Workflow",
+        description: "Loading workflow JSON into the canvas"
+    },
+    "workflow_list_files": {
+        icon: "📂",
+        label: "Workflows",
+        description: "Listing saved workflow files"
+    },
+    "workflow_save_current": {
+        icon: "💾",
+        label: "Save Workflow",
+        description: "Saving the current workflow"
     },
 
     // Node Value Manipulation
@@ -282,6 +317,41 @@ export const TOOL_CONFIG = {
         label: "Check Updates",
         description: "Checking for custom node updates"
     },
+    "manager_queue_action": {
+        icon: "🧰",
+        label: "Manager Action",
+        description: "Queueing a ComfyUI Manager action"
+    },
+    "manager_queue_status": {
+        icon: "📊",
+        label: "Manager Queue",
+        description: "Checking Manager queue status"
+    },
+    "comfy_jobs_list": {
+        icon: "📋",
+        label: "Jobs",
+        description: "Listing ComfyUI jobs"
+    },
+    "comfy_job_get": {
+        icon: "🔍",
+        label: "Job",
+        description: "Reading ComfyUI job details"
+    },
+    "comfy_free_memory": {
+        icon: "🧹",
+        label: "Free Memory",
+        description: "Requesting model memory cleanup"
+    },
+    "comfy_settings_get": {
+        icon: "⚙️",
+        label: "Settings",
+        description: "Reading ComfyUI settings"
+    },
+    "comfy_settings_set": {
+        icon: "⚙️",
+        label: "Set Settings",
+        description: "Updating ComfyUI settings"
+    },
 
     // Error Tracking
     "get_recent_errors": {
@@ -328,4 +398,3 @@ export const TOOL_CONFIG = {
 export function getToolConfig(toolName) {
     return TOOL_CONFIG[toolName] || TOOL_CONFIG["*"];
 }
-

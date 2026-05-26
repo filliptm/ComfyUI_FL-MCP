@@ -84,8 +84,21 @@ class ComfyReadFileRequest(BaseModel):
         description="Relative path to file from ComfyUI root"
     )
     max_size: int = Field(
-        1024 * 1024,  # 1MB
-        description="Maximum file size to read in bytes"
+        24000,
+        ge=1,
+        le=24000,
+        description="Maximum characters to return"
+    )
+    start_line: int = Field(
+        1,
+        ge=1,
+        description="First 1-based line number to return"
+    )
+    line_count: int = Field(
+        240,
+        ge=1,
+        le=800,
+        description="Maximum number of lines to return"
     )
 
 
@@ -105,10 +118,14 @@ class ComfySearchFilesRequest(BaseModel):
     )
     max_results: int = Field(
         20,
+        ge=1,
+        le=80,
         description="Maximum number of search results to return"
     )
     context_lines: int = Field(
         2,
+        ge=0,
+        le=5,
         description="Number of context lines around each match"
     )
 

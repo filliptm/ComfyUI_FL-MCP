@@ -34,7 +34,11 @@ export class ChatUI {
         this.messages = [];
         this.isTyping = false;
         this.isStreaming = false;
-        this.activeConversationId = chatClient?.conversationId || null;
+        this.conversations = [];
+        this.activeConversationId = localStorage.getItem('fl_ren_conversation_id') || chatClient?.conversationId || null;
+        if (this.chatClient && this.activeConversationId) {
+            this.chatClient.conversationId = this.activeConversationId;
+        }
         this.streamingAssistantEl = null;
         this.streamingAssistantContentEl = null;
         this.streamingAssistantText = '';
@@ -42,6 +46,9 @@ export class ChatUI {
         this.localModelOptions = [];
         this.authStep = 'initial';
         this.pendingOAuthState = null;
+        this.comfyStatusTimer = null;
+        this.renLauncherStatus = null;
+        this.renLauncherTimer = null;
 
         // Initialize message bubble renderer
         this.messageBubble = new MessageBubble();
@@ -50,6 +57,11 @@ export class ChatUI {
         this._initializeUI();
         this._attachEventHandlers();
         this._loadProviderStatus();
+        this._loadConversations();
+        this._loadComfyStatus();
+        this._loadRenLauncherStatus();
+        this.comfyStatusTimer = setInterval(() => this._loadComfyStatus(), 15000);
+        this.renLauncherTimer = setInterval(() => this._loadRenLauncherStatus(), 5000);
 
         // Track active tool chain for breadcrumb display
         this.activeToolChain = null; // Current tool chain message element
@@ -85,14 +97,25 @@ export class ChatUI {
         layout.innerHTML = `
             <div class="fl-chat-header">
                 <div class="fl-chat-title">Ren</div>
-                <div class="fl-chat-status">
-                    <span class="fl-status-indicator" id="fl-status-indicator"></span>
-                    <span class="fl-status-text" id="fl-status-text">Connecting...</span>
+                <div class="fl-chat-header-right">
+                    <div class="fl-chat-status">
+                        <span class="fl-status-indicator" id="fl-status-indicator"></span>
+                        <span class="fl-status-text" id="fl-status-text">Checking...</span>
+                    </div>
+                    <button class="fl-ren-launch" id="fl-ren-launch" title="Start hidden Ren daemon">Start</button>
                 </div>
             </div>
             <div class="fl-provider-bar">
                 <div class="fl-provider-toggle" id="fl-provider-toggle"></div>
                 <select class="fl-provider-model" id="fl-provider-model" title="Model"></select>
+            </div>
+            <div class="fl-conversation-bar">
+                <select class="fl-conversation-select" id="fl-conversation-select" title="Conversation"></select>
+                <button class="fl-conversation-new" id="fl-conversation-new" title="New chat">+</button>
+            </div>
+            <div class="fl-comfy-bar">
+                <span class="fl-comfy-state" id="fl-comfy-state">Comfy: checking...</span>
+                <button class="fl-comfy-restart" id="fl-comfy-restart" title="Restart ComfyUI">Restart</button>
             </div>
             <div class="fl-provider-setup" id="fl-provider-setup" style="display: none;"></div>
             <div class="fl-chat-messages" id="fl-chat-messages"></div>
@@ -133,9 +156,14 @@ export class ChatUI {
         this.typingIndicator = this.container.querySelector('#fl-chat-typing');
         this.statusIndicator = this.container.querySelector('#fl-status-indicator');
         this.statusText = this.container.querySelector('#fl-status-text');
+        this.renLaunchButton = this.container.querySelector('#fl-ren-launch');
         this.providerToggle = this.container.querySelector('#fl-provider-toggle');
         this.providerModelSelect = this.container.querySelector('#fl-provider-model');
         this.providerSetup = this.container.querySelector('#fl-provider-setup');
+        this.conversationSelect = this.container.querySelector('#fl-conversation-select');
+        this.newConversationButton = this.container.querySelector('#fl-conversation-new');
+        this.comfyState = this.container.querySelector('#fl-comfy-state');
+        this.comfyRestartButton = this.container.querySelector('#fl-comfy-restart');
 
         // Add debug styles for tool activity
         const debugStyle = document.createElement('style');
@@ -203,6 +231,24 @@ export class ChatUI {
 
         this.providerModelSelect.addEventListener('change', () => {
             this._selectProviderModel(this.providerModelSelect.value);
+        });
+
+        this.conversationSelect.addEventListener('change', () => {
+            if (this.conversationSelect.value) {
+                this._loadConversation(this.conversationSelect.value);
+            }
+        });
+
+        this.newConversationButton.addEventListener('click', () => {
+            this._createConversation();
+        });
+
+        this.comfyRestartButton.addEventListener('click', () => {
+            this._restartComfy();
+        });
+
+        this.renLaunchButton.addEventListener('click', () => {
+            this._toggleRenDaemon();
         });
         
         // WebSocket event handlers
@@ -390,6 +436,7 @@ export class ChatUI {
         try {
             if (this.chatClient) {
                 await this.chatClient.sendMessage(message, (event) => this._handleChatEvent(event));
+                await this._loadConversations(false);
             } else {
                 await this.wsClient.send({
                     type: 'user_message',
@@ -402,6 +449,179 @@ export class ChatUI {
             this.setTyping(false);
             this._setStreaming(false);
             this._finishAssistantStream();
+        }
+    }
+
+    async _loadConversations(loadActive = true) {
+        if (!this.chatClient?.listConversations || !this.conversationSelect) return;
+        try {
+            this.conversations = await this.chatClient.listConversations();
+            this._renderConversationSelect();
+            const savedId = localStorage.getItem('fl_ren_conversation_id');
+            const target = savedId || this.conversations[0]?.id;
+            if (loadActive && target && this.conversations.some((conversation) => conversation.id === target)) {
+                await this._loadConversation(target);
+            }
+        } catch (error) {
+            console.warn('[ChatUI] Could not load conversations:', error);
+        }
+    }
+
+    async _loadRenLauncherStatus() {
+        if (!this.renLaunchButton) return;
+        try {
+            const response = await fetch('/fl_ren/launcher/status');
+            if (!response.ok) {
+                throw new Error(`Launcher status failed: ${response.status}`);
+            }
+            const status = await response.json();
+            this.renLauncherStatus = status;
+            const running = Boolean(status.backendReachable);
+            this.renLaunchButton.textContent = running ? 'Stop' : 'Start';
+            this.renLaunchButton.title = running ? 'Stop hidden Ren daemon' : 'Start hidden Ren daemon';
+            this.renLaunchButton.classList.toggle('running', running);
+
+            if (!running) {
+                this._updateConnectionStatus('stopped');
+            } else if (this.wsClient && !this.wsClient.getState().connected && !this.wsClient.getState().handshakeComplete) {
+                this.wsClient.reconnectAttempts = 0;
+                this.wsClient.connect();
+            }
+        } catch (error) {
+            this.renLauncherStatus = null;
+            this.renLaunchButton.textContent = 'Start';
+            this.renLaunchButton.classList.remove('running');
+        }
+    }
+
+    async _toggleRenDaemon() {
+        if (!this.renLaunchButton) return;
+        const running = Boolean(this.renLauncherStatus?.backendReachable);
+        const endpoint = running ? '/fl_ren/launcher/stop' : '/fl_ren/launcher/start';
+        this.renLaunchButton.disabled = true;
+        this.renLaunchButton.textContent = running ? 'Stopping...' : 'Starting...';
+        try {
+            const response = await fetch(endpoint, { method: 'POST' });
+            const status = await response.json();
+            if (!response.ok || status.error) {
+                throw new Error(status.error || `Launcher request failed: ${response.status}`);
+            }
+            if (running) {
+                this.wsClient?.disconnect();
+                this._updateConnectionStatus('stopped');
+            } else {
+                this.wsClient?.connect();
+                await this._loadProviderStatus();
+                await this._loadConversations();
+                await this._loadComfyStatus();
+            }
+            await this._loadRenLauncherStatus();
+        } catch (error) {
+            console.error('[ChatUI] Ren launcher request failed:', error);
+            this.addMessage('error', `Ren launcher failed: ${error.message}`);
+        } finally {
+            this.renLaunchButton.disabled = false;
+            await this._loadRenLauncherStatus();
+        }
+    }
+
+    _renderConversationSelect() {
+        if (!this.conversationSelect) return;
+        const options = this.conversations.map((conversation) => {
+            const label = this._escapeHtml(conversation.title || 'New chat');
+            return `<option value="${this._escapeHtml(conversation.id)}">${label}</option>`;
+        });
+        if (!options.length) {
+            options.push('<option value="">New chat</option>');
+        }
+        this.conversationSelect.innerHTML = options.join('');
+        if (this.activeConversationId) {
+            this.conversationSelect.value = this.activeConversationId;
+        }
+    }
+
+    async _createConversation() {
+        if (!this.chatClient?.createConversation) return;
+        try {
+            const conversation = await this.chatClient.createConversation('New chat');
+            this.activeConversationId = conversation.id;
+            localStorage.setItem('fl_ren_conversation_id', conversation.id);
+            this.messages = [];
+            this.messagesContainer.innerHTML = '';
+            this._addWelcomeMessage();
+            await this._loadConversations(false);
+        } catch (error) {
+            console.error('[ChatUI] Could not create conversation:', error);
+            this.addMessage('error', `Failed to create chat: ${error.message}`);
+        }
+    }
+
+    async _loadConversation(conversationId) {
+        if (!this.chatClient?.loadConversation || this.isStreaming) return;
+        try {
+            const data = await this.chatClient.loadConversation(conversationId);
+            this.activeConversationId = conversationId;
+            localStorage.setItem('fl_ren_conversation_id', conversationId);
+            this._renderLoadedMessages(data.messages || []);
+            this._renderConversationSelect();
+        } catch (error) {
+            console.warn('[ChatUI] Could not load conversation:', error);
+        }
+    }
+
+    _renderLoadedMessages(messages) {
+        this.messages = [];
+        this.messagesContainer.innerHTML = '';
+        if (!messages.length) {
+            this._addWelcomeMessage();
+            return;
+        }
+
+        for (const item of messages) {
+            const message = {
+                role: item.role,
+                content: item.content,
+                timestamp: item.createdAt ? new Date(item.createdAt) : new Date(),
+                displayRole: item.role,
+            };
+            this.messages.push(message);
+            this._renderMessage(message);
+        }
+        this._scrollToBottom();
+    }
+
+    async _loadComfyStatus() {
+        if (!this.chatClient?.comfyStatus || !this.comfyState) return;
+        try {
+            const status = await this.chatClient.comfyStatus();
+            const reachable = Boolean(status.reachable);
+            const mode = status.mode || 'embedded';
+            this.comfyState.textContent = `Comfy: ${reachable ? 'online' : 'offline'} (${mode})`;
+            this.comfyState.className = `fl-comfy-state ${reachable ? 'online' : 'offline'}`;
+            if (this.comfyRestartButton) {
+                this.comfyRestartButton.disabled = !status.canManageProcess;
+                this.comfyRestartButton.title = status.canManageProcess
+                    ? 'Restart ComfyUI'
+                    : 'Restart requires Ren daemon mode';
+            }
+        } catch (error) {
+            this.comfyState.textContent = 'Comfy: unknown';
+            this.comfyState.className = 'fl-comfy-state offline';
+        }
+    }
+
+    async _restartComfy() {
+        if (!this.chatClient?.restartComfy || !this.comfyRestartButton) return;
+        this.comfyRestartButton.disabled = true;
+        this.comfyState.textContent = 'Comfy: restarting...';
+        try {
+            await this.chatClient.restartComfy();
+            setTimeout(() => this._loadComfyStatus(), 2000);
+        } catch (error) {
+            this.addMessage('error', `Failed to restart Comfy: ${error.message}`);
+            await this._loadComfyStatus();
+        } finally {
+            this.comfyRestartButton.disabled = false;
         }
     }
 
@@ -688,6 +908,10 @@ export class ChatUI {
         switch (data.type) {
             case 'conversation_id':
                 this.activeConversationId = data.id;
+                localStorage.setItem('fl_ren_conversation_id', data.id);
+                if (this.chatClient) {
+                    this.chatClient.conversationId = data.id;
+                }
                 break;
             case 'block_start':
                 if (data.blockType === 'text') {
@@ -914,6 +1138,15 @@ export class ChatUI {
             .replace(/\n/g, '<br>');
     }
 
+    _escapeHtml(text) {
+        return String(text)
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#39;');
+    }
+
     /**
      * Start a new tool in the breadcrumb chain
      * @param {string} toolName - Name of the tool being executed
@@ -1095,7 +1328,8 @@ export class ChatUI {
         const statusText = {
             'connected': 'Connected',
             'disconnected': 'Disconnected',
-            'connecting': 'Connecting...'
+            'connecting': 'Connecting...',
+            'stopped': 'Stopped'
         };
         
         this.statusText.textContent = statusText[status] || status;
@@ -1148,6 +1382,14 @@ export class ChatUI {
         }
         
         this.container.innerHTML = '';
+        if (this.comfyStatusTimer) {
+            clearInterval(this.comfyStatusTimer);
+            this.comfyStatusTimer = null;
+        }
+        if (this.renLauncherTimer) {
+            clearInterval(this.renLauncherTimer);
+            this.renLauncherTimer = null;
+        }
         console.log('[ChatUI] Destroyed');
     }
 }

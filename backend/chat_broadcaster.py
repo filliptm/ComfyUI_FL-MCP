@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 
 ChatEvent = Dict[str, Any]
@@ -72,9 +72,13 @@ class ChatBroadcaster:
 
     MAX_BUFFER = 10_000
 
-    def __init__(self) -> None:
+    def __init__(self, event_sink: Optional[Callable[[str, ChatEvent], None]] = None) -> None:
         self._streams: Dict[str, StreamState] = {}
         self._lock = asyncio.Lock()
+        self._event_sink = event_sink
+
+    def set_event_sink(self, event_sink: Optional[Callable[[str, ChatEvent], None]]) -> None:
+        self._event_sink = event_sink
 
     async def start(self, conversation_id: str, session_id: str) -> StreamHandle:
         async with self._lock:
@@ -94,6 +98,12 @@ class ChatBroadcaster:
 
             if len(state.buffer) < self.MAX_BUFFER:
                 state.buffer.append(event)
+
+            if self._event_sink:
+                try:
+                    self._event_sink(conversation_id, event)
+                except Exception:
+                    pass
 
             for queue in list(state.subscribers):
                 queue.put_nowait(event)

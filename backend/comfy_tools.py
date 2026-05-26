@@ -19,6 +19,43 @@ from path_resolver import PathResolver
 
 logger = logging.getLogger(__name__)
 
+READ_MAX_CHARS = 24000
+READ_MAX_LINES = 800
+LONG_LINE_CHARS = 1000
+SEARCH_LINE_CHARS = 600
+MAX_READ_FILE_BYTES = 5 * 1024 * 1024
+
+
+def _chunk_long_lines(text: str, limit: int = LONG_LINE_CHARS) -> str:
+    chunks: List[str] = []
+    for line in text.splitlines(keepends=True):
+        body = line[:-1] if line.endswith("\n") else line
+        newline = "\n" if line.endswith("\n") else ""
+        if len(body) <= limit:
+            chunks.append(line)
+            continue
+        for index in range(0, len(body), limit):
+            suffix = "\n" if index + limit < len(body) else newline
+            chunks.append(body[index:index + limit] + suffix)
+    return "".join(chunks)
+
+
+def _bounded_text(text: str, max_chars: int = READ_MAX_CHARS) -> str:
+    max_chars = max(1, min(int(max_chars), READ_MAX_CHARS))
+    separated = _chunk_long_lines(text)
+    if len(separated) <= max_chars:
+        return separated
+    return separated[:max_chars].rstrip() + (
+        f"\n\n[Ren truncated output at {max_chars} characters; "
+        "request a narrower line range or search if more context is needed.]"
+    )
+
+
+def _short_line(text: str, max_chars: int = SEARCH_LINE_CHARS) -> str:
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars].rstrip() + " [line truncated]"
+
 
 class ComfyUIError(Exception):
     """Base exception for ComfyUI tool errors."""
@@ -461,7 +498,13 @@ class ComfyUITools:
         
         return items
     
-    def read_file(self, path: str, max_size: int = 1024 * 1024) -> str:
+    def read_file(
+        self,
+        path: str,
+        max_size: int = READ_MAX_CHARS,
+        start_line: int = 1,
+        line_count: int = 240,
+    ) -> str:
         """Read a text file within the ComfyUI directory."""
         try:
             # Validate path
@@ -475,9 +518,9 @@ class ComfyUITools:
             
             # Check file size
             file_size = full_path.stat().st_size
-            if file_size > max_size:
+            if file_size > MAX_READ_FILE_BYTES:
                 raise ComfyUIError(
-                    f"File too large: {file_size} bytes (max: {max_size})"
+                    f"File too large for text inspection: {file_size} bytes (max: {MAX_READ_FILE_BYTES})"
                 )
             
             # Check file extension for safety
@@ -489,13 +532,23 @@ class ComfyUITools:
             # Read file
             try:
                 content = full_path.read_text(encoding='utf-8')
-                logger.info(f"Read file: {path} ({len(content)} chars)")
-                return content
             except UnicodeDecodeError:
                 # Try with fallback encoding
                 content = full_path.read_text(encoding='latin-1')
                 logger.warning(f"File read with fallback encoding: {path}")
-                return content
+
+            start_line = max(1, int(start_line))
+            line_count = max(1, min(int(line_count), READ_MAX_LINES))
+            lines = content.splitlines(keepends=True)
+            start_index = min(start_line - 1, len(lines))
+            end_index = min(start_index + line_count, len(lines))
+            selected = "".join(lines[start_index:end_index])
+            bounded = _bounded_text(selected, max_size)
+            logger.info(
+                f"Read file excerpt: {path} "
+                f"(lines {start_index + 1}-{end_index} of {len(lines)}, {len(bounded)} chars)"
+            )
+            return bounded
                 
         except ComfyUIError:
             raise
@@ -571,9 +624,9 @@ class ComfyUITools:
                                 results.append(ComfySearchResult(
                                     file_path=relative_path,
                                     line_number=line_num,
-                                    line_content=line.strip(),
-                                    context_before=context_before,
-                                    context_after=context_after
+                                    line_content=_short_line(line.strip()),
+                                    context_before=[_short_line(item) for item in context_before],
+                                    context_after=[_short_line(item) for item in context_after]
                                 ))
                                 
                                 if len(results) >= max_results:
