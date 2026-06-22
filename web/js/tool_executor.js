@@ -399,7 +399,7 @@ export class ToolExecutor {
     async _handleFocusOnNodes(params) {
         try {
             const { node_ids } = params;
-            const result = this.flApi.fitView(node_ids);
+            const result = await this.flApi.fitView(node_ids);
             return result;
         } catch (error) {
             throw new Error(`Failed to fit view: ${error.message}`);
@@ -412,7 +412,18 @@ export class ToolExecutor {
      */
     async _handleTakeScreenshot(params) {
         try {
-            const { format = 'jpeg', quality = 0.9 } = params;
+            const {
+                format = 'jpeg',
+                quality = 0.9,
+                fit_view = true,
+                node_ids = []
+            } = params;
+
+            let fitResult = null;
+            if (fit_view) {
+                fitResult = await this.flApi.fitView(node_ids);
+                await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+            }
             
             // Take screenshot
             const screenshotData = await this.flApi.takeScreenshot(format, quality);
@@ -431,7 +442,9 @@ export class ToolExecutor {
                 screenshot_id: screenshotData.screenshot_id,
                 filename: `${screenshotData.screenshot_id}.${ext}`,
                 format: format,
-                size_bytes: screenshotData.size_bytes
+                size_bytes: screenshotData.size_bytes,
+                fit_view: fit_view,
+                fit_result: fitResult
             };
             
         } catch (error) {

@@ -330,15 +330,15 @@ export class FL_API {
      * @param {Array<number>|null} nodeIds - Optional array of node IDs to fit (null for selected)
      * @returns {object} Result with count of fitted nodes
      */
-    fitView(nodeIds = null) {
+    async fitView(nodeIds = null) {
         try {
             const canvas = app.canvas;
             let nodes;
-            
+
             if (nodeIds === null) {
                 // Use currently selected nodes
                 nodes = Object.values(canvas.selected_nodes || {});
-                
+
                 if (nodes.length === 0) {
                     console.warn("[FL_API] No nodes selected, fitting all nodes");
                     nodes = app.graph._nodes;  // Use all nodes
@@ -356,54 +356,69 @@ export class FL_API {
                 // Empty array = fit all nodes
                 nodes = app.graph._nodes;
             }
-            
-            // FIT NODES
-            if (nodes.length > 0){
-                if (nodes.length === 1) // Single node: just center on it
-                    canvas.centerOnNode(nodes[0]);
-            
-                // Multiple nodes: calculate bounding box and fit to view
-                let minX = Infinity, minY = Infinity;
-                let maxX = -Infinity, maxY = -Infinity;
-                
-                for (const node of nodes) {
-                    minX = Math.min(minX, node.pos[0]);
-                    minY = Math.min(minY, node.pos[1]);
-                    maxX = Math.max(maxX, node.pos[0] + node.size[0]);
-                    maxY = Math.max(maxY, node.pos[1] + node.size[1]);
-                }
-                
-                const centerX = (minX + maxX) / 2;
-                const centerY = (minY + maxY) / 2;
-                const width = maxX - minX;
-                const height = maxY - minY;
-                
-                // Calculate zoom to fit with 10% padding
-                const zoomX = canvas.canvas.width / width - 0.1;
-                const zoomY = canvas.canvas.height / height - 0.1;
-                const targetZoom = Math.min(zoomX, zoomY, 1.0);  // Don't zoom in past 100%
-                
-                // Apply viewport transform
-                // canvas.ds.offset[0] = -centerX + canvas.canvas.width / 2 / targetZoom;
-                // canvas.ds.offset[1] = -centerY + canvas.canvas.height / 2 / targetZoom;
-                // canvas.ds.scale = targetZoom;
-                canvas.setZoom(targetZoom, [canvas.canvas.width / 2, canvas.canvas.height / 2]);
+
+            if (nodeIds === null && nodes.length > 0) {
+                // Keep the user's existing selection.
+            } else if (Array.isArray(nodeIds) && nodeIds.length > 0) {
+                canvas.selectNodes(nodes);
+            } else {
+                canvas.selectNodes([]);
             }
-            
+
+            const commandBridge = this._getCommandBridge();
+            if (commandBridge?.execute) {
+                await commandBridge.execute("Comfy.Canvas.FitView");
+            } else if (nodes.length > 0) {
+                this._fitNodesFallback(nodes);
+            }
+
             // Mark canvas for redraw
             canvas.setDirty(true, true);
-            
+
             const count = nodes.length;
             console.log(`[FL_API] Fit view to ${count} node(s)`);
-            
-            return { 
+
+            return {
                 fitted_count: count,
-                node_ids: nodes.map(n => n.id)
+                node_ids: nodes.map(n => n.id),
+                command_id: commandBridge?.execute ? "Comfy.Canvas.FitView" : null,
+                method: commandBridge?.execute ? "native_command" : "fallback"
             };
         } catch (error) {
             console.error("[FL_API] fitView error:", error);
             throw error;
         }
+    }
+
+    _fitNodesFallback(nodes) {
+        const canvas = app.canvas;
+        if (nodes.length === 1) {
+            canvas.centerOnNode(nodes[0]);
+            return;
+        }
+
+        let minX = Infinity, minY = Infinity;
+        let maxX = -Infinity, maxY = -Infinity;
+
+        for (const node of nodes) {
+            minX = Math.min(minX, node.pos[0]);
+            minY = Math.min(minY, node.pos[1]);
+            maxX = Math.max(maxX, node.pos[0] + node.size[0]);
+            maxY = Math.max(maxY, node.pos[1] + node.size[1]);
+        }
+
+        const width = Math.max(1, maxX - minX);
+        const height = Math.max(1, maxY - minY);
+        const padding = 96;
+        const viewportWidth = Math.max(1, canvas.canvas.width - padding * 2);
+        const viewportHeight = Math.max(1, canvas.canvas.height - padding * 2);
+        const targetZoom = Math.min(viewportWidth / width, viewportHeight / height, 1.0);
+        const centerX = (minX + maxX) / 2;
+        const centerY = (minY + maxY) / 2;
+
+        canvas.ds.scale = targetZoom;
+        canvas.ds.offset[0] = canvas.canvas.width / 2 / targetZoom - centerX;
+        canvas.ds.offset[1] = canvas.canvas.height / 2 / targetZoom - centerY;
     }
 
     /**

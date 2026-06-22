@@ -459,6 +459,14 @@ class TakeScreenshotRequest(BaseModel):
         le=1.0,
         description="JPEG quality (0.0-1.0, only applies to jpeg format)"
     )
+    fit_view: bool = Field(
+        True,
+        description="Fit the canvas before capture using ComfyUI's native Fit View command"
+    )
+    node_ids: Optional[List[int]] = Field(
+        default_factory=list,
+        description="Node IDs to fit before capture (null=selected nodes, empty=all nodes, ignored when fit_view=false)"
+    )
 
 
 # Node Manipulation
@@ -1215,7 +1223,12 @@ async def select_nodes(request: SelectNodesRequest, ctx: Context) -> Dict[str, A
 
 @mcp.tool()
 async def focus_on_nodes(request: FocusOnNodesRequest, ctx: Context) -> Dict[str, Any]:
-    """Fit canvas view to show specific nodes or current selection. If you don't know what nodes to focus on, use `workflow_overview` to get some node ids based on your task
+    """Fit canvas view to show specific nodes, the current selection, or the whole workflow.
+
+    This tool uses ComfyUI's native Fit View command, equivalent to pressing the `.` hotkey.
+    Use it before every screenshot and after layout edits so screenshots are centered and not cropped.
+
+    If you don't know what nodes to focus on, use `workflow_overview` to get node ids based on your task.
     
     This tool adjusts the canvas viewport to center and fit the specified nodes,
     making them clearly visible. Useful for:
@@ -1226,7 +1239,7 @@ async def focus_on_nodes(request: FocusOnNodesRequest, ctx: Context) -> Dict[str
     PARAMETERS:
     - node_ids: Optional list of node IDs
       - null (default): Fit to currently selected nodes
-      - [] (empty list): Fit to all nodes in workflow
+      - [] (empty list): Fit to all nodes in the workflow
       - [1, 2, 3]: Fit to specific nodes
     
     WORKFLOW:
@@ -1241,7 +1254,17 @@ async def focus_on_nodes(request: FocusOnNodesRequest, ctx: Context) -> Dict[str
 
 @mcp.tool()
 async def take_screenshot(request: TakeScreenshotRequest, ctx: Context) -> Dict[str, Any]:
-    """Capture the current ComfyUI canvas as an image. Make sure to use focus_on_nodes before this always.
+    """Capture the current ComfyUI canvas as an image.
+
+    By default, this tool automatically triggers ComfyUI's native Fit View behavior
+    before capture, equivalent to pressing the `.` hotkey.
+    - whole workflow: omit node_ids or pass an empty list
+    - specific section: pass those node IDs
+    - current selection: pass null for node_ids
+    - exact current viewport: set fit_view=false
+
+    This avoids cropped or off-center screenshots without requiring a separate
+    `focus_on_nodes` call.
     
     This tool takes a screenshot of the workflow canvas and saves it to
     output/screenshots/. The screenshot can then be displayed to the user
