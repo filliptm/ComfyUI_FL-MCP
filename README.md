@@ -10,7 +10,7 @@ MCP server and browser bridge for controlling ComfyUI from MCP-compatible client
 
 ## Demo
 
-<video src="assets/fl-mcp-demo.webm" controls muted loop playsinline></video>
+[![ComfyUI FL-MCP demo](assets/fl-mcp-demo-preview.png)](assets/fl-mcp-demo.webm)
 
 [Watch the demo video](assets/fl-mcp-demo.webm)
 
