@@ -8,6 +8,12 @@ MCP server and browser bridge for controlling ComfyUI from MCP-compatible client
 [![Python](https://img.shields.io/badge/Python-3.11+-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org/)
 [![Patreon](https://img.shields.io/badge/Patreon-Support%20Me-F96854?style=for-the-badge&logo=patreon&logoColor=white)](https://www.patreon.com/Machinedelusions)
 
+## Demo
+
+<video src="assets/fl-mcp-demo.webm" controls muted loop playsinline></video>
+
+[Watch the demo video](assets/fl-mcp-demo.webm)
+
 ## What It Does
 
 ComfyUI FL-MCP exposes ComfyUI as a tool server for MCP clients such as Claude Desktop, Cursor, Codex, and other agentic development environments.
@@ -438,6 +444,32 @@ ComfyUI/custom_nodes/ComfyUI_FL-MCP/logs/
 This is expected. Turn on the narrowest matching safety gate in `.env`, restart the backend, run the action, then turn it off again.
 
 </details>
+
+## Optional Agent Skill
+
+This repo includes an optional Codex-style skill at:
+
+```text
+skills/workflow-assistant/
+```
+
+The skill gives MCP clients workflow-first guidance for inspecting, editing, debugging, compacting, validating, and queueing ComfyUI graphs through FL-MCP. It is optional and does not change the FL-MCP server runtime.
+
+Install it by copying or symlinking the skill folder into your client skills directory. For Codex:
+
+```bash
+mkdir -p ~/.codex/skills
+ln -s /path/to/ComfyUI/custom_nodes/ComfyUI_FL-MCP/skills/workflow-assistant \
+  ~/.codex/skills/workflow-assistant
+```
+
+Then start a new client session and invoke it explicitly when useful:
+
+```text
+Use $workflow-assistant to inspect and clean up my open ComfyUI workflow.
+```
+
+You still need to configure the `comfyui-fl-mcp` MCP server separately as described in Quick Start.
 
 ## Development
 

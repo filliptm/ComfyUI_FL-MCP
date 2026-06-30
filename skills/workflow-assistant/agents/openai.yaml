@@ -1,0 +1,13 @@
+interface:
+  display_name: "Workflow Assistant"
+  short_description: "Guide ComfyUI workflow edits via FL-MCP"
+  default_prompt: "Use $workflow-assistant to inspect the open ComfyUI workflow and suggest the safest next edit."
+
+dependencies:
+  tools:
+    - type: "mcp"
+      value: "comfyui-fl-mcp"
+      description: "ComfyUI FL-MCP server for workflow inspection, canvas edits, queue control, model discovery, and screenshots."
+
+policy:
+  allow_implicit_invocation: true
