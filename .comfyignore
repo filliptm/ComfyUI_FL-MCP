@@ -1,0 +1,19 @@
+# Development-only files
+.github/
+tests/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local runtime state
+logs/
+sessions/
+.fl_mcp/
+.variables.json
+
+# Python caches
+__pycache__/
+*.py[cod]
+
+# Large demo source video; the README GIF remains tracked for GitHub display.
+assets/*.webm

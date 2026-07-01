@@ -1,28 +1,32 @@
-[tool.poetry]
+[project]
 name = "comfyui-fl-mcp"
 version = "0.1.0"
-description = "MCP server and browser bridge for ComfyUI"
-authors = ["ComfyUI FL-MCP Contributors"]
+description = "Local MCP server and browser bridge for ComfyUI. Inspect workflows, edit graphs, queue generations, manage models, and connect MCP-compatible agents to your local ComfyUI setup."
 readme = "README.md"
-license = "MIT"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = [
+    "fastapi",
+    "uvicorn[standard]",
+    "python-multipart",
+    "websockets",
+    "fastmcp",
+    "pydantic",
+    "pydantic-settings",
+    "python-dotenv",
+    "httpx",
+    "Pillow",
+    "PyYAML>=6.0",
+]
 
-[tool.poetry.dependencies]
-python = "^3.11"
-fastapi = "^0.104.1"
-uvicorn = {extras = ["standard"], version = "^0.24.0"}
-fastmcp = "^0.2.0"
-pydantic = "^2.5.0"
-pydantic-settings = "^2.1.0"
-websockets = "^12.0"
-python-dotenv = "^1.0.0"
+[project.urls]
+Repository = "https://github.com/filliptm/ComfyUI_FL-MCP"
+Homepage = "https://www.patreon.com/Machinedelusions"
 
-[tool.poetry.group.dev.dependencies]
-pytest = "^7.4.3"
-pytest-asyncio = "^0.21.1"
-pytest-cov = "^4.1.0"
-httpx = "^0.25.2"
-ruff = "^0.1.6"
-mypy = "^1.7.0"
+[tool.comfy]
+PublisherId = "machinedelusions"
+DisplayName = "ComfyUI FL-MCP"
+Icon = "https://avatars.githubusercontent.com/u/55672949"
 
 [tool.ruff]
 line-length = 100
@@ -56,7 +60,3 @@ asyncio_mode = "auto"
 testpaths = ["tests"]
 pythonpath = ["."]
 addopts = "-v --cov=backend --cov-report=term-missing"
-
-[build-system]
-requires = ["poetry-core"]
-build-backend = "poetry.core.masonry.api"
