@@ -8,10 +8,48 @@ import json
 import logging
 import mimetypes
 import os
+import sys
 import uuid
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any, AsyncIterator, Dict, List, Optional, Union, Literal
 from urllib.parse import quote
+
+# Ensure this file's own directory is importable for flat sibling imports below.
+# The embedded ComfyUI Python uses a ._pth file and does NOT auto-prepend the
+# script directory to sys.path, so an MCP client launching this with the
+# embedded interpreter would otherwise fail with ModuleNotFoundError.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+
+def _ensure_pywin32_importable() -> None:
+    """Make pywin32 (pywintypes/pythoncom) importable under embedded Python.
+
+    fastmcp's server support imports ``pywintypes`` (via keyring). On a normal
+    install ``pywin32.pth`` puts win32/win32/lib/pywin32_system32 on sys.path,
+    but the embedded ComfyUI Python disables ``site`` (its ``._pth`` has
+    ``# import site``), so those .pth files never run and the import fails with
+    ``ModuleNotFoundError: No module named 'pywintypes'``. Note the embedded
+    interpreter also ignores ``PYTHONPATH`` when a ``._pth`` is present, so this
+    has to be done in-process rather than via the environment.
+    """
+    if os.name != "nt":
+        return
+    try:
+        import pywintypes  # noqa: F401
+        return
+    except ImportError:
+        pass
+    site_packages = Path(sys.prefix) / "Lib" / "site-packages"
+    for sub in ("win32", "win32/lib", "pywin32_system32", "Pythonwin"):
+        candidate = site_packages.joinpath(*sub.split("/"))
+        if candidate.is_dir():
+            p = str(candidate)
+            if p not in sys.path:
+                sys.path.insert(0, p)
+
+
+_ensure_pywin32_importable()
 
 import websockets
 import httpx

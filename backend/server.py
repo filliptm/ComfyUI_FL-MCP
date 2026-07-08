@@ -18,6 +18,10 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
+# Also add this file's own directory so flat sibling imports (comfy_supervisor,
+# config, manager, ...) resolve. The embedded ComfyUI Python uses a ._pth file
+# and does NOT auto-prepend the script directory to sys.path.
+sys.path.insert(0, str(Path(__file__).parent))
 
 from comfy_supervisor import comfy_supervisor
 from config import settings
