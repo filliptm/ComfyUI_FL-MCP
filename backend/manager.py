@@ -243,9 +243,19 @@ class ConnectionManager:
         # Initialize session connections dict if needed
         if session_id not in self.active_connections:
             self.active_connections[session_id] = {}
-        
-        # Store connection by type
+
+        previous = self.active_connections[session_id].get(connection_type)
         self.active_connections[session_id][connection_type] = websocket
+        if previous is not None and previous is not websocket:
+            logger.warning(
+                "Session %s - %s connection replaced by a newer client",
+                session_id,
+                connection_type,
+            )
+            try:
+                await previous.close(code=4000, reason="replaced by a newer connection")
+            except Exception as exc:
+                logger.debug("Could not close replaced %s connection: %s", connection_type, exc)
 
         # Get or create session context
         if session_id in self.session_contexts:
@@ -259,17 +269,31 @@ class ConnectionManager:
 
         return context
 
-    def disconnect(self, session_id: str, connection_type: str = 'frontend') -> None:
+    def disconnect(
+        self,
+        session_id: str,
+        websocket: WebSocket,
+        connection_type: str = 'frontend',
+    ) -> None:
         """Disconnect a WebSocket connection.
 
         Note: Session context is kept alive for reconnection window.
 
         Args:
             session_id: Session ID to disconnect
+            websocket: WebSocket requesting removal
             connection_type: Type of connection to disconnect ('frontend' or 'mcp')
         """
         if session_id in self.active_connections:
             if connection_type in self.active_connections[session_id]:
+                current = self.active_connections[session_id][connection_type]
+                if current is not websocket:
+                    logger.info(
+                        "Session %s - ignored stale %s disconnect",
+                        session_id,
+                        connection_type,
+                    )
+                    return
                 del self.active_connections[session_id][connection_type]
                 logger.info(f"Session {session_id} - {connection_type} disconnected")
             

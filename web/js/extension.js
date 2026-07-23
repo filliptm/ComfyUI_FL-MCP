@@ -119,6 +119,9 @@ class BridgeStatusPanel {
         this.backendPill.textContent = running ? "Online" : "Offline";
         this.backendPill.classList.toggle("online", running);
         this.toggleButton.textContent = running ? "Stop backend" : "Start backend";
+        if (running && !this.wsClient.isConnectedOrConnecting()) {
+            this.wsClient.connect();
+        }
         this.updateConnection();
     }
 
@@ -171,7 +174,11 @@ class BridgeStatusPanel {
         this.toggleButton.textContent = running ? "Stopping..." : "Starting...";
         try {
             this.launcherStatus = await fetchJson(endpoint, { method: "POST" });
-            if (!running && this.launcherStatus?.backendReachable && !this.wsClient.connected) {
+            if (
+                !running
+                && this.launcherStatus?.backendReachable
+                && !this.wsClient.isConnectedOrConnecting()
+            ) {
                 this.wsClient.connect();
             }
         } catch (error) {
@@ -221,7 +228,7 @@ app.registerExtension({
                 url: wsUrl,
                 heartbeatInterval: 30000,
                 maxReconnectAttempts: 5,
-                clientVersion: "1.0.0-frontend",
+                clientVersion: `${config.version}-frontend`,
             });
             toolExecutor = new ToolExecutor(wsClient);
 
@@ -265,7 +272,7 @@ app.registerExtension({
                 wsClient,
                 toolExecutor,
                 app,
-                version: "0.4.0",
+                version: config.version,
             };
 
             if (launcherStatus.backendReachable) {

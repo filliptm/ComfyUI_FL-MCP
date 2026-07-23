@@ -74,20 +74,29 @@ class WSClient extends EventEmitter {
      * Connect to WebSocket server
      */
     connect() {
-        if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-            console.log('[FL-MCP WS] Already connected');
+        if (
+            this.ws
+            && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)
+        ) {
+            console.log('[FL-MCP WS] Already connected or connecting');
             return;
+        }
+
+        if (this.reconnectTimeout) {
+            clearTimeout(this.reconnectTimeout);
+            this.reconnectTimeout = null;
         }
         
         console.log(`[FL-MCP WS] Connecting to ${this.config.url}...`);
         
         try {
-            this.ws = new WebSocket(this.config.url);
-            
-            this.ws.onopen = () => this.handleOpen();
-            this.ws.onclose = (event) => this.handleClose(event);
-            this.ws.onerror = (error) => this.handleError(error);
-            this.ws.onmessage = (event) => this.handleMessage(event);
+            const websocket = new WebSocket(this.config.url);
+            this.ws = websocket;
+
+            websocket.onopen = () => this.handleOpen(websocket);
+            websocket.onclose = (event) => this.handleClose(websocket, event);
+            websocket.onerror = (error) => this.handleError(websocket, error);
+            websocket.onmessage = (event) => this.handleMessage(websocket, event);
             
         } catch (error) {
             console.error('[FL-MCP WS] Connection error:', error);
@@ -98,7 +107,8 @@ class WSClient extends EventEmitter {
     /**
      * Handle WebSocket open event
      */
-    handleOpen() {
+    handleOpen(websocket) {
+        if (this.ws !== websocket) return;
         console.log('[FL-MCP WS] WebSocket connected');
         this.connected = true;
         
@@ -125,8 +135,10 @@ class WSClient extends EventEmitter {
     /**
      * Handle WebSocket close event
      */
-    handleClose(event) {
+    handleClose(websocket, event) {
+        if (this.ws !== websocket) return;
         console.log('[FL-MCP WS] WebSocket closed:', event.code, event.reason);
+        this.ws = null;
         this.connected = false;
         this.handshakeComplete = false;
         
@@ -141,7 +153,8 @@ class WSClient extends EventEmitter {
     /**
      * Handle WebSocket error
      */
-    handleError(error) {
+    handleError(websocket, error) {
+        if (this.ws !== websocket) return;
         console.error('[FL-MCP WS] WebSocket error:', error);
         this.emit('error', error);
     }
@@ -149,7 +162,8 @@ class WSClient extends EventEmitter {
     /**
      * Handle incoming WebSocket message
      */
-    handleMessage(event) {
+    handleMessage(websocket, event) {
+        if (this.ws !== websocket) return;
         try {
             const message = JSON.parse(event.data);
             console.log('[FL-MCP WS] Received message:', message.type);
@@ -178,6 +192,13 @@ class WSClient extends EventEmitter {
         } catch (error) {
             console.error('[FL-MCP WS] Error parsing message:', error);
         }
+    }
+
+    isConnectedOrConnecting() {
+        return Boolean(
+            this.ws
+            && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)
+        );
     }
 
     /**

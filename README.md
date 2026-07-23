@@ -427,8 +427,9 @@ curl http://127.0.0.1:8000/health
 Logs are written under:
 
 ```text
-ComfyUI/custom_nodes/ComfyUI_FL-MCP/backend/logs/
-ComfyUI/custom_nodes/ComfyUI_FL-MCP/logs/
+ComfyUI/custom_nodes/ComfyUI_FL-MCP/backend/logs/fl_mcp_server.log
+ComfyUI/custom_nodes/ComfyUI_FL-MCP/backend/logs/fl_mcp_client-<pid>.log
+ComfyUI/custom_nodes/ComfyUI_FL-MCP/logs/fl_mcp_launcher.log
 ```
 
 </details>

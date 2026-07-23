@@ -15,6 +15,8 @@ import logging
 from typing import Optional, Literal
 from pathlib import Path
 
+from process_utils import managed_process_kwargs
+
 
 class ServerRunner:
     """Manages the ComfyUI FL-MCP FastAPI bridge server.
@@ -253,6 +255,7 @@ class ServerRunner:
                 stderr=stderr_dest,
                 bufsize=1,  # Line buffered
                 universal_newlines=True,
+                **managed_process_kwargs(),
             )
             
             self.active_mode = "subprocess"
@@ -302,7 +305,7 @@ class ServerRunner:
                             pass
                     
                     # Write to stdout (ComfyUI console)
-                print(f"[FL-MCP Backend] {line.rstrip()}")
+                    print(f"[FL-MCP Backend] {line.rstrip()}")
             
             except Exception as e:
                 print(f"[FL-MCP] Output capture error: {e}")

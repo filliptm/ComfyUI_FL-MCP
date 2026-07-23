@@ -27,6 +27,8 @@ from comfy_supervisor import comfy_supervisor
 from config import settings
 from manager import manager
 from models import Handshake, ScreenshotMessage, ToolResult
+from process_utils import pid_is_running
+from version import __version__
 
 
 LOG_LEVEL = getattr(logging, os.getenv("LOG_LEVEL", settings.log_level).upper(), logging.INFO)
@@ -62,14 +64,13 @@ async def parent_watchdog_task(parent_pid: int) -> None:
     while True:
         await asyncio.sleep(2)
         try:
-            os.kill(parent_pid, 0)
-        except PermissionError:
-            continue
-        except ProcessLookupError:
-            logger.warning("ComfyUI parent process exited; stopping managed backend")
-            os._exit(0)
+            parent_alive = pid_is_running(parent_pid)
         except Exception as exc:
             logger.warning("Parent watchdog check failed: %s", exc)
+            continue
+        if not parent_alive:
+            logger.warning("ComfyUI parent process exited; stopping managed backend")
+            os._exit(0)
 
 
 @asynccontextmanager
@@ -107,7 +108,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 app = FastAPI(
     title="ComfyUI FL-MCP",
     description="MCP bridge and tooling server for ComfyUI",
-    version="0.4.0",
+    version=__version__,
     lifespan=lifespan,
 )
 
@@ -124,7 +125,7 @@ app.mount("/js", StaticFiles(directory=str(WEB_JS_DIR)), name="shared_js")
 
 @app.get("/")
 async def root() -> Dict[str, str]:
-    return {"name": "ComfyUI FL-MCP", "version": "0.4.0", "status": "running"}
+    return {"name": "ComfyUI FL-MCP", "version": __version__, "status": "running"}
 
 
 @app.get("/health")
@@ -182,7 +183,7 @@ async def get_client_config() -> Dict[str, Any]:
             ws_url = f"{ws_url}/ws"
     else:
         ws_url = f"ws://{settings.ws_host}:{settings.ws_port}/ws"
-    return {"ws_url": ws_url, "version": "0.4.0", "public_url": settings.public_url}
+    return {"ws_url": ws_url, "version": __version__, "public_url": settings.public_url}
 
 
 @app.get("/api/sessions")
@@ -361,12 +362,12 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
 
     except WebSocketDisconnect:
         if session_id:
-            manager.disconnect(session_id, connection_type)
+            manager.disconnect(session_id, websocket, connection_type)
             logger.info("Session %s disconnected from %s", session_id, connection_type)
     except Exception as exc:
         logger.error("Error in WebSocket connection: %s", exc, exc_info=True)
         if session_id:
-            manager.disconnect(session_id, connection_type)
+            manager.disconnect(session_id, websocket, connection_type)
         try:
             await websocket.close()
         except Exception:

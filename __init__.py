@@ -6,6 +6,8 @@ launcher routes used by the MCP server.
 
 from __future__ import annotations
 
+import asyncio
+import http.client
 import json
 import os
 import signal
@@ -13,8 +15,8 @@ import socket
 import subprocess
 import sys
 import time
-import urllib.request
 from pathlib import Path
+from urllib.parse import urlsplit
 
 
 ROOT = Path(__file__).parent
@@ -25,6 +27,8 @@ LAUNCH_LOG = ROOT / "logs" / "fl_mcp_launcher.log"
 
 sys.path.insert(0, str(BACKEND_DIR))
 sys.path.insert(0, str(ROOT))
+
+from backend.process_utils import daemon_process_kwargs, pid_is_running
 
 try:
     from backend.config import settings
@@ -49,24 +53,28 @@ def _is_port_open(port: int) -> bool:
         return sock.connect_ex(("127.0.0.1", port)) == 0
 
 
-def _request_json(url: str, timeout: float = 1.0):
+def _request_json(url: str, timeout: float = 1.0, method: str = "GET"):
+    parsed = urlsplit(url)
+    connection = None
     try:
-        with urllib.request.urlopen(url, timeout=timeout) as response:
+        connection = http.client.HTTPConnection(
+            parsed.hostname or "127.0.0.1",
+            parsed.port or 80,
+            timeout=timeout,
+        )
+        path = parsed.path or "/"
+        if parsed.query:
+            path = f"{path}?{parsed.query}"
+        body = b"{}" if method == "POST" else None
+        headers = {"Content-Type": "application/json"} if body else {}
+        connection.request(method, path, body=body, headers=headers)
+        with connection.getresponse() as response:
             return json.loads(response.read().decode("utf-8"))
-    except Exception:
+    except (OSError, ValueError, json.JSONDecodeError):
         return None
-
-
-def _pid_is_running(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-        return True
-    except PermissionError:
-        return True
-    except ProcessLookupError:
-        return False
-    except Exception:
-        return False
+    finally:
+        if connection is not None:
+            connection.close()
 
 
 def _read_daemon_pid():
@@ -74,7 +82,7 @@ def _read_daemon_pid():
         pid = int(PID_FILE.read_text(encoding="utf-8").strip())
     except Exception:
         return None
-    return pid if _pid_is_running(pid) else None
+    return pid if pid_is_running(pid) else None
 
 
 def _launcher_status():
@@ -121,8 +129,8 @@ def _start_daemon():
             stdin=subprocess.DEVNULL,
             stdout=log,
             stderr=subprocess.STDOUT,
-            start_new_session=True,
             close_fds=True,
+            **daemon_process_kwargs(),
         )
 
     PID_FILE.write_text(str(proc.pid), encoding="utf-8")
@@ -144,16 +152,7 @@ def _stop_daemon():
     mcp_status = status.get("mcpStatus") or {}
 
     if status["backendReachable"] and mcp_status.get("mode") == "daemon":
-        try:
-            request = urllib.request.Request(
-                f"{backend_url}/api/mcp/shutdown",
-                data=b"{}",
-                method="POST",
-                headers={"Content-Type": "application/json"},
-            )
-            urllib.request.urlopen(request, timeout=1)
-        except Exception:
-            pass
+        _request_json(f"{backend_url}/api/mcp/shutdown", timeout=1, method="POST")
 
     pid = _read_daemon_pid()
     if pid:
@@ -187,11 +186,11 @@ try:
 
     @PromptServer.instance.routes.post("/fl_mcp/launcher/start")
     async def fl_mcp_launcher_start(request):
-        return web.json_response(_start_daemon())
+        return web.json_response(await asyncio.to_thread(_start_daemon))
 
     @PromptServer.instance.routes.post("/fl_mcp/launcher/stop")
     async def fl_mcp_launcher_stop(request):
-        return web.json_response(_stop_daemon())
+        return web.json_response(await asyncio.to_thread(_stop_daemon))
 
     print("[FL-MCP] Registered launcher routes")
 except Exception as exc:

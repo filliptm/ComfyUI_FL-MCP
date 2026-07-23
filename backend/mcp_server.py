@@ -103,12 +103,9 @@ from comfy_supervisor import comfy_supervisor
 log_level_name = os.getenv("LOG_LEVEL", "INFO").upper()
 log_level = getattr(logging, log_level_name, logging.INFO)
 
-# Ensure log directory exists (anchored to this file's dir, NOT the process cwd —
-# mcp_server.py is spawned by MCP clients whose cwd is arbitrary, so a relative
-# "logs/" path would scatter fl_mcp_server.log into every caller's directory).
-_LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
-os.makedirs(_LOG_DIR, exist_ok=True)
-log_file = os.path.join(_LOG_DIR, "fl_mcp_server.log")
+_LOG_DIR = Path(__file__).resolve().parent / "logs"
+_LOG_DIR.mkdir(exist_ok=True)
+log_file = _LOG_DIR / f"fl_mcp_client-{os.getpid()}.log"
 
 # Configure logging to both console and file
 logging.basicConfig(
@@ -116,7 +113,7 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     handlers=[
         logging.StreamHandler(),              # Console output
-        logging.FileHandler(log_file, mode="w", encoding="utf-8")  # File output
+        logging.FileHandler(log_file, mode="a", encoding="utf-8")  # File output
     ],
 )
 
@@ -135,62 +132,79 @@ class MCPWebSocketClient:
         self.session_id = session_id
         self.ws_url = ws_url
         self.ws = None
-        self.pending_requests = {}  # request_id -> asyncio.Future
+        self.pending_requests = {}  # request_id -> (Future, connection generation)
         self.connected = False
         self._receive_task = None
+        self._connect_lock = asyncio.Lock()
+        self._generation = 0
         
     async def connect(self):
-        """Connect to backend WebSocket server (one-time, persistent)."""
-        if self.connected and self.ws and not self.ws.closed:
-            return
+        """Connect to the backend once, serializing concurrent reconnects."""
+        async with self._connect_lock:
+            if self.connected and self.ws is not None:
+                return
 
-        logger.info(f"[MCP-WS] Connecting to {self.ws_url} with session {self.session_id}")
-        self.ws = await websockets.connect(self.ws_url)
+            previous = self.ws
+            self.ws = None
+            self.connected = False
+            if previous is not None:
+                await previous.close()
 
-        # Send handshake
-        await self.ws.send(json.dumps({
-            'type': 'handshake',
-            'session_id': self.session_id,
-            'client_version': '1.0.0-mcp',
-        }))
-        
-        # Wait for handshake ack
-        response = await self.ws.recv()
-        data = json.loads(response)
-        
-        if data.get('type') != 'handshake_ack':
-            raise RuntimeError(f"Unexpected handshake response: {data}")
+            logger.info(f"[MCP-WS] Connecting to {self.ws_url} with session {self.session_id}")
+            websocket = await websockets.connect(self.ws_url)
+            try:
+                await websocket.send(json.dumps({
+                    'type': 'handshake',
+                    'session_id': self.session_id,
+                    'client_version': '1.0.0-mcp',
+                }))
+                response = await websocket.recv()
+                data = json.loads(response)
+                if data.get('type') != 'handshake_ack':
+                    raise RuntimeError(f"Unexpected handshake response: {data}")
+            except Exception:
+                await websocket.close()
+                raise
 
-        self.connected = True
-        logger.info(f"[MCP-WS] Connected and handshake complete")
-
-        # Start a single persistent receive loop
-        if not self._receive_task or self._receive_task.done():
-            self._receive_task = asyncio.create_task(self._receive_loop())
+            self._generation += 1
+            generation = self._generation
+            self.ws = websocket
+            self.connected = True
+            logger.info("[MCP-WS] Connected and handshake complete")
+            self._receive_task = asyncio.create_task(
+                self._receive_loop(websocket, generation)
+            )
     
-    async def _receive_loop(self):
+    async def _receive_loop(self, websocket, generation: int):
         """Receive and process messages from backend."""
         try:
-            async for message in self.ws:
+            async for message in websocket:
                 data = json.loads(message)
-                await self._handle_message(data)
-        except websockets.exceptions.ConnectionClosed:  # includes OK(1000)
-            logger.warning(f"[MCP-WS] Connection closed")
-            self.connected = False
-            await self._fail_all_pending(RuntimeError("WebSocket closed"))
+                await self._handle_message(data, generation)
+        except websockets.exceptions.ConnectionClosed as exc:
+            logger.warning("[MCP-WS] Connection closed: %s", exc)
         except Exception as e:
             logger.error(f"[MCP-WS] Receive loop error: {e}")
-            self.connected = False
-            await self._fail_all_pending(RuntimeError(f"WebSocket error: {e!r}"))
+        finally:
+            if self.ws is websocket:
+                self.connected = False
+            await self._fail_pending_for_generation(
+                generation,
+                RuntimeError("WebSocket closed"),
+            )
     
-    async def _handle_message(self, data: dict):
+    async def _handle_message(self, data: dict, generation: int):
         """Handle incoming message from backend."""
         msg_type = data.get('type')
         
         if msg_type == 'tool_result':
             request_id = data.get('request_id')
-            future = self.pending_requests.get(request_id)
-            if future and not future.done():
+            pending = self.pending_requests.get(request_id)
+            if pending and pending[1] == generation:
+                future = pending[0]
+            else:
+                future = None
+            if future is not None and not future.done():
                 if data.get('success'):
                     future.set_result(data.get('data'))
                 else:
@@ -199,26 +213,33 @@ class MCPWebSocketClient:
         else:
             logger.warning(f"[MCP-WS] Unexpected message type: {msg_type}")
 
-    async def _fail_all_pending(self, exc: Exception):
-        # Fail and clear all outstanding tool calls so they don't hang to timeout
-        for rid, fut in list(self.pending_requests.items()):
+    async def _fail_pending_for_generation(self, generation: int, exc: Exception):
+        for rid, (fut, pending_generation) in list(self.pending_requests.items()):
+            if pending_generation != generation:
+                continue
             if not fut.done():
                 fut.set_exception(exc)
             self.pending_requests.pop(rid, None)
 
     async def execute_tool(self, tool_name: str, parameters: Dict[str, Any], timeout_ms: int = 30000) -> dict:
         """Execute a tool via WebSocket callback."""
-        if not self.connected or not self.ws:
-            raise RuntimeError("WebSocket not connected")
+        if not self.connected or self.ws is None:
+            logger.warning("[MCP-WS] Not connected; reconnecting before %s", tool_name)
+            await self.connect()
+
+        websocket = self.ws
+        generation = self._generation
+        if websocket is None:
+            raise RuntimeError("WebSocket reconnect did not produce a connection")
         
         request_id = str(uuid.uuid4())
         future = asyncio.get_running_loop().create_future()
-        self.pending_requests[request_id] = future
+        self.pending_requests[request_id] = (future, generation)
         
         logger.info(f"[MCP-WS] Executing tool: {tool_name} (request_id: {request_id})")
         
         try:
-            await self.ws.send(json.dumps({
+            await websocket.send(json.dumps({
                 'type': 'tool_request',
                 'session_id': self.session_id,
                 'request_id': request_id,
@@ -232,23 +253,39 @@ class MCPWebSocketClient:
             logger.info(f"[MCP-WS] Tool execution complete: {request_id}")
             return result
 
+        except websockets.exceptions.ConnectionClosed as exc:
+            if self.ws is websocket:
+                self.connected = False
+            self.pending_requests.pop(request_id, None)
+            raise RuntimeError(
+                "WebSocket disconnected while dispatching the tool; "
+                "the result is unknown and the operation was not retried"
+            ) from exc
         except Exception as e:
             logger.error(f"[MCP-WS] Tool execution error: {e}")
-            # ensure future is cleaned up on any error path
             self.pending_requests.pop(request_id, None)
             raise
     
     async def disconnect(self):
         """Optional explicit shutdown (not used by lifespan)."""
+        websocket = self.ws
+        self.ws = None
+        self.connected = False
+        if websocket is not None:
+            await websocket.close()
         if self._receive_task:
-            self._receive_task.cancel()
             try:
                 await self._receive_task
             except asyncio.CancelledError:
                 pass
-        if self.ws and not self.ws.closed:
-            await self.ws.close()
-        self.connected = False
+        for generation in {
+            pending_generation
+            for _, pending_generation in self.pending_requests.values()
+        }:
+            await self._fail_pending_for_generation(
+                generation,
+                RuntimeError("WebSocket disconnected"),
+            )
         logger.info("[MCP-WS] Disconnected")
 
 
@@ -294,24 +331,19 @@ async def mcp_lifespan(server: FastMCP) -> AsyncIterator[Any]:
         logger.info(f"[MCP] Starting in subprocess mode for session: {session_id}")
 
         try:
-            # Create once and keep alive across tool calls
             if _WS_CLIENT is None:
                 _WS_CLIENT = MCPWebSocketClient(session_id, ws_url)
-                await _WS_CLIENT.connect()
-                logger.info("[MCP] WebSocket client connected (persistent)")
-            elif not _WS_CLIENT.connected or (_WS_CLIENT.ws and _WS_CLIENT.ws.closed):
-                # Session exists but not connected (e.g., prior close). No auto-reconnect logic here;
-                # just try to connect once.
-                await _WS_CLIENT.connect()
-                logger.info("[MCP] WebSocket client reconnected (persistent)")
-            
-            yield {
-                "client": _WS_CLIENT,
-                "manager_client": manager_client,
-                "manager_available": manager_available
-            }
+            await _WS_CLIENT.connect()
+            logger.info("[MCP] WebSocket client connected (persistent)")
         except Exception as e:
             logger.error(f"MCP Initialization Failed: {str(e)}")
+            raise
+
+        yield {
+            "client": _WS_CLIENT,
+            "manager_client": manager_client,
+            "manager_available": manager_available
+        }
 
         # NOTE: no disconnect/teardown here; keep WS open for the process lifetime.
         return
