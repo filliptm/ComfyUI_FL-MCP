@@ -14,10 +14,13 @@ class FakeWebSocket {
     constructor(url) {
         this.url = url;
         this.readyState = FakeWebSocket.CONNECTING;
+        this.messages = [];
         FakeWebSocket.instances.push(this);
     }
 
-    send() {}
+    send(message) {
+        this.messages.push(JSON.parse(message));
+    }
 
     close(code = 1000, reason = "") {
         this.readyState = FakeWebSocket.CLOSED;
@@ -57,4 +60,25 @@ test("events from a stale socket cannot disconnect its replacement", () => {
 
     assert.equal(client.ws, newSocket);
     assert.equal(client.isConnectedOrConnecting(), true);
+});
+
+
+test("frontend handshake sends an explicit role and stable client identity", () => {
+    FakeWebSocket.instances = [];
+    const client = new WSClient("session", {
+        url: "ws://bridge/ws",
+        clientId: "browser-test",
+    });
+    client.connect();
+    const socket = FakeWebSocket.instances[0];
+    socket.readyState = FakeWebSocket.OPEN;
+    socket.onopen();
+
+    assert.deepEqual(socket.messages[0], {
+        type: "handshake",
+        session_id: "session",
+        client_version: "1.0.0",
+        connection_type: "frontend",
+        client_id: "browser-test",
+    });
 });

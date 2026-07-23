@@ -19,6 +19,16 @@ class Handshake(BaseMessage):
 
     type: Literal["handshake"] = "handshake"
     client_version: Optional[str] = Field(None, description="Client version")
+    connection_type: Optional[Literal["frontend", "mcp"]] = Field(
+        None,
+        description="Explicit client role. Older clients may omit this field.",
+    )
+    client_id: Optional[str] = Field(
+        None,
+        min_length=1,
+        max_length=128,
+        description="Stable identity used to reconnect one client without replacing others.",
+    )
 
 
 class ToolResult(BaseMessage):

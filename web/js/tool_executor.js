@@ -320,8 +320,8 @@ export class ToolExecutor {
                 let position = null;
                 if (nodeSpec.x !== undefined || nodeSpec.y !== undefined) {
                     position = {
-                        x: nodeSpec.x ?? 0,
-                        y: nodeSpec.y ?? 0
+                        x: nodeSpec.x,
+                        y: nodeSpec.y
                     };
                 }
 
@@ -333,7 +333,11 @@ export class ToolExecutor {
                 results.push({
                     success: true,
                     node_id: result.id,
-                    node_type: nodeSpec.node_type
+                    node_type: nodeSpec.node_type,
+                    title: result.title,
+                    position: result.position,
+                    size: result.size,
+                    placement_adjusted: result.placement_adjusted,
                 });
             } catch (error) {
                 console.error(`[ToolExecutor] Failed to create node ${nodeSpec.node_type}:`, error);

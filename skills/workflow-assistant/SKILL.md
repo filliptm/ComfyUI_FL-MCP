@@ -19,13 +19,16 @@ This skill is workflow-first. It borrows the old Ren Agent's operating disciplin
    - Prefer existing nodes and existing graph patterns.
    - Do not create replacement nodes when the user only asked to change a parameter.
    - Batch node creation or connection calls when the tool supports it.
+   - Treat nodes as rectangles. Never plan spacing from x/y points alone or guess that different node types share one size.
 3. Modify through explicit graph tools.
    - Use `set_node_values` for widget values.
    - Use `connect_nodes` or `connect_nodes_batch` for links.
+   - Omit x/y from `create_nodes` when exact placement is unimportant; collision-aware creation will place nodes beside the graph.
    - Use `workflow_load_json` only when replacing or restructuring a larger graph.
 4. Verify immediately.
    - Re-run `workflow_overview`.
    - For high-risk nodes, inspect slots or values directly.
+   - Read the final `position` and measured `size` returned by `create_nodes`; use those bounds for subsequent manual placement.
    - After layout changes, use `take_screenshot` or `focus_on_nodes` to verify visually.
 5. Queue only after validation.
    - Check required sampler, decoder, loader, and save connections.
@@ -54,7 +57,7 @@ Common patterns:
 - Understand the open graph: `workflow_overview`, `workflow_diagram`, `workflow_get_current_json`.
 - Explain selected nodes: `get_current_node_selection`, then `get_node_values` or `get_node_slots`.
 - Change parameters: find the existing node, then call `set_node_values`, then verify.
-- Add or rewire nodes: create/connect in batches when possible, then `modify_layout`, then screenshot.
+- Add or rewire nodes: inspect the surrounding layout, create nodes in a batch, use the returned rectangles, connect them, then `modify_layout` when semantic organization is needed and take a screenshot.
 - Compact or clean layout: `get_layout`, `modify_layout`, optionally edit group bounds via workflow JSON, then `take_screenshot`.
 - Debug execution: `queue_workflow`, `wait`, `get_execution_history`, `get_execution_details`, and error-buffer tools.
 - Check assets/models: `comfy_models_list`, `comfy_list_folders`, `comfy_read_file`, `extract_workflow_from_image`.
@@ -63,6 +66,8 @@ Common patterns:
 ## Workflow Rules
 
 - Never assume the graph is valid because it looks connected. Verify required slots.
+- Never place multiple new nodes at the same coordinates. Prefer automatic placement, or calculate manual positions from measured width and height plus a visible gap.
+- Never assume requested creation coordinates were retained. Collision avoidance may adjust them; use the final bounds returned by `create_nodes`.
 - Never set a ComfyUI KSampler seed to a negative value.
 - If a KSampler has `control_after_generate` set to fixed and the same prompt/settings are queued again, ComfyUI may reuse cached work. Change an intentional parameter or explain why no new run appears.
 - If positive and negative conditioning share the same prompt node, call it out unless the user intentionally asked for that.

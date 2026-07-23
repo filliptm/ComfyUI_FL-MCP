@@ -111,3 +111,78 @@ async def test_old_receive_loop_cannot_disconnect_new_generation(monkeypatch):
     assert client.connected is True
     assert client.ws is new_socket
     await client.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_handshake_includes_explicit_client_identity(monkeypatch):
+    socket = FakeClientSocket()
+
+    async def connect(_url):
+        return socket
+
+    monkeypatch.setattr(mcp_server.websockets, "connect", connect)
+    client = mcp_server.MCPWebSocketClient(
+        "session",
+        "ws://bridge/ws",
+        client_id="embedded-chat-test",
+    )
+    await client.connect()
+
+    handshake = socket.sent[0]
+    assert handshake["connection_type"] == "mcp"
+    assert handshake["client_id"] == "embedded-chat-test"
+    await client.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_embedded_tool_filter_removes_unselected_tools(monkeypatch):
+    class Tool:
+        def __init__(self, name):
+            self.name = name
+
+    class FakeMcp:
+        def __init__(self):
+            self.removed = []
+
+        async def get_tools(self):
+            return {
+                "workflow_overview": Tool("workflow_overview"),
+                "queue_workflow": Tool("queue_workflow"),
+            }
+
+        def remove_tool(self, name):
+            self.removed.append(name)
+
+    fake = FakeMcp()
+    monkeypatch.setattr(mcp_server, "mcp", fake)
+    monkeypatch.setenv("FL_MCP_ALLOWED_TOOLS", "workflow_overview")
+
+    await mcp_server._restrict_tools_from_environment()
+
+    assert fake.removed == ["queue_workflow"]
+
+
+@pytest.mark.asyncio
+async def test_embedded_tool_filter_supports_current_fastmcp_api(monkeypatch):
+    class Tool:
+        def __init__(self, name):
+            self.name = name
+
+    class FakeMcp:
+        def __init__(self):
+            self.removed = []
+
+        async def list_tools(self, *, run_middleware):
+            assert run_middleware is False
+            return [Tool("workflow_overview"), Tool("queue_workflow")]
+
+        def remove_tool(self, name):
+            self.removed.append(name)
+
+    fake = FakeMcp()
+    monkeypatch.setattr(mcp_server, "mcp", fake)
+    monkeypatch.setenv("FL_MCP_ALLOWED_TOOLS", "workflow_overview")
+
+    await mcp_server._restrict_tools_from_environment()
+
+    assert fake.removed == ["queue_workflow"]

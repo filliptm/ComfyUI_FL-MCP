@@ -390,11 +390,67 @@ export const TOOL_CONFIG = {
     }
 };
 
+const TOOL_ICON_CLASSES = {
+    workflow_overview: "pi pi-chart-bar",
+    query_workflow: "pi pi-search",
+    workflow_diagram: "pi pi-sitemap",
+    create_nodes: "pi pi-plus-circle",
+    remove_nodes: "pi pi-trash",
+    connect_nodes: "pi pi-link",
+    connect_nodes_batch: "pi pi-link",
+    set_node_values: "pi pi-sliders-h",
+    get_node_values: "pi pi-list",
+    get_node_slots: "pi pi-circle",
+    get_current_node_selection: "pi pi-stop-circle",
+    select_nodes: "pi pi-stop-circle",
+    find_node: "pi pi-search",
+    focus_on_nodes: "pi pi-expand",
+    modify_layout: "pi pi-th-large",
+    get_layout: "pi pi-table",
+    queue_workflow: "pi pi-play",
+    cancel_workflow: "pi pi-stop",
+    get_queue_status: "pi pi-clock",
+    workflow_get_current_json: "pi pi-code",
+    workflow_load_json: "pi pi-upload",
+    workflow_save_current: "pi pi-save",
+    take_screenshot: "pi pi-camera",
+    node_library_search: "pi pi-search",
+    node_library_get_details: "pi pi-info-circle",
+    manager_check_updates: "pi pi-refresh",
+    manager_queue_action: "pi pi-download",
+    get_recent_errors: "pi pi-exclamation-triangle",
+    get_execution_details: "pi pi-chart-line",
+};
+
+const TOOL_RUNNING_LABELS = {
+    workflow_overview: "Inspecting workflow",
+    query_workflow: "Searching workflow",
+    create_nodes: "Creating nodes",
+    remove_nodes: "Removing nodes",
+    connect_nodes: "Connecting nodes",
+    connect_nodes_batch: "Connecting nodes",
+    set_node_values: "Updating node values",
+    get_node_values: "Reading node values",
+    get_node_slots: "Reading node slots",
+    get_current_node_selection: "Reading selection",
+    modify_layout: "Arranging workflow",
+    get_layout: "Reading layout",
+    queue_workflow: "Queueing workflow",
+    take_screenshot: "Capturing canvas",
+    node_library_search: "Searching node library",
+    manager_check_updates: "Checking for updates",
+};
+
 /**
  * Get tool configuration by name
  * @param {string} toolName - Name of the tool
- * @returns {object} - Icon, label, and description
+ * @returns {object} - Icon class, labels, and description
  */
 export function getToolConfig(toolName) {
-    return TOOL_CONFIG[toolName] || TOOL_CONFIG["*"];
+    const config = TOOL_CONFIG[toolName] || TOOL_CONFIG["*"];
+    return {
+        ...config,
+        iconClass: TOOL_ICON_CLASSES[toolName] || "pi pi-bolt",
+        runningLabel: TOOL_RUNNING_LABELS[toolName] || config.description || "Working",
+    };
 }
