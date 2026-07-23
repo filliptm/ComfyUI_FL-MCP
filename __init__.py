@@ -90,7 +90,17 @@ def _launcher_status():
     mcp_status = _request_json(f"{backend_url}/api/mcp/status")
     health = _request_json(f"{backend_url}/health")
     pid = _read_daemon_pid()
-    backend_reachable = bool(health or mcp_status or _is_port_open(PORT))
+    health_matches = bool(
+        health
+        and health.get("status") == "healthy"
+        and "active_connections" in health
+    )
+    status_matches = bool(
+        mcp_status
+        and mcp_status.get("healthy") is True
+        and mcp_status.get("port") == PORT
+    )
+    backend_reachable = health_matches or status_matches
     mode = (mcp_status or {}).get("mode")
     return {
         "backendUrl": backend_url,

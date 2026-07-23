@@ -4,8 +4,10 @@ Handles automatic startup, monitoring, and cleanup of the FastAPI backend server
 Supports multiple launch modes: terminal window, subprocess, or manual.
 """
 
-import sys
+import http.client
+import json
 import os
+import sys
 import subprocess
 import atexit
 import socket
@@ -83,6 +85,25 @@ class ServerRunner:
         """
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             return s.connect_ex(('127.0.0.1', self.port)) == 0
+
+    def is_fl_mcp_backend(self) -> bool:
+        connection = None
+        try:
+            connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=1)
+            connection.request("GET", "/health")
+            response = connection.getresponse()
+            if response.status != 200:
+                return False
+            payload = json.loads(response.read().decode("utf-8"))
+            return (
+                payload.get("status") == "healthy"
+                and "active_connections" in payload
+            )
+        except (OSError, ValueError, json.JSONDecodeError):
+            return False
+        finally:
+            if connection is not None:
+                connection.close()
     
     def _setup_log_file(self) -> Optional[object]:
         """Setup log file for server output.
@@ -128,10 +149,13 @@ class ServerRunner:
         
         # Check port availability
         if self.is_port_in_use():
-            print(f"[FL-MCP] Port {self.port} already in use.")
-            print(f"[FL-MCP] Reusing existing backend on port {self.port}.")
-            self.active_mode = "external"
-            return True
+            if self.is_fl_mcp_backend():
+                print(f"[FL-MCP] Reusing existing backend on port {self.port}.")
+                self.active_mode = "external"
+                return True
+            print(f"[FL-MCP] Port {self.port} is occupied by another service.")
+            print("[FL-MCP] Set WS_PORT to an available port and restart ComfyUI.")
+            return False
         
         # Determine launch method
         if self.launch_mode == "manual":
