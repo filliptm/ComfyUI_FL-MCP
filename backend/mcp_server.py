@@ -103,9 +103,12 @@ from comfy_supervisor import comfy_supervisor
 log_level_name = os.getenv("LOG_LEVEL", "INFO").upper()
 log_level = getattr(logging, log_level_name, logging.INFO)
 
-# Ensure log directory exists (optional)
-os.makedirs("logs", exist_ok=True)
-log_file = "logs/fl_mcp_server.log"
+# Ensure log directory exists (anchored to this file's dir, NOT the process cwd —
+# mcp_server.py is spawned by MCP clients whose cwd is arbitrary, so a relative
+# "logs/" path would scatter fl_mcp_server.log into every caller's directory).
+_LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+os.makedirs(_LOG_DIR, exist_ok=True)
+log_file = os.path.join(_LOG_DIR, "fl_mcp_server.log")
 
 # Configure logging to both console and file
 logging.basicConfig(
