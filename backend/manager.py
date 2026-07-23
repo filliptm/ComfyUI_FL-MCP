@@ -213,9 +213,12 @@ class ConnectionManager:
         self,
         session_timeout_seconds: int = 300,  # 5 minutes
     ):
-        # Map session_id -> dict of connection types -> WebSocket.
-        # e.g. {"session123": {"frontend": WebSocket, "mcp": WebSocket}}
-        self.active_connections: Dict[str, Dict[str, WebSocket]] = {}
+        # Frontend remains a single browser bridge while MCP is a client-id map:
+        # {"session": {"frontend": WebSocket, "mcp": {"client-a": WebSocket}}}
+        self.active_connections: Dict[str, Dict[str, Any]] = {}
+        # Browser tool results are returned only to the MCP client that originated
+        # the request. The timestamp supports bounded cleanup of abandoned calls.
+        self.pending_tool_requests: Dict[tuple[str, str], Dict[str, Any]] = {}
         # Map session_id -> SessionContext
         self.session_contexts: Dict[str, SessionContext] = {}
         # Session timeout
@@ -228,7 +231,11 @@ class ConnectionManager:
         logger.info("ConnectionManager initialized with error tracking")
 
     async def connect(
-        self, websocket: WebSocket, session_id: str, connection_type: str = 'frontend'
+        self,
+        websocket: WebSocket,
+        session_id: str,
+        connection_type: str = "frontend",
+        client_id: Optional[str] = None,
     ) -> SessionContext:
         """Register a new WebSocket connection.
 
@@ -244,13 +251,22 @@ class ConnectionManager:
         if session_id not in self.active_connections:
             self.active_connections[session_id] = {}
 
-        previous = self.active_connections[session_id].get(connection_type)
-        self.active_connections[session_id][connection_type] = websocket
+        resolved_client_id = client_id or (
+            "legacy-mcp" if connection_type == "mcp" else "browser"
+        )
+        if connection_type == "mcp":
+            mcp_connections = self.active_connections[session_id].setdefault("mcp", {})
+            previous = mcp_connections.get(resolved_client_id)
+            mcp_connections[resolved_client_id] = websocket
+        else:
+            previous = self.active_connections[session_id].get("frontend")
+            self.active_connections[session_id]["frontend"] = websocket
         if previous is not None and previous is not websocket:
             logger.warning(
-                "Session %s - %s connection replaced by a newer client",
+                "Session %s - %s/%s connection replaced by a newer client",
                 session_id,
                 connection_type,
+                resolved_client_id,
             )
             try:
                 await previous.close(code=4000, reason="replaced by a newer connection")
@@ -261,11 +277,21 @@ class ConnectionManager:
         if session_id in self.session_contexts:
             context = self.session_contexts[session_id]
             context.last_activity = datetime.now()
-            logger.info(f"Session {session_id} - {connection_type} connected")
+            logger.info(
+                "Session %s - %s/%s connected",
+                session_id,
+                connection_type,
+                resolved_client_id,
+            )
         else:
             context = SessionContext(session_id=session_id)
             self.session_contexts[session_id] = context
-            logger.info(f"New session {session_id} created with {connection_type} connection")
+            logger.info(
+                "New session %s created with %s/%s connection",
+                session_id,
+                connection_type,
+                resolved_client_id,
+            )
 
         return context
 
@@ -274,6 +300,7 @@ class ConnectionManager:
         session_id: str,
         websocket: WebSocket,
         connection_type: str = 'frontend',
+        client_id: Optional[str] = None,
     ) -> None:
         """Disconnect a WebSocket connection.
 
@@ -285,17 +312,39 @@ class ConnectionManager:
             connection_type: Type of connection to disconnect ('frontend' or 'mcp')
         """
         if session_id in self.active_connections:
-            if connection_type in self.active_connections[session_id]:
-                current = self.active_connections[session_id][connection_type]
+            resolved_client_id = client_id or (
+                "legacy-mcp" if connection_type == "mcp" else "browser"
+            )
+            if connection_type == "mcp":
+                mcp_connections = self.active_connections[session_id].get("mcp", {})
+                current = mcp_connections.get(resolved_client_id)
                 if current is not websocket:
                     logger.info(
-                        "Session %s - ignored stale %s disconnect",
+                        "Session %s - ignored stale %s/%s disconnect",
                         session_id,
                         connection_type,
+                        resolved_client_id,
                     )
                     return
-                del self.active_connections[session_id][connection_type]
-                logger.info(f"Session {session_id} - {connection_type} disconnected")
+                mcp_connections.pop(resolved_client_id, None)
+                if not mcp_connections:
+                    self.active_connections[session_id].pop("mcp", None)
+                for key, owner in list(self.pending_tool_requests.items()):
+                    if key[0] == session_id and owner.get("client_id") == resolved_client_id:
+                        self.pending_tool_requests.pop(key, None)
+                logger.info(
+                    "Session %s - %s/%s disconnected",
+                    session_id,
+                    connection_type,
+                    resolved_client_id,
+                )
+            elif "frontend" in self.active_connections[session_id]:
+                current = self.active_connections[session_id]["frontend"]
+                if current is not websocket:
+                    logger.info("Session %s - ignored stale frontend disconnect", session_id)
+                    return
+                del self.active_connections[session_id]["frontend"]
+                logger.info("Session %s - frontend disconnected", session_id)
             
             # Clean up session entry if no more connections
             if not self.active_connections[session_id]:
@@ -303,7 +352,11 @@ class ConnectionManager:
                 logger.info(f"Session {session_id} - all connections closed")
 
     async def send_message(
-        self, session_id: str, message: Dict, target: str = 'frontend'
+        self,
+        session_id: str,
+        message: Dict,
+        target: str = "frontend",
+        client_id: Optional[str] = None,
     ) -> bool:
         """Send a message to a specific session connection.
 
@@ -325,8 +378,19 @@ class ConnectionManager:
         logger.debug(f"[SEND] {message.get('type', 'unknown')} -> {target} | available: {list(connections.keys())} | session: {session_id[:8]}...")
         
         # Determine which connections to send to
-        if target == 'all':
-            targets = list(connections.values())
+        if target == "all":
+            targets = []
+            frontend = connections.get("frontend")
+            if frontend:
+                targets.append(frontend)
+            targets.extend(connections.get("mcp", {}).values())
+        elif target == "mcp":
+            mcp_connections = connections.get("mcp", {})
+            if client_id:
+                websocket = mcp_connections.get(client_id)
+                targets = [websocket] if websocket else []
+            else:
+                targets = list(mcp_connections.values())
         else:
             targets = [connections.get(target)] if target in connections else []
         
@@ -353,7 +417,11 @@ class ConnectionManager:
         return sent
     
     async def send_handshake_ack(
-        self, session_id: str, is_reconnect: bool, connection_type: str = 'frontend'
+        self,
+        session_id: str,
+        is_reconnect: bool,
+        connection_type: str = "frontend",
+        client_id: Optional[str] = None,
     ) -> None:
         """Send handshake acknowledgment.
 
@@ -367,7 +435,12 @@ class ConnectionManager:
             status="reconnected" if is_reconnect else "ready",
             bridge_context=None,
         )
-        await self.send_message(session_id, message.model_dump(), target=connection_type)
+        await self.send_message(
+            session_id,
+            message.model_dump(),
+            target=connection_type,
+            client_id=client_id,
+        )
 
     async def send_error(
         self,
@@ -375,7 +448,8 @@ class ConnectionManager:
         error_code: str,
         error_message: str,
         details: Optional[Dict] = None,
-        target: str = 'frontend'
+        target: str = "frontend",
+        client_id: Optional[str] = None,
     ) -> None:
         """Send error message to client.
 
@@ -392,9 +466,19 @@ class ConnectionManager:
             message=error_message,
             details=details,
         )
-        await self.send_message(session_id, message.model_dump(), target=target)
+        await self.send_message(
+            session_id,
+            message.model_dump(),
+            target=target,
+            client_id=client_id,
+        )
 
-    def has_connection(self, session_id: str, connection_type: str) -> bool:
+    def has_connection(
+        self,
+        session_id: str,
+        connection_type: str,
+        client_id: Optional[str] = None,
+    ) -> bool:
         """Check if a specific connection type exists for a session.
         
         Args:
@@ -404,10 +488,47 @@ class ConnectionManager:
         Returns:
             True if connection exists, False otherwise
         """
-        return (
-            session_id in self.active_connections
-            and connection_type in self.active_connections[session_id]
-        )
+        if session_id not in self.active_connections:
+            return False
+        connections = self.active_connections[session_id]
+        if connection_type == "mcp":
+            mcp_connections = connections.get("mcp", {})
+            return client_id in mcp_connections if client_id else bool(mcp_connections)
+        return connection_type in connections
+
+    def register_tool_request(
+        self,
+        session_id: str,
+        request_id: str,
+        client_id: str,
+    ) -> bool:
+        """Claim a browser tool request for one MCP client."""
+        self.cleanup_pending_tool_requests()
+        key = (session_id, request_id)
+        if key in self.pending_tool_requests:
+            return False
+        self.pending_tool_requests[key] = {
+            "client_id": client_id,
+            "created_at": datetime.now(),
+        }
+        return True
+
+    def resolve_tool_request(self, session_id: str, request_id: str) -> Optional[str]:
+        """Remove and return the MCP client that owns a browser tool result."""
+        owner = self.pending_tool_requests.pop((session_id, request_id), None)
+        return str(owner["client_id"]) if owner else None
+
+    def cleanup_pending_tool_requests(self, timeout_seconds: int = 300) -> int:
+        """Discard abandoned request ownership records."""
+        cutoff = datetime.now() - timedelta(seconds=timeout_seconds)
+        stale = [
+            key
+            for key, owner in self.pending_tool_requests.items()
+            if owner["created_at"] < cutoff
+        ]
+        for key in stale:
+            self.pending_tool_requests.pop(key, None)
+        return len(stale)
 
     def cleanup_stale_sessions(self) -> int:
         """Clean up sessions that have been inactive and disconnected.
@@ -415,6 +536,7 @@ class ConnectionManager:
         Returns:
             Number of sessions cleaned up
         """
+        self.cleanup_pending_tool_requests()
         now = datetime.now()
         stale_sessions = []
 
@@ -461,9 +583,13 @@ class ConnectionManager:
         """
         if session_id not in self.active_connections:
             return {}
+        connections = self.active_connections[session_id]
+        mcp_connections = connections.get("mcp", {})
         return {
-            conn_type: True
-            for conn_type in self.active_connections[session_id].keys()
+            "frontend": bool(connections.get("frontend")),
+            "mcp": bool(mcp_connections),
+            "mcp_client_count": len(mcp_connections),
+            "mcp_clients": sorted(mcp_connections.keys()),
         }
     
     def _get_session_id_for_prompt(self, prompt_id: str) -> Optional[str]:

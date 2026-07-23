@@ -128,9 +128,10 @@ logger.info(f"Logger initialized with level: {log_level_name}")
 class MCPWebSocketClient:
     """WebSocket client for MCP subprocess to communicate with backend."""
     
-    def __init__(self, session_id: str, ws_url: str):
+    def __init__(self, session_id: str, ws_url: str, client_id: Optional[str] = None):
         self.session_id = session_id
         self.ws_url = ws_url
+        self.client_id = client_id or os.getenv("FL_MCP_CLIENT_ID") or f"mcp-{os.getpid()}"
         self.ws = None
         self.pending_requests = {}  # request_id -> (Future, connection generation)
         self.connected = False
@@ -157,6 +158,8 @@ class MCPWebSocketClient:
                     'type': 'handshake',
                     'session_id': self.session_id,
                     'client_version': '1.0.0-mcp',
+                    'connection_type': 'mcp',
+                    'client_id': self.client_id,
                 }))
                 response = await websocket.recv()
                 data = json.loads(response)
@@ -509,10 +512,12 @@ class CreateNodeRequest(BaseModel):
 
     Simplified schema for better MCP JSON generation reliability.
     Position flattened to x/y fields. Parameters removed - set them separately with set_node_values.
+    The frontend measures the real node rectangle and moves colliding nodes to
+    the nearest free position. Omit x/y to place the node beside the graph.
     """
     node_type: str = Field(..., description="ComfyUI node class name (e.g., 'CheckpointLoaderSimple')")
-    x: Optional[float] = Field(None, description="X position (pixels from left)")
-    y: Optional[float] = Field(None, description="Y position (pixels from top)")
+    x: Optional[float] = Field(None, description="Preferred X position; omit for automatic collision-free placement")
+    y: Optional[float] = Field(None, description="Preferred Y position; omit for automatic collision-free placement")
     
 class CreateNodesRequest(BaseModel):
     nodes: List[CreateNodeRequest] = Field(..., description="List of nodes to create each their own parameters")
@@ -1359,6 +1364,9 @@ async def create_nodes(request: CreateNodesRequest, ctx: Context) -> List[Dict[s
     """Create one or more new nodes in the workflow. BEFORE CALLING THIS TOOL: check to see that the node exists by searching using node_library_search tool.
 
     This is a TRUE BATCH operation - all nodes are created in a single frontend execution without round-trips per node.
+    Placement is collision-aware: each node is measured after creation, moved
+    clear of existing rectangles when needed, and returned with its final
+    position and size. Omit x/y when exact placement is unimportant.
     """
     if not settings.enable_workflow_writes:
         return _disabled_by_config("FL_MCP_ENABLE_WORKFLOW_WRITES")  # type: ignore[return-value]
@@ -3646,7 +3654,30 @@ async def comfy_status(request: GetSystemInfoRequest, ctx: Context) -> Dict[str,
 #   Workflow awareness: list workflows, find workflows? or like rather, be pointed at a folder or workflow to load? loading, etc. stuff that's in the file menu?
 #   (**DONE**) Node Search and Node Finding: What is already possible through comfy lib? It'd be nice to have tools for find_installed_node that lets us search over all nodes names, descriptions, etc.
 
+async def _restrict_tools_from_environment() -> None:
+    """Expose only the tools selected for an embedded chat run."""
+    raw = os.getenv("FL_MCP_ALLOWED_TOOLS", "").strip()
+    if not raw:
+        return
+    allowed = {name.strip() for name in raw.split(",") if name.strip()}
+    if hasattr(mcp, "list_tools"):
+        registered = await mcp.list_tools(run_middleware=False)
+    else:
+        registered = (await mcp.get_tools()).values()
+    removed = 0
+    for tool in registered:
+        if tool.name not in allowed:
+            mcp.remove_tool(tool.name)
+            removed += 1
+    logger.info(
+        "[MCP] Restricted embedded tool surface to %s tools (%s removed)",
+        len(allowed),
+        removed,
+    )
+
+
 def main():
+    asyncio.run(_restrict_tools_from_environment())
     mcp.run()
     
 if __name__ == "__main__":

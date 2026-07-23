@@ -5,12 +5,16 @@ from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
 
-def _handshake(websocket, session_id, client_version):
-    websocket.send_json({
+def _handshake(websocket, session_id, client_version, client_id=None):
+    payload = {
         "type": "handshake",
         "session_id": session_id,
         "client_version": client_version,
-    })
+    }
+    if client_id:
+        payload["connection_type"] = "mcp"
+        payload["client_id"] = client_id
+    websocket.send_json(payload)
     message = websocket.receive_json()
     assert message["type"] == "handshake_ack"
 
@@ -69,3 +73,62 @@ def test_replaced_mcp_disconnect_does_not_remove_new_connection():
             status = client.get("/api/sessions").json()
             session = next(item for item in status["sessions"] if item["session_id"] == session_id)
             assert session["has_mcp"] is True
+
+
+def test_multiple_mcp_clients_receive_only_their_results():
+    session_id = f"integration-{uuid.uuid4()}"
+    with TestClient(server.app) as client:
+        with client.websocket_connect("/ws") as frontend:
+            _handshake(frontend, session_id, "1.0.0-frontend")
+            with client.websocket_connect("/ws") as first:
+                _handshake(first, session_id, "1.0.0-mcp", "first")
+                with client.websocket_connect("/ws") as second:
+                    _handshake(second, session_id, "1.0.0-mcp", "second")
+
+                    first.send_json({
+                        "type": "tool_request",
+                        "session_id": session_id,
+                        "request_id": "first-request",
+                        "tool_name": "generate_seed",
+                        "parameters": {},
+                    })
+                    second.send_json({
+                        "type": "tool_request",
+                        "session_id": session_id,
+                        "request_id": "second-request",
+                        "tool_name": "workflow_overview",
+                        "parameters": {},
+                    })
+
+                    requests = [frontend.receive_json(), frontend.receive_json()]
+                    assert {item["request_id"] for item in requests} == {
+                        "first-request",
+                        "second-request",
+                    }
+
+                    frontend.send_json({
+                        "type": "tool_result",
+                        "session_id": session_id,
+                        "request_id": "second-request",
+                        "success": True,
+                        "data": {"owner": "second"},
+                        "execution_time_ms": 1,
+                    })
+                    frontend.send_json({
+                        "type": "tool_result",
+                        "session_id": session_id,
+                        "request_id": "first-request",
+                        "success": True,
+                        "data": {"owner": "first"},
+                        "execution_time_ms": 1,
+                    })
+
+                    assert second.receive_json()["data"] == {"owner": "second"}
+                    assert first.receive_json()["data"] == {"owner": "first"}
+
+                    session = next(
+                        item
+                        for item in client.get("/api/sessions").json()["sessions"]
+                        if item["session_id"] == session_id
+                    )
+                    assert session["connections"]["mcp_client_count"] == 2

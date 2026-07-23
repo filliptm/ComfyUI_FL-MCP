@@ -48,6 +48,7 @@ class WSClient extends EventEmitter {
             initialReconnectDelay: config.initialReconnectDelay || 1000, // 1 second
             maxReconnectDelay: config.maxReconnectDelay || 30000, // 30 seconds
             clientVersion: config.clientVersion || '1.0.0',
+            clientId: config.clientId || 'browser',
         };
         
         // State
@@ -126,6 +127,8 @@ class WSClient extends EventEmitter {
             type: 'handshake',
             session_id: this.sessionId,
             client_version: this.config.clientVersion,
+            connection_type: 'frontend',
+            client_id: this.config.clientId,
         };
         
         console.log('[FL-MCP WS] Sending handshake:', handshake);

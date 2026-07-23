@@ -93,6 +93,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         yield
     finally:
         logger.info("Shutting down ComfyUI FL-MCP bridge server")
+        try:
+            from chat_runtime import chat_runtime
+
+            await chat_runtime.shutdown()
+        except Exception as exc:
+            logger.warning("Embedded chat shutdown cleanup failed: %s", exc)
         cleanup_handle.cancel()
         if watchdog_handle:
             watchdog_handle.cancel()
@@ -121,6 +127,13 @@ app.add_middleware(
 )
 
 app.mount("/js", StaticFiles(directory=str(WEB_JS_DIR)), name="shared_js")
+
+try:
+    from chat_routes import router as chat_router
+
+    app.include_router(chat_router)
+except Exception as exc:
+    logger.error("Embedded chat routes are unavailable: %s", exc, exc_info=True)
 
 
 @app.get("/")
@@ -293,6 +306,7 @@ async def view_image(
 async def websocket_endpoint(websocket: WebSocket) -> None:
     session_id: str | None = None
     connection_type = "frontend"
+    client_id = "browser"
 
     try:
         await websocket.accept()
@@ -319,11 +333,26 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
 
         session_id = handshake.session_id
         version = (handshake.client_version or "").lower()
-        connection_type = "mcp" if "mcp" in version else "frontend"
-        is_reconnect = manager.has_connection(session_id, connection_type)
-        await manager.connect(websocket, session_id, connection_type)
-        await manager.send_handshake_ack(session_id, is_reconnect, connection_type)
-        logger.info("Session %s connected as %s", session_id, connection_type)
+        connection_type = handshake.connection_type or (
+            "mcp" if "mcp" in version else "frontend"
+        )
+        client_id = handshake.client_id or (
+            "legacy-mcp" if connection_type == "mcp" else "browser"
+        )
+        is_reconnect = manager.has_connection(session_id, connection_type, client_id)
+        await manager.connect(websocket, session_id, connection_type, client_id)
+        await manager.send_handshake_ack(
+            session_id,
+            is_reconnect,
+            connection_type,
+            client_id,
+        )
+        logger.info(
+            "Session %s connected as %s/%s",
+            session_id,
+            connection_type,
+            client_id,
+        )
 
         while True:
             data = await websocket.receive_json()
@@ -335,13 +364,23 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     "SESSION_MISMATCH",
                     f"Message session_id '{msg_session_id}' does not match connection session_id '{session_id}'",
                     target=connection_type,
+                    client_id=client_id,
                 )
                 continue
 
             if msg_type == "tool_result":
                 await handle_tool_result(session_id, data)
             elif msg_type == "tool_request":
-                await route_tool_request_to_frontend(session_id, data)
+                if connection_type != "mcp":
+                    await manager.send_error(
+                        session_id,
+                        "INVALID_CLIENT_ROLE",
+                        "Only MCP connections may send tool requests.",
+                        target=connection_type,
+                        client_id=client_id,
+                    )
+                    continue
+                await route_tool_request_to_frontend(session_id, data, client_id)
             elif msg_type == "tool_report":
                 await route_tool_report_to_frontend(session_id, data)
             elif msg_type == "screenshot":
@@ -358,16 +397,17 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     "UNKNOWN_MESSAGE_TYPE",
                     f"Unknown message type: {msg_type}",
                     target=connection_type,
+                    client_id=client_id,
                 )
 
     except WebSocketDisconnect:
         if session_id:
-            manager.disconnect(session_id, websocket, connection_type)
+            manager.disconnect(session_id, websocket, connection_type, client_id)
             logger.info("Session %s disconnected from %s", session_id, connection_type)
     except Exception as exc:
         logger.error("Error in WebSocket connection: %s", exc, exc_info=True)
         if session_id:
-            manager.disconnect(session_id, websocket, connection_type)
+            manager.disconnect(session_id, websocket, connection_type, client_id)
         try:
             await websocket.close()
         except Exception:
@@ -382,11 +422,20 @@ async def handle_tool_result(session_id: str, data: Dict[str, Any]) -> None:
         await manager.send_error(session_id, "TOOL_RESULT_ERROR", str(exc), target="frontend")
         return
 
-    if manager.has_connection(session_id, "mcp"):
-        await manager.send_message(session_id, data, target="mcp")
+    owner_client_id = manager.resolve_tool_request(session_id, result.request_id)
+    if owner_client_id and manager.has_connection(session_id, "mcp", owner_client_id):
+        await manager.send_message(
+            session_id,
+            data,
+            target="mcp",
+            client_id=owner_client_id,
+        )
         logger.info("Tool result routed to MCP: request_id=%s", result.request_id)
     else:
-        logger.warning("No MCP connection for tool result: request_id=%s", result.request_id)
+        logger.warning(
+            "No MCP request owner for tool result: request_id=%s",
+            result.request_id,
+        )
 
 
 async def handle_screenshot(session_id: str, data: Dict[str, Any]) -> None:
@@ -413,8 +462,33 @@ async def handle_screenshot(session_id: str, data: Dict[str, Any]) -> None:
         await manager.send_error(session_id, "SCREENSHOT_ERROR", str(exc), target="frontend")
 
 
-async def route_tool_request_to_frontend(session_id: str, data: Dict[str, Any]) -> None:
+async def route_tool_request_to_frontend(
+    session_id: str,
+    data: Dict[str, Any],
+    client_id: str,
+) -> None:
+    request_id = str(data.get("request_id") or "")
+    if not request_id:
+        await manager.send_error(
+            session_id,
+            "MISSING_REQUEST_ID",
+            "Tool requests must include request_id.",
+            target="mcp",
+            client_id=client_id,
+        )
+        return
+    if not manager.register_tool_request(session_id, request_id, client_id):
+        await manager.send_message(session_id, {
+            "type": "tool_result",
+            "session_id": session_id,
+            "request_id": request_id,
+            "success": False,
+            "error": "duplicate_request_id: this request ID is already active",
+            "execution_time_ms": 0,
+        }, target="mcp", client_id=client_id)
+        return
     if not manager.has_connection(session_id, "frontend"):
+        manager.resolve_tool_request(session_id, request_id)
         error_msg = (
             "requires_browser_bridge: no ComfyUI browser bridge is connected for this "
             "session. Open ComfyUI in a browser and keep the FL-MCP bridge panel connected."
@@ -427,7 +501,7 @@ async def route_tool_request_to_frontend(session_id: str, data: Dict[str, Any]) 
             "success": False,
             "error": error_msg,
             "execution_time_ms": 0,
-        }, target="mcp")
+        }, target="mcp", client_id=client_id)
         return
 
     await manager.send_message(session_id, data, target="frontend")

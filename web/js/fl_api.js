@@ -10,6 +10,10 @@
 
 import { app } from "../../../../scripts/app.js";
 import { api } from "../../../../scripts/api.js";
+import {
+    findNonOverlappingPosition,
+    getGraphInsertionOrigin,
+} from "./node_placement.js";
 
 /**
  * FL_API class - Wrapper for workflow manipulation functions
@@ -74,13 +78,32 @@ export class FL_API {
                 }
             }
 
-            // Set position if provided
-            if (position && typeof position.x === "number" && typeof position.y === "number") {
-                node.pos = [position.x, position.y];
-            }
+            const occupiedRects = (app.graph?._nodes || []).map(existingNode => ({
+                x: existingNode.pos[0],
+                y: existingNode.pos[1],
+                width: existingNode.size[0],
+                height: existingNode.size[1],
+            }));
+            const insertionOrigin = getGraphInsertionOrigin(occupiedRects);
+            const requestedPosition = {
+                x: Number.isFinite(position?.x) ? position.x : insertionOrigin.x,
+                y: Number.isFinite(position?.y) ? position.y : insertionOrigin.y,
+            };
+            node.pos = [requestedPosition.x, requestedPosition.y];
 
             // Add to graph
             app.graph.add(node);
+
+            // Use the final LiteGraph size after onAdded/widget setup. If the
+            // requested rectangle is occupied, keep its y intent and move it
+            // right just far enough to clear every existing node.
+            const finalPosition = findNonOverlappingPosition({
+                x: requestedPosition.x,
+                y: requestedPosition.y,
+                width: node.size[0],
+                height: node.size[1],
+            }, occupiedRects);
+            node.pos = [finalPosition.x, finalPosition.y];
             this._markGraphChanged();
 
             console.log(`[FL_API] Created node: ${nodeType} (id: ${node.id})`);
@@ -89,7 +112,11 @@ export class FL_API {
                 type: node.comfyClass || node.type,
                 title: node.title,
                 position: { x: node.pos[0], y: node.pos[1] },
-                size: { width: node.size[0], height: node.size[1] }
+                size: { width: node.size[0], height: node.size[1] },
+                placement_adjusted: (
+                    node.pos[0] !== requestedPosition.x
+                    || node.pos[1] !== requestedPosition.y
+                ),
             };
         } catch (error) {
             console.error("[FL_API] create error:", error);

@@ -1,8 +1,13 @@
-fastapi
+fastapi>=0.115,<0.116
 uvicorn[standard]
 python-multipart
 websockets
-fastmcp
+fastmcp>=2.14.7,<3
+Authlib>=1.6.5,<1.7
+claude-agent-sdk>=0.2.120,<0.3
+openai-codex==0.144.4
+pydantic-ai-slim[ag-ui,anthropic,mcp,openai]>=1.1,<1.2
+keyring>=25,<26
 pydantic
 pydantic-settings
 python-dotenv

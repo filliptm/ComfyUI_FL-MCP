@@ -1,20 +1,61 @@
 /**
  * ComfyUI FL-MCP browser bridge.
  *
- * The visible UI is intentionally small: it reports bridge/backend state and
- * recent MCP activity. MCP clients call tools externally; this browser bridge
- * only executes canvas/workflow actions that require ComfyUI frontend access.
+ * The sidebar exposes Ren, the embedded FL-MCP Assistant. Ren and external
+ * MCP clients share this browser bridge and the same MCP tool implementation.
  */
 
 import { app } from "../../scripts/app.js";
+import { api } from "../../scripts/api.js";
 import SessionManager from "./session_manager.js";
 import WSClient from "./ws_client.js";
 import { ToolExecutor } from "./tool_executor.js";
 import { getToolConfig } from "./tool_activity.js";
+import { AssistantPanel } from "./chat_panel.js";
+import { installRenAwareFitView } from "./fit_view.js";
 
 let wsClient = null;
 let toolExecutor = null;
-let statusPanel = null;
+let assistantPanel = null;
+
+function selectedNodeCount() {
+    const selected = app.canvas?.selected_nodes;
+    if (!selected) return 0;
+    if (typeof selected.size === "number") return selected.size;
+    if (Array.isArray(selected)) return selected.length;
+    return Object.keys(selected).length;
+}
+
+function getCanvasContext() {
+    return {
+        connected: Boolean(wsClient?.connected && wsClient?.handshakeComplete),
+        nodeCount: Array.isArray(app.graph?._nodes) ? app.graph._nodes.length : 0,
+        selectedCount: selectedNodeCount(),
+    };
+}
+
+function subscribeCanvasContext(callback) {
+    let frame = null;
+    const notify = () => {
+        if (frame !== null) cancelAnimationFrame(frame);
+        frame = requestAnimationFrame(() => {
+            frame = null;
+            callback();
+        });
+    };
+    const canvasElement = app.canvas?.canvas;
+    canvasElement?.addEventListener("pointerup", notify);
+    window.addEventListener("keyup", notify);
+    api.addEventListener("graphChanged", notify);
+    api.addEventListener("execution_start", notify);
+    return () => {
+        if (frame !== null) cancelAnimationFrame(frame);
+        canvasElement?.removeEventListener("pointerup", notify);
+        window.removeEventListener("keyup", notify);
+        api.removeEventListener("graphChanged", notify);
+        api.removeEventListener("execution_start", notify);
+    };
+}
 
 async function fetchJson(url, options = {}) {
     const response = await fetch(url, options);
@@ -24,9 +65,9 @@ async function fetchJson(url, options = {}) {
     return await response.json();
 }
 
-async function fetchClientConfig() {
+async function fetchClientConfig(baseUrl = "") {
     try {
-        return await fetchJson("/api/config");
+        return await fetchJson(`${baseUrl}/api/config`);
     } catch (error) {
         console.warn("[FL-MCP] Failed to fetch config, using defaults:", error);
         return {
@@ -47,11 +88,12 @@ async function fetchLauncherStatus() {
 }
 
 class BridgeStatusPanel {
-    constructor(container, sessionManager, wsClient, toolExecutor) {
+    constructor(container, sessionManager, wsClient, toolExecutor, options = {}) {
         this.container = container;
         this.sessionManager = sessionManager;
         this.wsClient = wsClient;
         this.toolExecutor = toolExecutor;
+        this.onBackendStatus = options.onBackendStatus;
         this.launcherStatus = null;
         this.recentTools = [];
         this.pollTimer = null;
@@ -123,6 +165,7 @@ class BridgeStatusPanel {
             this.wsClient.connect();
         }
         this.updateConnection();
+        this.onBackendStatus?.(running);
     }
 
     updateConnection() {
@@ -221,7 +264,7 @@ app.registerExtension({
             const sessionManager = new SessionManager();
             const sessionId = sessionManager.getSessionId();
             const launcherStatus = await fetchLauncherStatus();
-            const config = await fetchClientConfig();
+            const config = await fetchClientConfig(launcherStatus.backendUrl || "");
             const wsUrl = launcherStatus.wsUrl || config.ws_url;
 
             wsClient = new WSClient(sessionId, {
@@ -232,10 +275,10 @@ app.registerExtension({
             });
             toolExecutor = new ToolExecutor(wsClient);
 
-            wsClient.on("connected", () => statusPanel?.updateConnection());
-            wsClient.on("disconnected", () => statusPanel?.updateConnection());
+            wsClient.on("connected", () => assistantPanel?.updateConnection());
+            wsClient.on("disconnected", () => assistantPanel?.updateConnection());
             wsClient.on("handshake_ack", () => {
-                statusPanel?.updateConnection();
+                assistantPanel?.updateConnection();
                 if (window.app?.api) {
                     wsClient.setupComfyListeners(window.app.api);
                 } else {
@@ -248,23 +291,26 @@ app.registerExtension({
             });
 
             wsClient.on("tool_request", async (message) => {
-                statusPanel?.addTool(message.tool_name, "running");
+                assistantPanel?.addTool(message.tool_name, "running");
                 try {
                     await toolExecutor.executeToolRequest(message);
-                    statusPanel?.completeTool(message.tool_name, true);
+                    assistantPanel?.completeTool(message.tool_name, true);
                 } catch (error) {
                     console.error("[FL-MCP] Tool execution failed:", error);
-                    statusPanel?.completeTool(message.tool_name, false);
+                    assistantPanel?.completeTool(message.tool_name, false);
+                } finally {
+                    assistantPanel?.refreshCanvasContext();
                 }
             });
 
             wsClient.on("tool_report", (message) => {
-                statusPanel?.addTool(message.tool_name, "done");
+                assistantPanel?.addTool(message.tool_name, "done");
+                assistantPanel?.refreshCanvasContext();
             });
 
             wsClient.on("error", (error) => {
                 console.error("[FL-MCP] WebSocket error:", error);
-                statusPanel?.updateConnection();
+                assistantPanel?.updateConnection();
             });
 
             window.FL_MCP = {
@@ -273,6 +319,7 @@ app.registerExtension({
                 toolExecutor,
                 app,
                 version: config.version,
+                backendUrl: launcherStatus.backendUrl || config.public_url,
             };
 
             if (launcherStatus.backendReachable) {
@@ -302,6 +349,8 @@ app.registerExtension({
             }, 100);
         });
 
+        installRenAwareFitView(app);
+
         const style = document.createElement("link");
         style.rel = "stylesheet";
         style.href = new URL("./style.css", import.meta.url);
@@ -309,22 +358,41 @@ app.registerExtension({
 
         app.extensionManager.registerSidebarTab({
             id: "fl_mcp_bridge",
-            icon: "pi pi-share-alt",
-            title: "FL-MCP",
-            tooltip: "ComfyUI FL-MCP bridge status",
+            icon: "pi pi-comments",
+            title: "Ren",
+            tooltip: "Ren: connect your flow with FL-MCP",
             type: "custom",
             render: (el) => {
-                if (!statusPanel && window.FL_MCP?.sessionManager && wsClient && toolExecutor) {
-                    statusPanel = new BridgeStatusPanel(el, window.FL_MCP.sessionManager, wsClient, toolExecutor);
-                    window.FL_MCP.statusPanel = statusPanel;
+                // Setup normally installs this once. Re-check when the tab is
+                // rendered in case ComfyUI initialized or replaced its canvas
+                // after extension setup.
+                installRenAwareFitView(app);
+                if (!assistantPanel && window.FL_MCP?.sessionManager && wsClient && toolExecutor) {
+                    assistantPanel = new AssistantPanel(
+                        el,
+                        window.FL_MCP.sessionManager,
+                        {
+                            baseUrl: window.FL_MCP.backendUrl || "",
+                            createDiagnostics: (host, hooks) => new BridgeStatusPanel(
+                                host,
+                                window.FL_MCP.sessionManager,
+                                wsClient,
+                                toolExecutor,
+                                hooks,
+                            ),
+                            getCanvasContext,
+                            subscribeCanvasContext,
+                        },
+                    );
+                    window.FL_MCP.assistantPanel = assistantPanel;
                 }
                 return el;
             },
             destroy: () => {
-                statusPanel?.destroy();
-                statusPanel = null;
+                assistantPanel?.destroy();
+                assistantPanel = null;
                 if (window.FL_MCP) {
-                    window.FL_MCP.statusPanel = null;
+                    window.FL_MCP.assistantPanel = null;
                 }
             },
         });
