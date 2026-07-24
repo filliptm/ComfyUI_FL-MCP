@@ -6,7 +6,7 @@ from typing import Any, Literal
 
 import httpx
 from chat_config import PROVIDER_PRESETS, chat_settings, credential_store
-from chat_runtime import chat_runtime
+from chat_runtime import chat_runtime, normalize_approval_decision
 from chat_store import chat_store
 from claude_subscription import claude_subscription
 from codex_subscription import codex_subscription
@@ -64,6 +64,7 @@ async def update_chat_settings(request: Request) -> dict[str, Any]:
         value = chat_settings.update(await request.json())
     except (ValueError, TypeError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    value["resolvedApprovals"] = chat_runtime.sync_approval_settings(value)
     value["presets"] = PROVIDER_PRESETS
     value["credential"] = await _connection_status(value["provider"])
     return value
@@ -269,11 +270,21 @@ async def cancel_run(run_id: str) -> dict[str, bool]:
 
 
 @router.post("/approvals/{approval_id}")
-async def resolve_approval(approval_id: str, request: Request) -> dict[str, bool]:
+async def resolve_approval(approval_id: str, request: Request) -> dict[str, Any]:
     data = await request.json()
-    if "approved" not in data:
-        raise HTTPException(status_code=400, detail="approved is required.")
-    approved = bool(data["approved"])
-    if not await chat_runtime.resolve_approval(approval_id, approved):
+    decision = data.get("decision")
+    if decision is None and "approved" in data:
+        decision = bool(data["approved"])
+    if decision is None:
+        raise HTTPException(status_code=400, detail="decision is required.")
+    try:
+        resolution = normalize_approval_decision(decision)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not await chat_runtime.resolve_approval(approval_id, decision):
         raise HTTPException(status_code=404, detail="Pending approval not found.")
-    return {"resolved": True, "approved": approved}
+    return {
+        "resolved": True,
+        "approved": resolution in {"approved", "always_allowed"},
+        "resolution": resolution,
+    }

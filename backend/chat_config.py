@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import threading
 from copy import deepcopy
 from pathlib import Path
@@ -13,6 +14,8 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = Path(os.getenv("FL_MCP_DATA_DIR", PROJECT_ROOT / ".fl_mcp"))
 SETTINGS_PATH = DATA_DIR / "chat_settings.json"
 KEYRING_SERVICE = "comfyui-fl-mcp"
+APPROVAL_MODES = {"autonomous_edits", "bypass_all"}
+TOOL_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 
 PROVIDER_PRESETS: dict[str, dict[str, Any]] = {
     "lmstudio": {
@@ -114,6 +117,7 @@ def default_settings() -> dict[str, Any]:
         "model": "",
         "base_url": PROVIDER_PRESETS["lmstudio"]["base_url"],
         "approval_mode": "autonomous_edits",
+        "always_allowed_tools": [],
         "temperature": 0.2,
     }
 
@@ -121,7 +125,14 @@ def default_settings() -> dict[str, Any]:
 class ChatSettingsStore:
     """Small JSON settings store that never accepts secret values."""
 
-    ALLOWED_FIELDS = {"provider", "model", "base_url", "approval_mode", "temperature"}
+    ALLOWED_FIELDS = {
+        "provider",
+        "model",
+        "base_url",
+        "approval_mode",
+        "always_allowed_tools",
+        "temperature",
+    }
 
     def __init__(self, path: Path = SETTINGS_PATH):
         self.path = path
@@ -162,6 +173,19 @@ class ChatSettingsStore:
         value["presets"] = deepcopy(PROVIDER_PRESETS)
         return value
 
+    def always_allow_tool(self, tool_name: str) -> dict[str, Any]:
+        normalized = str(tool_name).strip()
+        if not TOOL_NAME_PATTERN.fullmatch(normalized):
+            raise ValueError("Invalid tool name for an approval rule.")
+        with self._lock:
+            value = self.load()
+            return self.update({
+                "always_allowed_tools": [
+                    *value["always_allowed_tools"],
+                    normalized,
+                ],
+            })
+
     def _normalize(self, value: dict[str, Any]) -> dict[str, Any]:
         provider = str(value.get("provider") or "lmstudio").lower()
         if provider not in PROVIDER_PRESETS:
@@ -173,11 +197,30 @@ class ChatSettingsStore:
         temperature = float(value.get("temperature", 0.2))
         if temperature < 0 or temperature > 2:
             raise ValueError("temperature must be between 0 and 2")
+        approval_mode = str(
+            value.get("approval_mode") or "autonomous_edits"
+        ).strip().lower()
+        if approval_mode not in APPROVAL_MODES:
+            raise ValueError(f"Unsupported approval mode: {approval_mode}")
+        raw_allowed_tools = value.get("always_allowed_tools", [])
+        if not isinstance(raw_allowed_tools, list):
+            raise ValueError("always_allowed_tools must be a list.")
+        always_allowed_tools = sorted({
+            str(tool_name).strip()
+            for tool_name in raw_allowed_tools
+            if str(tool_name).strip()
+        })
+        if any(
+            not TOOL_NAME_PATTERN.fullmatch(tool_name)
+            for tool_name in always_allowed_tools
+        ):
+            raise ValueError("always_allowed_tools contains an invalid tool name.")
         return {
             "provider": provider,
             "model": str(value.get("model") or preset["default_model"]).strip(),
             "base_url": base_url,
-            "approval_mode": "autonomous_edits",
+            "approval_mode": approval_mode,
+            "always_allowed_tools": always_allowed_tools,
             "temperature": temperature,
         }
 

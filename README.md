@@ -81,7 +81,7 @@ COMFYUI_SERVER_URL=http://127.0.0.1:8188
 1. Start ComfyUI.
 2. Open ComfyUI in your browser.
 3. Open the `Ren` sidebar tab.
-4. Select the provider badge in the top bar, or open **More options → Model and connection**.
+4. Select the provider badge in the top bar, or open **More options → Settings**.
 5. Select a provider, discover or choose a model, then choose **Save and test**.
 6. Ask about the open workflow. Tool calls remain in chronological order alongside the response that produced them.
 
@@ -106,7 +106,7 @@ To use a Claude Pro, Max, Team, or Enterprise subscription, install Claude Code 
 claude auth login
 ```
 
-Then choose **Claude subscription** under **Model and connection**. FL-MCP checks the official Claude Code login, does not read or copy its OAuth credentials, and keeps direct Anthropic API-key access as a separate provider.
+Then choose **Claude subscription** under **Settings → Model & provider**. FL-MCP checks the official Claude Code login, does not read or copy its OAuth credentials, and keeps direct Anthropic API-key access as a separate provider.
 
 To use a ChatGPT Plus, Pro, Business, Edu, or Enterprise subscription with Codex, install the Codex CLI and sign in once:
 
@@ -114,15 +114,17 @@ To use a ChatGPT Plus, Pro, Business, Edu, or Enterprise subscription with Codex
 codex login
 ```
 
-Then choose **Codex subscription** under **Model and connection**. FL-MCP uses the official Codex SDK and its existing ChatGPT login without reading or copying OAuth credentials. Direct OpenAI API-key access remains a separate provider and billing path.
+Then choose **Codex subscription** under **Settings → Model & provider**. FL-MCP uses the official Codex SDK and its existing ChatGPT login without reading or copying OAuth credentials. Direct OpenAI API-key access remains a separate provider and billing path.
 
-Routine canvas edits can run without an extra prompt. Queueing, workflow deletion, package changes, file writes, Git operations, and process restarts always display an approval card before the tool runs. The server-side safety gates described below still apply.
+Routine canvas edits can run without an extra prompt. Queueing, workflow deletion, package changes, file writes, Git operations, and process restarts display an approval card before the tool runs by default. Choose **Always allow** on a card to remember that MCP tool, or enable **Bypass all approval prompts** under **Settings → Tool approvals** to skip every chat approval. The server-side safety gates described below still apply in either mode.
 
 ### Using the built-in chat
 
 - The fixed top bar shows **MCP**, connection status, and the active provider and model.
 - Select **History** to search, rename, archive, restore, or permanently delete conversations.
 - Tool calls stay at their chronological position in the conversation. Consecutive identical calls collapse into a single row with an `×N` count while retaining each call's details.
+- Approval cards support **Deny**, **Allow once**, and persistent per-tool **Always allow** decisions. Saved rules can be cleared from **Settings → Tool approvals**.
+- **Bypass all approval prompts** disables the chat approval layer globally. It does not override the environment-controlled workflow, file, Git, Manager, or process safety gates.
 - The composer remains fixed below the scrollable conversation. **Jump to present** scrolls smoothly when new activity arrives out of view.
 - ComfyUI's native Fit View accounts for the visible canvas beside the open chat panel.
 - Automatic node insertion uses real node bounds and graph extents to avoid stacking new nodes on top of existing nodes.
@@ -197,6 +199,7 @@ The bridge backend does **not** run inside ComfyUI's main event loop. It runs as
 ## Assistant Data and Security
 
 - Non-secret assistant settings are stored under `.fl_mcp/chat_settings.json`.
+- Approval mode and per-tool **Always allow** rules are non-secret settings stored in that same file.
 - Conversations, messages, run state, approvals, and tool activity are stored locally in `.fl_mcp/chat.db`.
 - Existing conversations from `.ren/ren.db` are imported once when that database is present. Legacy provider secrets and session metadata are not copied.
 - API credentials use the OS keychain when available, then environment variables, with an in-memory fallback if the keychain cannot be used.
@@ -439,7 +442,7 @@ The built-in chat uses local routes under `/api/chat`:
 | `/api/chat/claude/*` and `/api/chat/codex/*` | Check or start subscription CLI authentication |
 | `/api/chat/conversations*` | Create, load, rename, archive, restore, or delete conversations |
 | `/api/chat/runs*` | Start, stream, or cancel assistant runs |
-| `/api/chat/approvals/{approval_id}` | Resolve high-impact tool approvals |
+| `/api/chat/approvals/{approval_id}` | Deny, allow once, or always allow a high-impact tool |
 
 These routes are local UI plumbing for the embedded chat. MCP clients should continue to use `backend/mcp_server.py` rather than treating the chat routes as a remote public API.
 
@@ -509,7 +512,7 @@ claude auth status
 codex login status
 ```
 
-Return to **Model and connection**, select the subscription provider, and use its refresh action. FL-MCP never substitutes an API key provider for a subscription provider.
+Return to **Settings → Model & provider**, select the subscription provider, and use its refresh action. FL-MCP never substitutes an API key provider for a subscription provider.
 
 </details>
 

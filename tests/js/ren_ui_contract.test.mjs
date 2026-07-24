@@ -44,6 +44,41 @@ test("chat shell has compact two-row chrome and full-panel sheets", async () => 
     assert.doesNotMatch(panel, /fl-provider-toggle|fl-comfy-bar|openDrawer/);
 });
 
+
+test("settings use defined cards with live state and collapsed diagnostics", async () => {
+    const panel = await readFile(new URL("web/js/chat_panel.js", root), "utf8");
+    const styles = await readFile(new URL("web/js/style.css", root), "utf8");
+
+    assert.match(panel, /<h2 id="fl-settings-title">Settings<\/h2>/);
+    assert.match(panel, /fl-settings-card-model/);
+    assert.match(panel, /Model &amp; provider/);
+    assert.match(panel, /fl-settings-card-approvals/);
+    assert.match(panel, /Tool approvals/);
+    assert.match(
+        panel,
+        /<details class="fl-settings-card fl-settings-disclosure fl-settings-card-diagnostics"/,
+    );
+    assert.doesNotMatch(
+        panel,
+        /<details class="fl-settings-card fl-settings-disclosure fl-settings-card-diagnostics"[^>]*\sopen/,
+    );
+    assert.match(panel, /data-settings-state="model"/);
+    assert.match(panel, /data-settings-state="approvals"/);
+    assert.match(panel, /data-settings-state="diagnostics"/);
+    assert.match(panel, /target instanceof HTMLDetailsElement/);
+    assert.match(panel, /target\.open = true/);
+    assert.match(panel, /updateModelSettingsState/);
+    assert.match(panel, /updateDiagnosticsSettingsState/);
+    assert.match(styles, /\.fl-settings-content\s*\{[^}]*gap:\s*10px/s);
+    assert.match(styles, /\.fl-settings-card\s*\{[^}]*border-radius:\s*10px/s);
+    assert.match(styles, /\.fl-settings-disclosure > summary\s*\{[^}]*list-style:\s*none/s);
+    assert.match(
+        styles,
+        /@media \(prefers-reduced-motion: reduce\)[\s\S]*\.fl-settings-chevron/,
+    );
+});
+
+
 test("top bar identifies the active provider and model", async () => {
     const panel = await readFile(new URL("web/js/chat_panel.js", root), "utf8");
     const styles = await readFile(new URL("web/js/style.css", root), "utf8");
@@ -51,7 +86,7 @@ test("top bar identifies the active provider and model", async () => {
     assert.match(panel, /class="fl-provider-badge"/);
     assert.match(panel, /modelProviderSummary/);
     assert.match(panel, /updateProviderBadge/);
-    assert.match(panel, /Using \$\{description\}\. Open model and connection settings\./);
+    assert.match(panel, /Using \$\{description\}\. Open settings\./);
     assert.match(styles, /\.fl-provider-badge\s*\{[^}]*max-width:\s*148px/s);
     assert.match(styles, /\.fl-provider-mark\s*\{[^}]*width:\s*23px/s);
     assert.match(styles, /\.fl-provider-badge\[data-provider="claude_subscription"\]/);
@@ -155,6 +190,12 @@ test("smart follow, accessible approvals, and structured recovery are explicit",
     assert.match(panel, /prefers-reduced-motion: reduce/);
     assert.match(panel, /this\.jumpingToLatest/);
     assert.match(panel, /Allow once/);
+    assert.match(panel, /Always allow/);
+    assert.match(panel, /data-setting="approval_bypass"/);
+    assert.match(panel, /Bypass all approval prompts/);
+    assert.match(panel, /setApprovalBypass/);
+    assert.match(panel, /clearAlwaysAllowedTools/);
+    assert.match(panel, /always_allowed: "Always allowed"/);
     assert.match(panel, /value\.resolution/);
     assert.match(panel, /showRunError/);
     assert.match(panel, /retryLastMessage/);

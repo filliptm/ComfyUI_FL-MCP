@@ -117,3 +117,31 @@ test("Codex subscription actions use dedicated non-credential endpoints", async 
     assert.ok(requests.every(({ options }) => options.method === "POST"));
     assert.ok(requests.every(({ options }) => options.body === "{}"));
 });
+
+
+test("approval decisions distinguish allow once from always allow", async () => {
+    const originalFetch = globalThis.fetch;
+    const requests = [];
+    globalThis.fetch = async (url, options = {}) => {
+        requests.push({ url: String(url), options });
+        return new Response(JSON.stringify({
+            resolved: true,
+            approved: true,
+            resolution: "always_allowed",
+        }), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+        });
+    };
+    try {
+        const client = new ChatClient("http://127.0.0.1:18000");
+        await client.approve("approval 1", "always_allow");
+    } finally {
+        globalThis.fetch = originalFetch;
+    }
+
+    assert.match(requests[0].url, /approvals\/approval%201$/);
+    assert.deepEqual(JSON.parse(requests[0].options.body), {
+        decision: "always_allow",
+    });
+});

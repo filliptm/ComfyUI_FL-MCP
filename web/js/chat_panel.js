@@ -34,6 +34,7 @@ export class AssistantPanel {
         this.currentAssistant = null;
         this.availableModels = [];
         this.diagnostics = null;
+        this.backendRunning = null;
         this.canvasContext = { connected: false, nodeCount: 0, selectedCount: 0 };
         this.followOutput = true;
         this.jumpingToLatest = false;
@@ -64,7 +65,7 @@ export class AssistantPanel {
                             </div>
                         </div>
                         <div class="fl-chat-header-right">
-                            <button class="fl-provider-badge" data-action="settings" data-provider="unknown" type="button" title="Open model and connection settings" aria-label="Open model and connection settings">
+                            <button class="fl-provider-badge" data-action="settings" data-provider="unknown" type="button" title="Open settings" aria-label="Open settings">
                                 <span class="fl-provider-mark" aria-hidden="true">AI</span>
                                 <span class="fl-provider-copy">
                                     <span class="fl-provider-name">Model</span>
@@ -79,7 +80,7 @@ export class AssistantPanel {
                             </button>
                             <div class="fl-overflow-menu" role="menu" hidden>
                                 <button data-action="history" type="button" role="menuitem"><i class="pi pi-history" aria-hidden="true"></i>History</button>
-                                <button data-action="settings" type="button" role="menuitem"><i class="pi pi-cog" aria-hidden="true"></i>Model and connection</button>
+                                <button data-action="settings" type="button" role="menuitem"><i class="pi pi-cog" aria-hidden="true"></i>Settings</button>
                                 <button data-action="diagnostics" type="button" role="menuitem"><i class="pi pi-link" aria-hidden="true"></i>Bridge diagnostics</button>
                             </div>
                         </div>
@@ -163,55 +164,117 @@ export class AssistantPanel {
                 <section class="fl-chat-sheet" data-sheet="settings" role="dialog" aria-modal="true" aria-labelledby="fl-settings-title" hidden>
                     <header class="fl-sheet-header">
                         <button class="fl-icon-button" data-action="close-sheet" type="button" aria-label="Back to chat"><i class="pi pi-arrow-left" aria-hidden="true"></i></button>
-                        <h2 id="fl-settings-title">Model and connection</h2>
+                        <h2 id="fl-settings-title">Settings</h2>
                         <span class="fl-sheet-header-spacer"></span>
                     </header>
-                    <div class="fl-sheet-content">
-                        <section class="fl-settings-section">
-                            <h3>Model</h3>
-                            <label class="fl-field">
-                                <span>Provider</span>
-                                <select class="fl-provider-input" data-setting="provider"></select>
-                            </label>
-                            <label class="fl-field fl-endpoint-field">
-                                <span>Endpoint</span>
-                                <input class="fl-provider-input" data-setting="base_url" type="url" spellcheck="false" placeholder="Provider endpoint">
-                            </label>
-                            <label class="fl-field">
-                                <span>Model</span>
-                                <span class="fl-field-action">
-                                    <input class="fl-provider-input" data-setting="model" type="text" list="fl-mcp-model-options" spellcheck="false" placeholder="Choose or enter a model">
-                                    <select class="fl-provider-input" data-setting="subscription_model" aria-label="Subscription model" hidden></select>
-                                    <button class="fl-secondary-button" data-action="discover-models" type="button">Refresh</button>
+                    <div class="fl-sheet-content fl-settings-content">
+                        <section class="fl-settings-card fl-settings-card-model" data-settings-section="model" aria-labelledby="fl-settings-model-title">
+                            <header class="fl-settings-card-header">
+                                <div class="fl-settings-card-heading">
+                                    <span class="fl-settings-card-icon" aria-hidden="true"><i class="pi pi-sliders-h"></i></span>
+                                    <div>
+                                        <h3 id="fl-settings-model-title">Model &amp; provider</h3>
+                                        <p>Choose how Ren thinks and connects.</p>
+                                    </div>
+                                </div>
+                                <span class="fl-settings-state neutral" data-settings-state="model" role="status">Checking</span>
+                            </header>
+                            <div class="fl-settings-card-body">
+                                <div class="fl-settings-fields">
+                                    <label class="fl-field">
+                                        <span>Provider</span>
+                                        <select class="fl-provider-input" data-setting="provider"></select>
+                                    </label>
+                                    <label class="fl-field fl-endpoint-field">
+                                        <span>Endpoint</span>
+                                        <input class="fl-provider-input" data-setting="base_url" type="url" spellcheck="false" placeholder="Provider endpoint">
+                                    </label>
+                                    <label class="fl-field">
+                                        <span>Model</span>
+                                        <span class="fl-field-action">
+                                            <input class="fl-provider-input" data-setting="model" type="text" list="fl-mcp-model-options" spellcheck="false" placeholder="Choose or enter a model">
+                                            <select class="fl-provider-input" data-setting="subscription_model" aria-label="Subscription model" hidden></select>
+                                            <button class="fl-secondary-button" data-action="discover-models" type="button">Refresh</button>
+                                        </span>
+                                    </label>
+                                    <datalist id="fl-mcp-model-options"></datalist>
+                                    <label class="fl-field fl-credential-field">
+                                        <span>API key</span>
+                                        <input class="fl-provider-input" data-setting="credential" type="password" autocomplete="off" placeholder="Stored in your OS keychain">
+                                    </label>
+                                </div>
+                                <div class="fl-subscription-connection fl-claude-subscription" hidden>
+                                    <div>
+                                        <strong>Use your Claude subscription</strong>
+                                        <span>Ren uses the Claude Code login already stored on this computer.</span>
+                                    </div>
+                                    <button class="fl-secondary-button" data-action="claude-login" type="button">Sign in with Claude</button>
+                                </div>
+                                <div class="fl-subscription-connection fl-codex-subscription" hidden>
+                                    <div>
+                                        <strong>Use your Codex subscription</strong>
+                                        <span>Ren uses the ChatGPT login already stored by Codex on this computer.</span>
+                                    </div>
+                                    <button class="fl-secondary-button" data-action="codex-login" type="button">Sign in with Codex</button>
+                                </div>
+                            </div>
+                            <footer class="fl-settings-card-footer">
+                                <div class="fl-credential-status" role="status" aria-live="polite"></div>
+                                <button class="fl-primary-button fl-settings-save" data-action="save-settings" type="button">Save and test</button>
+                            </footer>
+                        </section>
+
+                        <section class="fl-settings-card fl-settings-card-approvals" data-settings-section="approvals" aria-labelledby="fl-settings-approvals-title">
+                            <header class="fl-settings-card-header">
+                                <div class="fl-settings-card-heading">
+                                    <span class="fl-settings-card-icon" aria-hidden="true"><i class="pi pi-shield"></i></span>
+                                    <div>
+                                        <h3 id="fl-settings-approvals-title">Tool approvals</h3>
+                                        <p>Control when Ren asks before acting.</p>
+                                    </div>
+                                </div>
+                                <span class="fl-settings-state neutral" data-settings-state="approvals" role="status">Prompts on</span>
+                            </header>
+                            <div class="fl-settings-card-body">
+                                <label class="fl-approval-toggle">
+                                    <input data-setting="approval_bypass" type="checkbox">
+                                    <span>
+                                        <strong>Bypass all approval prompts</strong>
+                                        <span>Run every Ren MCP tool without asking in the chat.</span>
+                                    </span>
+                                </label>
+                                <div class="fl-approval-rules">
+                                    <div>
+                                        <strong>Always allowed tools</strong>
+                                        <span class="fl-approval-rules-copy">None</span>
+                                    </div>
+                                    <button class="fl-secondary-button" data-action="clear-always-allowed" type="button" hidden>Clear</button>
+                                </div>
+                                <p class="fl-approval-warning">
+                                    <i class="pi pi-shield" aria-hidden="true"></i>
+                                    <span>Server-side workflow, file, Git, Manager, and process safety gates still apply.</span>
+                                </p>
+                            </div>
+                        </section>
+
+                        <details class="fl-settings-card fl-settings-disclosure fl-settings-card-diagnostics" data-settings-section="diagnostics">
+                            <summary class="fl-settings-card-header">
+                                <div class="fl-settings-card-heading">
+                                    <span class="fl-settings-card-icon" aria-hidden="true"><i class="pi pi-link"></i></span>
+                                    <div>
+                                        <h3>Bridge diagnostics</h3>
+                                        <p>Connection health and recent tool activity.</p>
+                                    </div>
+                                </div>
+                                <span class="fl-settings-summary-state">
+                                    <span class="fl-settings-state neutral" data-settings-state="diagnostics" role="status">Checking</span>
+                                    <i class="pi pi-chevron-down fl-settings-chevron" aria-hidden="true"></i>
                                 </span>
-                            </label>
-                            <datalist id="fl-mcp-model-options"></datalist>
-                            <label class="fl-field fl-credential-field">
-                                <span>API key</span>
-                                <input class="fl-provider-input" data-setting="credential" type="password" autocomplete="off" placeholder="Stored in your OS keychain">
-                            </label>
-                            <div class="fl-subscription-connection fl-claude-subscription" hidden>
-                                <div>
-                                    <strong>Use your Claude subscription</strong>
-                                    <span>Ren uses the Claude Code login already stored on this computer.</span>
-                                </div>
-                                <button class="fl-secondary-button" data-action="claude-login" type="button">Sign in with Claude</button>
+                            </summary>
+                            <div class="fl-settings-card-body fl-diagnostics-card-body">
+                                <div class="fl-diagnostics-host"></div>
                             </div>
-                            <div class="fl-subscription-connection fl-codex-subscription" hidden>
-                                <div>
-                                    <strong>Use your Codex subscription</strong>
-                                    <span>Ren uses the ChatGPT login already stored by Codex on this computer.</span>
-                                </div>
-                                <button class="fl-secondary-button" data-action="codex-login" type="button">Sign in with Codex</button>
-                            </div>
-                            <div class="fl-credential-status"></div>
-                            <button class="fl-primary-button fl-settings-save" data-action="save-settings" type="button">Save and test</button>
-                        </section>
-                        <section class="fl-settings-section" data-settings-section="diagnostics">
-                            <h3>Bridge diagnostics</h3>
-                            <div class="fl-diagnostics-host"></div>
-                        </section>
-                        <p class="fl-provider-note">High-impact actions still require approval.</p>
+                        </details>
                     </div>
                 </section>
 
@@ -268,6 +331,24 @@ export class AssistantPanel {
         this.codexSubscription = this.container.querySelector(".fl-codex-subscription");
         this.credentialStatus = this.container.querySelector(".fl-credential-status");
         this.modelOptions = this.container.querySelector("#fl-mcp-model-options");
+        this.modelSettingsState = this.container.querySelector(
+            '[data-settings-state="model"]',
+        );
+        this.approvalBypassInput = this.container.querySelector(
+            '[data-setting="approval_bypass"]',
+        );
+        this.approvalSettingsState = this.container.querySelector(
+            '[data-settings-state="approvals"]',
+        );
+        this.approvalRulesCopy = this.container.querySelector(".fl-approval-rules-copy");
+        this.clearApprovalRulesButton = this.container.querySelector(
+            '[data-action="clear-always-allowed"]',
+        );
+        this.approvalWarning = this.container.querySelector(".fl-approval-warning");
+        this.approvalWarningCopy = this.approvalWarning.querySelector("span");
+        this.diagnosticsSettingsState = this.container.querySelector(
+            '[data-settings-state="diagnostics"]',
+        );
         this.historyList = this.container.querySelector(".fl-history-list");
         this.historySearch = this.container.querySelector("[data-history-search]");
         this.canvasContextElement = this.container.querySelector(".fl-canvas-context");
@@ -307,6 +388,7 @@ export class AssistantPanel {
             if (action === "save-settings") this.saveSettings();
             if (action === "claude-login") this.connectClaudeSubscription();
             if (action === "codex-login") this.connectCodexSubscription();
+            if (action === "clear-always-allowed") this.clearAlwaysAllowedTools();
             if (action === "history-view") this.setHistoryView(actionElement.dataset.view);
             if (action === "select-conversation") this.selectConversation(actionElement.dataset.conversationId);
             if (action === "rename-conversation") this.renameConversation(actionElement.dataset.conversationId);
@@ -322,7 +404,13 @@ export class AssistantPanel {
         this.providerSelect.addEventListener("change", () => this.applyProviderPreset());
         this.subscriptionModelSelect.addEventListener("change", () => {
             this.modelInput.value = this.subscriptionModelSelect.value;
+            this.updateModelSettingsState();
         });
+        this.modelInput.addEventListener("input", () => this.updateModelSettingsState());
+        this.approvalBypassInput.addEventListener(
+            "change",
+            () => this.setApprovalBypass(),
+        );
         this.textarea.addEventListener("keydown", (event) => {
             if (
                 event.key === "Enter"
@@ -387,8 +475,11 @@ export class AssistantPanel {
         if (name === "history") this.renderHistory();
         requestAnimationFrame(() => {
             if (section) {
-                sheet.querySelector(`[data-settings-section="${CSS.escape(section)}"]`)
-                    ?.scrollIntoView({ block: "start" });
+                const target = sheet.querySelector(
+                    `[data-settings-section="${CSS.escape(section)}"]`,
+                );
+                if (target instanceof HTMLDetailsElement) target.open = true;
+                target?.scrollIntoView({ block: "start" });
             }
             this.focusableElements(sheet)[0]?.focus();
         });
@@ -506,6 +597,8 @@ export class AssistantPanel {
     }
 
     async refreshBackendStatus(running) {
+        this.backendRunning = Boolean(running);
+        this.updateDiagnosticsSettingsState();
         if (this.initializing) return;
         if (!running) {
             this.updateStatus("error");
@@ -551,6 +644,9 @@ export class AssistantPanel {
         this.providerSelect.value = this.settings.provider;
         this.baseUrlInput.value = this.settings.base_url || "";
         this.modelInput.value = this.settings.model || "";
+        this.approvalBypassInput.checked = (
+            this.settings.approval_mode === "bypass_all"
+        );
         const preset = this.settings.presets?.[this.settings.provider];
         this.availableModels = preset?.models || (this.settings.model
             ? [{ id: this.settings.model, label: this.settings.model }]
@@ -558,6 +654,127 @@ export class AssistantPanel {
         this.renderProviderControls();
         this.updateCredentialField();
         this.updateProviderBadge();
+        this.renderApprovalSettings();
+    }
+
+    setSettingsState(element, label, tone = "neutral") {
+        if (!element) return;
+        element.textContent = label;
+        element.classList.remove("neutral", "ready", "warning", "error");
+        element.classList.add(tone);
+    }
+
+    updateModelSettingsState() {
+        if (!this.settings) return;
+        const preset = this.settings.presets?.[this.providerSelect.value];
+        const hasModel = Boolean(this.modelInput.value.trim());
+        const connection = this.settings.credential || {};
+        const configured = (
+            this.providerSelect.value === this.settings.provider
+            && connection.configured
+        );
+        if (!hasModel) {
+            this.setSettingsState(this.modelSettingsState, "Choose model", "warning");
+            return;
+        }
+        if (["claude_cli", "codex_cli"].includes(preset?.type)) {
+            if (connection.installed === false) {
+                this.setSettingsState(this.modelSettingsState, "CLI missing", "error");
+            } else if (configured) {
+                this.setSettingsState(this.modelSettingsState, "Connected", "ready");
+            } else {
+                this.setSettingsState(this.modelSettingsState, "Sign in needed", "warning");
+            }
+            return;
+        }
+        if (preset?.requires_key && !configured) {
+            this.setSettingsState(this.modelSettingsState, "API key needed", "warning");
+            return;
+        }
+        this.setSettingsState(this.modelSettingsState, "Ready", "ready");
+    }
+
+    renderApprovalSettings() {
+        const bypassed = this.approvalBypassInput.checked;
+        const tools = this.settings?.always_allowed_tools || [];
+        this.approvalRulesCopy.textContent = tools.length
+            ? tools.join(", ")
+            : "None";
+        this.clearApprovalRulesButton.hidden = tools.length === 0;
+        this.approvalWarning.classList.toggle("active", bypassed);
+        this.approvalWarningCopy.textContent = bypassed
+            ? "All chat approval prompts are bypassed. Server-side workflow, file, Git, Manager, and process safety gates still apply."
+            : "Server-side workflow, file, Git, Manager, and process safety gates still apply.";
+        this.setSettingsState(
+            this.approvalSettingsState,
+            bypassed ? "Bypassed" : "Prompts on",
+            bypassed ? "warning" : "ready",
+        );
+    }
+
+    updateDiagnosticsSettingsState(force = null) {
+        if (this.status?.bridgeConnected) {
+            this.setSettingsState(this.diagnosticsSettingsState, "Connected", "ready");
+            return;
+        }
+        if (
+            force === "error"
+            || this.backendRunning === false
+            || this.status?.available === false
+        ) {
+            this.setSettingsState(this.diagnosticsSettingsState, "Unavailable", "error");
+            return;
+        }
+        if (!this.status && this.backendRunning === null) {
+            this.setSettingsState(this.diagnosticsSettingsState, "Checking", "neutral");
+            return;
+        }
+        this.setSettingsState(this.diagnosticsSettingsState, "Canvas offline", "warning");
+    }
+
+    async setApprovalBypass() {
+        const requestedMode = this.approvalBypassInput.checked
+            ? "bypass_all"
+            : "autonomous_edits";
+        const previousMode = this.settings.approval_mode;
+        this.approvalBypassInput.disabled = true;
+        this.renderApprovalSettings();
+        try {
+            this.settings = await this.chat.updateSettings({
+                approval_mode: requestedMode,
+            });
+            this.approvalBypassInput.checked = (
+                this.settings.approval_mode === "bypass_all"
+            );
+            this.renderApprovalSettings();
+            const resolved = Number(this.settings.resolvedApprovals || 0);
+            this.announce(
+                requestedMode === "bypass_all"
+                    ? `Approval prompts bypassed.${resolved ? ` ${resolved} pending approval resolved.` : ""}`
+                    : "Approval prompts restored.",
+            );
+        } catch (error) {
+            this.approvalBypassInput.checked = previousMode === "bypass_all";
+            this.renderApprovalSettings();
+            this.showError(`Approval mode could not be changed: ${error.message}`);
+        } finally {
+            this.approvalBypassInput.disabled = false;
+        }
+    }
+
+    async clearAlwaysAllowedTools() {
+        this.clearApprovalRulesButton.disabled = true;
+        try {
+            this.settings = await this.chat.updateSettings({
+                always_allowed_tools: [],
+            });
+            this.renderApprovalSettings();
+            this.announce("Always allowed tools cleared.");
+        } catch (error) {
+            this.showError(`Approval rules could not be cleared: ${error.message}`);
+        } finally {
+            this.clearApprovalRulesButton.disabled = false;
+        }
     }
 
     async applyProviderPreset() {
@@ -644,10 +861,10 @@ export class AssistantPanel {
         this.providerMark.textContent = summary.mark;
         this.providerName.textContent = summary.providerLabel;
         this.providerModel.textContent = summary.modelLabel;
-        this.providerBadge.title = `Using ${description}. Open model and connection settings.`;
+        this.providerBadge.title = `Using ${description}. Open settings.`;
         this.providerBadge.setAttribute(
             "aria-label",
-            `Using ${description}. Open model and connection settings.`,
+            `Using ${description}. Open settings.`,
         );
     }
 
@@ -658,6 +875,11 @@ export class AssistantPanel {
         const isSubscription = isClaudeSubscription || isCodexSubscription;
         const requiresKey = Boolean(preset?.requires_key);
         const supportsKey = requiresKey || this.providerSelect.value === "custom";
+        const connection = this.settings.credential || {};
+        const configured = (
+            this.providerSelect.value === this.settings.provider
+            && connection.configured
+        );
         this.endpointField.hidden = isSubscription;
         this.credentialField.hidden = !supportsKey;
         this.claudeSubscription.hidden = !isClaudeSubscription;
@@ -665,23 +887,19 @@ export class AssistantPanel {
         this.credentialField.querySelector("span").textContent = requiresKey
             ? "API key"
             : "API key (optional)";
-        const configured = (
-            this.providerSelect.value === this.settings.provider
-            && this.settings.credential?.configured
-        );
         if (isSubscription) {
-            const connection = this.settings.credential || {};
             const subscription = isClaudeSubscription
                 ? this.claudeSubscription
                 : this.codexSubscription;
             const button = subscription.querySelector("button");
-            button.textContent = connection.configured
+            button.textContent = configured
                 ? "Refresh status"
                 : (isClaudeSubscription ? "Sign in with Claude" : "Sign in with Codex");
             button.disabled = connection.installed === false;
             this.credentialStatus.textContent = connection.message
                 || (isClaudeSubscription ? "Checking Claude Code…" : "Checking Codex…");
-            this.credentialStatus.classList.toggle("error", !connection.configured);
+            this.credentialStatus.classList.toggle("error", !configured);
+            this.updateModelSettingsState();
             return;
         }
         this.credentialStatus.classList.remove("error");
@@ -692,6 +910,7 @@ export class AssistantPanel {
                     ? "No credential configured"
                     : "No credential configured · optional"))
             : "No API key required for this preset";
+        this.updateModelSettingsState();
     }
 
     async connectClaudeSubscription() {
@@ -818,6 +1037,9 @@ export class AssistantPanel {
                 provider,
                 base_url: this.baseUrlInput.value,
                 model: this.modelInput.value,
+                approval_mode: this.approvalBypassInput.checked
+                    ? "bypass_all"
+                    : "autonomous_edits",
             });
             const providerType = this.settings.presets[provider].type;
             if (
@@ -831,6 +1053,7 @@ export class AssistantPanel {
             this.updateStatus();
             this.updateCredentialField();
             this.renderProviderControls();
+            this.renderApprovalSettings();
             if (this.status.configured) this.closeSheet();
         } catch (error) {
             this.showError(`Connection test failed: ${error.message}`);
@@ -1545,9 +1768,23 @@ export class AssistantPanel {
         approve.type = "button";
         approve.className = "fl-primary-button";
         approve.textContent = "Allow once";
-        deny.addEventListener("click", () => this.submitApproval(value.approvalId, false));
-        approve.addEventListener("click", () => this.submitApproval(value.approvalId, true));
-        actions.append(deny, approve);
+        const alwaysAllow = document.createElement("button");
+        alwaysAllow.type = "button";
+        alwaysAllow.className = "fl-secondary-button fl-always-allow-button";
+        alwaysAllow.textContent = "Always allow";
+        deny.addEventListener(
+            "click",
+            () => this.submitApproval(value.approvalId, "deny"),
+        );
+        approve.addEventListener(
+            "click",
+            () => this.submitApproval(value.approvalId, "allow_once"),
+        );
+        alwaysAllow.addEventListener(
+            "click",
+            () => this.submitApproval(value.approvalId, "always_allow"),
+        );
+        actions.append(deny, approve, alwaysAllow);
         card.append(eyebrow, title, consequence, details, actions);
         this.finishActiveTextSegment(message, true);
         message.timeline.appendChild(card);
@@ -1590,7 +1827,7 @@ export class AssistantPanel {
         };
     }
 
-    async submitApproval(approvalId, approved) {
+    async submitApproval(approvalId, decision) {
         const card = this.container.querySelector(
             `.fl-approval-card[data-approval-id="${CSS.escape(approvalId)}"]`,
         );
@@ -1598,8 +1835,18 @@ export class AssistantPanel {
             button.disabled = true;
         });
         try {
-            await this.chat.approve(approvalId, approved);
+            const result = await this.chat.approve(approvalId, decision);
+            if (result.resolution === "always_allowed") {
+                this.settings = await this.chat.settings();
+                this.approvalBypassInput.checked = (
+                    this.settings.approval_mode === "bypass_all"
+                );
+                this.renderApprovalSettings();
+            }
         } catch (error) {
+            card?.querySelectorAll("button").forEach((button) => {
+                button.disabled = false;
+            });
             this.showError(`Approval could not be submitted: ${error.message}`);
         }
     }
@@ -1613,6 +1860,7 @@ export class AssistantPanel {
         card.classList.add(resolution);
         const labels = {
             approved: "Approved",
+            always_allowed: "Always allowed",
             denied: "Denied",
             expired: "Approval expired",
         };
@@ -1719,6 +1967,7 @@ export class AssistantPanel {
         this.statusBanner.hidden = state === "online";
         this.statusBannerCopy.textContent = bannerCopy[state] || "";
         this.statusBanner.querySelector("button").textContent = bannerAction[state] || "";
+        this.updateDiagnosticsSettingsState(force === "error" ? "error" : null);
         if (this.status?.model) {
             this.modelInput.value = this.status.model;
             this.renderProviderControls();

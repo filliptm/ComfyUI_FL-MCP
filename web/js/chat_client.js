@@ -195,10 +195,10 @@ export class ChatClient {
         return true;
     }
 
-    approve(approvalId, approved) {
+    approve(approvalId, decision) {
         return this.request(`/api/chat/approvals/${encodeURIComponent(approvalId)}`, {
             method: "POST",
-            body: JSON.stringify({ approved }),
+            body: JSON.stringify({ decision }),
         });
     }
 

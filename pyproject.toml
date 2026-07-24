@@ -1,6 +1,6 @@
 [project]
 name = "comfyui-fl-mcp"
-version = "0.5.0"
+version = "0.6.0"
 description = "Local MCP server and browser bridge for ComfyUI. Inspect workflows, edit graphs, queue generations, manage models, and connect MCP-compatible agents to your local ComfyUI setup."
 readme = "README.md"
 requires-python = ">=3.11"

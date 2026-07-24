@@ -236,6 +236,38 @@ def approval_fingerprint(tool_name: str, tool_args: dict[str, Any]) -> str:
     )
 
 
+def normalize_approval_decision(decision: bool | str) -> str:
+    if isinstance(decision, bool):
+        return "approved" if decision else "denied"
+    normalized = str(decision).strip().lower()
+    aliases = {
+        "allow_once": "approved",
+        "approved": "approved",
+        "always_allow": "always_allowed",
+        "always_allowed": "always_allowed",
+        "deny": "denied",
+        "denied": "denied",
+    }
+    if normalized not in aliases:
+        raise ValueError(f"Unsupported approval decision: {normalized}")
+    return aliases[normalized]
+
+
+def approval_is_granted(resolution: str) -> bool:
+    return resolution in {"approved", "always_allowed"}
+
+
+def should_request_approval(
+    tool_name: str,
+    settings: dict[str, Any],
+) -> bool:
+    if not requires_approval(tool_name):
+        return False
+    if settings.get("approval_mode") == "bypass_all":
+        return False
+    return tool_name not in set(settings.get("always_allowed_tools") or [])
+
+
 def _event_payload(raw: str) -> dict[str, Any] | None:
     for line in raw.splitlines():
         if line.startswith("data:"):
@@ -278,6 +310,7 @@ class ActiveRun:
     run_id: str
     conversation_id: str
     session_id: str
+    settings: dict[str, Any] | None = None
     events: list[str] = field(default_factory=list)
     subscribers: list[asyncio.Queue[str | None]] = field(default_factory=list)
     task: asyncio.Task[None] | None = None
@@ -293,6 +326,7 @@ class PendingApproval:
     approval_id: str
     run_id: str
     future: asyncio.Future[str]
+    tool_name: str = ""
 
 
 class ChatRuntime:
@@ -364,7 +398,7 @@ class ChatRuntime:
                 model=settings["model"],
             )
             run_id = str(uuid.uuid4())
-            state = ActiveRun(run_id, identifier, session_id)
+            state = ActiveRun(run_id, identifier, session_id, settings=settings)
             self.runs[run_id] = state
             self._prune_completed_runs()
             self.store.create_run(run_id, identifier)
@@ -457,13 +491,49 @@ class ChatRuntime:
         state.task.cancel()
         return True
 
-    async def resolve_approval(self, approval_id: str, approved: bool) -> bool:
-        pending = self.approvals.pop(approval_id, None)
+    async def resolve_approval(
+        self,
+        approval_id: str,
+        decision: bool | str,
+    ) -> bool:
+        pending = self.approvals.get(approval_id)
         if not pending or pending.future.done():
             return False
-        self.store.resolve_approval(approval_id, approved)
-        pending.future.set_result("approved" if approved else "denied")
+        resolution = normalize_approval_decision(decision)
+        if resolution == "always_allowed":
+            if not pending.tool_name:
+                raise ValueError("The pending approval has no tool name.")
+            chat_settings.always_allow_tool(pending.tool_name)
+            state = self.runs.get(pending.run_id)
+            if state and state.settings is not None:
+                allowed = set(state.settings.get("always_allowed_tools") or [])
+                allowed.add(pending.tool_name)
+                state.settings["always_allowed_tools"] = sorted(allowed)
+        self.approvals.pop(approval_id, None)
+        self.store.resolve_approval(approval_id, resolution)
+        pending.future.set_result(resolution)
         return True
+
+    def sync_approval_settings(self, settings: dict[str, Any]) -> int:
+        """Apply approval changes to active runs and release prompts in bypass mode."""
+        approval_mode = str(settings.get("approval_mode") or "autonomous_edits")
+        allowed_tools = list(settings.get("always_allowed_tools") or [])
+        for state in self.runs.values():
+            if state.done or state.settings is None:
+                continue
+            state.settings["approval_mode"] = approval_mode
+            state.settings["always_allowed_tools"] = allowed_tools.copy()
+        if approval_mode != "bypass_all":
+            return 0
+        resolved = 0
+        for approval_id, pending in list(self.approvals.items()):
+            if pending.future.done():
+                continue
+            self.approvals.pop(approval_id, None)
+            self.store.resolve_approval(approval_id, "approved")
+            pending.future.set_result("approved")
+            resolved += 1
+        return resolved
 
     async def shutdown(self) -> None:
         active_runs = [
@@ -482,7 +552,7 @@ class ChatRuntime:
             if pending.run_id != run_id:
                 continue
             self.approvals.pop(approval_id, None)
-            self.store.resolve_approval(approval_id, False)
+            self.store.resolve_approval(approval_id, "expired")
             if not pending.future.done():
                 pending.future.set_result("expired")
 
@@ -499,7 +569,7 @@ class ChatRuntime:
 
     async def _execute(self, state: ActiveRun, user_message_id: str) -> None:
         del user_message_id
-        settings = chat_settings.load()
+        settings = state.settings or chat_settings.load()
         try:
             provider_type = PROVIDER_PRESETS[settings["provider"]]["type"]
             if provider_type == "claude_cli":
@@ -543,7 +613,7 @@ class ChatRuntime:
                 risk = classify_tool(tool_name)
                 approval_key = approval_fingerprint(tool_name, tool_args)
                 used_retry_grant = False
-                if requires_approval(tool_name):
+                if should_request_approval(tool_name, settings):
                     if approval_key in retry_approval_grants:
                         retry_approval_grants.remove(approval_key)
                         used_retry_grant = True
@@ -555,6 +625,7 @@ class ChatRuntime:
                             approval_id,
                             state.run_id,
                             future,
+                            tool_name,
                         )
                         self.store.create_approval(
                             approval_id,
@@ -575,10 +646,10 @@ class ChatRuntime:
                         })
                         try:
                             resolution = await asyncio.wait_for(future, timeout=120)
-                            approved = resolution == "approved"
+                            approved = approval_is_granted(resolution)
                         except TimeoutError:
                             self.approvals.pop(approval_id, None)
-                            self.store.resolve_approval(approval_id, False)
+                            self.store.resolve_approval(approval_id, "expired")
                             resolution = "expired"
                             approved = False
                         await self.publish(state, {
@@ -776,7 +847,7 @@ class ChatRuntime:
                 return PermissionResultDeny(
                     message="Ren only allows the tools selected for this request.",
                 )
-            if not requires_approval(short_name):
+            if not should_request_approval(short_name, settings):
                 return PermissionResultAllow(updated_input=input_data)
 
             approval_id = str(uuid.uuid4())
@@ -785,6 +856,7 @@ class ChatRuntime:
                 approval_id,
                 state.run_id,
                 future,
+                short_name,
             )
             self.store.create_approval(
                 approval_id,
@@ -805,10 +877,10 @@ class ChatRuntime:
             })
             try:
                 resolution = await asyncio.wait_for(future, timeout=120)
-                approved = resolution == "approved"
+                approved = approval_is_granted(resolution)
             except TimeoutError:
                 self.approvals.pop(approval_id, None)
-                self.store.resolve_approval(approval_id, False)
+                self.store.resolve_approval(approval_id, "expired")
                 resolution = "expired"
                 approved = False
             await self.publish(state, {
@@ -1124,7 +1196,7 @@ class ChatRuntime:
             "tools": {
                 name: {"approval_mode": "prompt"}
                 for name in sorted(allowed_tools)
-                if requires_approval(name)
+                if should_request_approval(name, settings)
             },
         }
         codex_environment = {
@@ -1152,6 +1224,7 @@ class ChatRuntime:
                 approval_id,
                 state.run_id,
                 future,
+                tool_name,
             )
             self.store.create_approval(
                 approval_id,
@@ -1172,10 +1245,10 @@ class ChatRuntime:
             })
             try:
                 resolution = await asyncio.wait_for(future, timeout=120)
-                approved = resolution == "approved"
+                approved = approval_is_granted(resolution)
             except TimeoutError:
                 self.approvals.pop(approval_id, None)
-                self.store.resolve_approval(approval_id, False)
+                self.store.resolve_approval(approval_id, "expired")
                 resolution = "expired"
                 approved = False
             await self.publish(state, {
@@ -1211,9 +1284,10 @@ class ChatRuntime:
                     values.get("serverName") != "ren"
                     or not is_tool_approval
                     or tool_name not in allowed_tools
-                    or not requires_approval(str(tool_name))
                 ):
                     return {"action": "decline"}
+                if not should_request_approval(str(tool_name), settings):
+                    return {"action": "accept", "content": {}}
                 pending = asyncio.run_coroutine_threadsafe(
                     request_approval(str(tool_name), arguments),
                     loop,

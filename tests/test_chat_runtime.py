@@ -2,7 +2,9 @@ import asyncio
 import json
 from types import SimpleNamespace
 
+import chat_runtime as chat_runtime_module
 import pytest
+from chat_config import ChatSettingsStore
 from chat_runtime import (
     ActiveRun,
     ChatRuntime,
@@ -12,7 +14,9 @@ from chat_runtime import (
     claude_tool_name,
     codex_tool_name,
     install_codex_approval_handler,
+    normalize_approval_decision,
     normalize_assistant_timeline,
+    should_request_approval,
     tool_result_content,
     tools_for_message,
     wait_for_claude_mcp,
@@ -120,6 +124,88 @@ async def test_approval_resolution_preserves_boolean_compatibility(
 
     assert await runtime.resolve_approval("approval-1", approved)
     assert await future == resolution
+
+
+@pytest.mark.asyncio
+async def test_always_allow_resolution_persists_tool_rule(
+    tmp_path,
+    monkeypatch,
+):
+    settings = ChatSettingsStore(tmp_path / "settings.json")
+    monkeypatch.setattr(chat_runtime_module, "chat_settings", settings)
+    runtime = ChatRuntime(ChatStore(tmp_path / "chat.db", tmp_path / "missing.db"))
+    state_settings = {
+        "approval_mode": "autonomous_edits",
+        "always_allowed_tools": [],
+    }
+    runtime.runs["run-1"] = ActiveRun(
+        "run-1",
+        "conversation-1",
+        "session-1",
+        settings=state_settings,
+    )
+    future = asyncio.get_running_loop().create_future()
+    runtime.approvals["approval-1"] = PendingApproval(
+        "approval-1",
+        "run-1",
+        future,
+        "queue_workflow",
+    )
+
+    assert await runtime.resolve_approval("approval-1", "always_allow")
+    assert await future == "always_allowed"
+    assert settings.load()["always_allowed_tools"] == ["queue_workflow"]
+    assert state_settings["always_allowed_tools"] == ["queue_workflow"]
+
+
+def test_approval_policy_supports_tool_rules_and_global_bypass():
+    defaults = {
+        "approval_mode": "autonomous_edits",
+        "always_allowed_tools": [],
+    }
+    assert should_request_approval("queue_workflow", defaults) is True
+    assert should_request_approval("workflow_overview", defaults) is False
+    assert should_request_approval("queue_workflow", {
+        **defaults,
+        "always_allowed_tools": ["queue_workflow"],
+    }) is False
+    assert should_request_approval("workflow_delete_file", {
+        **defaults,
+        "approval_mode": "bypass_all",
+    }) is False
+    assert normalize_approval_decision("allow_once") == "approved"
+    assert normalize_approval_decision("always_allow") == "always_allowed"
+    assert normalize_approval_decision("deny") == "denied"
+
+
+@pytest.mark.asyncio
+async def test_global_bypass_updates_active_runs_and_releases_pending_approvals(
+    tmp_path,
+):
+    runtime = ChatRuntime(ChatStore(tmp_path / "chat.db", tmp_path / "missing.db"))
+    settings = {
+        "approval_mode": "autonomous_edits",
+        "always_allowed_tools": [],
+    }
+    state = ActiveRun("run-1", "conversation-1", "session-1", settings=settings)
+    runtime.runs[state.run_id] = state
+    future = asyncio.get_running_loop().create_future()
+    runtime.approvals["approval-1"] = PendingApproval(
+        "approval-1",
+        state.run_id,
+        future,
+        "queue_workflow",
+    )
+
+    resolved = runtime.sync_approval_settings({
+        "approval_mode": "bypass_all",
+        "always_allowed_tools": [],
+    })
+
+    assert resolved == 1
+    assert state.settings["approval_mode"] == "bypass_all"
+    assert await future == "approved"
+    assert runtime.approvals == {}
 
 
 def test_intent_tool_filter_keeps_core_and_adds_narrow_groups():

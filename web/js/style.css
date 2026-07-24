@@ -809,16 +809,24 @@
 
 .fl-approval-actions {
     display: flex;
+    flex-wrap: wrap;
     justify-content: flex-end;
     gap: 6px;
 }
 
-.fl-approval-card.approved {
+.fl-always-allow-button {
+    border-color: rgba(210, 169, 104, 0.42);
+    color: #dfc28c;
+}
+
+.fl-approval-card.approved,
+.fl-approval-card.always_allowed {
     border-color: rgba(115, 211, 145, 0.28);
     background: rgba(115, 211, 145, 0.07);
 }
 
-.fl-approval-card.approved .fl-approval-state {
+.fl-approval-card.approved .fl-approval-state,
+.fl-approval-card.always_allowed .fl-approval-state {
     color: var(--ren-success);
 }
 
@@ -1229,22 +1237,243 @@
     text-align: center;
 }
 
-.fl-settings-section {
+.fl-settings-content {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    padding: 10px;
+    scroll-padding: 10px;
+}
+
+.fl-settings-card {
+    --ren-settings-accent: var(--ren-accent);
+    position: relative;
+    flex: 0 0 auto;
+    overflow: hidden;
+    border: 1px solid var(--ren-border);
+    border-radius: 10px;
+    background:
+        linear-gradient(180deg, rgba(255, 255, 255, 0.025), transparent 76px),
+        var(--ren-surface);
+    box-shadow:
+        0 4px 14px rgba(0, 0, 0, 0.12),
+        inset 0 1px rgba(255, 255, 255, 0.02);
+}
+
+.fl-settings-card-approvals {
+    --ren-settings-accent: var(--ren-warning);
+}
+
+.fl-settings-card-diagnostics {
+    --ren-settings-accent: var(--ren-info);
+}
+
+.fl-settings-card-header {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    min-height: 58px;
+    gap: 8px;
+    padding: 10px 12px;
+}
+
+.fl-settings-card-heading {
+    display: flex;
+    min-width: 0;
+    flex: 1 1 185px;
+    align-items: center;
+    gap: 9px;
+}
+
+.fl-settings-card-icon {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 28px;
+    height: 28px;
+    flex: 0 0 auto;
+    border: 1px solid color-mix(in srgb, var(--ren-settings-accent) 34%, transparent);
+    border-radius: 7px;
+    background: color-mix(in srgb, var(--ren-settings-accent) 11%, transparent);
+    color: color-mix(in srgb, var(--ren-settings-accent) 78%, white);
+    font-size: 12px;
+}
+
+.fl-settings-card-heading > div {
+    min-width: 0;
+}
+
+.fl-settings-card h3 {
+    margin: 0;
+    color: var(--ren-text);
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: -0.005em;
+}
+
+.fl-settings-card-heading p {
+    margin: 2px 0 0;
+    color: var(--ren-text-muted);
+    font-size: 11px;
+    line-height: 1.35;
+}
+
+.fl-settings-state {
+    display: inline-flex;
+    align-items: center;
+    min-height: 22px;
+    flex: 0 0 auto;
+    padding: 0 7px;
+    border: 1px solid var(--ren-border);
+    border-radius: 11px;
+    background: rgba(255, 255, 255, 0.035);
+    color: var(--ren-text-muted);
+    font-size: 10px;
+    font-weight: 650;
+    line-height: 1;
+    white-space: nowrap;
+}
+
+.fl-settings-state.ready {
+    border-color: rgba(115, 211, 145, 0.28);
+    background: rgba(115, 211, 145, 0.08);
+    color: color-mix(in srgb, var(--ren-success) 74%, white);
+}
+
+.fl-settings-state.warning {
+    border-color: rgba(210, 169, 104, 0.34);
+    background: rgba(210, 169, 104, 0.09);
+    color: color-mix(in srgb, var(--ren-warning) 76%, white);
+}
+
+.fl-settings-state.error {
+    border-color: rgba(239, 130, 120, 0.34);
+    background: rgba(239, 130, 120, 0.09);
+    color: color-mix(in srgb, var(--ren-danger) 74%, white);
+}
+
+.fl-settings-card-body {
     display: flex;
     flex-direction: column;
     gap: 9px;
-    padding: 0 0 18px;
+    padding: 0 12px 12px;
 }
 
-.fl-settings-section + .fl-settings-section {
-    padding-top: 15px;
+.fl-settings-fields {
+    display: flex;
+    flex-direction: column;
+    gap: 9px;
+}
+
+.fl-settings-card-footer {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 9px 12px;
     border-top: 1px solid var(--ren-border);
+    background: rgba(0, 0, 0, 0.09);
 }
 
-.fl-settings-section h3 {
-    margin: 0 0 2px;
+.fl-approval-toggle {
+    display: flex;
+    align-items: flex-start;
+    gap: 9px;
+    padding: 10px;
+    border: 1px solid var(--ren-border);
+    border-radius: 8px;
+    background: rgba(0, 0, 0, 0.16);
+    cursor: pointer;
+    transition:
+        border-color 160ms ease,
+        background-color 160ms ease;
+}
+
+.fl-approval-toggle:has(input:checked) {
+    border-color: rgba(210, 169, 104, 0.48);
+    background: rgba(210, 169, 104, 0.08);
+}
+
+.fl-approval-toggle:has(input:disabled) {
+    cursor: wait;
+    opacity: 0.58;
+}
+
+.fl-approval-toggle input {
+    width: 15px;
+    height: 15px;
+    margin: 1px 0 0;
+    flex: 0 0 auto;
+    accent-color: var(--ren-warning);
+}
+
+.fl-approval-toggle > span,
+.fl-approval-rules > div {
+    display: flex;
+    min-width: 0;
+    flex: 1;
+    flex-direction: column;
+    gap: 3px;
+}
+
+.fl-approval-toggle strong,
+.fl-approval-rules strong {
     color: var(--ren-text);
-    font-size: 12px;
+    font-size: 11px;
+}
+
+.fl-approval-toggle > span > span,
+.fl-approval-rules-copy {
+    color: var(--ren-text-muted);
+    font-size: 11px;
+    line-height: 1.4;
+    overflow-wrap: anywhere;
+}
+
+.fl-approval-rules {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    padding: 8px 10px;
+    border: 1px solid var(--ren-border);
+    border-radius: 8px;
+    background: rgba(0, 0, 0, 0.08);
+}
+
+.fl-approval-rules button {
+    flex: 0 0 auto;
+    min-height: 28px;
+}
+
+.fl-approval-warning {
+    display: flex;
+    align-items: flex-start;
+    gap: 7px;
+    margin: 0;
+    padding: 7px 8px;
+    border: 1px solid transparent;
+    border-radius: 7px;
+    background: rgba(255, 255, 255, 0.018);
+    color: var(--ren-text-muted);
+    font-size: 11px;
+    line-height: 1.45;
+    transition:
+        border-color 160ms ease,
+        background-color 160ms ease,
+        color 160ms ease;
+}
+
+.fl-approval-warning i {
+    margin-top: 2px;
+    flex: 0 0 auto;
+}
+
+.fl-approval-warning.active {
+    border-color: rgba(210, 169, 104, 0.24);
+    background: rgba(210, 169, 104, 0.07);
+    color: #dfc28c;
 }
 
 .fl-field {
@@ -1258,7 +1487,7 @@
 .fl-provider-input {
     width: 100%;
     min-width: 0;
-    height: 34px;
+    height: 36px;
     padding: 0 9px;
     border: 1px solid var(--ren-border);
     border-radius: 7px;
@@ -1280,6 +1509,7 @@
 
 .fl-subscription-connection {
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
     justify-content: space-between;
     gap: 10px;
@@ -1317,6 +1547,8 @@
 
 .fl-credential-status,
 .fl-provider-note {
+    min-width: 0;
+    flex: 1 1 160px;
     margin: 0;
     color: var(--ren-text-muted);
     font-size: 11px;
@@ -1327,7 +1559,51 @@
 }
 
 .fl-settings-save {
-    align-self: flex-start;
+    flex: 0 0 auto;
+}
+
+.fl-settings-disclosure > summary {
+    list-style: none;
+    cursor: pointer;
+    user-select: none;
+    transition: background-color 160ms ease;
+}
+
+.fl-settings-disclosure > summary::-webkit-details-marker {
+    display: none;
+}
+
+.fl-settings-disclosure > summary:hover {
+    background: rgba(255, 255, 255, 0.025);
+}
+
+.fl-settings-disclosure > summary:focus-visible {
+    box-shadow: inset 0 0 0 2px #b888ee;
+}
+
+.fl-settings-summary-state {
+    display: inline-flex;
+    align-items: center;
+    flex: 0 0 auto;
+    gap: 7px;
+}
+
+.fl-settings-chevron {
+    color: var(--ren-text-muted);
+    font-size: 10px;
+    transition: transform 180ms ease;
+}
+
+.fl-settings-disclosure[open] > summary {
+    border-bottom: 1px solid var(--ren-border);
+}
+
+.fl-settings-disclosure[open] .fl-settings-chevron {
+    transform: rotate(180deg);
+}
+
+.fl-diagnostics-card-body {
+    padding-top: 10px;
 }
 
 .fl-dialog-scrim {
@@ -1619,5 +1895,12 @@
     .fl-status-indicator.connecting,
     .fl-toolchain-crumb.loading {
         animation: none;
+    }
+
+    .fl-approval-toggle,
+    .fl-approval-warning,
+    .fl-settings-disclosure > summary,
+    .fl-settings-chevron {
+        transition: none;
     }
 }

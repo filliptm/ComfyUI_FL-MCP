@@ -79,6 +79,59 @@ def test_chat_settings_reject_secret_fields(tmp_path, monkeypatch):
     assert "credential endpoint" in response.json()["detail"]
 
 
+def test_global_bypass_syncs_running_approvals(tmp_path, monkeypatch):
+    synced = []
+
+    class Runtime:
+        def sync_approval_settings(self, value):
+            synced.append(value.copy())
+            return 2
+
+    monkeypatch.setattr(
+        chat_routes,
+        "chat_settings",
+        ChatSettingsStore(tmp_path / "settings.json"),
+    )
+    monkeypatch.setattr(chat_routes, "credential_store", CredentialStore())
+    monkeypatch.setattr(chat_routes, "chat_runtime", Runtime())
+
+    with TestClient(server.app) as client:
+        response = client.patch(
+            "/api/chat/settings",
+            json={"approval_mode": "bypass_all"},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["approval_mode"] == "bypass_all"
+    assert response.json()["resolvedApprovals"] == 2
+    assert synced[0]["approval_mode"] == "bypass_all"
+
+
+def test_approval_route_accepts_always_allow_decision(monkeypatch):
+    decisions = []
+
+    class Runtime:
+        async def resolve_approval(self, approval_id, decision):
+            decisions.append((approval_id, decision))
+            return True
+
+    monkeypatch.setattr(chat_routes, "chat_runtime", Runtime())
+
+    with TestClient(server.app) as client:
+        response = client.post(
+            "/api/chat/approvals/approval-1",
+            json={"decision": "always_allow"},
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "resolved": True,
+        "approved": True,
+        "resolution": "always_allowed",
+    }
+    assert decisions == [("approval-1", "always_allow")]
+
+
 def test_claude_subscription_status_and_models_use_cli_auth(tmp_path, monkeypatch):
     settings = ChatSettingsStore(tmp_path / "settings.json")
     settings.update({"provider": "claude_subscription", "model": "sonnet"})

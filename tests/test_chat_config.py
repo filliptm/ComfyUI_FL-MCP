@@ -23,6 +23,39 @@ def test_settings_reject_secret_fields(tmp_path):
         store.update({"api_key": "secret"})
 
 
+def test_approval_preferences_persist_and_validate(tmp_path):
+    store = ChatSettingsStore(tmp_path / "settings.json")
+    value = store.update({
+        "approval_mode": "bypass_all",
+        "always_allowed_tools": [
+            "queue_workflow",
+            "workflow_delete_file",
+            "queue_workflow",
+        ],
+    })
+
+    assert value["approval_mode"] == "bypass_all"
+    assert value["always_allowed_tools"] == [
+        "queue_workflow",
+        "workflow_delete_file",
+    ]
+    assert store.load()["approval_mode"] == "bypass_all"
+
+    with pytest.raises(ValueError, match="approval mode"):
+        store.update({"approval_mode": "unsafe_unknown_mode"})
+    with pytest.raises(ValueError, match="invalid tool name"):
+        store.update({"always_allowed_tools": ["bad tool name"]})
+
+
+def test_always_allow_tool_adds_one_persistent_rule(tmp_path):
+    store = ChatSettingsStore(tmp_path / "settings.json")
+
+    store.always_allow_tool("queue_workflow")
+    store.always_allow_tool("queue_workflow")
+
+    assert store.load()["always_allowed_tools"] == ["queue_workflow"]
+
+
 def test_claude_subscription_is_separate_from_anthropic_api():
     subscription = PROVIDER_PRESETS["claude_subscription"]
     anthropic = PROVIDER_PRESETS["anthropic"]

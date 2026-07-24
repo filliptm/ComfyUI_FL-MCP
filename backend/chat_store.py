@@ -322,11 +322,17 @@ class ChatStore:
                 ),
             )
 
-    def resolve_approval(self, approval_id: str, approved: bool) -> None:
+    def resolve_approval(self, approval_id: str, resolution: bool | str) -> None:
+        if isinstance(resolution, bool):
+            status = "approved" if resolution else "denied"
+        else:
+            status = str(resolution)
+        if status not in {"approved", "always_allowed", "denied", "expired"}:
+            raise ValueError(f"Unsupported approval resolution: {status}")
         with self._lock, self._connect() as connection:
             connection.execute(
                 "UPDATE approvals SET status = ?, resolved_at = ? WHERE id = ?",
-                ("approved" if approved else "denied", utc_now(), approval_id),
+                (status, utc_now(), approval_id),
             )
 
     def import_legacy(self) -> int:
