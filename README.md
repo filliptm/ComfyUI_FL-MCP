@@ -9,6 +9,8 @@ Built-in MCP chat, tool server, and browser bridge for controlling ComfyUI.
 
 ![ComfyUI FL-MCP demo](assets/fl-mcp-demo.gif)
 
+![ComfyUI FL-MCP built-in chat editing a workflow](assets/fl-mcp-chat-demo.gif)
+
 ## What It Does
 
 ComfyUI FL-MCP adds an MCP-native workflow chat to ComfyUI and exposes the same tools to external clients such as Claude Desktop, Cursor, Codex, and other agentic development environments. The built-in assistant is powered by Ren and appears directly in the ComfyUI sidebar.
