@@ -1867,8 +1867,23 @@ export class AssistantPanel {
 
     approvalCopy(toolName, argumentsValue) {
         const args = argumentsValue || {};
-        const nodeIds = args.node_ids || args.nodeIds;
+        const request = args.request && typeof args.request === "object"
+            ? args.request
+            : args;
+        const nodeIds = request.node_ids || request.nodeIds;
         const nodeCount = Array.isArray(nodeIds) ? nodeIds.length : null;
+        const maskRegions = Array.isArray(request.regions) ? request.regions : [];
+        const maskOperations = new Set(
+            maskRegions.map(region => region?.operation || "paint"),
+        );
+        const maskVerb = maskOperations.size === 1 && maskOperations.has("paint")
+            ? "paint"
+            : maskOperations.size === 1 && maskOperations.has("erase")
+                ? "erase"
+                : "apply";
+        const maskRegionCount = `${maskRegions.length} ${
+            maskRegions.length === 1 ? "region" : "regions"
+        }`;
         const copies = {
             queue_workflow: {
                 title: "Run this workflow?",
@@ -1887,6 +1902,14 @@ export class AssistantPanel {
             workflow_save_current: {
                 title: "Save this workflow?",
                 consequence: "This will write the current workflow to the requested file.",
+            },
+            edit_node_mask: {
+                title: request.clear_existing
+                    ? "Replace this image mask?"
+                    : "Edit this image mask?",
+                consequence: maskRegions.length
+                    ? `Ren will ${maskVerb} ${maskRegionCount}, save a new mask image, and update the selected image node.`
+                    : "Ren will save a new mask image and update the selected image node.",
             },
             manager_queue_action: {
                 title: "Change installed custom nodes?",
