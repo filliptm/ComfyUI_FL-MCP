@@ -193,6 +193,27 @@ async def get_conversation(conversation_id: str) -> dict[str, Any]:
     }
 
 
+@router.post("/conversations/{conversation_id}/messages/{message_id}/version")
+async def select_message_version(
+    conversation_id: str,
+    message_id: str,
+    request: Request,
+) -> dict[str, Any]:
+    if not chat_store.get_conversation(conversation_id):
+        raise HTTPException(status_code=404, detail="Conversation not found.")
+    data = await request.json()
+    try:
+        direction = int(data.get("direction") or 0)
+        messages = chat_store.select_message_version(
+            conversation_id,
+            message_id,
+            direction,
+        )
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {"messages": messages}
+
+
 @router.patch("/conversations/{conversation_id}")
 async def update_conversation(conversation_id: str, request: Request) -> dict[str, Any]:
     data = await request.json()
@@ -247,6 +268,9 @@ async def start_run(request: Request) -> StreamingResponse:
             ),
             message=str(data.get("message") or ""),
             reasoning_effort=reasoning_effort,
+            edit_message_id=(
+                str(data["editMessageId"]) if data.get("editMessageId") else None
+            ),
         )
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc

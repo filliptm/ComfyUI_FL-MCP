@@ -343,6 +343,7 @@ class ActiveRun:
     conversation_id: str
     session_id: str
     settings: dict[str, Any] | None = None
+    user_message_id: str | None = None
     events: list[str] = field(default_factory=list)
     subscribers: list[asyncio.Queue[str | None]] = field(default_factory=list)
     task: asyncio.Task[None] | None = None
@@ -396,6 +397,7 @@ class ChatRuntime:
         conversation_id: str | None,
         message: str,
         reasoning_effort: str = "default",
+        edit_message_id: str | None = None,
     ) -> ActiveRun:
         text = message.strip()
         if not text:
@@ -411,6 +413,15 @@ class ChatRuntime:
             settings["provider"],
             settings["model"],
         )
+        edit_source = None
+        if edit_message_id:
+            edit_source = self.store.get_message(edit_message_id)
+            if (
+                not edit_source
+                or edit_source["conversationId"] != identifier
+                or edit_source["role"] != "user"
+            ):
+                raise ValueError("The message to edit was not found in this conversation.")
         self.store.update_conversation(
             identifier,
             provider=settings["provider"],
@@ -425,15 +436,34 @@ class ChatRuntime:
                 for state in self.runs.values()
             ):
                 raise ValueError("This conversation already has an active run.")
+            message_options: dict[str, Any] = {}
+            if edit_source:
+                root_id = edit_source["revision"]["rootId"]
+                message_options = {
+                    "parent_message_id": edit_source["parentMessageId"],
+                    "revision_root_id": root_id,
+                    "revision_index": self.store.next_revision_index(
+                        identifier,
+                        root_id,
+                    ),
+                    "branch_from_active": False,
+                }
             user_message = self.store.append_message(
                 identifier,
                 "user",
                 text,
                 provider=settings["provider"],
                 model=settings["model"],
+                **message_options,
             )
             run_id = str(uuid.uuid4())
-            state = ActiveRun(run_id, identifier, session_id, settings=settings)
+            state = ActiveRun(
+                run_id,
+                identifier,
+                session_id,
+                settings=settings,
+                user_message_id=user_message["id"],
+            )
             self.runs[run_id] = state
             self._prune_completed_runs()
             self.store.create_run(run_id, identifier)
@@ -610,7 +640,6 @@ class ChatRuntime:
                 overflow -= 1
 
     async def _execute(self, state: ActiveRun, user_message_id: str) -> None:
-        del user_message_id
         settings = state.settings or chat_settings.load()
         try:
             provider_type = PROVIDER_PRESETS[settings["provider"]]["type"]
@@ -788,6 +817,8 @@ class ChatRuntime:
                 model=settings["model"],
                 serialized=serialized,
                 metadata={"toolSteps": persisted_tool_steps, "runId": state.run_id},
+                parent_message_id=user_message_id,
+                branch_from_active=False,
             )
             self.store.finish_run(state.run_id, "complete")
         except asyncio.CancelledError:
@@ -1170,6 +1201,8 @@ class ChatRuntime:
             provider=settings["provider"],
             model=settings["model"],
             metadata=metadata,
+            parent_message_id=state.user_message_id,
+            branch_from_active=False,
         )
         self.store.finish_run(state.run_id, "complete")
 
@@ -1626,6 +1659,8 @@ class ChatRuntime:
                 "codexThreadId": codex_thread_id,
                 "usage": usage,
             },
+            parent_message_id=state.user_message_id,
+            branch_from_active=False,
         )
         self.store.finish_run(state.run_id, "complete")
 

@@ -118,7 +118,26 @@ export class ChatClient {
         });
     }
 
-    async startRun({ sessionId, conversationId, message, reasoningEffort, onEvent, onReady }) {
+    selectMessageVersion(conversationId, messageId, direction) {
+        return this.request(
+            `/api/chat/conversations/${encodeURIComponent(conversationId)}`
+            + `/messages/${encodeURIComponent(messageId)}/version`,
+            {
+                method: "POST",
+                body: JSON.stringify({ direction }),
+            },
+        );
+    }
+
+    async startRun({
+        sessionId,
+        conversationId,
+        message,
+        reasoningEffort,
+        editMessageId,
+        onEvent,
+        onReady,
+    }) {
         this.abortController = new AbortController();
         const response = await fetch(`${this.baseUrl}/api/chat/runs`, {
             method: "POST",
@@ -128,6 +147,7 @@ export class ChatClient {
                 conversationId: conversationId || null,
                 message,
                 reasoningEffort: reasoningEffort || "default",
+                editMessageId: editMessageId || null,
             }),
             signal: this.abortController.signal,
         });

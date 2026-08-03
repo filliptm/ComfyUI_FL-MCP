@@ -53,6 +53,7 @@ export class AssistantPanel {
         this.sheetReturnFocus = null;
         this.undoTimer = null;
         this.lastFailedMessage = "";
+        this.lastFailedEditMessageId = null;
         this.lastArchivedConversation = null;
         this.pendingDeleteConversationId = null;
         this.contextUnsubscribe = null;
@@ -427,6 +428,12 @@ export class AssistantPanel {
             if (action === "cancel-confirm") this.closeDeleteConfirmation();
             if (action === "confirm-delete") this.confirmPermanentDelete();
             if (action === "undo-archive") this.undoArchive();
+            if (action === "edit-message") this.startMessageEdit(actionElement.dataset.messageId);
+            if (action === "cancel-message-edit") this.cancelMessageEdit(actionElement.dataset.messageId);
+            if (action === "submit-message-edit") this.submitMessageEdit(actionElement.dataset.messageId);
+            if (action === "resend-message") this.resendMessage(actionElement.dataset.messageId);
+            if (action === "previous-message-version") this.changeMessageVersion(actionElement.dataset.messageId, -1);
+            if (action === "next-message-version") this.changeMessageVersion(actionElement.dataset.messageId, 1);
         });
         this.providerSelect.addEventListener("change", () => this.applyProviderPreset());
         this.subscriptionModelSelect.addEventListener("change", () => {
@@ -1430,6 +1437,8 @@ export class AssistantPanel {
         for (const message of messages) {
             this.appendMessage(message.role, message.content, {
                 ...(message.metadata || {}),
+                messageId: message.id,
+                revision: message.revision,
                 createdAt: message.createdAt,
             });
         }
@@ -1444,6 +1453,8 @@ export class AssistantPanel {
         this.messagesElement.hidden = false;
         const article = document.createElement("article");
         article.className = `fl-message ${role}`;
+        if (metadata.messageId) article.dataset.messageId = metadata.messageId;
+        article.messageContent = String(content || "");
         const header = document.createElement("div");
         header.className = "fl-message-header";
         const label = document.createElement("span");
@@ -1467,10 +1478,61 @@ export class AssistantPanel {
         } else {
             body = this.createMessageContent(content);
             article.append(header, body);
+            if (role === "user" && metadata.messageId) {
+                article.appendChild(this.createUserMessageActions(metadata));
+            }
         }
         this.messagesElement.appendChild(article);
         this.maybeFollowOutput();
         return { article, body, timeline };
+    }
+
+    createUserMessageActions(metadata = {}) {
+        const actions = document.createElement("div");
+        actions.className = "fl-message-actions";
+        const actionButton = (action, iconClass, label) => {
+            const button = document.createElement("button");
+            button.type = "button";
+            button.dataset.action = action;
+            button.dataset.messageId = metadata.messageId;
+            button.title = label;
+            button.setAttribute("aria-label", label);
+            const icon = document.createElement("i");
+            icon.className = iconClass;
+            icon.setAttribute("aria-hidden", "true");
+            button.appendChild(icon);
+            return button;
+        };
+        actions.append(
+            actionButton("edit-message", "pi pi-pencil", "Edit and resend request"),
+            actionButton("resend-message", "pi pi-refresh", "Resend request"),
+        );
+
+        const revision = metadata.revision || {};
+        const index = Number(revision.index) || 1;
+        const count = Number(revision.count) || 1;
+        if (count > 1) {
+            const versions = document.createElement("span");
+            versions.className = "fl-message-versions";
+            const previous = actionButton(
+                "previous-message-version",
+                "pi pi-chevron-left",
+                "Previous request version",
+            );
+            previous.disabled = index <= 1;
+            const position = document.createElement("span");
+            position.textContent = `${index} / ${count}`;
+            position.setAttribute("aria-label", `Request version ${index} of ${count}`);
+            const next = actionButton(
+                "next-message-version",
+                "pi pi-chevron-right",
+                "Next request version",
+            );
+            next.disabled = index >= count;
+            versions.append(previous, position, next);
+            actions.appendChild(versions);
+        }
+        return actions;
     }
 
     createMessageContent(content = "") {
@@ -1986,14 +2048,30 @@ export class AssistantPanel {
             this.showError("Choose and test a model before sending a message.");
             return;
         }
+        this.textarea.value = "";
+        this.resizeComposer();
+        this.updateComposerState();
+        await this.runMessage(message);
+    }
+
+    async runMessage(message, editMessageId = null) {
+        if (!message || this.running) return;
+        if (!this.status?.configured) {
+            this.openSheet("settings");
+            this.showError("Choose and test a model before sending a message.");
+            return;
+        }
         this.clearError();
         this.lastFailedMessage = message;
+        this.lastFailedEditMessageId = editMessageId;
         this.running = true;
         this.currentAssistant = null;
         this.followOutput = true;
-        this.appendMessage("user", message);
-        this.textarea.value = "";
-        this.resizeComposer();
+        if (editMessageId) {
+            this.renderOptimisticRevision(editMessageId, message);
+        } else {
+            this.appendMessage("user", message);
+        }
         this.updateComposerState();
         try {
             await this.chat.startRun({
@@ -2001,6 +2079,7 @@ export class AssistantPanel {
                 conversationId: this.conversationId,
                 message,
                 reasoningEffort: this.composerReasoningSelect.value,
+                editMessageId,
                 onReady: ({ conversationId }) => {
                     this.conversationId = conversationId;
                 },
@@ -2014,6 +2093,116 @@ export class AssistantPanel {
             this.running = false;
             this.updateComposerState();
             await this.refreshConversations(this.conversationId);
+        }
+    }
+
+    renderOptimisticRevision(messageId, content) {
+        const article = this.messagesElement.querySelector(
+            `.fl-message.user[data-message-id="${CSS.escape(messageId)}"]`,
+        );
+        if (!article) {
+            this.appendMessage("user", content);
+            return;
+        }
+        let following = article.nextElementSibling;
+        while (following) {
+            const next = following.nextElementSibling;
+            following.remove();
+            following = next;
+        }
+        article.remove();
+        this.appendMessage("user", content);
+    }
+
+    startMessageEdit(messageId) {
+        if (!messageId || this.running) return;
+        this.container.querySelectorAll(".fl-message-edit-form").forEach(form => {
+            const existingId = form.closest(".fl-message")?.dataset.messageId;
+            this.cancelMessageEdit(existingId);
+        });
+        const article = this.messagesElement.querySelector(
+            `.fl-message.user[data-message-id="${CSS.escape(messageId)}"]`,
+        );
+        if (!article || article.querySelector(".fl-message-edit-form")) return;
+        article.querySelector(".fl-message-content").hidden = true;
+        article.querySelector(".fl-message-actions").hidden = true;
+        const form = document.createElement("div");
+        form.className = "fl-message-edit-form";
+        const input = document.createElement("textarea");
+        input.value = article.messageContent || "";
+        input.rows = 3;
+        input.setAttribute("aria-label", "Edit request");
+        const actions = document.createElement("div");
+        const cancel = document.createElement("button");
+        cancel.type = "button";
+        cancel.className = "fl-secondary-button";
+        cancel.dataset.action = "cancel-message-edit";
+        cancel.dataset.messageId = messageId;
+        cancel.textContent = "Cancel";
+        const submit = document.createElement("button");
+        submit.type = "button";
+        submit.className = "fl-primary-button";
+        submit.dataset.action = "submit-message-edit";
+        submit.dataset.messageId = messageId;
+        submit.textContent = "Send edited request";
+        actions.append(cancel, submit);
+        form.append(input, actions);
+        article.appendChild(form);
+        input.addEventListener("keydown", (event) => {
+            if (event.key === "Escape") this.cancelMessageEdit(messageId);
+            if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
+                event.preventDefault();
+                this.submitMessageEdit(messageId);
+            }
+        });
+        input.focus();
+        input.setSelectionRange(input.value.length, input.value.length);
+    }
+
+    cancelMessageEdit(messageId) {
+        if (!messageId) return;
+        const article = this.messagesElement.querySelector(
+            `.fl-message.user[data-message-id="${CSS.escape(messageId)}"]`,
+        );
+        article?.querySelector(".fl-message-edit-form")?.remove();
+        const content = article?.querySelector(".fl-message-content");
+        const actions = article?.querySelector(".fl-message-actions");
+        if (content) content.hidden = false;
+        if (actions) actions.hidden = false;
+    }
+
+    async submitMessageEdit(messageId) {
+        if (this.running) return;
+        const article = this.messagesElement.querySelector(
+            `.fl-message.user[data-message-id="${CSS.escape(messageId)}"]`,
+        );
+        const content = article?.querySelector(".fl-message-edit-form textarea")
+            ?.value.trim();
+        if (!content) return;
+        await this.runMessage(content, messageId);
+    }
+
+    async resendMessage(messageId) {
+        if (this.running) return;
+        const article = this.messagesElement.querySelector(
+            `.fl-message.user[data-message-id="${CSS.escape(messageId)}"]`,
+        );
+        const content = article?.messageContent?.trim();
+        if (!content) return;
+        await this.runMessage(content, messageId);
+    }
+
+    async changeMessageVersion(messageId, direction) {
+        if (!this.conversationId || !messageId || this.running) return;
+        try {
+            const result = await this.chat.selectMessageVersion(
+                this.conversationId,
+                messageId,
+                direction,
+            );
+            this.renderMessages(result.messages || []);
+        } catch (error) {
+            this.showError(`Message version could not load: ${error.message}`);
         }
     }
 
@@ -2147,6 +2336,13 @@ export class AssistantPanel {
 
     retryLastMessage() {
         if (!this.lastFailedMessage || this.running) return;
+        if (this.lastFailedEditMessageId) {
+            this.runMessage(
+                this.lastFailedMessage,
+                this.lastFailedEditMessageId,
+            );
+            return;
+        }
         this.textarea.value = this.lastFailedMessage;
         this.resizeComposer();
         this.updateComposerState();

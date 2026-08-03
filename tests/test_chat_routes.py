@@ -36,6 +36,24 @@ def test_chat_settings_and_conversation_crud_use_http_api(tmp_path, monkeypatch)
         assert renamed.status_code == 200
         assert renamed.json()["conversation"]["title"] == "Workflow review"
 
+        first = store.append_message(conversation_id, "user", "original")
+        revision = store.append_message(
+            conversation_id,
+            "user",
+            "edited",
+            parent_message_id=first["parentMessageId"],
+            revision_root_id=first["revision"]["rootId"],
+            revision_index=2,
+            branch_from_active=False,
+        )
+        selected = client.post(
+            f"/api/chat/conversations/{conversation_id}/messages/"
+            f"{revision['id']}/version",
+            json={"direction": -1},
+        )
+        assert selected.status_code == 200
+        assert selected.json()["messages"][0]["content"] == "original"
+
         active = client.get("/api/chat/conversations?view=active")
         assert [item["id"] for item in active.json()["conversations"]] == [
             conversation_id
