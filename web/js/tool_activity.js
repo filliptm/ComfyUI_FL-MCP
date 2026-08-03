@@ -110,17 +110,17 @@ export const TOOL_CONFIG = {
     "view_output_image": {
         icon: "🖼️",
         label: "Review Output",
-        description: "Inspecting the generated image for visual issues"
+        description: "Loading generated pixels for visual review"
     },
     "view_node_mask": {
         icon: "🎭",
         label: "Inspect Mask",
-        description: "Reviewing masked pixels on the node image"
+        description: "Highlighting masked pixels in magenta"
     },
     "edit_node_mask": {
         icon: "🖌️",
         label: "Edit Mask",
-        description: "Painting or erasing regions in the image mask"
+        description: "Painting mask regions and updating the image node"
     },
     "enable_auto_queue": {
         icon: "🔄",
@@ -454,9 +454,9 @@ const TOOL_RUNNING_LABELS = {
     modify_layout: "Arranging workflow",
     get_layout: "Reading layout",
     queue_workflow: "Queueing workflow",
-    view_output_image: "Reviewing generated image",
-    view_node_mask: "Inspecting image mask",
-    edit_node_mask: "Editing image mask",
+    view_output_image: "Loading final output for review",
+    view_node_mask: "Loading mask overlay",
+    edit_node_mask: "Saving mask edit",
     take_screenshot: "Capturing canvas",
     node_library_search: "Searching node library",
     manager_check_updates: "Checking for updates",

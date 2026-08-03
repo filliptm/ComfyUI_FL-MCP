@@ -140,6 +140,7 @@ test("tool calls keep chronological placement and one shared renderer", async ()
 
 
 test("action trail stays compact, visible, and visually quiet when complete", async () => {
+    const panel = await readFile(new URL("web/js/chat_panel.js", root), "utf8");
     const styles = await readFile(new URL("web/js/style.css", root), "utf8");
     const tools = await readFile(new URL("web/js/tool_activity.js", root), "utf8");
 
@@ -152,6 +153,8 @@ test("action trail stays compact, visible, and visually quiet when complete", as
     assert.match(tools, /pi pi-plus-circle/);
     assert.match(tools, /view_node_mask/);
     assert.match(tools, /edit_node_mask/);
+    assert.match(panel, /Replace this image mask\?/);
+    assert.match(panel, /save a new mask image, and update the selected image node/);
 });
 
 
