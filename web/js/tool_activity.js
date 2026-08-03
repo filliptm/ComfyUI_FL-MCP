@@ -107,6 +107,11 @@ export const TOOL_CONFIG = {
         label: "Status",
         description: "Checking execution queue status"
     },
+    "view_output_image": {
+        icon: "🖼️",
+        label: "Review Output",
+        description: "Inspecting the generated image for visual issues"
+    },
     "enable_auto_queue": {
         icon: "🔄",
         label: "Auto Queue",
@@ -408,6 +413,7 @@ const TOOL_ICON_CLASSES = {
     modify_layout: "pi pi-th-large",
     get_layout: "pi pi-table",
     queue_workflow: "pi pi-play",
+    view_output_image: "pi pi-image",
     cancel_workflow: "pi pi-stop",
     get_queue_status: "pi pi-clock",
     workflow_get_current_json: "pi pi-code",
@@ -436,6 +442,7 @@ const TOOL_RUNNING_LABELS = {
     modify_layout: "Arranging workflow",
     get_layout: "Reading layout",
     queue_workflow: "Queueing workflow",
+    view_output_image: "Reviewing generated image",
     take_screenshot: "Capturing canvas",
     node_library_search: "Searching node library",
     manager_check_updates: "Checking for updates",

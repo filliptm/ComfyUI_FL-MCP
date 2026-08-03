@@ -44,6 +44,9 @@ CORE_CHAT_TOOLS = {
     "modify_layout",
     "take_screenshot",
     "queue_workflow",
+    "wait",
+    "get_execution_history",
+    "view_output_image",
     "get_queue_status",
     "mcp_capability_audit",
 }
@@ -134,11 +137,28 @@ def claude_tool_name(tool_name: str) -> str | None:
     return tool_name[len(prefix):] if tool_name.startswith(prefix) else None
 
 
+def _redact_binary_tool_content(content: Any) -> Any:
+    """Keep image payloads available to the model without copying base64 into chat UI."""
+    if isinstance(content, list):
+        return [_redact_binary_tool_content(item) for item in content]
+    if not isinstance(content, dict):
+        return content
+    redacted = {
+        key: _redact_binary_tool_content(value)
+        for key, value in content.items()
+        if not (content.get("type") == "image" and key == "data")
+    }
+    if content.get("type") == "image" and "data" in content:
+        redacted["data"] = "[image content shown to Ren]"
+    return redacted
+
+
 def tool_result_content(content: Any) -> str:
     if isinstance(content, str):
         return content
     if hasattr(content, "model_dump"):
         content = content.model_dump(mode="json", by_alias=True)
+    content = _redact_binary_tool_content(content)
     return json.dumps(content, ensure_ascii=False, separators=(",", ":"))
 
 
@@ -220,7 +240,13 @@ async def wait_for_claude_mcp(
 def tools_for_message(message: str) -> set[str]:
     text = message.lower()
     selected = set(CORE_CHAT_TOOLS)
-    if any(word in text for word in ("error", "broken", "debug", "failed", "queue")):
+    if any(
+        word in text
+        for word in (
+            "error", "broken", "debug", "failed", "queue", "output", "result",
+            "image", "review", "validate", "distortion", "artifact",
+        )
+    ):
         selected.update(INTENT_TOOL_GROUPS["debug"])
     if any(
         word in text

@@ -111,6 +111,7 @@ READ_ONLY_TOOLS = {
     "manager_check_updates",
     "manager_search_external_models",
     "get_execution_history",
+    "view_output_image",
     "get_queue_status_details",
     "get_execution_details",
     "custom_nodes_list_packs",

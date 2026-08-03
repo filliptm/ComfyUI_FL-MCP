@@ -4,6 +4,7 @@ This module defines MCP tools for controlling and inspecting ComfyUI.
 """
 
 import asyncio
+import io
 import json
 import logging
 import mimetypes
@@ -54,6 +55,9 @@ _ensure_pywin32_importable()
 import websockets
 import httpx
 from fastmcp import FastMCP, Context
+from fastmcp.tools.tool import ToolResult
+from fastmcp.utilities.types import Image as MCPImage
+from PIL import Image as PILImage, ImageOps, UnidentifiedImageError
 from pydantic import BaseModel, Field, model_validator
 
 from config import settings
@@ -61,7 +65,7 @@ from models import WorkflowQuery
 from comfy_models import (
     ComfyListFoldersRequest, ComfyListFoldersResponse,
     ComfyReadFileRequest, ComfyReadFileResponse,
-    ComfySearchFilesRequest, ComfySearchFilesResponse
+    ComfySearchFilesRequest, ComfySearchFilesResponse, ComfyFolderType
 )
 from comfy_tools import get_comfy_tools, ComfyUIError, ComfyUINotFoundError
 from node_library import (
@@ -945,6 +949,29 @@ class GetQueueStatusDetailsRequest(BaseModel):
 class GetExecutionDetailsRequest(BaseModel):
     """Request to get execution details for a specific run."""
     prompt_id: str = Field(..., description="The prompt/run ID to get details for")
+
+
+class ViewOutputImageRequest(BaseModel):
+    """Request a generated image as visual MCP content."""
+    prompt_id: Optional[str] = Field(
+        default=None,
+        description="Execution prompt ID. If omitted, use the latest successful execution with images.",
+    )
+    node_id: Optional[str] = Field(
+        default=None,
+        description="Optional output node ID. If omitted, consider images from all output nodes.",
+    )
+    output_index: int = Field(
+        default=-1,
+        ge=-1,
+        description="Image index across matching outputs. -1 selects the final image.",
+    )
+    max_dimension: int = Field(
+        default=2048,
+        ge=256,
+        le=4096,
+        description="Maximum preview width or height sent to the vision model.",
+    )
 
 class ClearErrorBufferRequest(BaseModel):
     """Request to clear the error buffer."""
@@ -3298,6 +3325,184 @@ async def manager_search_external_models(
 # ============================================================================
 # ERROR FEEDBACK & QUEUE STATUS TOOLS
 # ============================================================================
+
+def _output_image_candidates(
+    outputs: Dict[str, Any],
+    node_id: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Flatten ComfyUI history outputs into stable, selectable image records."""
+    candidates: List[Dict[str, Any]] = []
+    for output_node_id, output in outputs.items():
+        if node_id is not None and str(output_node_id) != str(node_id):
+            continue
+        if not isinstance(output, dict):
+            continue
+        images = output.get("images")
+        if not isinstance(images, list):
+            continue
+        for node_image_index, image in enumerate(images):
+            if not isinstance(image, dict) or not image.get("filename"):
+                continue
+            candidates.append({
+                "nodeId": str(output_node_id),
+                "nodeImageIndex": node_image_index,
+                "filename": str(image["filename"]),
+                "subfolder": str(image.get("subfolder") or ""),
+                "type": str(image.get("type") or "output").lower(),
+            })
+    return candidates
+
+
+def _resolve_output_image_path(comfy_tools: Any, image: Dict[str, Any]) -> Path:
+    """Resolve one history image inside trusted ComfyUI output/input/temp roots."""
+    folder_types = {
+        "output": ComfyFolderType.OUTPUT,
+        "input": ComfyFolderType.INPUT,
+        "temp": ComfyFolderType.TEMP,
+    }
+    folder_type = folder_types.get(image["type"])
+    if folder_type is None:
+        raise ComfyUIError(f"Unsupported output image type: {image['type']}")
+
+    relative = Path(image["subfolder"]) / image["filename"]
+    if relative.is_absolute():
+        raise ComfyUIError("Output image path must be relative to ComfyUI.")
+    for root in comfy_tools._iter_all_paths(folder_type):
+        trusted_root = root.resolve()
+        candidate = (trusted_root / relative).resolve()
+        if candidate.is_relative_to(trusted_root) and candidate.is_file():
+            return candidate
+    raise ComfyUINotFoundError(
+        f"Output image was not found: {image['type']}/{relative.as_posix()}"
+    )
+
+
+def _output_image_preview(path: Path, max_dimension: int) -> tuple[bytes, str, tuple[int, int], tuple[int, int]]:
+    """Create a bounded visual-review image while preserving transparency."""
+    try:
+        with PILImage.open(path) as source:
+            source.seek(0)
+            image = ImageOps.exif_transpose(source).copy()
+    except (OSError, UnidentifiedImageError) as exc:
+        raise ComfyUIError(f"Output is not a readable image: {path.name}") from exc
+
+    original_size = image.size
+    image.thumbnail((max_dimension, max_dimension), PILImage.Resampling.LANCZOS)
+    preview_size = image.size
+    has_alpha = "A" in image.getbands() or (
+        image.mode == "P" and "transparency" in image.info
+    )
+    buffer = io.BytesIO()
+    if has_alpha:
+        image.save(buffer, format="PNG", optimize=True)
+        preview_format = "png"
+    else:
+        image.convert("RGB").save(
+            buffer,
+            format="JPEG",
+            quality=90,
+            optimize=True,
+        )
+        preview_format = "jpeg"
+    return buffer.getvalue(), preview_format, original_size, preview_size
+
+
+@mcp.tool()
+async def view_output_image(request: ViewOutputImageRequest, ctx: Context) -> ToolResult:
+    """View a generated ComfyUI output as real image content for visual review.
+
+    Use after queueing and waiting for completion, or whenever the user asks to
+    inspect the latest result. The default selects the last image from the latest
+    successful execution. Pass prompt_id, node_id, or output_index to choose a
+    specific result. The returned image is visible to vision-capable MCP clients,
+    so inspect its pixels rather than relying only on filenames or execution status.
+    """
+    await _report_tool_activity(ctx, "view_output_image")
+    comfy_tools = get_comfy_tools()
+    if request.prompt_id:
+        prompt_id = request.prompt_id
+        history_entry = await comfy_tools.fetch_history(prompt_id=prompt_id)
+    else:
+        prompt_id = None
+        history_entry = None
+        history = await comfy_tools.fetch_history(max_items=20)
+        for candidate_prompt_id, candidate_entry in history.items():
+            status = candidate_entry.get("status", {})
+            candidate_images = _output_image_candidates(
+                candidate_entry.get("outputs", {}),
+                request.node_id,
+            )
+            if status.get("status_str") == "success" and candidate_images:
+                prompt_id = candidate_prompt_id
+                history_entry = candidate_entry
+                break
+
+    if not history_entry or not prompt_id:
+        result = {
+            "success": False,
+            "error": "No matching completed execution with image outputs was found.",
+        }
+        return ToolResult(content=result, structured_content=result)
+
+    status = history_entry.get("status", {})
+    if status.get("status_str") != "success":
+        result = {
+            "success": False,
+            "promptId": prompt_id,
+            "status": status.get("status_str", "unknown"),
+            "error": "The execution has not completed successfully.",
+        }
+        return ToolResult(content=result, structured_content=result)
+
+    images = _output_image_candidates(
+        history_entry.get("outputs", {}),
+        request.node_id,
+    )
+    if not images:
+        result = {
+            "success": False,
+            "promptId": prompt_id,
+            "error": "The execution completed but has no matching image outputs.",
+        }
+        return ToolResult(content=result, structured_content=result)
+    if request.output_index >= len(images):
+        result = {
+            "success": False,
+            "promptId": prompt_id,
+            "error": f"output_index {request.output_index} is out of range.",
+            "availableOutputCount": len(images),
+        }
+        return ToolResult(content=result, structured_content=result)
+
+    selected_index = request.output_index if request.output_index >= 0 else len(images) - 1
+    selected = images[selected_index]
+    path = _resolve_output_image_path(comfy_tools, selected)
+    preview, preview_format, original_size, preview_size = _output_image_preview(
+        path,
+        request.max_dimension,
+    )
+    relative_path = "/".join(filter(None, (
+        selected["type"],
+        selected["subfolder"],
+        selected["filename"],
+    )))
+    result = {
+        "success": True,
+        "promptId": prompt_id,
+        "status": "success",
+        "selectedOutputIndex": selected_index,
+        "availableOutputCount": len(images),
+        "nodeId": selected["nodeId"],
+        "nodeImageIndex": selected["nodeImageIndex"],
+        "relativePath": relative_path,
+        "originalSize": {"width": original_size[0], "height": original_size[1]},
+        "previewSize": {"width": preview_size[0], "height": preview_size[1]},
+        "message": "The generated image follows as visual MCP content. Inspect the pixels before judging the result.",
+    }
+    return ToolResult(
+        content=[result, MCPImage(data=preview, format=preview_format)],
+        structured_content=result,
+    )
 
 @mcp.tool()
 async def get_execution_history(request: GetWorkflowHistoryRequest, ctx: Context) -> Dict[str, Any]:

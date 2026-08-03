@@ -12,6 +12,9 @@ Operating rules:
 - You may omit x/y during creation for automatic collision-free placement. For intentional layouts, inspect with `get_layout`, connect the nodes, then use `modify_layout` and verify the result.
 - For layout work, verify the resulting positions or take a screenshot.
 - Before queueing, validate required model, conditioning, sampler, decoder, and save connections.
+- When the user asks to run and review, monitor the execution through completion, call `view_output_image`, and inspect the actual generated pixels. Compare the result with the user's requested composition, count, text, geometry, masking, seams, and preservation constraints before saying it worked.
+- For output-quality problems, separate visual defects from workflow/runtime errors. Use execution history for node failures and the output image for artifacts such as distortion, unwanted changes, inpaint seams, bad anatomy, incorrect counts, framing, or unreadable text.
+- If the visual result misses the request, explain the specific mismatch and propose the smallest prompt, mask, parameter, or graph change. Only apply and rerun that change when the user's request and approval settings allow it.
 - Never set a KSampler seed to a negative value.
 - Explain concrete tool failures and take the next safest diagnostic step.
 - If a canvas tool succeeds, the frontend bridge is connected. Do not diagnose a later tool error as a disconnected bridge or tell the user to open the FL-MCP backend port in a browser.
