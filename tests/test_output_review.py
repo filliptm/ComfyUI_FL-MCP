@@ -198,6 +198,8 @@ async def test_edit_node_mask_returns_saved_mask_overlay(tmp_path, monkeypatch):
             "success": True,
             "node_id": 7,
             "image": {"filename": "edited.png", "subfolder": "", "type": "input"},
+            "review_required": True,
+            "review_token": "review-1",
         }
 
     monkeypatch.setattr(mcp_server, "_execute_tool", execute_tool)
@@ -212,4 +214,27 @@ async def test_edit_node_mask_returns_saved_mask_overlay(tmp_path, monkeypatch):
     )
 
     assert result.structured_content["success"] is True
+    assert result.structured_content["review_required"] is True
+    assert result.structured_content["review_token"] == "review-1"
     assert [item.type for item in result.content] == ["text", "image"]
+
+
+@pytest.mark.asyncio
+async def test_confirm_mask_review_forwards_review_token(monkeypatch):
+    async def execute_tool(ctx, tool_name, parameters):
+        del ctx
+        assert tool_name == "confirm_mask_review"
+        assert parameters == {"node_id": 7, "review_token": "review-1"}
+        return {"success": True, "approved": True}
+
+    monkeypatch.setattr(mcp_server, "_execute_tool", execute_tool)
+
+    result = await mcp_server.confirm_mask_review.fn(
+        mcp_server.ConfirmMaskReviewRequest(
+            node_id=7,
+            review_token="review-1",
+        ),
+        fake_context(),
+    )
+
+    assert result == {"success": True, "approved": True}

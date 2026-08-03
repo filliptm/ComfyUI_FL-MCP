@@ -116,6 +116,11 @@ test("image review and mask summaries report the visible outcome", () => {
         name: "view_output_image",
         status: "failed",
     }), "Couldn’t review output image");
+
+    assert.equal(summarizeToolStep({
+        name: "confirm_mask_review",
+        status: "done",
+    }), "Mask approved for workflow");
 });
 
 test("consecutive identical tool calls stack and retain the strongest state", () => {

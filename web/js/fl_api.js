@@ -29,6 +29,8 @@ export class FL_API {
         console.log("[FL_API] Initialized");
         this.sessionId = null;  // Will be set by extension
         this.layoutEngine = null;  // Lazy loaded when auto-layout is used
+        this.pendingMaskReviews = new Map();
+        this.maskReviewAutoQueueState = null;
     }
 
     /**
@@ -678,6 +680,22 @@ export class FL_API {
 
         const editedMask = maskContext.getImageData(0, 0, maskCanvas.width, maskCanvas.height);
         const maskSummary = summarizeMaskPixels(editedMask);
+        const reviewCanvas = document.createElement("canvas");
+        reviewCanvas.width = rgbImage.width;
+        reviewCanvas.height = rgbImage.height;
+        const reviewContext = reviewCanvas.getContext("2d");
+        reviewContext.drawImage(rgbImage, 0, 0);
+        const highlightCanvas = document.createElement("canvas");
+        highlightCanvas.width = rgbImage.width;
+        highlightCanvas.height = rgbImage.height;
+        const highlightContext = highlightCanvas.getContext("2d");
+        highlightContext.fillStyle = "#ff00a8";
+        highlightContext.fillRect(0, 0, highlightCanvas.width, highlightCanvas.height);
+        highlightContext.globalCompositeOperation = "destination-in";
+        highlightContext.drawImage(maskCanvas, 0, 0);
+        reviewContext.globalAlpha = 0.62;
+        reviewContext.drawImage(highlightCanvas, 0, 0);
+        const reviewImage = await this._canvasToImage(reviewCanvas);
         const uploadCanvas = document.createElement("canvas");
         uploadCanvas.width = rgbImage.width;
         uploadCanvas.height = rgbImage.height;
@@ -729,6 +747,18 @@ export class FL_API {
                 node.widgets_values[widgetIndex] = widgetValue;
             }
         }
+        const reviewToken = crypto.randomUUID();
+        if (this.pendingMaskReviews.size === 0) {
+            this.maskReviewAutoQueueState = this._pauseAutoQueueForMaskReview();
+        }
+        this.pendingMaskReviews.set(String(node.id), {
+            token: reviewToken,
+            nodeId: node.id,
+            image,
+        });
+        node.imgs = [reviewImage];
+        app.canvas?.selectNodes?.([node]);
+        app.canvas?.centerOnNode?.(node);
         this._markGraphChanged();
 
         return {
@@ -741,6 +771,36 @@ export class FL_API {
             clear_existing: clearExisting,
             regions: normalizedRegions,
             mask: maskSummary,
+            preview_visible: true,
+            review_required: true,
+            review_token: reviewToken,
+        };
+    }
+
+    confirmMaskReview(nodeId, reviewToken) {
+        const pendingEntry = [...this.pendingMaskReviews.entries()].find(
+            ([, value]) => nodeIdsEqual(value.nodeId, nodeId)
+        );
+        const pending = pendingEntry?.[1];
+        if (!pending) {
+            throw new Error(`There is no edited mask on node ${nodeId} waiting for review`);
+        }
+        if (pending.token !== reviewToken) {
+            throw new Error("This mask review is stale; inspect the latest mask before approving it");
+        }
+        this.pendingMaskReviews.delete(pendingEntry[0]);
+        if (this.pendingMaskReviews.size === 0) {
+            this._restoreAutoQueueAfterMaskReview(this.maskReviewAutoQueueState);
+            this.maskReviewAutoQueueState = null;
+        }
+        this._markCanvasDirty();
+        return {
+            success: true,
+            node_id: pending.nodeId,
+            image: pending.image,
+            review_token: pending.token,
+            approved: true,
+            message: "The user approved this mask for workflow execution.",
         };
     }
 
@@ -1755,6 +1815,13 @@ export class FL_API {
      */
     async queueWorkflow(batchCount = null) {
         try {
+            if (this.pendingMaskReviews.size > 0) {
+                const pending = this.pendingMaskReviews.values().next().value;
+                throw new Error(
+                    `Mask review required for node ${pending.nodeId}. `
+                    + "Ask the user to approve the visible magenta mask before queueing."
+                );
+            }
             const queueSettings = this._getQueueSettings();
             if (batchCount !== null) {
                 this.setBatchCount(batchCount);
@@ -2058,6 +2125,50 @@ export class FL_API {
                 else reject(new Error("Failed to encode mask image"));
             }, "image/png");
         });
+    }
+
+    async _canvasToImage(canvas) {
+        const blob = await this._canvasToBlob(canvas);
+        const url = URL.createObjectURL(blob);
+        try {
+            const image = new Image();
+            image.src = url;
+            if (typeof image.decode === "function") {
+                await image.decode();
+            } else {
+                await new Promise((resolve, reject) => {
+                    image.onload = resolve;
+                    image.onerror = () => reject(new Error("Failed to load mask review preview"));
+                });
+            }
+            return image;
+        } finally {
+            URL.revokeObjectURL(url);
+        }
+    }
+
+    _pauseAutoQueueForMaskReview() {
+        const queueSettings = this._getQueueSettings();
+        if (queueSettings) {
+            const state = { kind: "queueSettings", mode: queueSettings.mode };
+            queueSettings.mode = "disabled";
+            return state;
+        }
+        if (app.ui && "autoQueueEnabled" in app.ui) {
+            const state = { kind: "legacy", enabled: Boolean(app.ui.autoQueueEnabled) };
+            app.ui.autoQueueEnabled = false;
+            return state;
+        }
+        return null;
+    }
+
+    _restoreAutoQueueAfterMaskReview(state) {
+        if (state?.kind === "queueSettings") {
+            const queueSettings = this._getQueueSettings();
+            if (queueSettings) queueSettings.mode = state.mode;
+        } else if (state?.kind === "legacy" && app.ui) {
+            app.ui.autoQueueEnabled = state.enabled;
+        }
     }
 
     _setWidgetValue(node, widget, value) {
