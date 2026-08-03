@@ -1356,7 +1356,7 @@ async def workflow_duplicate_current(request: GetSystemInfoRequest, ctx: Context
 @mcp.tool()
 async def find_node(request: FindNodeRequest, ctx: Context) -> Dict[str, Any]:
     """Find a node by ID, type, or title."""
-    return await _execute_tool(ctx, "find_node", request.model_dump())
+    return await _execute_tool(ctx, "find_node", request.model_dump(exclude_none=True))
 
 
 @mcp.tool()
@@ -2309,11 +2309,24 @@ async def mcp_capability_audit(request: GetSystemInfoRequest, ctx: Context) -> D
     audit: Dict[str, Any] = {}
 
     client = ctx.request_context.lifespan_context.get('client')
+    bridge_available = False
+    bridge_reason = None
+    if client:
+        try:
+            # Probe a read-only frontend command so the audit both reconnects a
+            # stale MCP socket and confirms that the browser canvas is present.
+            await client.execute_tool("frontend_list_commands", {}, timeout_ms=5000)
+            bridge_available = True
+        except Exception as exc:
+            bridge_reason = str(exc)
+    else:
+        bridge_reason = "MCP WebSocket client is not initialized"
+
     audit["bridge"] = {
-        "available": bool(client and client.connected),
+        "available": bridge_available,
         "session_id": getattr(client, "session_id", None) if client else None,
-        "state": "available" if client and client.connected else "blocked",
-        "reason": None if client and client.connected else "No connected MCP WebSocket client/frontend bridge",
+        "state": "available" if bridge_available else "blocked",
+        "reason": bridge_reason,
     }
 
     system_stats = await _comfy_request("GET", "/system_stats")

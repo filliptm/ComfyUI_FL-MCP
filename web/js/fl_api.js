@@ -14,6 +14,7 @@ import {
     findNonOverlappingPosition,
     getGraphInsertionOrigin,
 } from "./node_placement.js";
+import { nodeIdsEqual } from "./node_identity.js";
 
 /**
  * FL_API class - Wrapper for workflow manipulation functions
@@ -1910,23 +1911,7 @@ export class FL_API {
      * @private
      */
     _findNode(query) {
-        if (typeof query === "object" && query.id !== undefined) {
-            return query;  // Already a node object
-        }
-
-        if (typeof query === "number") {
-            // Find by ID
-            return app.graph._nodes.find(n => n.id === query) || null;
-        }
-
-        if (typeof query === "string") {
-            // Try as title first, then type
-            return app.graph._nodes.find(n => n.title === query) ||
-                   app.graph._nodes.find(n => n.type === query || n.comfyClass === query) ||
-                   null;
-        }
-
-        return null;
+        return this._find(query);
     }
 
     /**
@@ -1940,11 +1925,12 @@ export class FL_API {
         }
 
         if (typeof query === "number") {
-            return app.graph._nodes.find(n => n.id === query) || null;
+            return app.graph._nodes.find(n => nodeIdsEqual(n.id, query)) || null;
         }
 
         if (typeof query === "string") {
-            return app.graph._nodes.find(n => n.title === query) ||
+            return app.graph._nodes.find(n => nodeIdsEqual(n.id, query)) ||
+                   app.graph._nodes.find(n => n.title === query) ||
                    app.graph._nodes.find(n => n.type === query || n.comfyClass === query) ||
                    null;
         }
@@ -1965,12 +1951,16 @@ export class FL_API {
 
         if (typeof query === "number") {
             for (let i = nodes.length - 1; i >= 0; i--) {
-                if (nodes[i].id === query) return nodes[i];
+                if (nodeIdsEqual(nodes[i].id, query)) return nodes[i];
             }
             return null;
         }
 
         if (typeof query === "string") {
+            // Try ID first so serialized string IDs remain addressable.
+            for (let i = nodes.length - 1; i >= 0; i--) {
+                if (nodeIdsEqual(nodes[i].id, query)) return nodes[i];
+            }
             // Try title first
             for (let i = nodes.length - 1; i >= 0; i--) {
                 if (nodes[i].title === query) return nodes[i];
