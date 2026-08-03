@@ -617,8 +617,9 @@ async def test_codex_subscription_streams_ren_tools_and_persists_thread(
             self.codex = codex
             self.id = thread_id
 
-        async def turn(self, input_text, **_kwargs):
+        async def turn(self, input_text, **kwargs):
             assert input_text == "Inspect the open workflow."
+            assert kwargs["effort"] == "high"
             return FakeTurn()
 
     class FakeSyncClient:
@@ -674,6 +675,7 @@ async def test_codex_subscription_streams_ren_tools_and_persists_thread(
         {
             "provider": "codex_subscription",
             "model": "gpt-5.6-sol",
+            "reasoning_effort": "high",
             "temperature": 0.2,
         },
     )

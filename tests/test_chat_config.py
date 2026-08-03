@@ -23,6 +23,17 @@ def test_settings_reject_secret_fields(tmp_path):
         store.update({"api_key": "secret"})
 
 
+def test_reasoning_effort_persists_and_validates(tmp_path):
+    store = ChatSettingsStore(tmp_path / "settings.json")
+
+    assert store.load()["reasoning_effort"] == "default"
+    assert store.update({"reasoning_effort": "xhigh"})["reasoning_effort"] == "xhigh"
+    assert store.load()["reasoning_effort"] == "xhigh"
+
+    with pytest.raises(ValueError, match="reasoning effort"):
+        store.update({"reasoning_effort": "unlimited"})
+
+
 def test_approval_preferences_persist_and_validate(tmp_path):
     store = ChatSettingsStore(tmp_path / "settings.json")
     value = store.update({

@@ -363,11 +363,14 @@ class ChatRuntime:
         session_id: str,
         conversation_id: str | None,
         message: str,
+        reasoning_effort: str = "default",
     ) -> ActiveRun:
         text = message.strip()
         if not text:
             raise ValueError("Message cannot be empty.")
         settings = chat_settings.load()
+        if reasoning_effort != "default":
+            settings["reasoning_effort"] = reasoning_effort
         if not settings["model"]:
             raise ValueError("Choose a model before sending a message.")
         identifier = conversation_id or str(uuid.uuid4())
@@ -691,11 +694,17 @@ class ChatRuntime:
                 process_tool_call=process_tool_call,
                 read_timeout=300,
             )
+            model_settings: dict[str, Any] = {
+                "temperature": settings["temperature"],
+            }
+            reasoning_effort = settings.get("reasoning_effort", "default")
+            if reasoning_effort != "default":
+                model_settings["openai_reasoning_effort"] = reasoning_effort
             agent = Agent(
                 model,
                 instructions=prompt,
                 toolsets=[mcp_server],
-                model_settings={"temperature": settings["temperature"]},
+                model_settings=model_settings,
                 prepare_tools=prepare_tools,
             )
             messages = [
@@ -938,6 +947,11 @@ class ChatRuntime:
             "setting_sources": [],
             "skills": [],
         }
+        reasoning_effort = settings.get("reasoning_effort", "default")
+        if reasoning_effort != "default":
+            if reasoning_effort == "ultra":
+                raise ValueError("Claude does not support Ultra reasoning.")
+            option_values["effort"] = reasoning_effort
         if claude_session_id:
             option_values["resume"] = claude_session_id
         else:
@@ -1437,6 +1451,11 @@ class ChatRuntime:
 
             turn = await thread.turn(
                 latest_user_message,
+                effort=(
+                    None
+                    if settings.get("reasoning_effort", "default") == "default"
+                    else settings["reasoning_effort"]
+                ),
                 model=settings["model"],
                 sandbox=None,
             )
