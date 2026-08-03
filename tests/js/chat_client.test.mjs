@@ -50,7 +50,56 @@ test("run requests include the per-message reasoning level", async () => {
     }
 
     assert.equal(request.url, "http://127.0.0.1:18000/api/chat/runs");
-    assert.equal(JSON.parse(request.options.body).reasoningEffort, "xhigh");
+    assert.deepEqual(JSON.parse(request.options.body), {
+        sessionId: "session-1",
+        conversationId: null,
+        message: "Inspect this workflow",
+        reasoningEffort: "xhigh",
+        editMessageId: null,
+    });
+});
+
+
+test("edited requests and version navigation use branch-aware endpoints", async () => {
+    const originalFetch = globalThis.fetch;
+    const requests = [];
+    globalThis.fetch = async (url, options = {}) => {
+        requests.push({ url: String(url), options });
+        if (String(url).endsWith("/api/chat/runs")) {
+            return new Response("", {
+                status: 200,
+                headers: {
+                    "X-FL-MCP-Run-Id": "run-1",
+                    "X-FL-MCP-Conversation-Id": "conversation-1",
+                },
+            });
+        }
+        return new Response(JSON.stringify({ messages: [] }), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+        });
+    };
+    try {
+        const client = new ChatClient("http://127.0.0.1:18000");
+        await client.startRun({
+            sessionId: "session-1",
+            conversationId: "conversation 1",
+            message: "Revised request",
+            editMessageId: "message 1",
+        });
+        await client.selectMessageVersion("conversation 1", "message 1", -1);
+    } finally {
+        globalThis.fetch = originalFetch;
+    }
+
+    assert.equal(JSON.parse(requests[0].options.body).editMessageId, "message 1");
+    assert.equal(
+        requests[1].url,
+        "http://127.0.0.1:18000/api/chat/conversations/conversation%201"
+        + "/messages/message%201/version",
+    );
+    assert.equal(requests[1].options.method, "POST");
+    assert.deepEqual(JSON.parse(requests[1].options.body), { direction: -1 });
 });
 
 

@@ -274,6 +274,29 @@ test("smart follow, accessible approvals, and structured recovery are explicit",
 });
 
 
+test("sent requests can be edited, resent, and browsed by version", async () => {
+    const panel = await readFile(new URL("web/js/chat_panel.js", root), "utf8");
+    const client = await readFile(new URL("web/js/chat_client.js", root), "utf8");
+    const styles = await readFile(new URL("web/js/style.css", root), "utf8");
+
+    for (const action of [
+        "edit-message",
+        "resend-message",
+        "previous-message-version",
+        "next-message-version",
+    ]) {
+        assert.match(panel, new RegExp(`data\\.action = action|\"${action}\"`));
+    }
+    assert.match(panel, /Send edited request/);
+    assert.match(panel, /editMessageId/);
+    assert.match(panel, /selectMessageVersion/);
+    assert.match(client, /messages\/\$\{encodeURIComponent\(messageId\)\}\/version/);
+    assert.match(styles, /\.fl-message-actions/);
+    assert.match(styles, /\.fl-message-edit-form/);
+    assert.match(styles, /\.fl-message-versions/);
+});
+
+
 test("Claude subscription setup stays separate from API key providers", async () => {
     const panel = await readFile(new URL("web/js/chat_panel.js", root), "utf8");
     const client = await readFile(new URL("web/js/chat_client.js", root), "utf8");

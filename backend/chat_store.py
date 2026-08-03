@@ -61,11 +61,15 @@ class ChatStore:
                     model TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
-                    archived_at TEXT
+                    archived_at TEXT,
+                    active_leaf_message_id TEXT
                 );
                 CREATE TABLE IF NOT EXISTS messages (
                     id TEXT PRIMARY KEY,
                     conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+                    parent_message_id TEXT,
+                    revision_root_id TEXT,
+                    revision_index INTEGER NOT NULL DEFAULT 1,
                     role TEXT NOT NULL,
                     content TEXT NOT NULL,
                     status TEXT NOT NULL,
@@ -108,6 +112,79 @@ class ChatStore:
                 CREATE INDEX IF NOT EXISTS idx_messages_conversation
                     ON messages(conversation_id, created_at);
                 """
+            )
+            self._ensure_column(
+                connection,
+                "conversations",
+                "active_leaf_message_id",
+                "TEXT",
+            )
+            self._ensure_column(connection, "messages", "parent_message_id", "TEXT")
+            self._ensure_column(connection, "messages", "revision_root_id", "TEXT")
+            self._ensure_column(
+                connection,
+                "messages",
+                "revision_index",
+                "INTEGER NOT NULL DEFAULT 1",
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_messages_revision
+                ON messages(conversation_id, revision_root_id, revision_index)
+                """
+            )
+            self._migrate_linear_message_history(connection)
+
+    @staticmethod
+    def _ensure_column(
+        connection: sqlite3.Connection,
+        table: str,
+        column: str,
+        definition: str,
+    ) -> None:
+        columns = {
+            str(row["name"])
+            for row in connection.execute(f"PRAGMA table_info({table})").fetchall()
+        }
+        if column not in columns:
+            connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+    @staticmethod
+    def _migrate_linear_message_history(connection: sqlite3.Connection) -> None:
+        conversations = connection.execute(
+            """
+            SELECT id FROM conversations
+            WHERE active_leaf_message_id IS NULL
+              AND EXISTS (
+                  SELECT 1 FROM messages WHERE conversation_id = conversations.id
+              )
+            """
+        ).fetchall()
+        for conversation in conversations:
+            previous_id = None
+            rows = connection.execute(
+                """
+                SELECT id, parent_message_id, revision_root_id
+                FROM messages WHERE conversation_id = ?
+                ORDER BY created_at ASC, rowid ASC
+                """,
+                (conversation["id"],),
+            ).fetchall()
+            for row in rows:
+                parent_id = row["parent_message_id"] or previous_id
+                revision_root_id = row["revision_root_id"] or row["id"]
+                connection.execute(
+                    """
+                    UPDATE messages
+                    SET parent_message_id = ?, revision_root_id = ?, revision_index = 1
+                    WHERE id = ?
+                    """,
+                    (parent_id, revision_root_id, row["id"]),
+                )
+                previous_id = row["id"]
+            connection.execute(
+                "UPDATE conversations SET active_leaf_message_id = ? WHERE id = ?",
+                (previous_id, conversation["id"]),
             )
 
     def create_conversation(
@@ -219,20 +296,36 @@ class ChatStore:
         metadata: Optional[Dict[str, Any]] = None,
         message_id: Optional[str] = None,
         created_at: Optional[str] = None,
+        parent_message_id: Optional[str] = None,
+        revision_root_id: Optional[str] = None,
+        revision_index: int = 1,
+        branch_from_active: bool = True,
     ) -> Dict[str, Any]:
         identifier = message_id or str(uuid.uuid4())
         now = created_at or utc_now()
         with self._lock, self._connect() as connection:
+            if branch_from_active:
+                conversation = connection.execute(
+                    "SELECT active_leaf_message_id FROM conversations WHERE id = ?",
+                    (conversation_id,),
+                ).fetchone()
+                if conversation:
+                    parent_message_id = conversation["active_leaf_message_id"]
+            revision_root_id = revision_root_id or identifier
             connection.execute(
                 """
                 INSERT OR IGNORE INTO messages
-                    (id, conversation_id, role, content, status, provider, model,
+                    (id, conversation_id, parent_message_id, revision_root_id,
+                     revision_index, role, content, status, provider, model,
                      serialized_json, metadata_json, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     identifier,
                     conversation_id,
+                    parent_message_id,
+                    revision_root_id,
+                    revision_index,
                     role,
                     content,
                     status,
@@ -244,8 +337,12 @@ class ChatStore:
                 ),
             )
             connection.execute(
-                "UPDATE conversations SET updated_at = ? WHERE id = ?",
-                (now, conversation_id),
+                """
+                UPDATE conversations
+                SET updated_at = ?, active_leaf_message_id = ?
+                WHERE id = ?
+                """,
+                (now, identifier, conversation_id),
             )
         return {
             "id": identifier,
@@ -257,33 +354,172 @@ class ChatStore:
             "model": model,
             "createdAt": now,
             "metadata": metadata or {},
+            "parentMessageId": parent_message_id,
+            "revision": {
+                "rootId": revision_root_id,
+                "index": revision_index,
+                "count": revision_index,
+            },
         }
 
     def list_messages(self, conversation_id: str, limit: int = 500) -> List[Dict[str, Any]]:
         with self._lock, self._connect() as connection:
+            conversation = connection.execute(
+                "SELECT active_leaf_message_id FROM conversations WHERE id = ?",
+                (conversation_id,),
+            ).fetchone()
+            if not conversation or not conversation["active_leaf_message_id"]:
+                return []
             rows = connection.execute(
                 """
-                SELECT * FROM messages WHERE conversation_id = ?
-                ORDER BY created_at ASC LIMIT ?
+                WITH RECURSIVE active_path AS (
+                    SELECT messages.*, 0 AS path_depth
+                    FROM messages WHERE id = ? AND conversation_id = ?
+                    UNION ALL
+                    SELECT parent.*, active_path.path_depth + 1
+                    FROM messages AS parent
+                    JOIN active_path ON active_path.parent_message_id = parent.id
+                )
+                SELECT * FROM active_path
+                ORDER BY path_depth DESC LIMIT ?
                 """,
-                (conversation_id, max(1, min(int(limit), 2000))),
+                (
+                    conversation["active_leaf_message_id"],
+                    conversation_id,
+                    max(1, min(int(limit), 2000)),
+                ),
             ).fetchall()
-        return [self._message(row) for row in rows]
+            roots = {
+                str(row["revision_root_id"])
+                for row in rows
+                if row["role"] == "user" and row["revision_root_id"]
+            }
+            counts = {}
+            for root_id in roots:
+                count_row = connection.execute(
+                    """
+                    SELECT COUNT(*) AS count FROM messages
+                    WHERE conversation_id = ? AND revision_root_id = ?
+                          AND role = 'user'
+                    """,
+                    (conversation_id, root_id),
+                ).fetchone()
+                counts[root_id] = int(count_row["count"])
+        return [
+            self._message(
+                row,
+                revision_count=counts.get(str(row["revision_root_id"]), 1),
+            )
+            for row in rows
+        ]
 
-    def serialized_history(self, conversation_id: str) -> Optional[bytes]:
+    def get_message(self, message_id: str) -> Optional[Dict[str, Any]]:
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM messages WHERE id = ?",
+                (message_id,),
+            ).fetchone()
+            if not row:
+                return None
+            count_row = connection.execute(
+                """
+                SELECT COUNT(*) AS count FROM messages
+                WHERE conversation_id = ? AND revision_root_id = ?
+                      AND role = 'user'
+                """,
+                (row["conversation_id"], row["revision_root_id"]),
+            ).fetchone()
+        return self._message(row, revision_count=int(count_row["count"] or 1))
+
+    def next_revision_index(self, conversation_id: str, revision_root_id: str) -> int:
         with self._lock, self._connect() as connection:
             row = connection.execute(
                 """
+                SELECT COALESCE(MAX(revision_index), 0) + 1 AS next_index
+                FROM messages
+                WHERE conversation_id = ? AND revision_root_id = ?
+                      AND role = 'user'
+                """,
+                (conversation_id, revision_root_id),
+            ).fetchone()
+        return int(row["next_index"])
+
+    def select_message_version(
+        self,
+        conversation_id: str,
+        message_id: str,
+        direction: int,
+    ) -> List[Dict[str, Any]]:
+        if direction not in {-1, 1}:
+            raise ValueError("Version direction must be -1 or 1.")
+        with self._lock, self._connect() as connection:
+            current = connection.execute(
+                """
+                SELECT * FROM messages
+                WHERE id = ? AND conversation_id = ? AND role = 'user'
+                """,
+                (message_id, conversation_id),
+            ).fetchone()
+            if not current:
+                raise ValueError("User message not found.")
+            target = connection.execute(
+                """
+                SELECT * FROM messages
+                WHERE conversation_id = ? AND revision_root_id = ?
+                      AND role = 'user' AND revision_index = ?
+                """,
+                (
+                    conversation_id,
+                    current["revision_root_id"],
+                    int(current["revision_index"]) + direction,
+                ),
+            ).fetchone()
+            if not target:
+                raise ValueError("No message version in that direction.")
+            leaf = connection.execute(
+                """
+                WITH RECURSIVE branch AS (
+                    SELECT id, created_at FROM messages WHERE id = ?
+                    UNION ALL
+                    SELECT child.id, child.created_at
+                    FROM messages AS child
+                    JOIN branch ON child.parent_message_id = branch.id
+                )
+                SELECT branch.id FROM branch
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM messages AS child
+                    WHERE child.parent_message_id = branch.id
+                )
+                ORDER BY branch.created_at DESC LIMIT 1
+                """,
+                (target["id"],),
+            ).fetchone()
+            connection.execute(
+                """
+                UPDATE conversations
+                SET active_leaf_message_id = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (leaf["id"], utc_now(), conversation_id),
+            )
+        return self.list_messages(conversation_id)
+
+    def serialized_history(self, conversation_id: str) -> Optional[bytes]:
+        message_ids = [item["id"] for item in self.list_messages(conversation_id)]
+        if not message_ids:
+            return None
+        placeholders = ",".join("?" for _ in message_ids)
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                f"""
                 SELECT serialized_json FROM messages
-                WHERE conversation_id = ? AND role = 'assistant'
+                WHERE id IN ({placeholders}) AND role = 'assistant'
                       AND serialized_json IS NOT NULL
                 ORDER BY created_at DESC LIMIT 1
                 """,
-                (conversation_id,),
+                message_ids,
             ).fetchone()
-        if not row:
-            return None
-        return str(row["serialized_json"]).encode("utf-8")
+        return str(row["serialized_json"]).encode("utf-8") if row else None
 
     def create_run(self, run_id: str, conversation_id: str) -> None:
         with self._lock, self._connect() as connection:
@@ -401,6 +637,7 @@ class ChatStore:
                     "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
                     (marker, result),
                 )
+                self._migrate_linear_message_history(destination)
             finally:
                 source.close()
         return imported
@@ -418,7 +655,12 @@ class ChatStore:
         }
 
     @staticmethod
-    def _message(row: sqlite3.Row) -> Dict[str, Any]:
+    def _message(
+        row: sqlite3.Row,
+        *,
+        revision_count: int = 1,
+    ) -> Dict[str, Any]:
+        revision_root_id = row["revision_root_id"] or row["id"]
         return {
             "id": row["id"],
             "conversationId": row["conversation_id"],
@@ -429,6 +671,12 @@ class ChatStore:
             "model": row["model"],
             "createdAt": row["created_at"],
             "metadata": _loads(row["metadata_json"], {}),
+            "parentMessageId": row["parent_message_id"],
+            "revision": {
+                "rootId": revision_root_id,
+                "index": int(row["revision_index"] or 1),
+                "count": max(1, int(revision_count)),
+            },
         }
 
 

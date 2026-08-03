@@ -53,6 +53,115 @@ def test_conversation_list_rejects_unknown_view(tmp_path):
         raise AssertionError("Unknown conversation view should be rejected")
 
 
+def test_message_edits_create_navigable_request_response_versions(tmp_path):
+    store = ChatStore(tmp_path / "chat.db", tmp_path / "missing.db")
+    conversation = store.create_conversation()
+    first = store.append_message(conversation["id"], "user", "first request")
+    store.append_message(conversation["id"], "assistant", "first response")
+    store.append_message(conversation["id"], "user", "follow up")
+    store.append_message(conversation["id"], "assistant", "follow-up response")
+
+    revision = store.append_message(
+        conversation["id"],
+        "user",
+        "edited request",
+        parent_message_id=first["parentMessageId"],
+        revision_root_id=first["revision"]["rootId"],
+        revision_index=store.next_revision_index(
+            conversation["id"],
+            first["revision"]["rootId"],
+        ),
+        branch_from_active=False,
+    )
+    store.append_message(
+        conversation["id"],
+        "assistant",
+        "edited response",
+        parent_message_id=revision["id"],
+        branch_from_active=False,
+    )
+
+    edited_branch = store.list_messages(conversation["id"])
+    assert [item["content"] for item in edited_branch] == [
+        "edited request",
+        "edited response",
+    ]
+    assert edited_branch[0]["revision"] == {
+        "rootId": first["id"],
+        "index": 2,
+        "count": 2,
+    }
+
+    original_branch = store.select_message_version(
+        conversation["id"],
+        revision["id"],
+        -1,
+    )
+    assert [item["content"] for item in original_branch] == [
+        "first request",
+        "first response",
+        "follow up",
+        "follow-up response",
+    ]
+    assert original_branch[0]["revision"]["index"] == 1
+    assert original_branch[0]["revision"]["count"] == 2
+
+    restored_edit = store.select_message_version(
+        conversation["id"],
+        first["id"],
+        1,
+    )
+    assert [item["content"] for item in restored_edit] == [
+        "edited request",
+        "edited response",
+    ]
+
+
+def test_existing_linear_history_migrates_to_active_branch(tmp_path):
+    database = tmp_path / "chat.db"
+    with sqlite3.connect(database) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE conversations (
+                id TEXT PRIMARY KEY, title TEXT NOT NULL, provider TEXT,
+                model TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                archived_at TEXT
+            );
+            CREATE TABLE messages (
+                id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL,
+                role TEXT NOT NULL, content TEXT NOT NULL, status TEXT NOT NULL,
+                provider TEXT, model TEXT, serialized_json TEXT,
+                metadata_json TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL
+            );
+            INSERT INTO conversations VALUES (
+                'c1', 'Existing chat', 'ollama', 'qwen',
+                '2026-01-01', '2026-01-01', NULL
+            );
+            INSERT INTO messages VALUES (
+                'm1', 'c1', 'user', 'before upgrade', 'complete',
+                NULL, NULL, NULL, '{}', '2026-01-01T00:00:00Z'
+            );
+            INSERT INTO messages VALUES (
+                'm2', 'c1', 'assistant', 'still here', 'complete',
+                NULL, NULL, NULL, '{}', '2026-01-01T00:00:01Z'
+            );
+            """
+        )
+
+    store = ChatStore(database, tmp_path / "missing.db")
+    assert [item["content"] for item in store.list_messages("c1")] == [
+        "before upgrade",
+        "still here",
+    ]
+    added = store.append_message("c1", "user", "after upgrade")
+    assert added["parentMessageId"] == "m2"
+    assert [item["content"] for item in store.list_messages("c1")] == [
+        "before upgrade",
+        "still here",
+        "after upgrade",
+    ]
+
+
 def test_legacy_import_is_idempotent_and_drops_sensitive_session_data(tmp_path):
     legacy = tmp_path / "ren.db"
     with sqlite3.connect(legacy) as connection:
