@@ -227,7 +227,15 @@ export function summarizeToolStep(step, config = {}) {
     if (name === "focus_on_nodes") return "Focused canvas";
     if (name === "modify_layout") return "Updated workflow layout";
     if (name === "get_layout") return "Inspected workflow layout";
-    if (name === "queue_workflow") return "Queued workflow";
+    if (name === "queue_workflow") {
+        const outcomes = {
+            completed: "Completed workflow",
+            execution_error: "Workflow execution failed",
+            cancelled: "Workflow execution cancelled",
+            timeout: "Workflow wait timed out",
+        };
+        return outcomes[result?.status] || "Queued workflow";
+    }
     if (name === "take_screenshot") return "Captured canvas";
     if (name === "query_workflow") return "Searched workflow";
     if (name === "workflow_get_current_json") return "Read workflow JSON";

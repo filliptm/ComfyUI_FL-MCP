@@ -30,6 +30,11 @@ logger = logging.getLogger(__name__)
 PROMPT_PATH = Path(__file__).with_name("chat_prompt.md")
 MANDATORY_REVIEW_TOOLS = {"confirm_mask_review"}
 
+
+def mcp_tool_timeout_seconds() -> int:
+    return max(300, bridge_settings.generation_completion_timeout + 30)
+
+
 CORE_CHAT_TOOLS = {
     "workflow_overview",
     "workflow_get_current_json",
@@ -775,7 +780,7 @@ class ChatRuntime:
                 cwd=PROJECT_ROOT,
                 env=environment,
                 process_tool_call=process_tool_call,
-                read_timeout=300,
+                read_timeout=mcp_tool_timeout_seconds(),
             )
             agent = Agent(
                 model,
@@ -914,6 +919,7 @@ class ChatRuntime:
             "FL_MCP_WS_URL": self._ws_url(),
             "FL_MCP_CLIENT_ID": f"embedded-claude-{state.run_id}",
             "FL_MCP_ALLOWED_TOOLS": ",".join(sorted(allowed_tools)),
+            "MCP_TOOL_TIMEOUT": str(mcp_tool_timeout_seconds() * 1000),
             "CLAUDE_AGENT_SDK_CLIENT_APP": "comfyui-fl-mcp/ren",
             # A configured Anthropic API key otherwise takes precedence over
             # the user's Claude Code subscription in non-interactive mode.
@@ -1285,7 +1291,7 @@ class ChatRuntime:
             "env": mcp_environment,
             "required": True,
             "startup_timeout_sec": 15,
-            "tool_timeout_sec": 300,
+            "tool_timeout_sec": mcp_tool_timeout_seconds(),
             "enabled_tools": sorted(allowed_tools),
             "default_tools_approval_mode": "approve",
             "tools": {

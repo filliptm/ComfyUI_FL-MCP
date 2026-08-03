@@ -464,6 +464,178 @@ async def _comfy_request(
     }
 
 
+def _history_completion_result(
+    prompt_id: str,
+    history_entry: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    status = history_entry.get("status") or {}
+    status_str = status.get("status_str")
+    messages = status.get("messages") or []
+    interrupted = any(
+        isinstance(message, (list, tuple))
+        and len(message) >= 1
+        and message[0] == "execution_interrupted"
+        for message in messages
+    )
+
+    if interrupted:
+        return {
+            "success": False,
+            "status": "cancelled",
+            "completed": False,
+            "terminal": True,
+            "error": "Workflow execution was cancelled.",
+            "prompt_id": prompt_id,
+        }
+
+    if status_str == "success":
+        return {
+            "success": True,
+            "status": "completed",
+            "completed": True,
+            "terminal": True,
+            "outputs": history_entry.get("outputs", {}),
+            "prompt_id": prompt_id,
+        }
+
+    if status_str == "error":
+        errors = []
+        for message in messages:
+            if (
+                not isinstance(message, (list, tuple))
+                or len(message) < 2
+                or message[0] != "execution_error"
+                or not isinstance(message[1], dict)
+            ):
+                continue
+            data = message[1]
+            errors.append({
+                "node_id": data.get("node_id"),
+                "node_type": data.get("node_type"),
+                "exception_type": data.get("exception_type"),
+                "exception_message": data.get("exception_message"),
+            })
+        return {
+            "success": False,
+            "status": "execution_error",
+            "completed": False,
+            "terminal": True,
+            "error": "Workflow execution failed.",
+            "errors": errors,
+            "prompt_id": prompt_id,
+        }
+
+    return None
+
+
+def _queue_contains_prompt(queue_data: Any, prompt_id: str) -> bool:
+    if not isinstance(queue_data, dict):
+        return False
+    for key in ("queue_running", "queue_pending"):
+        for item in queue_data.get(key, []):
+            if isinstance(item, dict):
+                item_prompt_id = item.get("prompt_id")
+            elif isinstance(item, (list, tuple)) and len(item) > 1:
+                item_prompt_id = item[1]
+            else:
+                continue
+            if str(item_prompt_id) == prompt_id:
+                return True
+    return False
+
+
+async def _read_history_completion(
+    prompt_id: str,
+    timeout: float,
+) -> Optional[Dict[str, Any]]:
+    response = await _comfy_request(
+        "GET",
+        f"/history/{quote(prompt_id, safe='')}",
+        timeout=timeout,
+    )
+    if not response["success"] or not isinstance(response["data"], dict):
+        return None
+    history_entry = response["data"].get(prompt_id)
+    if not isinstance(history_entry, dict):
+        return None
+    return _history_completion_result(prompt_id, history_entry)
+
+
+async def _wait_for_generation_completion(
+    prompt_id: str,
+    timeout_seconds: int,
+    poll_interval: float = 1.0,
+) -> Dict[str, Any]:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_seconds
+    observed_in_queue = False
+
+    while True:
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            return {
+                "success": False,
+                "status": "timeout",
+                "completed": False,
+                "terminal": False,
+                "error": (
+                    f"Timed out after {timeout_seconds} seconds while waiting for "
+                    "workflow completion. The workflow may still be running."
+                ),
+                "prompt_id": prompt_id,
+            }
+        request_timeout = max(
+            0.1,
+            min(float(settings.comfyui_api_timeout), 5.0, remaining),
+        )
+        try:
+            outcome = await _read_history_completion(prompt_id, request_timeout)
+            if outcome is not None:
+                return outcome
+
+            queue_response = await _comfy_request(
+                "GET",
+                "/queue",
+                timeout=request_timeout,
+            )
+            if queue_response["success"]:
+                in_queue = _queue_contains_prompt(queue_response["data"], prompt_id)
+                if in_queue:
+                    observed_in_queue = True
+                elif observed_in_queue:
+                    outcome = await _read_history_completion(
+                        prompt_id,
+                        request_timeout,
+                    )
+                    if outcome is not None:
+                        return outcome
+                    return {
+                        "success": False,
+                        "status": "cancelled",
+                        "completed": False,
+                        "terminal": True,
+                        "error": "Workflow left the queue before execution completed.",
+                        "prompt_id": prompt_id,
+                    }
+        except httpx.HTTPError as exc:
+            logger.debug(f"Could not poll ComfyUI generation {prompt_id}: {exc}")
+
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            return {
+                "success": False,
+                "status": "timeout",
+                "completed": False,
+                "terminal": False,
+                "error": (
+                    f"Timed out after {timeout_seconds} seconds while waiting for "
+                    "workflow completion. The workflow may still be running."
+                ),
+                "prompt_id": prompt_id,
+            }
+        await asyncio.sleep(min(poll_interval, remaining))
+
+
 def _resolve_comfy_file(path: str) -> str:
     tools = get_comfy_tools()
     return str(tools._validate_path(path))
@@ -817,8 +989,16 @@ class MoveNodeBottomRequest(BaseModel):
 # Workflow Control
 class QueueWorkflowRequest(BaseModel):
     """Request to queue workflow for execution."""
-    # batch_count: Optional[int] = Field(None, description="Number of times to execute (default: current batch count)")
-    pass
+    wait_for_completion: Optional[bool] = Field(
+        None,
+        description="Override the saved generation waiting behavior for this call",
+    )
+    completion_timeout: Optional[int] = Field(
+        None,
+        ge=1,
+        le=3600,
+        description="Maximum seconds to wait when completion waiting is enabled",
+    )
 
 class CancelWorkflowRequest(BaseModel):
     """Request to cancel workflow execution."""
@@ -1970,51 +2150,24 @@ async def modify_layout(request: BatchLayoutRequest, ctx: Context) -> List[Dict[
 @mcp.tool()
 async def queue_workflow(request: QueueWorkflowRequest, ctx: Context) -> Dict[str, Any]:
     """Queue the workflow for execution.
-    
-    Before calling this tool, call `workflow_overview` to double check for 
-    disconnected nodes and any missing slot connections.
-    
-    This tool verifies that the workflow actually made it into ComfyUI's queue
-    and provides detailed feedback on any validation errors or queue failures.
-    
-    Returns:
-        Success case:
-        {
-            "success": True,
-            "prompt_id": str,
-            "queue_number": int,
-            "batch_count": int,
-            "status": "queued" | "running",
-            "message": str
-        }
-        
-        Validation error case:
-        {
-            "success": False,
-            "error": "Workflow validation failed",
-            "node_errors": {...},
-            "suggestion": str
-        }
-        
-        Queue failure case:
-        {
-            "success": False,
-            "error": str,
-            "prompt_id": str,
-            "suggestion": str
-        }
+
+    Before calling this tool, call `workflow_overview` to check for disconnected
+    nodes and missing slot connections. When completion waiting is enabled, this
+    one tool call remains open and returns completed, execution_error, cancelled,
+    or timeout without requiring model-driven status calls.
     """
-    # Queue the workflow via frontend
-    r = await _execute_tool(ctx, "queue_workflow", request.model_dump())
+    frontend_parameters = request.model_dump(
+        exclude={"wait_for_completion", "completion_timeout"},
+        exclude_none=True,
+    )
+    r = await _execute_tool(ctx, "queue_workflow", frontend_parameters)
     logger.debug(f"Queue result: {r}")
-    
-    # Extract queue information from frontend response
-    prompt_id = r.get('prompt_id')
-    node_errors = r.get('node_errors', {})
-    queue_number = r.get('queue_number')
-    batch_count = r.get('batch_count')
-    
-    # Check for node validation errors first
+
+    prompt_id = r.get("prompt_id")
+    node_errors = r.get("node_errors", {})
+    queue_number = r.get("queue_number")
+    batch_count = r.get("batch_count")
+
     if node_errors:
         logger.warning(f"Workflow validation failed: {node_errors}")
         return {
@@ -2027,72 +2180,49 @@ async def queue_workflow(request: QueueWorkflowRequest, ctx: Context) -> Dict[st
                 "Fix the errors and try queueing again."
             )
         }
-    
-    # Verify the workflow actually made it into the queue
-    if prompt_id:
-        try:
-            # Check if prompt appears in history (it should appear immediately when queued)
-            history_result = await get_execution_history(
-                GetWorkflowHistoryRequest(prompt_id=prompt_id),
-                ctx
-            )
-            
-            # If status is 'unknown', the prompt never made it to the queue
-            if history_result.get('status') == 'unknown':
-                logger.error(f"Prompt {prompt_id} not found in queue or history")
-                return {
-                    "success": False,
-                    "error": "Workflow failed to queue",
-                    "prompt_id": prompt_id,
-                    "suggestion": (
-                        "ComfyUI did not accept the workflow. This can happen when:\n"
-                        "1. No parameter in the workflow has changed and ComfyUI is returning cached results (example: you're running on a fixed seed in all ksamplers and trying to queue without changing prompts or setting any other values in any node)\n"
-                        "2. ComfyUI rejected the workflow for internal reasons\n\n"
-                        "Give the user ren links with options to modify different parameters (like seed, steps, or strength) and queue again or try some other next thing they might do."
-                        "Use get_execution_history to check for further errors using the prompt_id."
-                    )
-                }
-            
-            # Success - workflow is queued or already running
-            status = history_result.get('status', 'queued')
-            logger.info(f"Workflow queued successfully: {prompt_id} (position {queue_number}, status: {status})")
-            
-            return {
-                "success": True,
-                "prompt_id": prompt_id,
-                "queue_number": queue_number,
-                "batch_count": batch_count,
-                "status": status,
-                "message": f"Workflow queued successfully at position {queue_number} (status: {status})"
-            }
-            
-        except Exception as e:
-            # History check failed - log but don't fail the queue operation
-            logger.warning(f"Could not verify queue status: {e}")
-            return {
-                "success": True,
-                "prompt_id": prompt_id,
-                "queue_number": queue_number,
-                "batch_count": batch_count,
-                "status": "queued",
-                "message": f"Workflow queued at position {queue_number} (verification skipped)",
-                "warning": "Could not verify queue status"
-            }
-    else:
-        # No prompt_id returned - unexpected error
+
+    if not prompt_id:
         logger.error(f"No prompt_id in queue result: {r}")
         return {
             "success": False,
-            "error": "No prompt_id returned from queue operation",
+            "error": r.get("error", "No prompt_id returned from queue operation"),
             "raw_result": r,
-            "suggestion": (
-                "ComfyUI did not accept the workflow. This can happen when:\n"
-                "1. No parameter in the workflow has changed and ComfyUI is returning cached results (example: you're running on a fixed seed in all ksamplers and trying to queue without changing prompts or setting any other values in any node)\n"
-                "2. ComfyUI rejected the workflow for internal reasons\n\n"
-                "Give the user ren links with options to modify different parameters (like seed, steps, or strength) and queue again or try some other next thing they might do."
-                "Use get_execution_history to check for further errors using the prompt_id."
-            )
+            "suggestion": "Check the open workflow for validation errors and try again.",
         }
+
+    base_result = {
+        "queued": True,
+        "prompt_id": prompt_id,
+        "queue_number": queue_number,
+        "batch_count": batch_count,
+    }
+    wait_for_completion = (
+        request.wait_for_completion
+        if request.wait_for_completion is not None
+        else settings.wait_for_generation_completion
+    )
+    if not wait_for_completion:
+        logger.info(f"Workflow queued successfully: {prompt_id} (position {queue_number})")
+        return base_result | {
+            "success": True,
+            "status": "queued",
+            "completed": False,
+            "terminal": False,
+            "waited": False,
+            "message": f"Workflow queued successfully at position {queue_number}.",
+        }
+
+    timeout_seconds = (
+        request.completion_timeout
+        if request.completion_timeout is not None
+        else settings.generation_completion_timeout
+    )
+    logger.info(f"Waiting up to {timeout_seconds}s for workflow {prompt_id}")
+    outcome = await _wait_for_generation_completion(prompt_id, timeout_seconds)
+    return base_result | outcome | {
+        "waited": True,
+        "completion_timeout": timeout_seconds,
+    }
 
 
 @mcp.tool()

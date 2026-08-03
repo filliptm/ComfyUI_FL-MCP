@@ -57,6 +57,8 @@ class Settings(BaseModel):
     public_url: str = "http://127.0.0.1:8000"
 
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
+    wait_for_generation_completion: bool = False
+    generation_completion_timeout: int = Field(300, ge=1, le=3600)
     comfyui_path: str | None = None
     extra_model_paths_path: str | None = None
 
