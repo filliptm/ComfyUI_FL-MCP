@@ -20,6 +20,7 @@ dependencies = [
     "pydantic-settings",
     "python-dotenv",
     "httpx",
+    "selectolax>=0.4.11,<0.5",
     "Pillow",
     "PyYAML>=6.0",
 ]
