@@ -35,6 +35,8 @@ CORE_CHAT_TOOLS = {
     "find_node",
     "get_current_node_selection",
     "get_node_values",
+    "view_node_mask",
+    "edit_node_mask",
     "get_node_slots",
     "create_nodes",
     "remove_nodes",

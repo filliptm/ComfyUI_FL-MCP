@@ -150,6 +150,8 @@ test("action trail stays compact, visible, and visually quiet when complete", as
     assert.match(styles, /\.fl-toolchain-crumb\.completed\s*\{[^}]*background:\s*rgba\(255, 255, 255, 0\.018\)/s);
     assert.match(tools, /TOOL_ICON_CLASSES/);
     assert.match(tools, /pi pi-plus-circle/);
+    assert.match(tools, /view_node_mask/);
+    assert.match(tools, /edit_node_mask/);
 });
 
 

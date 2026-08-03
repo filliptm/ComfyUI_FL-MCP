@@ -112,6 +112,16 @@ export const TOOL_CONFIG = {
         label: "Review Output",
         description: "Inspecting the generated image for visual issues"
     },
+    "view_node_mask": {
+        icon: "🎭",
+        label: "Inspect Mask",
+        description: "Reviewing masked pixels on the node image"
+    },
+    "edit_node_mask": {
+        icon: "🖌️",
+        label: "Edit Mask",
+        description: "Painting or erasing regions in the image mask"
+    },
     "enable_auto_queue": {
         icon: "🔄",
         label: "Auto Queue",
@@ -414,6 +424,8 @@ const TOOL_ICON_CLASSES = {
     get_layout: "pi pi-table",
     queue_workflow: "pi pi-play",
     view_output_image: "pi pi-image",
+    view_node_mask: "pi pi-eye",
+    edit_node_mask: "pi pi-pencil",
     cancel_workflow: "pi pi-stop",
     get_queue_status: "pi pi-clock",
     workflow_get_current_json: "pi pi-code",
@@ -443,6 +455,8 @@ const TOOL_RUNNING_LABELS = {
     get_layout: "Reading layout",
     queue_workflow: "Queueing workflow",
     view_output_image: "Reviewing generated image",
+    view_node_mask: "Inspecting image mask",
+    edit_node_mask: "Editing image mask",
     take_screenshot: "Capturing canvas",
     node_library_search: "Searching node library",
     manager_check_updates: "Checking for updates",

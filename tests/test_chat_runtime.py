@@ -212,6 +212,8 @@ def test_intent_tool_filter_keeps_core_and_adds_narrow_groups():
     basic = tools_for_message("Inspect the open graph")
     assert "workflow_overview" in basic
     assert "view_output_image" in basic
+    assert "view_node_mask" in basic
+    assert "edit_node_mask" in basic
     assert "get_execution_history" in basic
     assert "manager_queue_action" not in basic
 

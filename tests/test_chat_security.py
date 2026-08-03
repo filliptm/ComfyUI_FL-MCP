@@ -40,5 +40,6 @@ def test_consequential_tools_require_approval():
         "custom_nodes_write_file",
         "custom_nodes_git_push",
         "comfy_restart",
+        "edit_node_mask",
     ):
         assert classify_tool(name) == "approval_required"

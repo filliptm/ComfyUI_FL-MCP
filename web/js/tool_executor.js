@@ -62,6 +62,8 @@ export class ToolExecutor {
             
             // Node Manipulation
             "get_node_values": this._handleGetNodeValues.bind(this),
+            "get_node_image_ref": this._handleGetNodeImageRef.bind(this),
+            "edit_node_mask": this._handleEditNodeMask.bind(this),
             "set_node_values": this._handleSetNodeValues.bind(this),
             "connect_nodes": this._handleConnectNodes.bind(this),
             "get_node_slots": this._handleGetNodeSlots.bind(this),
@@ -477,6 +479,19 @@ export class ToolExecutor {
         const { node_id } = params;
         const values = this.flApi.getValues(node_id);
         return { node_id, values };
+    }
+
+    async _handleGetNodeImageRef(params) {
+        return this.flApi.getNodeImageRef(params.node_id);
+    }
+
+    async _handleEditNodeMask(params) {
+        return await this.flApi.editNodeMask(
+            params.node_id,
+            params.regions,
+            params.coordinate_space,
+            params.clear_existing
+        );
     }
 
     async _handleSetNodeValues(params) {
