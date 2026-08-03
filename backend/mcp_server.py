@@ -588,6 +588,51 @@ class GetNodeValuesRequest(BaseModel):
     """Request to get node parameter values."""
     node_id: Union[int, str] = Field(..., description="Node ID or title")
 
+
+class ViewNodeMaskRequest(BaseModel):
+    """Request to inspect a node image with its mask highlighted."""
+    node_id: Union[int, str] = Field(..., description="Node ID or title")
+    max_dimension: int = Field(
+        default=2048,
+        ge=256,
+        le=4096,
+        description="Maximum preview width or height sent to the vision model.",
+    )
+
+
+class MaskRegionRequest(BaseModel):
+    """One rectangle or ellipse to paint into or erase from a mask."""
+    x: float = Field(..., ge=0, description="Left edge in pixels or normalized coordinates")
+    y: float = Field(..., ge=0, description="Top edge in pixels or normalized coordinates")
+    width: float = Field(..., gt=0, description="Region width in pixels or normalized coordinates")
+    height: float = Field(..., gt=0, description="Region height in pixels or normalized coordinates")
+    shape: Literal["rectangle", "ellipse"] = Field("rectangle", description="Region shape")
+    operation: Literal["paint", "erase"] = Field("paint", description="Add to or remove from the mask")
+    feather: float = Field(0, ge=0, le=512, description="Soft edge radius in image pixels")
+
+
+class EditNodeMaskRequest(BaseModel):
+    """Paint or erase regions in the image mask attached to a canvas node."""
+    node_id: Union[int, str] = Field(..., description="Load Image node ID or title")
+    regions: List[MaskRegionRequest] = Field(..., min_length=1, max_length=100)
+    coordinate_space: Literal["pixels", "normalized"] = Field(
+        "pixels",
+        description="Whether x/y/width/height use image pixels or values from 0 to 1",
+    )
+    clear_existing: bool = Field(
+        False,
+        description="Clear the current mask before applying regions; use when these should be the only masked areas",
+    )
+
+    @model_validator(mode="after")
+    def validate_normalized_regions(self) -> "EditNodeMaskRequest":
+        if self.coordinate_space == "normalized":
+            for region in self.regions:
+                if region.x + region.width > 1 or region.y + region.height > 1:
+                    raise ValueError("Normalized mask regions must remain within 0..1")
+        return self
+
+
 class SetNodeValuesRequest(BaseModel):
     """Request to set node parameter values."""
     node_id: Union[int, str] = Field(..., description="Node ID or title")
@@ -1570,6 +1615,76 @@ async def get_current_node_selection(request: GetSelectedNodesRequest, ctx: Cont
 async def get_node_values(request: GetNodeValuesRequest, ctx: Context) -> Dict[str, Any]:
     """Get all parameter values from a node."""
     return await _execute_tool(ctx, "get_node_values", request.model_dump())
+
+
+@mcp.tool()
+async def view_node_mask(request: ViewNodeMaskRequest, ctx: Context) -> ToolResult:
+    """View a node's current image with masked pixels highlighted in magenta.
+
+    Inspect this overlay before editing so coordinates avoid subjects that must
+    remain unchanged. Coordinates reported by visual inspection use the image's
+    top-left as (0, 0).
+    """
+    node_result = await _execute_tool(
+        ctx,
+        "get_node_image_ref",
+        {"node_id": request.node_id},
+    )
+    image_ref = node_result["image"]
+    path = _resolve_comfy_image_path(get_comfy_tools(), image_ref)
+    preview, preview_format, original_size, preview_size, mask_info = _mask_overlay_preview(
+        path,
+        request.max_dimension,
+    )
+    result = {
+        "success": True,
+        **node_result,
+        "image": image_ref,
+        "originalSize": {"width": original_size[0], "height": original_size[1]},
+        "previewSize": {"width": preview_size[0], "height": preview_size[1]},
+        "mask": mask_info,
+        "message": "Masked pixels are highlighted in magenta. Inspect the overlay before choosing edit coordinates.",
+    }
+    return ToolResult(
+        content=[result, MCPImage(data=preview, format=preview_format)],
+        structured_content=result,
+    )
+
+
+@mcp.tool()
+async def edit_node_mask(request: EditNodeMaskRequest, ctx: Context) -> ToolResult:
+    """Paint or erase rectangular/elliptical regions in a node's image mask.
+
+    This uses ComfyUI's authenticated browser upload path and updates the node's
+    image widget to the newly saved masked image. Use normalized coordinates for
+    resolution-independent edits. Set clear_existing=true when the supplied
+    regions should be the only masked areas.
+    """
+    if not settings.enable_workflow_writes:
+        result = _disabled_by_config("FL_MCP_ENABLE_WORKFLOW_WRITES")
+        return ToolResult(content=result, structured_content=result)
+    edit_result = await _execute_tool(
+        ctx,
+        "edit_node_mask",
+        request.model_dump(),
+    )
+    image_ref = edit_result["image"]
+    path = _resolve_comfy_image_path(get_comfy_tools(), image_ref)
+    preview, preview_format, original_size, preview_size, mask_info = _mask_overlay_preview(
+        path,
+        2048,
+    )
+    result = {
+        **edit_result,
+        "originalSize": {"width": original_size[0], "height": original_size[1]},
+        "previewSize": {"width": preview_size[0], "height": preview_size[1]},
+        "mask": mask_info,
+        "message": "Mask saved and the node image was updated. Magenta shows the resulting masked pixels; verify it before queueing.",
+    }
+    return ToolResult(
+        content=[result, MCPImage(data=preview, format=preview_format)],
+        structured_content=result,
+    )
 
 
 @mcp.tool()
@@ -3353,8 +3468,8 @@ def _output_image_candidates(
     return candidates
 
 
-def _resolve_output_image_path(comfy_tools: Any, image: Dict[str, Any]) -> Path:
-    """Resolve one history image inside trusted ComfyUI output/input/temp roots."""
+def _resolve_comfy_image_path(comfy_tools: Any, image: Dict[str, Any]) -> Path:
+    """Resolve one image inside trusted ComfyUI output/input/temp roots."""
     folder_types = {
         "output": ComfyFolderType.OUTPUT,
         "input": ComfyFolderType.INPUT,
@@ -3362,18 +3477,18 @@ def _resolve_output_image_path(comfy_tools: Any, image: Dict[str, Any]) -> Path:
     }
     folder_type = folder_types.get(image["type"])
     if folder_type is None:
-        raise ComfyUIError(f"Unsupported output image type: {image['type']}")
+        raise ComfyUIError(f"Unsupported ComfyUI image type: {image['type']}")
 
     relative = Path(image["subfolder"]) / image["filename"]
     if relative.is_absolute():
-        raise ComfyUIError("Output image path must be relative to ComfyUI.")
+        raise ComfyUIError("Image path must be relative to ComfyUI.")
     for root in comfy_tools._iter_all_paths(folder_type):
         trusted_root = root.resolve()
         candidate = (trusted_root / relative).resolve()
         if candidate.is_relative_to(trusted_root) and candidate.is_file():
             return candidate
     raise ComfyUINotFoundError(
-        f"Output image was not found: {image['type']}/{relative.as_posix()}"
+        f"ComfyUI image was not found: {image['type']}/{relative.as_posix()}"
     )
 
 
@@ -3405,6 +3520,44 @@ def _output_image_preview(path: Path, max_dimension: int) -> tuple[bytes, str, t
         )
         preview_format = "jpeg"
     return buffer.getvalue(), preview_format, original_size, preview_size
+
+
+def _mask_overlay_preview(
+    path: Path,
+    max_dimension: int,
+) -> tuple[bytes, str, tuple[int, int], tuple[int, int], Dict[str, Any]]:
+    """Render masked pixels as a magenta overlay for visual verification."""
+    try:
+        with PILImage.open(path) as source:
+            source.seek(0)
+            image = ImageOps.exif_transpose(source).convert("RGBA")
+    except (OSError, UnidentifiedImageError) as exc:
+        raise ComfyUIError(f"Mask source is not a readable image: {path.name}") from exc
+
+    original_size = image.size
+    mask = ImageOps.invert(image.getchannel("A"))
+    histogram = mask.histogram()
+    weighted_pixels = sum(value * count for value, count in enumerate(histogram)) / 255
+    total_pixels = max(1, image.width * image.height)
+    bbox = mask.getbbox()
+    mask_info = {
+        "coveragePercent": round(weighted_pixels / total_pixels * 100, 3),
+        "bounds": None if bbox is None else {
+            "x": bbox[0],
+            "y": bbox[1],
+            "width": bbox[2] - bbox[0],
+            "height": bbox[3] - bbox[1],
+        },
+    }
+    base = image.convert("RGB")
+    tint = PILImage.new("RGB", base.size, (255, 0, 180))
+    highlighted = PILImage.blend(base, tint, 0.62)
+    preview = PILImage.composite(highlighted, base, mask)
+    preview.thumbnail((max_dimension, max_dimension), PILImage.Resampling.LANCZOS)
+    preview_size = preview.size
+    buffer = io.BytesIO()
+    preview.save(buffer, format="JPEG", quality=90, optimize=True)
+    return buffer.getvalue(), "jpeg", original_size, preview_size, mask_info
 
 
 @mcp.tool()
@@ -3476,7 +3629,7 @@ async def view_output_image(request: ViewOutputImageRequest, ctx: Context) -> To
 
     selected_index = request.output_index if request.output_index >= 0 else len(images) - 1
     selected = images[selected_index]
-    path = _resolve_output_image_path(comfy_tools, selected)
+    path = _resolve_comfy_image_path(comfy_tools, selected)
     preview, preview_format, original_size, preview_size = _output_image_preview(
         path,
         request.max_dimension,

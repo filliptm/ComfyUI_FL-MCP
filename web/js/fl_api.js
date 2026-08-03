@@ -16,6 +16,11 @@ import {
 } from "./node_placement.js";
 import { nodeMatchesQuery } from "./node_identity.js";
 import { captureAuthenticatedQueue } from "./queue_capture.js";
+import {
+    normalizeMaskRegion,
+    parseImageWidgetRef,
+    summarizeMaskPixels,
+} from "./mask_utils.js";
 
 /**
  * FL_API class - Wrapper for workflow manipulation functions
@@ -574,6 +579,170 @@ export class FL_API {
             console.error("[FL_API] setValues error:", error);
             throw error;
         }
+    }
+
+    getNodeImageRef(nodeId) {
+        const node = this._findNode(nodeId);
+        if (!node) {
+            throw new Error(`Node not found: ${nodeId}`);
+        }
+        const imageWidget = node.widgets?.find(widget => widget.name === "image");
+        const widgetRef = parseImageWidgetRef(imageWidget?.value);
+        const nodeImage = node.images?.[0];
+        const image = widgetRef || (nodeImage?.filename ? {
+            filename: nodeImage.filename,
+            subfolder: nodeImage.subfolder || "",
+            type: nodeImage.type || "output",
+        } : null);
+        if (!image) {
+            throw new Error(`Node ${nodeId} does not reference a ComfyUI image`);
+        }
+        return {
+            node_id: node.id,
+            node_type: node.comfyClass || node.type,
+            title: node.title,
+            image,
+        };
+    }
+
+    async editNodeMask(nodeId, regions, coordinateSpace = "pixels", clearExisting = false) {
+        const node = this._findNode(nodeId);
+        if (!node) {
+            throw new Error(`Node not found: ${nodeId}`);
+        }
+        const imageWidget = node.widgets?.find(widget => widget.name === "image");
+        if (!imageWidget) {
+            throw new Error(`Node ${nodeId} has no image widget to receive the edited mask`);
+        }
+
+        const source = this.getNodeImageRef(nodeId).image;
+        const [rgbImage, alphaImage] = await Promise.all([
+            this._loadComfyImage(source, "rgb"),
+            this._loadComfyImage(source, "a"),
+        ]);
+        if (rgbImage.width !== alphaImage.width || rgbImage.height !== alphaImage.height) {
+            throw new Error("Image RGB and alpha dimensions do not match");
+        }
+
+        const maskCanvas = document.createElement("canvas");
+        maskCanvas.width = rgbImage.width;
+        maskCanvas.height = rgbImage.height;
+        const maskContext = maskCanvas.getContext("2d");
+        const alphaCanvas = document.createElement("canvas");
+        alphaCanvas.width = alphaImage.width;
+        alphaCanvas.height = alphaImage.height;
+        const alphaContext = alphaCanvas.getContext("2d");
+        alphaContext.drawImage(alphaImage, 0, 0);
+        const sourceAlpha = alphaContext.getImageData(0, 0, alphaImage.width, alphaImage.height);
+        const maskPixels = maskContext.createImageData(maskCanvas.width, maskCanvas.height);
+        for (let index = 0; index < maskPixels.data.length; index += 4) {
+            maskPixels.data[index] = 255;
+            maskPixels.data[index + 1] = 255;
+            maskPixels.data[index + 2] = 255;
+            maskPixels.data[index + 3] = clearExisting ? 0 : 255 - sourceAlpha.data[index + 3];
+        }
+        maskContext.putImageData(maskPixels, 0, 0);
+
+        const normalizedRegions = regions.map(region =>
+            normalizeMaskRegion(region, coordinateSpace, maskCanvas.width, maskCanvas.height)
+        );
+        for (const region of normalizedRegions) {
+            const regionCanvas = document.createElement("canvas");
+            regionCanvas.width = maskCanvas.width;
+            regionCanvas.height = maskCanvas.height;
+            const regionContext = regionCanvas.getContext("2d");
+            regionContext.fillStyle = "white";
+            regionContext.filter = region.feather > 0 ? `blur(${region.feather}px)` : "none";
+            regionContext.beginPath();
+            if (region.shape === "ellipse") {
+                regionContext.ellipse(
+                    region.x + region.width / 2,
+                    region.y + region.height / 2,
+                    region.width / 2,
+                    region.height / 2,
+                    0,
+                    0,
+                    Math.PI * 2
+                );
+            } else {
+                regionContext.rect(region.x, region.y, region.width, region.height);
+            }
+            regionContext.fill();
+
+            maskContext.save();
+            maskContext.globalCompositeOperation = region.operation === "erase"
+                ? "destination-out"
+                : "source-over";
+            maskContext.drawImage(regionCanvas, 0, 0);
+            maskContext.restore();
+        }
+
+        const editedMask = maskContext.getImageData(0, 0, maskCanvas.width, maskCanvas.height);
+        const maskSummary = summarizeMaskPixels(editedMask);
+        const uploadCanvas = document.createElement("canvas");
+        uploadCanvas.width = rgbImage.width;
+        uploadCanvas.height = rgbImage.height;
+        const uploadContext = uploadCanvas.getContext("2d");
+        uploadContext.drawImage(rgbImage, 0, 0);
+        const uploadPixels = uploadContext.getImageData(0, 0, uploadCanvas.width, uploadCanvas.height);
+        for (let index = 0; index < uploadPixels.data.length; index += 4) {
+            uploadPixels.data[index + 3] = 255 - editedMask.data[index + 3];
+        }
+        uploadContext.putImageData(uploadPixels, 0, 0);
+
+        const blob = await this._canvasToBlob(uploadCanvas);
+        const filename = `fl-mcp-mask-${Date.now()}-${crypto.randomUUID().slice(0, 8)}.png`;
+        const formData = new FormData();
+        formData.append("image", blob, filename);
+        formData.append("type", "input");
+        formData.append("subfolder", "fl_mcp_masks");
+        formData.append("original_ref", JSON.stringify(source));
+        const response = await api.fetchApi("/upload/mask", {
+            method: "POST",
+            body: formData,
+        });
+        if (!response.ok) {
+            const detail = await response.text().catch(() => "");
+            throw new Error(
+                `Mask upload failed (${response.status}${detail ? `: ${detail}` : ""})`
+            );
+        }
+        const uploaded = await response.json();
+        if (!uploaded?.name) {
+            throw new Error("Mask upload response did not include a filename");
+        }
+        const image = {
+            filename: uploaded.name,
+            subfolder: uploaded.subfolder || "",
+            type: uploaded.type || "input",
+        };
+        const widgetPath = [image.subfolder, image.filename].filter(Boolean).join("/");
+        const widgetValue = `${widgetPath} [${image.type}]`;
+        this._setWidgetValue(node, imageWidget, widgetValue);
+        node.images = [image];
+        node.imgs = undefined;
+        if (node.properties) {
+            node.properties.image = widgetValue;
+        }
+        if (node.widgets_values && node.widgets) {
+            const widgetIndex = node.widgets.indexOf(imageWidget);
+            if (widgetIndex >= 0) {
+                node.widgets_values[widgetIndex] = widgetValue;
+            }
+        }
+        this._markGraphChanged();
+
+        return {
+            success: true,
+            node_id: node.id,
+            source_image: source,
+            image,
+            image_size: { width: rgbImage.width, height: rgbImage.height },
+            coordinate_space: coordinateSpace,
+            clear_existing: clearExisting,
+            regions: normalizedRegions,
+            mask: maskSummary,
+        };
     }
 
     /**
@@ -1850,6 +2019,31 @@ export class FL_API {
         } catch (error) {
             console.debug("[FL_API] Could not dispatch graphChanged:", error);
         }
+    }
+
+    async _loadComfyImage(ref, channel) {
+        const params = new URLSearchParams({
+            filename: ref.filename,
+            subfolder: ref.subfolder || "",
+            type: ref.type || "input",
+            channel,
+        });
+        params.set("rand", String(Date.now()));
+        const response = await api.fetchApi(`/view?${params.toString()}`);
+        if (!response.ok) {
+            throw new Error(`Failed to load ${channel} image channel (${response.status})`);
+        }
+        const blob = await response.blob();
+        return await createImageBitmap(blob);
+    }
+
+    _canvasToBlob(canvas) {
+        return new Promise((resolve, reject) => {
+            canvas.toBlob(blob => {
+                if (blob) resolve(blob);
+                else reject(new Error("Failed to encode mask image"));
+            }, "image/png");
+        });
     }
 
     _setWidgetValue(node, widget, value) {

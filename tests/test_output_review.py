@@ -4,12 +4,13 @@ import mcp_server
 import pytest
 from comfy_models import ComfyFolderType
 from mcp.types import ImageContent, TextContent
-from PIL import Image
+from PIL import Image, ImageDraw
 
 
 class FakeComfyTools:
-    def __init__(self, output_root, history):
+    def __init__(self, output_root, history, input_root=None):
         self.output_root = output_root
+        self.input_root = input_root or output_root
         self.history = history
 
     async def fetch_history(self, prompt_id=None, max_items=10):
@@ -19,8 +20,12 @@ class FakeComfyTools:
         return self.history
 
     def _iter_all_paths(self, folder_type):
-        assert folder_type == ComfyFolderType.OUTPUT
-        yield self.output_root
+        if folder_type == ComfyFolderType.OUTPUT:
+            yield self.output_root
+        elif folder_type == ComfyFolderType.INPUT:
+            yield self.input_root
+        else:
+            raise AssertionError(f"Unexpected folder type: {folder_type}")
 
 
 def fake_context():
@@ -130,8 +135,117 @@ def test_output_path_resolution_rejects_traversal(tmp_path):
     tools = FakeComfyTools(output_root, {})
 
     with pytest.raises(mcp_server.ComfyUINotFoundError):
-        mcp_server._resolve_output_image_path(tools, {
+        mcp_server._resolve_comfy_image_path(tools, {
             "filename": "../secret.png",
             "subfolder": "",
             "type": "output",
         })
+
+
+def test_mask_overlay_preview_reports_coverage_and_bounds(tmp_path):
+    image_path = tmp_path / "masked.png"
+    image = Image.new("RGBA", (100, 50), (40, 80, 120, 255))
+    alpha = image.getchannel("A")
+    ImageDraw.Draw(alpha).rectangle((10, 5, 29, 14), fill=0)
+    image.putalpha(alpha)
+    image.save(image_path)
+
+    preview, preview_format, original_size, preview_size, mask = (
+        mcp_server._mask_overlay_preview(image_path, 512)
+    )
+
+    assert preview_format == "jpeg"
+    assert len(preview) > 100
+    assert original_size == (100, 50)
+    assert preview_size == (100, 50)
+    assert mask == {
+        "coveragePercent": 4.0,
+        "bounds": {"x": 10, "y": 5, "width": 20, "height": 10},
+    }
+
+
+def test_normalized_mask_regions_must_fit_inside_image():
+    with pytest.raises(ValueError, match="0..1"):
+        mcp_server.EditNodeMaskRequest(
+            node_id=1,
+            coordinate_space="normalized",
+            regions=[{
+                "x": 0.8,
+                "y": 0.2,
+                "width": 0.3,
+                "height": 0.2,
+            }],
+        )
+
+
+@pytest.mark.asyncio
+async def test_view_node_mask_returns_visual_overlay(tmp_path, monkeypatch):
+    input_root = tmp_path / "input"
+    input_root.mkdir()
+    image = Image.new("RGBA", (64, 32), (20, 40, 60, 255))
+    alpha = image.getchannel("A")
+    ImageDraw.Draw(alpha).rectangle((4, 5, 11, 12), fill=0)
+    image.putalpha(alpha)
+    image.save(input_root / "mask.png")
+    monkeypatch.setattr(
+        mcp_server,
+        "get_comfy_tools",
+        lambda: FakeComfyTools(tmp_path / "output", {}, input_root),
+    )
+
+    async def execute_tool(ctx, tool_name, parameters):
+        del ctx, parameters
+        assert tool_name == "get_node_image_ref"
+        return {
+            "node_id": 7,
+            "node_type": "LoadImage",
+            "title": "LOAD & MASK IMAGE",
+            "image": {"filename": "mask.png", "subfolder": "", "type": "input"},
+        }
+
+    monkeypatch.setattr(mcp_server, "_execute_tool", execute_tool)
+
+    result = await mcp_server.view_node_mask.fn(
+        mcp_server.ViewNodeMaskRequest(node_id=7),
+        fake_context(),
+    )
+
+    assert result.structured_content["mask"]["coveragePercent"] == 3.125
+    assert [item.type for item in result.content] == ["text", "image"]
+
+
+@pytest.mark.asyncio
+async def test_edit_node_mask_returns_saved_mask_overlay(tmp_path, monkeypatch):
+    input_root = tmp_path / "input"
+    input_root.mkdir()
+    Image.new("RGBA", (40, 20), (20, 40, 60, 255)).save(input_root / "edited.png")
+    monkeypatch.setattr(
+        mcp_server,
+        "get_comfy_tools",
+        lambda: FakeComfyTools(tmp_path / "output", {}, input_root),
+    )
+    monkeypatch.setattr(mcp_server.settings, "enable_workflow_writes", True)
+
+    async def execute_tool(ctx, tool_name, parameters):
+        del ctx
+        assert tool_name == "edit_node_mask"
+        assert parameters["clear_existing"] is True
+        return {
+            "success": True,
+            "node_id": 7,
+            "image": {"filename": "edited.png", "subfolder": "", "type": "input"},
+        }
+
+    monkeypatch.setattr(mcp_server, "_execute_tool", execute_tool)
+
+    result = await mcp_server.edit_node_mask.fn(
+        mcp_server.EditNodeMaskRequest(
+            node_id=7,
+            clear_existing=True,
+            regions=[{"x": 1, "y": 2, "width": 3, "height": 4}],
+        ),
+        fake_context(),
+    )
+
+    assert result.structured_content["success"] is True
+    assert [item.type for item in result.content] == ["text", "image"]
