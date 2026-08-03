@@ -104,7 +104,7 @@ from comfy_supervisor import comfy_supervisor
 
 # LOGGING
 
-log_level_name = os.getenv("LOG_LEVEL", "INFO").upper()
+log_level_name = settings.log_level
 log_level = getattr(logging, log_level_name, logging.INFO)
 
 _LOG_DIR = Path(__file__).resolve().parent / "logs"
@@ -421,11 +421,21 @@ def _comfy_base_url() -> str:
 
 
 def _disabled_by_config(flag_name: str) -> Dict[str, Any]:
+    setting_name = {
+        "FL_MCP_ENABLE_WORKFLOW_WRITES": "enable_workflow_writes",
+        "FL_MCP_ENABLE_CUSTOM_NODE_WRITES": "enable_custom_node_writes",
+        "FL_MCP_ENABLE_GIT_WRITES": "enable_git_writes",
+        "FL_MCP_ENABLE_MANAGER_MUTATIONS": "enable_manager_mutations",
+        "FL_MCP_ENABLE_COMFY_PROCESS_CONTROL": "enable_comfy_process_control",
+    }[flag_name]
     return {
         "success": False,
-        "error": f"disabled_by_config: set {flag_name}=true to enable this tool.",
+        "error": (
+            "disabled_by_config: enable the matching capability under "
+            "Ren > Settings > Bridge & safety, then restart ComfyUI."
+        ),
         "disabled_by_config": True,
-        "required_flag": flag_name,
+        "required_setting": setting_name,
     }
 
 

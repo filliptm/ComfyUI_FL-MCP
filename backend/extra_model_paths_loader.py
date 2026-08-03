@@ -39,21 +39,27 @@ class ExtraModelPathsLoader:
     YAML_FILENAME = "extra_model_paths.yaml"
     YAML_EXAMPLE_FILENAME = "extra_model_paths.yaml.example"
     
-    def __init__(self, comfyui_root: Path):
+    def __init__(
+        self,
+        comfyui_root: Path,
+        config_path: Optional[str] = None,
+    ):
         """Initialize loader.
         
         Args:
             comfyui_root: Path to ComfyUI installation root
+            config_path: Optional explicit extra_model_paths.yaml location
         """
         self.comfyui_root = comfyui_root
+        self.config_path = Path(config_path) if config_path else None
     
     def find_yaml_file(self) -> Optional[Path]:
         """Find extra_model_paths.yaml in expected locations.
         
         Searches in priority order:
         1. ComfyUI root directory
-        2. Platform-specific config directories
-        3. Environment variable override
+        2. Configured file path
+        3. Platform-specific config directories
         
         Returns:
             Path to YAML file if found, None otherwise
@@ -62,8 +68,8 @@ class ExtraModelPathsLoader:
             # 1. ComfyUI root directory (highest priority)
             self.comfyui_root / self.YAML_FILENAME,
             
-            # 2. Environment variable override
-            self._get_env_config_path(),
+            # 2. Configured file path
+            self.config_path,
             
             # 3. Platform-specific config directories
             self._get_platform_config_path(),
@@ -90,17 +96,6 @@ class ExtraModelPathsLoader:
         else:  # Linux/Mac
             home = Path.home()
             return home / ".config" / "ComfyUI" / self.YAML_FILENAME
-        return None
-    
-    def _get_env_config_path(self) -> Optional[Path]:
-        """Get path from environment variable.
-        
-        Returns:
-            Path from COMFYUI_EXTRA_MODEL_PATHS env var, or None
-        """
-        env_path = os.getenv('COMFYUI_EXTRA_MODEL_PATHS')
-        if env_path:
-            return Path(env_path)
         return None
     
     def load(self) -> List[ExtraModelPathsConfig]:

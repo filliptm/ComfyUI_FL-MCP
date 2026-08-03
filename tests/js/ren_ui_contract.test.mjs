@@ -54,6 +54,12 @@ test("settings use defined cards with live state and collapsed diagnostics", asy
     assert.match(panel, /Model &amp; provider/);
     assert.match(panel, /fl-settings-card-approvals/);
     assert.match(panel, /Tool approvals/);
+    assert.match(panel, /fl-settings-card-bridge/);
+    assert.match(panel, /Bridge &amp; safety/);
+    assert.match(panel, /data-bridge-setting="ws_port"/);
+    assert.match(panel, /data-bridge-setting="enable_workflow_writes"/);
+    assert.match(panel, /saveBridgeSettings/);
+    assert.match(panel, /pendingRestartFields/);
     assert.match(
         panel,
         /<details class="fl-settings-card fl-settings-disclosure fl-settings-card-diagnostics"/,
@@ -71,11 +77,27 @@ test("settings use defined cards with live state and collapsed diagnostics", asy
     assert.match(panel, /updateDiagnosticsSettingsState/);
     assert.match(styles, /\.fl-settings-content\s*\{[^}]*gap:\s*10px/s);
     assert.match(styles, /\.fl-settings-card\s*\{[^}]*border-radius:\s*10px/s);
+    assert.match(styles, /\.fl-bridge-settings-grid\s*\{[^}]*display:\s*grid/s);
     assert.match(styles, /\.fl-settings-disclosure > summary\s*\{[^}]*list-style:\s*none/s);
     assert.match(
         styles,
         /@media \(prefers-reduced-motion: reduce\)[\s\S]*\.fl-settings-chevron/,
     );
+});
+
+
+test("bridge settings use ComfyUI-side JSON endpoints", async () => {
+    const extension = await readFile(new URL("web/js/extension.js", root), "utf8");
+    const backend = await readFile(new URL("__init__.py", root), "utf8");
+    const config = await readFile(new URL("backend/config.py", root), "utf8");
+
+    assert.match(extension, /fetchJson\("\/fl_mcp\/settings"/);
+    assert.match(extension, /method: "PATCH"/);
+    assert.match(backend, /routes\.get\("\/fl_mcp\/settings"\)/);
+    assert.match(backend, /routes\.patch\("\/fl_mcp\/settings"\)/);
+    assert.match(config, /bridge_settings\.json/);
+    assert.match(config, /dotenv_values/);
+    assert.doesNotMatch(config, /pydantic_settings|BaseSettings/);
 });
 
 
