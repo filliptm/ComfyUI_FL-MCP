@@ -211,6 +211,8 @@ async def test_global_bypass_updates_active_runs_and_releases_pending_approvals(
 def test_intent_tool_filter_keeps_core_and_adds_narrow_groups():
     basic = tools_for_message("Inspect the open graph")
     assert "workflow_overview" in basic
+    assert "view_output_image" in basic
+    assert "get_execution_history" in basic
     assert "manager_queue_action" not in basic
 
     manager = tools_for_message("Install a missing custom node with Manager")
@@ -220,6 +222,23 @@ def test_intent_tool_filter_keeps_core_and_adds_narrow_groups():
     coding = tools_for_message("Patch Python code in this custom node pack")
     assert "custom_nodes_apply_patch" in coding
     assert "comfy_models_list" not in coding
+
+    review = tools_for_message("Review the final output image for distortion")
+    assert "view_output_image" in review
+    assert "get_execution_details" in review
+
+
+def test_tool_result_content_redacts_image_base64_from_chat_timeline():
+    content = [{
+        "type": "image",
+        "mimeType": "image/png",
+        "data": "very-large-base64-payload",
+    }]
+
+    rendered = tool_result_content(content)
+
+    assert "very-large-base64-payload" not in rendered
+    assert "[image content shown to Ren]" in rendered
 
 
 def test_completed_run_retention_is_bounded(tmp_path):
