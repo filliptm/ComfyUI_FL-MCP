@@ -45,6 +45,7 @@ APPROVAL_REQUIRED_TOOLS = {
     "comfy_upload_image",
     "comfy_upload_mask",
     "edit_node_mask",
+    "confirm_mask_review",
     "comfy_asset_upload",
     "comfy_assets_upload",
     "clear_error_buffer",

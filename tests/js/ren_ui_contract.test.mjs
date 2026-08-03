@@ -153,8 +153,30 @@ test("action trail stays compact, visible, and visually quiet when complete", as
     assert.match(tools, /pi pi-plus-circle/);
     assert.match(tools, /view_node_mask/);
     assert.match(tools, /edit_node_mask/);
+    assert.match(tools, /confirm_mask_review/);
     assert.match(panel, /Replace this image mask\?/);
     assert.match(panel, /save a new mask image, and update the selected image node/);
+    assert.match(panel, /Use this mask\?/);
+    assert.match(panel, /Needs changes/);
+    assert.match(panel, /if \(!isMaskReview\) actions\.appendChild\(alwaysAllow\)/);
+    assert.match(panel, /Mask approved/);
+});
+
+
+test("mask edits show a live preview and block queueing until review", async () => {
+    const api = await readFile(new URL("web/js/fl_api.js", root), "utf8");
+    const executor = await readFile(new URL("web/js/tool_executor.js", root), "utf8");
+    const prompt = await readFile(new URL("backend/chat_prompt.md", root), "utf8");
+
+    assert.match(api, /node\.imgs = \[reviewImage\]/);
+    assert.match(api, /app\.canvas\?\.centerOnNode\?\.\(node\)/);
+    assert.match(api, /this\.pendingMaskReviews/);
+    assert.match(api, /Mask review required for node/);
+    assert.match(api, /_pauseAutoQueueForMaskReview/);
+    assert.match(api, /The node image changed after this mask was created/);
+    assert.match(api, /node\.imgs = undefined/);
+    assert.match(executor, /confirm_mask_review/);
+    assert.match(prompt, /Never queue until the latest mask is approved/);
 });
 
 

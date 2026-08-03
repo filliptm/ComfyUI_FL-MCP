@@ -151,6 +151,7 @@ export function summarizeToolStep(step, config = {}) {
             view_output_image: "Couldn’t review output image",
             view_node_mask: "Couldn’t inspect image mask",
             edit_node_mask: "Couldn’t update image mask",
+            confirm_mask_review: "Mask needs changes",
         };
         return config.failureLabel
             || failureLabels[name]
@@ -189,6 +190,7 @@ export function summarizeToolStep(step, config = {}) {
         const coverage = coverageLabel(result);
         return coverage ? `${regionSummary} · ${coverage}` : regionSummary;
     }
+    if (name === "confirm_mask_review") return "Mask approved for workflow";
 
     if (name === "create_nodes") {
         const count = countSuccessful(result)

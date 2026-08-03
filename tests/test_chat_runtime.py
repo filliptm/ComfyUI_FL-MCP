@@ -175,6 +175,21 @@ async def test_always_allow_resolution_persists_tool_rule(
     assert state_settings["always_allowed_tools"] == ["queue_workflow"]
 
 
+@pytest.mark.asyncio
+async def test_mask_review_cannot_be_persistently_allowed(tmp_path):
+    runtime = ChatRuntime(ChatStore(tmp_path / "chat.db", tmp_path / "missing.db"))
+    future = asyncio.get_running_loop().create_future()
+    runtime.approvals["mask-review-1"] = PendingApproval(
+        "mask-review-1",
+        "run-1",
+        future,
+        "confirm_mask_review",
+    )
+
+    assert await runtime.resolve_approval("mask-review-1", "always_allow")
+    assert await future == "approved"
+
+
 def test_approval_policy_supports_tool_rules_and_global_bypass():
     defaults = {
         "approval_mode": "autonomous_edits",
@@ -190,6 +205,11 @@ def test_approval_policy_supports_tool_rules_and_global_bypass():
         **defaults,
         "approval_mode": "bypass_all",
     }) is False
+    assert should_request_approval("confirm_mask_review", {
+        **defaults,
+        "approval_mode": "bypass_all",
+        "always_allowed_tools": ["confirm_mask_review"],
+    }) is True
     assert normalize_approval_decision("allow_once") == "approved"
     assert normalize_approval_decision("always_allow") == "always_allowed"
     assert normalize_approval_decision("deny") == "denied"
@@ -225,12 +245,41 @@ async def test_global_bypass_updates_active_runs_and_releases_pending_approvals(
     assert runtime.approvals == {}
 
 
+@pytest.mark.asyncio
+async def test_global_bypass_does_not_release_mandatory_mask_review(tmp_path):
+    runtime = ChatRuntime(ChatStore(tmp_path / "chat.db", tmp_path / "missing.db"))
+    state = ActiveRun(
+        "run-1",
+        "conversation-1",
+        "session-1",
+        settings={"approval_mode": "autonomous_edits", "always_allowed_tools": []},
+    )
+    runtime.runs[state.run_id] = state
+    future = asyncio.get_running_loop().create_future()
+    runtime.approvals["mask-review-1"] = PendingApproval(
+        "mask-review-1",
+        state.run_id,
+        future,
+        "confirm_mask_review",
+    )
+
+    resolved = runtime.sync_approval_settings({
+        "approval_mode": "bypass_all",
+        "always_allowed_tools": [],
+    })
+
+    assert resolved == 0
+    assert not future.done()
+    assert "mask-review-1" in runtime.approvals
+
+
 def test_intent_tool_filter_keeps_core_and_adds_narrow_groups():
     basic = tools_for_message("Inspect the open graph")
     assert "workflow_overview" in basic
     assert "view_output_image" in basic
     assert "view_node_mask" in basic
     assert "edit_node_mask" in basic
+    assert "confirm_mask_review" in basic
     assert "get_execution_history" in basic
     assert "manager_queue_action" not in basic
 

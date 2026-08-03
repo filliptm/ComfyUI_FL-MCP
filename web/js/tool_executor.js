@@ -64,6 +64,7 @@ export class ToolExecutor {
             "get_node_values": this._handleGetNodeValues.bind(this),
             "get_node_image_ref": this._handleGetNodeImageRef.bind(this),
             "edit_node_mask": this._handleEditNodeMask.bind(this),
+            "confirm_mask_review": this._handleConfirmMaskReview.bind(this),
             "set_node_values": this._handleSetNodeValues.bind(this),
             "connect_nodes": this._handleConnectNodes.bind(this),
             "get_node_slots": this._handleGetNodeSlots.bind(this),
@@ -491,6 +492,13 @@ export class ToolExecutor {
             params.regions,
             params.coordinate_space,
             params.clear_existing
+        );
+    }
+
+    async _handleConfirmMaskReview(params) {
+        return this.flApi.confirmMaskReview(
+            params.node_id,
+            params.review_token
         );
     }
 

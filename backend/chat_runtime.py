@@ -28,6 +28,7 @@ from config import settings as bridge_settings
 
 logger = logging.getLogger(__name__)
 PROMPT_PATH = Path(__file__).with_name("chat_prompt.md")
+MANDATORY_REVIEW_TOOLS = {"confirm_mask_review"}
 
 CORE_CHAT_TOOLS = {
     "workflow_overview",
@@ -37,6 +38,7 @@ CORE_CHAT_TOOLS = {
     "get_node_values",
     "view_node_mask",
     "edit_node_mask",
+    "confirm_mask_review",
     "get_node_slots",
     "create_nodes",
     "remove_nodes",
@@ -302,6 +304,8 @@ def should_request_approval(
     tool_name: str,
     settings: dict[str, Any],
 ) -> bool:
+    if tool_name in MANDATORY_REVIEW_TOOLS:
+        return True
     if not requires_approval(tool_name):
         return False
     if settings.get("approval_mode") == "bypass_all":
@@ -544,6 +548,11 @@ class ChatRuntime:
         if not pending or pending.future.done():
             return False
         resolution = normalize_approval_decision(decision)
+        if (
+            pending.tool_name in MANDATORY_REVIEW_TOOLS
+            and resolution == "always_allowed"
+        ):
+            resolution = "approved"
         if resolution == "always_allowed":
             if not pending.tool_name:
                 raise ValueError("The pending approval has no tool name.")
@@ -572,6 +581,8 @@ class ChatRuntime:
         resolved = 0
         for approval_id, pending in list(self.approvals.items()):
             if pending.future.done():
+                continue
+            if pending.tool_name in MANDATORY_REVIEW_TOOLS:
                 continue
             self.approvals.pop(approval_id, None)
             self.store.resolve_approval(approval_id, "approved")

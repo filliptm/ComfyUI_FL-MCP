@@ -633,6 +633,19 @@ class EditNodeMaskRequest(BaseModel):
         return self
 
 
+class ConfirmMaskReviewRequest(BaseModel):
+    """Confirm that the user accepts the currently visible edited mask."""
+    node_id: Union[int, str] = Field(
+        ...,
+        description="Edited image node ID or title",
+    )
+    review_token: str = Field(
+        ...,
+        min_length=1,
+        description="Token returned by edit_node_mask",
+    )
+
+
 class SetNodeValuesRequest(BaseModel):
     """Request to set node parameter values."""
     node_id: Union[int, str] = Field(..., description="Node ID or title")
@@ -1679,12 +1692,30 @@ async def edit_node_mask(request: EditNodeMaskRequest, ctx: Context) -> ToolResu
         "originalSize": {"width": original_size[0], "height": original_size[1]},
         "previewSize": {"width": preview_size[0], "height": preview_size[1]},
         "mask": mask_info,
-        "message": "Mask saved and the node image was updated. Magenta shows the resulting masked pixels; verify it before queueing.",
+        "message": (
+            "Mask saved and shown in magenta on the canvas. Call "
+            "confirm_mask_review with the returned review token so the user "
+            "can approve it before queueing."
+        ),
     }
     return ToolResult(
         content=[result, MCPImage(data=preview, format=preview_format)],
         structured_content=result,
     )
+
+
+@mcp.tool()
+async def confirm_mask_review(
+    request: ConfirmMaskReviewRequest,
+    ctx: Context,
+) -> Dict[str, Any]:
+    """Ask the user to approve the visible mask before workflow execution.
+
+    Call this immediately after every successful edit_node_mask. The user must
+    explicitly accept the magenta canvas preview; this review cannot be bypassed
+    or remembered for future masks. Queueing remains blocked until it succeeds.
+    """
+    return await _execute_tool(ctx, "confirm_mask_review", request.model_dump())
 
 
 @mcp.tool()

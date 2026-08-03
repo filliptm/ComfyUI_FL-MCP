@@ -1806,15 +1806,20 @@ export class AssistantPanel {
     renderApproval(value) {
         const message = this.ensureAssistantMessage();
         const copy = this.approvalCopy(value.toolName, value.arguments);
+        const isMaskReview = value.toolName === "confirm_mask_review";
         const card = document.createElement("section");
         card.className = "fl-approval-card";
         card.dataset.approvalId = value.approvalId;
+        card.dataset.toolName = value.toolName || "";
         const eyebrow = document.createElement("span");
         eyebrow.className = "fl-approval-state";
         const shield = document.createElement("i");
         shield.className = "pi pi-shield";
         shield.setAttribute("aria-hidden", "true");
-        eyebrow.append(shield, document.createTextNode("Approval required"));
+        eyebrow.append(
+            shield,
+            document.createTextNode(isMaskReview ? "Mask review" : "Approval required"),
+        );
         const title = document.createElement("strong");
         title.textContent = copy.title;
         const consequence = document.createElement("p");
@@ -1831,11 +1836,11 @@ export class AssistantPanel {
         const deny = document.createElement("button");
         deny.type = "button";
         deny.className = "fl-secondary-button";
-        deny.textContent = "Deny";
+        deny.textContent = isMaskReview ? "Needs changes" : "Deny";
         const approve = document.createElement("button");
         approve.type = "button";
         approve.className = "fl-primary-button";
-        approve.textContent = "Allow once";
+        approve.textContent = isMaskReview ? "Use this mask" : "Allow once";
         const alwaysAllow = document.createElement("button");
         alwaysAllow.type = "button";
         alwaysAllow.className = "fl-secondary-button fl-always-allow-button";
@@ -1852,7 +1857,8 @@ export class AssistantPanel {
             "click",
             () => this.submitApproval(value.approvalId, "always_allow"),
         );
-        actions.append(deny, approve, alwaysAllow);
+        actions.append(deny, approve);
+        if (!isMaskReview) actions.appendChild(alwaysAllow);
         card.append(eyebrow, title, consequence, details, actions);
         this.finishActiveTextSegment(message, true);
         message.timeline.appendChild(card);
@@ -1905,6 +1911,10 @@ export class AssistantPanel {
                     ? `Ren will ${maskVerb} ${maskRegionCount}, save a new mask image, and update the selected image node.`
                     : "Ren will save a new mask image and update the selected image node.",
             },
+            confirm_mask_review: {
+                title: "Use this mask?",
+                consequence: "Inspect the magenta mask on the canvas. Approve it to continue, or choose Needs changes and tell Ren what to revise.",
+            },
             manager_queue_action: {
                 title: "Change installed custom nodes?",
                 consequence: "ComfyUI Manager will perform the requested install, update, or removal action.",
@@ -1949,11 +1959,12 @@ export class AssistantPanel {
         if (!card) return;
         const resolution = value.resolution || (value.approved ? "approved" : "denied");
         card.classList.add(resolution);
+        const isMaskReview = card.dataset.toolName === "confirm_mask_review";
         const labels = {
-            approved: "Approved",
+            approved: isMaskReview ? "Mask approved" : "Approved",
             always_allowed: "Always allowed",
-            denied: "Denied",
-            expired: "Approval expired",
+            denied: isMaskReview ? "Needs changes" : "Denied",
+            expired: isMaskReview ? "Mask review expired" : "Approval expired",
         };
         const state = card.querySelector(".fl-approval-state");
         state.replaceChildren(document.createTextNode(labels[resolution] || "Resolved"));

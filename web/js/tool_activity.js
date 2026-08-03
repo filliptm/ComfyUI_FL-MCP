@@ -122,6 +122,11 @@ export const TOOL_CONFIG = {
         label: "Edit Mask",
         description: "Painting mask regions and updating the image node"
     },
+    "confirm_mask_review": {
+        icon: "✅",
+        label: "Mask Review",
+        description: "Waiting for you to approve the visible mask"
+    },
     "enable_auto_queue": {
         icon: "🔄",
         label: "Auto Queue",
@@ -426,6 +431,7 @@ const TOOL_ICON_CLASSES = {
     view_output_image: "pi pi-image",
     view_node_mask: "pi pi-eye",
     edit_node_mask: "pi pi-pencil",
+    confirm_mask_review: "pi pi-check-circle",
     cancel_workflow: "pi pi-stop",
     get_queue_status: "pi pi-clock",
     workflow_get_current_json: "pi pi-code",
@@ -457,6 +463,7 @@ const TOOL_RUNNING_LABELS = {
     view_output_image: "Loading final output for review",
     view_node_mask: "Loading mask overlay",
     edit_node_mask: "Saving mask edit",
+    confirm_mask_review: "Waiting for mask approval",
     take_screenshot: "Capturing canvas",
     node_library_search: "Searching node library",
     manager_check_updates: "Checking for updates",
