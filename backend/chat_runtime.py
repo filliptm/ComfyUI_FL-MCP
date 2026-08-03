@@ -1425,10 +1425,14 @@ class ChatRuntime:
             unexpected_servers = [
                 item.name
                 for item in server_status.data
-                # This first-party picker can remain advertised by the host even
+                # First-party UI helpers can remain advertised by the host even
                 # with apps/plugins disabled. Client-side dynamic tool calls are
-                # denied by approval_handler above, so it is not executable.
-                if item.name not in {"ren", "sites-design-picker"} and item.tools
+                # denied by approval_handler above, so they are not executable.
+                if item.name not in {
+                    "ren",
+                    "sites-design-picker",
+                    "dataAnalyticsWidgets",
+                } and item.tools
             ]
             if unexpected_servers:
                 raise RuntimeError(
