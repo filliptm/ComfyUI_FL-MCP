@@ -169,6 +169,28 @@ test("composer supports drafting during runs without queueing another message", 
 });
 
 
+test("reasoning can be set as a default and overridden in the composer", async () => {
+    const panel = await readFile(new URL("web/js/chat_panel.js", root), "utf8");
+    const client = await readFile(new URL("web/js/chat_client.js", root), "utf8");
+
+    assert.match(panel, /data-setting="reasoning_effort"/);
+    assert.match(panel, /data-reasoning="composer"/);
+    assert.match(panel, /reasoningEffort: this\.composerReasoningSelect\.value/);
+    assert.match(panel, /ultra: "Ultra"/);
+    assert.match(client, /reasoningEffort: reasoningEffort \|\| "default"/);
+});
+
+
+test("workflow queueing preserves ComfyUI frontend authentication", async () => {
+    const api = await readFile(new URL("web/js/fl_api.js", root), "utf8");
+
+    assert.match(api, /await app\.queuePrompt\(0, effectiveBatchCount\)/);
+    assert.match(api, /const originalQueuePrompt = api\.queuePrompt/);
+    assert.match(api, /api\.queuePrompt = originalQueuePrompt/);
+    assert.match(api, /partner\/API nodes report "Please login first"/);
+});
+
+
 test("history uses archive-first deletion and an undo affordance", async () => {
     const panel = await readFile(new URL("web/js/chat_panel.js", root), "utf8");
     const routes = await readFile(new URL("backend/chat_routes.py", root), "utf8");

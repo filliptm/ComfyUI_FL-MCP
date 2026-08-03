@@ -25,7 +25,7 @@ class CodexSubscriptionService:
     def __init__(self) -> None:
         self._cached_status: dict[str, Any] | None = None
         self._cached_at = 0.0
-        self._cached_models: list[dict[str, str]] | None = None
+        self._cached_models: list[dict[str, Any]] | None = None
         self._models_cached_at = 0.0
 
     @staticmethod
@@ -112,7 +112,7 @@ class CodexSubscriptionService:
         self._remember(value)
         return dict(value)
 
-    async def models(self, *, refresh: bool = False) -> list[dict[str, str]]:
+    async def models(self, *, refresh: bool = False) -> list[dict[str, Any]]:
         """Return the visible model catalog exposed by the installed Codex CLI."""
         now = time.monotonic()
         if (
@@ -148,7 +148,7 @@ class CodexSubscriptionService:
                 await process.wait()
             return []
 
-        candidates: list[dict[str, str]] = []
+        candidates: list[dict[str, Any]] = []
         seen: set[str] = set()
         for item in payload.get("models", []) if isinstance(payload, dict) else []:
             if not isinstance(item, dict) or item.get("visibility") != "list":
@@ -162,6 +162,18 @@ class CodexSubscriptionService:
             description = str(item.get("description") or "").strip()
             if description:
                 candidate["description"] = description
+            supported_efforts = [
+                str(option.get("effort") or "").strip()
+                for option in item.get("supported_reasoning_levels", [])
+                if isinstance(option, dict) and option.get("effort")
+            ]
+            if supported_efforts:
+                candidate["reasoningEfforts"] = supported_efforts
+            default_effort = str(
+                item.get("default_reasoning_level") or ""
+            ).strip()
+            if default_effort:
+                candidate["defaultReasoningEffort"] = default_effort
             candidates.append(candidate)
 
         label_counts = Counter(item["label"].casefold() for item in candidates)

@@ -25,6 +25,35 @@ test("SSE consumer handles chunk boundaries and multiple events", async () => {
 });
 
 
+test("run requests include the per-message reasoning level", async () => {
+    const originalFetch = globalThis.fetch;
+    let request;
+    globalThis.fetch = async (url, options = {}) => {
+        request = { url: String(url), options };
+        return new Response("", {
+            status: 200,
+            headers: {
+                "X-FL-MCP-Run-Id": "run-1",
+                "X-FL-MCP-Conversation-Id": "conversation-1",
+            },
+        });
+    };
+    try {
+        const client = new ChatClient("http://127.0.0.1:18000");
+        await client.startRun({
+            sessionId: "session-1",
+            message: "Inspect this workflow",
+            reasoningEffort: "xhigh",
+        });
+    } finally {
+        globalThis.fetch = originalFetch;
+    }
+
+    assert.equal(request.url, "http://127.0.0.1:18000/api/chat/runs");
+    assert.equal(JSON.parse(request.options.body).reasoningEffort, "xhigh");
+});
+
+
 test("conversation requests preserve active/archive views and additive updates", async () => {
     const originalFetch = globalThis.fetch;
     const requests = [];
