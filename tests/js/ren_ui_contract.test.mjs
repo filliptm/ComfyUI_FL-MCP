@@ -19,6 +19,19 @@ test("sidebar keeps the stable Ren entry and reads live canvas context", async (
 });
 
 
+test("run identity remains available across CORS and provider startup", async () => {
+    const client = await readFile(new URL("web/js/chat_client.js", root), "utf8");
+    const runtime = await readFile(new URL("backend/chat_runtime.py", root), "utf8");
+    const server = await readFile(new URL("backend/server.py", root), "utf8");
+
+    assert.match(client, /event\.type === "RUN_STARTED"/);
+    assert.match(client, /markRunReady\(event\.runId, event\.threadId\)/);
+    assert.match(runtime, /Publish before provider setup/);
+    assert.match(runtime, /Codex timed out while connecting to the Ren MCP tools/);
+    assert.match(server, /expose_headers=/);
+});
+
+
 test("chat shell has compact two-row chrome and full-panel sheets", async () => {
     const panel = await readFile(new URL("web/js/chat_panel.js", root), "utf8");
 

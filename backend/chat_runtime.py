@@ -353,6 +353,30 @@ async def wait_for_claude_mcp(
         await asyncio.sleep(0.1)
 
 
+async def wait_for_codex_mcp_status(
+    client: Any,
+    status_params: dict[str, Any],
+    response_model: Any,
+    *,
+    timeout: float = 30,
+) -> Any:
+    """Bound Codex MCP discovery so a broken provider cannot freeze the chat."""
+    try:
+        return await asyncio.wait_for(
+            client.request(
+                "mcpServerStatus/list",
+                status_params,
+                response_model=response_model,
+            ),
+            timeout=timeout,
+        )
+    except TimeoutError as exc:
+        raise RuntimeError(
+            "Codex timed out while connecting to the Ren MCP tools. "
+            "Stop the response and retry."
+        ) from exc
+
+
 def tools_for_message(message: str, search_mode: str = "off") -> set[str]:
     text = message.lower()
     selected = set(CORE_CHAT_TOOLS)
@@ -537,6 +561,7 @@ class ActiveRun:
     assistant_text: str = ""
     tool_steps: list[dict[str, Any]] = field(default_factory=list)
     error_emitted: bool = False
+    started_emitted: bool = False
     cancel_callback: Callable[[], Awaitable[Any]] | None = None
 
 
@@ -682,6 +707,13 @@ class ChatRuntime:
             self.runs[run_id] = state
             self._prune_completed_runs()
             self.store.create_run(run_id, identifier)
+            # Publish before provider setup so StreamingResponse can flush its
+            # headers and the browser can stop or steer a run immediately.
+            await self.publish(state, {
+                "type": "RUN_STARTED",
+                "threadId": state.conversation_id,
+                "runId": state.run_id,
+            })
             state.task = asyncio.create_task(
                 self._execute(state, user_message["id"]),
                 name=f"fl-mcp-chat-{run_id}",
@@ -714,9 +746,13 @@ class ChatRuntime:
 
     async def publish(self, state: ActiveRun, event: str | dict[str, Any]) -> None:
         raw = _sse(event) if isinstance(event, dict) else event
+        payload = _event_payload(raw)
+        if payload and payload.get("type") == "RUN_STARTED":
+            if state.started_emitted:
+                return
+            state.started_emitted = True
         if len(state.events) < self.MAX_EVENTS:
             state.events.append(raw)
-        payload = _event_payload(raw)
         if payload:
             event_type = payload.get("type")
             if event_type == "RUN_ERROR":
@@ -1775,10 +1811,10 @@ class ChatRuntime:
                 thread_id=thread.id,
                 detail="full",
             ).model_dump(mode="json", by_alias=True, exclude_none=True)
-            server_status = await codex._client.request(
-                "mcpServerStatus/list",
+            server_status = await wait_for_codex_mcp_status(
+                codex._client,
                 status_params,
-                response_model=ListMcpServerStatusResponse,
+                ListMcpServerStatusResponse,
             )
             unexpected_servers = [
                 item.name

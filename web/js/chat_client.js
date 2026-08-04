@@ -151,6 +151,18 @@ export class ChatClient {
         this.runReady = new Promise(resolve => {
             resolveRunReady = resolve;
         });
+        let runReadyResolved = false;
+        const markRunReady = (runId, conversationId) => {
+            if (runId) this.runId = runId;
+            if (conversationId) this.conversationId = conversationId;
+            if (runReadyResolved || !this.runId) return;
+            runReadyResolved = true;
+            resolveRunReady(this.runId);
+            onReady?.({
+                runId: this.runId,
+                conversationId: this.conversationId,
+            });
+        };
         let response;
         try {
             response = await fetch(`${this.baseUrl}/api/chat/runs`, {
@@ -168,11 +180,11 @@ export class ChatClient {
                 signal: this.abortController.signal,
             });
         } catch (error) {
-            resolveRunReady(null);
+            if (!runReadyResolved) resolveRunReady(null);
             throw error;
         }
         if (!response.ok) {
-            resolveRunReady(null);
+            if (!runReadyResolved) resolveRunReady(null);
             let detail = `${response.status} ${response.statusText}`;
             try {
                 const payload = await response.json();
@@ -182,14 +194,25 @@ export class ChatClient {
             }
             throw new Error(detail);
         }
-        this.runId = response.headers.get("X-FL-MCP-Run-Id");
-        resolveRunReady(this.runId);
-        this.conversationId = response.headers.get("X-FL-MCP-Conversation-Id");
-        onReady?.({
-            runId: this.runId,
-            conversationId: this.conversationId,
-        });
-        await this.consumeSSE(response.body, onEvent);
+        markRunReady(
+            response.headers.get("X-FL-MCP-Run-Id"),
+            response.headers.get("X-FL-MCP-Conversation-Id"),
+        );
+        try {
+            await this.consumeSSE(response.body, event => {
+                if (event.type === "RUN_STARTED") {
+                    // Custom response headers can be hidden by CORS. The first
+                    // SSE event carries the same IDs and is always readable.
+                    markRunReady(event.runId, event.threadId);
+                }
+                onEvent?.(event);
+            });
+        } finally {
+            if (!runReadyResolved) {
+                runReadyResolved = true;
+                resolveRunReady(null);
+            }
+        }
     }
 
     async attach(runId, onEvent) {

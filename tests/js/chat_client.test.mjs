@@ -142,6 +142,52 @@ test("cancel waits for a starting run and targets its resolved run id", async ()
 });
 
 
+test("cancel gets the run id from SSE when CORS hides response headers", async () => {
+    const originalFetch = globalThis.fetch;
+    const encoder = new TextEncoder();
+    const requests = [];
+    let streamController;
+    globalThis.fetch = (url, options = {}) => {
+        requests.push({ url: String(url), options });
+        if (String(url).endsWith("/api/chat/runs")) {
+            return Promise.resolve(new Response(new ReadableStream({
+                start(controller) {
+                    streamController = controller;
+                },
+            }), { status: 200 }));
+        }
+        return Promise.resolve(new Response(JSON.stringify({ cancelled: true }), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+        }));
+    };
+    try {
+        const client = new ChatClient("http://127.0.0.1:18000");
+        const run = client.startRun({
+            sessionId: "session-1",
+            message: "Initial request",
+        });
+        const cancelled = client.cancel();
+        await Promise.resolve();
+        streamController.enqueue(encoder.encode(
+            'data: {"type":"RUN_STARTED","runId":"run-from-event",'
+            + '"threadId":"conversation-1"}\n\n',
+        ));
+        assert.equal(await cancelled, true);
+        streamController.close();
+        await run;
+        assert.equal(client.conversationId, "conversation-1");
+    } finally {
+        globalThis.fetch = originalFetch;
+    }
+
+    assert.equal(
+        requests[1].url,
+        "http://127.0.0.1:18000/api/chat/runs/run-from-event/cancel",
+    );
+});
+
+
 test("web image previews stay on the local Ren backend", () => {
     const client = new ChatClient("http://127.0.0.1:18000");
 

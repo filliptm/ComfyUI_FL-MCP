@@ -2591,6 +2591,7 @@ export class AssistantPanel {
             this.showError(`Message could not steer the response: ${error.message}`);
         } finally {
             this.steering = false;
+            if (this.running) this.runStatusText.textContent = "Ren is working…";
             this.updateComposerState();
         }
     }
@@ -2782,6 +2783,7 @@ export class AssistantPanel {
             this.showError(`Response could not be stopped: ${error.message}`);
         } finally {
             this.stopping = false;
+            if (this.running) this.runStatusText.textContent = "Ren is working…";
             this.updateComposerState();
         }
     }

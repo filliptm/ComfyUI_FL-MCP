@@ -130,6 +130,10 @@ app.add_middleware(
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=[
+        "X-FL-MCP-Run-Id",
+        "X-FL-MCP-Conversation-Id",
+    ],
 )
 
 app.mount("/js", StaticFiles(directory=str(WEB_JS_DIR)), name="shared_js")

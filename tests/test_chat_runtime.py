@@ -22,6 +22,7 @@ from chat_runtime import (
     tool_result_content,
     tools_for_message,
     wait_for_claude_mcp,
+    wait_for_codex_mcp_status,
     web_image_requested,
     web_search_environment,
     web_search_instructions,
@@ -97,6 +98,11 @@ async def test_starting_an_edit_creates_a_sibling_user_revision(tmp_path, monkey
     }
     assert state.user_message_id == messages[0]["id"]
     assert messages[0]["metadata"]["searchMode"] == "free"
+    assert _payload(state.events[0]) == {
+        "type": "RUN_STARTED",
+        "threadId": conversation["id"],
+        "runId": state.run_id,
+    }
 
 
 @pytest.mark.asyncio
@@ -172,6 +178,22 @@ async def test_run_events_track_text_tools_retries_and_replay(tmp_path):
     replay = [_payload(raw) async for raw in runtime.subscribe(state.run_id)]
     assert replay[0]["type"] == "TOOL_CALL_START"
     assert replay[-1]["type"] == "RUN_FINISHED"
+
+
+@pytest.mark.asyncio
+async def test_duplicate_run_started_events_are_suppressed(tmp_path):
+    runtime = ChatRuntime(ChatStore(tmp_path / "chat.db", tmp_path / "missing.db"))
+    state = ActiveRun("run-1", "conversation-1", "session-1")
+
+    event = {
+        "type": "RUN_STARTED",
+        "threadId": state.conversation_id,
+        "runId": state.run_id,
+    }
+    await runtime.publish(state, event)
+    await runtime.publish(state, event)
+
+    assert [_payload(raw) for raw in state.events] == [event]
 
 
 @pytest.mark.asyncio
@@ -576,6 +598,21 @@ async def test_claude_waits_for_mcp_tool_discovery(monkeypatch):
     client = FakeClient()
     await wait_for_claude_mcp(client, timeout=1)
     assert client.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_codex_mcp_discovery_has_a_startup_timeout():
+    class HangingClient:
+        async def request(self, *_args, **_kwargs):
+            await asyncio.Event().wait()
+
+    with pytest.raises(RuntimeError, match="timed out while connecting"):
+        await wait_for_codex_mcp_status(
+            HangingClient(),
+            {"threadId": "thread-1"},
+            object,
+            timeout=0.01,
+        )
 
 
 @pytest.mark.asyncio
