@@ -3,6 +3,7 @@ import server
 from chat_config import ChatSettingsStore, CredentialStore
 from chat_store import ChatStore
 from fastapi.testclient import TestClient
+from web_image_service import WebImagePreview
 
 
 def test_chat_settings_and_conversation_crud_use_http_api(tmp_path, monkeypatch):
@@ -119,6 +120,36 @@ def test_tavily_credential_uses_dedicated_endpoint(tmp_path, monkeypatch):
 
     assert response.status_code == 200
     assert response.json()["stored"] is True
+
+
+def test_web_image_preview_route_returns_validated_local_bytes(monkeypatch):
+    class PreviewService:
+        async def preview(self, url):
+            assert url == "https://example.com/reference.png"
+            return WebImagePreview(
+                content=b"preview-bytes",
+                media_type="image/jpeg",
+                source_url=url,
+                original_size=(2000, 1000),
+                preview_size=(1400, 700),
+            )
+
+        async def aclose(self):
+            return None
+
+    monkeypatch.setattr(chat_routes, "web_image_previews", PreviewService())
+
+    with TestClient(server.app) as client:
+        response = client.get(
+            "/api/chat/web-images/preview",
+            params={"url": "https://example.com/reference.png"},
+        )
+
+    assert response.status_code == 200
+    assert response.content == b"preview-bytes"
+    assert response.headers["content-type"] == "image/jpeg"
+    assert response.headers["x-content-type-options"] == "nosniff"
+    assert response.headers["x-fl-mcp-original-size"] == "2000x1000"
 
 
 def test_global_bypass_syncs_running_approvals(tmp_path, monkeypatch):

@@ -99,6 +99,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             await chat_runtime.shutdown()
         except Exception as exc:
             logger.warning("Embedded chat shutdown cleanup failed: %s", exc)
+        try:
+            from chat_routes import web_image_previews
+
+            await web_image_previews.aclose()
+        except Exception as exc:
+            logger.warning("Web image preview cleanup failed: %s", exc)
         cleanup_handle.cancel()
         if watchdog_handle:
             watchdog_handle.cancel()

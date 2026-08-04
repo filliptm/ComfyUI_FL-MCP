@@ -3781,6 +3781,11 @@ async def view_output_image(request: ViewOutputImageRequest, ctx: Context) -> To
         "nodeId": selected["nodeId"],
         "nodeImageIndex": selected["nodeImageIndex"],
         "relativePath": relative_path,
+        "image": {
+            "filename": selected["filename"],
+            "subfolder": selected["subfolder"],
+            "type": selected["type"],
+        },
         "originalSize": {"width": original_size[0], "height": original_size[1]},
         "previewSize": {"width": preview_size[0], "height": preview_size[1]},
         "message": "The generated image follows as visual MCP content. Inspect the pixels before judging the result.",

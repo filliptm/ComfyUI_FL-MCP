@@ -62,6 +62,17 @@ test("run requests include per-message reasoning and search modes", async () => 
 });
 
 
+test("web image previews stay on the local Ren backend", () => {
+    const client = new ChatClient("http://127.0.0.1:18000");
+
+    assert.equal(
+        client.webImagePreviewUrl("https://images.example/reference one.png"),
+        "http://127.0.0.1:18000/api/chat/web-images/preview"
+        + "?url=https%3A%2F%2Fimages.example%2Freference%20one.png",
+    );
+});
+
+
 test("edited requests and version navigation use branch-aware endpoints", async () => {
     const originalFetch = globalThis.fetch;
     const requests = [];

@@ -17,10 +17,14 @@ from chat_store import chat_store
 from claude_subscription import claude_subscription
 from codex_subscription import codex_subscription
 from fastapi import APIRouter, HTTPException, Query, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from manager import manager
+from web_fetcher import WebFetchError
+from web_image_service import WebImagePreviewError, WebImagePreviewService
+from web_security import WebUrlError
 
 router = APIRouter(prefix="/api/chat", tags=["chat"])
+web_image_previews = WebImagePreviewService()
 
 
 async def _connection_status(provider: str, *, refresh: bool = False) -> dict[str, Any]:
@@ -76,6 +80,32 @@ async def update_chat_settings(request: Request) -> dict[str, Any]:
     value["credential"] = await _connection_status(value["provider"])
     value["searchCredential"] = credential_store.status("tavily")
     return value
+
+
+@router.get("/web-images/preview")
+async def web_image_preview(
+    url: str = Query(min_length=1, max_length=2048),
+) -> Response:
+    """Return a safe, bounded local preview for one public raster image."""
+
+    try:
+        preview = await web_image_previews.preview(url)
+    except (WebUrlError, WebImagePreviewError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except WebFetchError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return Response(
+        content=preview.content,
+        media_type=preview.media_type,
+        headers={
+            "Cache-Control": "private, max-age=1800",
+            "Content-Security-Policy": "default-src 'none'; sandbox",
+            "X-Content-Type-Options": "nosniff",
+            "X-FL-MCP-Original-Size": (
+                f"{preview.original_size[0]}x{preview.original_size[1]}"
+            ),
+        },
+    )
 
 
 @router.get("/models")

@@ -84,6 +84,11 @@ async def test_view_output_image_returns_bounded_visual_content(tmp_path, monkey
     assert result.structured_content["promptId"] == "prompt-newest"
     assert result.structured_content["nodeId"] == "29"
     assert result.structured_content["relativePath"] == "output/run/final.png"
+    assert result.structured_content["image"] == {
+        "filename": "final.png",
+        "subfolder": "run",
+        "type": "output",
+    }
     assert result.structured_content["originalSize"] == {"width": 3000, "height": 1500}
     assert result.structured_content["previewSize"] == {"width": 1024, "height": 512}
     assert isinstance(result.content[0], TextContent)

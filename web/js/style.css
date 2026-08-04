@@ -686,6 +686,98 @@
     border-left: 1px solid rgba(153, 102, 217, 0.24);
 }
 
+.fl-tool-image-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 5px;
+    padding: 2px 0 5px;
+}
+
+.fl-tool-image-grid[data-layout="single"] {
+    grid-template-columns: minmax(0, 1fr);
+}
+
+.fl-tool-image-grid[data-layout="hero"] .fl-tool-image-card:first-child {
+    grid-column: 1 / -1;
+}
+
+.fl-tool-image-grid[data-layout="hero"] .fl-tool-image-card:first-child a,
+.fl-tool-image-grid[data-layout="single"] .fl-tool-image-card a {
+    aspect-ratio: 16 / 10;
+}
+
+.fl-tool-image-card {
+    min-width: 0;
+    margin: 0;
+    overflow: hidden;
+    border: 1px solid rgba(153, 102, 217, 0.2);
+    border-radius: 8px;
+    background: rgba(7, 7, 10, 0.72);
+}
+
+.fl-tool-image-card a {
+    position: relative;
+    display: flex;
+    width: 100%;
+    aspect-ratio: 1 / 1;
+    align-items: center;
+    justify-content: center;
+    overflow: hidden;
+    background:
+        linear-gradient(135deg, rgba(153, 102, 217, 0.08), transparent 58%),
+        var(--ren-surface-deep);
+}
+
+.fl-tool-image-card img {
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+    transition: transform 180ms ease, opacity 180ms ease;
+}
+
+.fl-tool-image-card a:hover img {
+    transform: scale(1.025);
+}
+
+.fl-tool-image-card figcaption {
+    overflow: hidden;
+    padding: 5px 7px 6px;
+    color: var(--ren-text-muted);
+    font-size: 10px;
+    line-height: 1.2;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.fl-tool-image-fallback {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 5px;
+    color: var(--ren-text-muted);
+    font-size: 10px;
+}
+
+.fl-tool-image-fallback[hidden] {
+    display: none;
+}
+
+.fl-tool-image-fallback i {
+    font-size: 18px;
+}
+
+.fl-tool-image-card.failed {
+    border-color: rgba(239, 130, 120, 0.24);
+}
+
+.fl-tool-image-overflow {
+    grid-column: 1 / -1;
+    padding: 3px 6px;
+    color: var(--ren-text-muted);
+    font-size: 10px;
+    text-align: center;
+}
+
 .fl-toolchain-crumb {
     width: 100%;
     min-width: 0;

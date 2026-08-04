@@ -37,6 +37,70 @@ function toolResultPayload(value) {
     return parsed;
 }
 
+function publicHttpUrl(value) {
+    try {
+        const parsed = new URL(String(value || ""));
+        return ["http:", "https:"].includes(parsed.protocol) ? parsed.href : "";
+    } catch (_) {
+        return "";
+    }
+}
+
+export function toolDisplayImages(step) {
+    const name = step?.name || "";
+    const result = toolResultPayload(step?.result);
+    let candidates = Array.isArray(result?.displayImages)
+        ? result.displayImages
+        : [];
+    if (name === "web_fetch_page" && Array.isArray(result?.images)) {
+        candidates = result.images.map(image => ({ ...image, kind: "web" }));
+    } else if (name === "view_output_image" && result?.image) {
+        candidates = [{
+            ...result.image,
+            kind: "comfy",
+            title: "Generated output",
+            alt: "Generated ComfyUI output",
+        }];
+    }
+
+    const images = [];
+    const seen = new Set();
+    for (const candidate of candidates) {
+        if (!candidate || typeof candidate !== "object") continue;
+        if (candidate.kind === "comfy") {
+            const filename = String(candidate.filename || "").trim();
+            const subfolder = String(candidate.subfolder || "").trim();
+            const type = String(candidate.type || "output").toLowerCase();
+            if (!filename || !["input", "output", "temp"].includes(type)) continue;
+            const key = `comfy:${type}:${subfolder}:${filename}`;
+            if (seen.has(key)) continue;
+            seen.add(key);
+            images.push({
+                kind: "comfy",
+                filename,
+                subfolder,
+                type,
+                title: String(candidate.title || "Generated output").trim(),
+                alt: String(candidate.alt || candidate.title || "Generated output").trim(),
+            });
+            continue;
+        }
+        const url = publicHttpUrl(candidate.url);
+        if (!url || seen.has(url)) continue;
+        seen.add(url);
+        images.push({
+            kind: "web",
+            url,
+            sourceUrl: publicHttpUrl(candidate.source_url || candidate.sourceUrl),
+            title: String(candidate.title || "").trim(),
+            alt: String(candidate.alt || candidate.title || "Web image").trim(),
+            width: Number(candidate.width) || null,
+            height: Number(candidate.height) || null,
+        });
+    }
+    return images;
+}
+
 function dimensionsLabel(value) {
     const width = Number(value?.width);
     const height = Number(value?.height);
@@ -206,11 +270,13 @@ export function summarizeToolStep(step, config = {}) {
     if (name === "web_fetch_page") {
         const title = String(result?.title || "web page").trim();
         const length = Number(result?.contentLength);
+        const imageCount = Array.isArray(result?.images) ? result.images.length : 0;
         const cacheLabel = result?.fromCache ? " from cache" : "";
         const summary = `Read ${title}${cacheLabel}`;
-        return Number.isFinite(length) && length > 0
+        const sized = Number.isFinite(length) && length > 0
             ? `${summary} · ${length.toLocaleString("en-US")} chars`
             : summary;
+        return imageCount > 0 ? `${sized} · ${plural(imageCount, "image")}` : sized;
     }
 
     if (name === "create_nodes") {

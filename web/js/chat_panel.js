@@ -6,6 +6,7 @@ import {
     starterPrompts,
     summarizeToolStep,
     technicalText,
+    toolDisplayImages,
     toolStackState,
 } from "./chat_ui_helpers.js";
 import { renderMarkdown } from "./safe_markdown.js";
@@ -27,6 +28,8 @@ const SEARCH_MODE_OPTIONS = [
     { id: "tavily_basic", label: "Tavily basic", detail: "Managed search · 1 credit." },
     { id: "tavily_advanced", label: "Tavily deep", detail: "Higher relevance · 2 credits." },
 ];
+
+const MAX_TOOL_GALLERY_IMAGES = 12;
 
 export class AssistantPanel {
     constructor(container, sessionManager, options = {}) {
@@ -1851,7 +1854,10 @@ export class AssistantPanel {
     }
 
     addToolStep(rail, step) {
-        const previousItem = rail.lastElementChild;
+        const lastElement = rail.lastElementChild;
+        const previousItem = lastElement?.classList.contains("fl-tool-image-grid")
+            ? lastElement.previousElementSibling
+            : lastElement;
         const previousSteps = previousItem?.toolSteps || [];
         if (canStackToolSteps(previousSteps.at(-1), step)) {
             previousSteps.push(step);
@@ -1947,6 +1953,130 @@ export class AssistantPanel {
         technical.querySelector("pre").textContent = technicalText(
             technicalSections.join("\n\n"),
         );
+        this.renderToolImages(item, steps);
+    }
+
+    renderToolImages(item, steps) {
+        const discovered = [];
+        const seen = new Set();
+        for (const step of steps) {
+            for (const image of toolDisplayImages(step)) {
+                const key = image.kind === "comfy"
+                    ? `${image.type}:${image.subfolder}:${image.filename}`
+                    : image.url;
+                if (seen.has(key)) continue;
+                seen.add(key);
+                discovered.push(image);
+            }
+        }
+        if (!discovered.length) {
+            item.imageGrid?.remove();
+            item.imageGrid = null;
+            return;
+        }
+
+        const images = discovered.slice(0, MAX_TOOL_GALLERY_IMAGES);
+        let grid = item.imageGrid;
+        if (!grid?.isConnected) {
+            grid = document.createElement("section");
+            grid.className = "fl-tool-image-grid";
+            grid.setAttribute("role", "list");
+            item.after(grid);
+            item.imageGrid = grid;
+        }
+        grid.replaceChildren();
+        grid.dataset.count = String(images.length);
+        grid.dataset.layout = images.length === 1
+            ? "single"
+            : images.length % 2 === 1
+                ? "hero"
+                : "grid";
+        grid.setAttribute(
+            "aria-label",
+            `${images.length} ${images.length === 1 ? "image" : "images"}`,
+        );
+
+        for (const [index, image] of images.entries()) {
+            const figure = document.createElement("figure");
+            figure.className = "fl-tool-image-card";
+            figure.setAttribute("role", "listitem");
+            const source = this.toolImageSource(image);
+            const link = document.createElement("a");
+            link.href = image.kind === "web"
+                ? (image.sourceUrl || image.url)
+                : source;
+            link.target = "_blank";
+            link.rel = "noopener noreferrer";
+            link.title = image.kind === "web"
+                ? "Open original source"
+                : "Open full generated image";
+
+            const preview = document.createElement("img");
+            preview.src = source;
+            preview.alt = image.alt || image.title || `Image ${index + 1}`;
+            preview.loading = index < 2 ? "eager" : "lazy";
+            preview.decoding = "async";
+            preview.referrerPolicy = "no-referrer";
+            if (index === 0) preview.fetchPriority = "high";
+
+            const fallback = document.createElement("span");
+            fallback.className = "fl-tool-image-fallback";
+            fallback.hidden = true;
+            const fallbackIcon = document.createElement("i");
+            fallbackIcon.className = "pi pi-image";
+            fallbackIcon.setAttribute("aria-hidden", "true");
+            const fallbackCopy = document.createElement("span");
+            fallbackCopy.textContent = "Preview unavailable";
+            fallback.append(fallbackIcon, fallbackCopy);
+            preview.addEventListener("error", () => {
+                figure.classList.add("failed");
+                preview.hidden = true;
+                fallback.hidden = false;
+            }, { once: true });
+            link.append(preview, fallback);
+            figure.appendChild(link);
+
+            const caption = this.toolImageCaption(image, index);
+            if (caption) {
+                const figcaption = document.createElement("figcaption");
+                figcaption.textContent = caption;
+                figcaption.title = caption;
+                figure.appendChild(figcaption);
+            }
+            grid.appendChild(figure);
+        }
+
+        if (discovered.length > images.length) {
+            const overflow = document.createElement("span");
+            overflow.className = "fl-tool-image-overflow";
+            overflow.textContent = `+${discovered.length - images.length} more images`;
+            grid.appendChild(overflow);
+        }
+    }
+
+    toolImageSource(image) {
+        if (image.kind === "web") {
+            return this.chat.webImagePreviewUrl(image.url);
+        }
+        const params = new URLSearchParams({
+            filename: image.filename,
+            type: image.type,
+        });
+        if (image.subfolder) params.set("subfolder", image.subfolder);
+        return `/api/view?${params.toString()}`;
+    }
+
+    toolImageCaption(image, index) {
+        const explicit = String(image.title || image.alt || "").trim();
+        if (explicit && explicit !== "Web image") return explicit.slice(0, 120);
+        if (image.kind === "web") {
+            try {
+                return new URL(image.sourceUrl || image.url).hostname;
+            } catch (_) {
+                return `Web image ${index + 1}`;
+            }
+        }
+        return image.title || `Generated output ${index + 1}`;
     }
 
     toolVisualStatus(status) {

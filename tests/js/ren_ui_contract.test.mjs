@@ -145,6 +145,27 @@ test("tool calls keep chronological placement and one shared renderer", async ()
 });
 
 
+test("web and generated images render in ordered chat galleries", async () => {
+    const panel = await readFile(new URL("web/js/chat_panel.js", root), "utf8");
+    const helpers = await readFile(new URL("web/js/chat_ui_helpers.js", root), "utf8");
+    const client = await readFile(new URL("web/js/chat_client.js", root), "utf8");
+    const styles = await readFile(new URL("web/js/style.css", root), "utf8");
+    const routes = await readFile(new URL("backend/chat_routes.py", root), "utf8");
+
+    assert.match(panel, /renderToolImages/);
+    assert.match(panel, /MAX_TOOL_GALLERY_IMAGES = 12/);
+    assert.match(panel, /grid\.dataset\.layout = images\.length === 1/);
+    assert.match(panel, /image\.sourceUrl \|\| image\.url/);
+    assert.match(panel, /preview\.referrerPolicy = "no-referrer"/);
+    assert.match(helpers, /export function toolDisplayImages/);
+    assert.match(client, /api\/chat\/web-images\/preview/);
+    assert.match(routes, /WebImagePreviewService/);
+    assert.match(styles, /\.fl-tool-image-grid\s*\{[^}]*grid-template-columns:\s*repeat\(2,/s);
+    assert.match(styles, /data-layout="hero"[^}]*first-child/s);
+    assert.match(styles, /object-fit:\s*contain/);
+});
+
+
 test("action trail stays compact, visible, and visually quiet when complete", async () => {
     const panel = await readFile(new URL("web/js/chat_panel.js", root), "utf8");
     const styles = await readFile(new URL("web/js/style.css", root), "utf8");

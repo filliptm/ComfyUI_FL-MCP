@@ -46,6 +46,9 @@ extraction is only a fallback for pages that cannot be read reliably.
 
 - Discover images from search results and fetched pages, including lazy-loaded and `srcset`
   candidates.
+- Render fetched web images and reviewed ComfyUI outputs inside Ren using a source-ordered,
+  responsive gallery. Route remote previews through the bounded local image proxy, cap each
+  gallery, and keep unavailable sources as clear fallback cards.
 - Show preview, source page, dimensions when known, and an explicit `license unknown` state.
 - Fetch only reviewed source IDs; revalidate redirects, content type, file signature, byte
   size, and decoded pixel count. Initially accept PNG, JPEG, and WebP and reject unsafe SVG.

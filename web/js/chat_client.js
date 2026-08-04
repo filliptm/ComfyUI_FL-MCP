@@ -129,6 +129,10 @@ export class ChatClient {
         );
     }
 
+    webImagePreviewUrl(url) {
+        return `${this.baseUrl}/api/chat/web-images/preview?url=${encodeURIComponent(url)}`;
+    }
+
     async startRun({
         sessionId,
         conversationId,

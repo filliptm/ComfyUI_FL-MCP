@@ -8,6 +8,7 @@ import {
     starterPrompts,
     summarizeToolStep,
     technicalText,
+    toolDisplayImages,
     toolStackState,
 } from "../../web/js/chat_ui_helpers.js";
 
@@ -149,12 +150,67 @@ test("web research summaries identify provider, cost, and fetched content", () =
             title: "Example reference",
             contentLength: 12345,
             fromCache: true,
+            images: [{ url: "https://example.com/one.png" }, { url: "https://example.com/two.png" }],
         }),
-    }), "Read Example reference from cache · 12,345 chars");
+    }), "Read Example reference from cache · 12,345 chars · 2 images");
     assert.equal(summarizeToolStep({
         name: "web_search",
         status: "failed",
     }), "Couldn’t search the web");
+});
+
+test("tool image candidates preserve source order and reject unsafe URLs", () => {
+    assert.deepEqual(toolDisplayImages({
+        name: "web_fetch_page",
+        result: JSON.stringify({
+            images: [{
+                url: "https://images.example/hero.png",
+                source_url: "https://example.com/article",
+                alt: "Primary reference",
+                width: 1200,
+                height: 800,
+            }, {
+                url: "javascript:alert(1)",
+                alt: "Unsafe",
+            }, {
+                url: "https://images.example/hero.png",
+                alt: "Duplicate",
+            }, {
+                url: "https://images.example/detail.webp",
+                title: "Detail",
+            }],
+        }),
+    }), [{
+        kind: "web",
+        url: "https://images.example/hero.png",
+        sourceUrl: "https://example.com/article",
+        title: "",
+        alt: "Primary reference",
+        width: 1200,
+        height: 800,
+    }, {
+        kind: "web",
+        url: "https://images.example/detail.webp",
+        sourceUrl: "",
+        title: "Detail",
+        alt: "Detail",
+        width: null,
+        height: null,
+    }]);
+
+    assert.deepEqual(toolDisplayImages({
+        name: "view_output_image",
+        result: JSON.stringify({
+            image: { filename: "final.png", subfolder: "run", type: "output" },
+        }),
+    }), [{
+        kind: "comfy",
+        filename: "final.png",
+        subfolder: "run",
+        type: "output",
+        title: "Generated output",
+        alt: "Generated ComfyUI output",
+    }]);
 });
 
 test("consecutive identical tool calls stack and retain the strongest state", () => {
