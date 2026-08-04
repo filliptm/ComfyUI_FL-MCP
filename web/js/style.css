@@ -1040,6 +1040,27 @@
     padding: 3px 7px 0 9px;
 }
 
+.fl-composer-controls,
+.fl-composer-actions,
+.fl-search-action-control {
+    display: flex;
+    align-items: center;
+}
+
+.fl-composer-controls {
+    min-width: 0;
+    flex: 0 1 auto;
+    gap: 5px;
+}
+
+.fl-composer-actions {
+    min-width: 0;
+}
+
+.fl-composer-actions[hidden] {
+    display: none;
+}
+
 .fl-canvas-context {
     display: flex;
     min-width: 0;
@@ -1071,6 +1092,27 @@
     align-items: center;
     gap: 3px;
     color: var(--ren-text-muted);
+}
+
+.fl-search-action-control {
+    min-width: 0;
+    gap: 3px;
+    color: var(--ren-info);
+}
+
+.fl-search-action-control select {
+    width: 78px;
+    height: 24px;
+    padding: 0 2px;
+    border: 0;
+    outline: 0;
+    background: transparent;
+    color: var(--ren-text-muted);
+    font-size: 10px;
+}
+
+.fl-search-action-control select:focus-visible {
+    box-shadow: 0 0 0 1px var(--ren-info);
 }
 
 .fl-reasoning-control select {
@@ -1372,6 +1414,10 @@
     --ren-settings-accent: var(--ren-warning);
 }
 
+.fl-settings-card-search {
+    --ren-settings-accent: var(--ren-info);
+}
+
 .fl-settings-card-diagnostics {
     --ren-settings-accent: var(--ren-info);
 }
@@ -1497,6 +1543,75 @@
     transition:
         border-color 160ms ease,
         background-color 160ms ease;
+}
+
+.fl-settings-toggle {
+    display: flex;
+    align-items: flex-start;
+    gap: 9px;
+    padding: 10px;
+    border: 1px solid var(--ren-border);
+    border-radius: 8px;
+    background: rgba(0, 0, 0, 0.12);
+    cursor: pointer;
+}
+
+.fl-settings-toggle:has(input:checked) {
+    border-color: rgba(114, 161, 235, 0.4);
+    background: rgba(114, 161, 235, 0.07);
+}
+
+.fl-settings-toggle:has(input:disabled) {
+    cursor: wait;
+    opacity: 0.58;
+}
+
+.fl-settings-toggle input {
+    width: 15px;
+    height: 15px;
+    margin: 1px 0 0;
+    flex: 0 0 auto;
+    accent-color: var(--ren-info);
+}
+
+.fl-settings-toggle > span {
+    display: flex;
+    min-width: 0;
+    flex: 1;
+    flex-direction: column;
+    gap: 3px;
+}
+
+.fl-settings-toggle strong {
+    color: var(--ren-text);
+    font-size: 11px;
+}
+
+.fl-settings-toggle > span > span,
+.fl-search-mode-detail {
+    color: var(--ren-text-muted);
+    font-size: 11px;
+    font-style: normal;
+    line-height: 1.4;
+}
+
+.fl-tavily-credential-field em {
+    color: var(--ren-text-muted);
+    font-size: 10px;
+    font-style: normal;
+    font-weight: 400;
+}
+
+.fl-search-credential-status {
+    min-width: 0;
+    flex: 1 1 160px;
+    color: var(--ren-text-muted);
+    font-size: 10px;
+    line-height: 1.35;
+}
+
+.fl-search-credential-status.error {
+    color: var(--ren-danger);
 }
 
 .fl-approval-toggle:has(input:checked) {

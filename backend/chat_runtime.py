@@ -19,6 +19,7 @@ from typing import Any
 from chat_config import (
     PROJECT_ROOT,
     PROVIDER_PRESETS,
+    SEARCH_MODES,
     chat_settings,
     credential_store,
 )
@@ -228,7 +229,7 @@ async def wait_for_claude_mcp(
         await asyncio.sleep(0.1)
 
 
-def tools_for_message(message: str) -> set[str]:
+def tools_for_message(message: str, search_mode: str = "off") -> set[str]:
     text = message.lower()
     selected = set(CORE_CHAT_TOOLS)
     if any(
@@ -253,7 +254,47 @@ def tools_for_message(message: str) -> set[str]:
         for word in ("save workflow", "load workflow", "workflow file", "delete workflow")
     ):
         selected.update(INTENT_TOOL_GROUPS["files"])
+    if search_mode != "off":
+        selected.update({"web_search", "web_fetch_page"})
     return selected
+
+
+def web_search_instructions(search_mode: str) -> str:
+    """Explain the user-selected, server-enforced web capability to the model."""
+
+    descriptions = {
+        "off": (
+            "Web access is off for this message. Do not claim to search or fetch the web; "
+            "ask the user to choose a web-search action if current sources are required."
+        ),
+        "free": (
+            "Free web search is enabled for this message. Use `web_search` when external or "
+            "current information is needed, then use `web_fetch_page` on the most relevant "
+            "results. This provider is no-cost and best-effort, so report rate limits clearly."
+        ),
+        "tavily_basic": (
+            "Tavily Basic search is enabled for this message. Use `web_search` when external "
+            "or current information is needed and `web_fetch_page` for full source text. "
+            "Basic search uses one Tavily credit per query."
+        ),
+        "tavily_advanced": (
+            "Tavily Advanced search is enabled for this message. Use `web_search` for higher-"
+            "relevance research and `web_fetch_page` for full source text. Advanced search "
+            "uses two Tavily credits per query, so avoid redundant searches."
+        ),
+    }
+    return "Ren web-search selection:\n- " + descriptions.get(search_mode, descriptions["off"])
+
+
+def web_search_environment(settings: dict[str, Any]) -> dict[str, str]:
+    """Pass the selected mode and secret to the isolated Ren MCP subprocess."""
+
+    mode = str(settings.get("search_mode") or "off")
+    tavily_key = credential_store.get("tavily") if mode.startswith("tavily_") else None
+    return {
+        "FL_MCP_WEB_SEARCH_MODE": mode,
+        "FL_MCP_TAVILY_API_KEY": tavily_key or "",
+    }
 
 
 def approval_fingerprint(tool_name: str, tool_args: dict[str, Any]) -> str:
@@ -397,6 +438,7 @@ class ChatRuntime:
         conversation_id: str | None,
         message: str,
         reasoning_effort: str = "default",
+        search_mode: str | None = None,
         edit_message_id: str | None = None,
     ) -> ActiveRun:
         text = message.strip()
@@ -405,6 +447,17 @@ class ChatRuntime:
         settings = chat_settings.load()
         if reasoning_effort != "default":
             settings["reasoning_effort"] = reasoning_effort
+        if search_mode is not None:
+            normalized_search_mode = str(search_mode).strip().lower()
+            if normalized_search_mode not in SEARCH_MODES:
+                raise ValueError(f"Unsupported web search mode: {normalized_search_mode}")
+            settings["search_mode"] = normalized_search_mode
+        if str(settings.get("search_mode") or "").startswith("tavily_"):
+            if not credential_store.get("tavily"):
+                raise ValueError(
+                    "Tavily search needs an API key. Add one in Ren Settings → Web search, "
+                    "or choose Free web."
+                )
         if not settings["model"]:
             raise ValueError("Choose a model before sending a message.")
         identifier = conversation_id or str(uuid.uuid4())
@@ -454,6 +507,7 @@ class ChatRuntime:
                 text,
                 provider=settings["provider"],
                 model=settings["model"],
+                metadata={"searchMode": settings.get("search_mode", "off")},
                 **message_options,
             )
             run_id = str(uuid.uuid4())
@@ -659,7 +713,11 @@ class ChatRuntime:
                 if self.model_factory is not None
                 else self._build_model(settings)
             )
-            prompt = PROMPT_PATH.read_text(encoding="utf-8")
+            prompt = (
+                PROMPT_PATH.read_text(encoding="utf-8")
+                + "\n\n"
+                + web_search_instructions(str(settings.get("search_mode") or "off"))
+            )
             latest_user_message = next(
                 (
                     item["content"]
@@ -668,7 +726,10 @@ class ChatRuntime:
                 ),
                 "",
             )
-            allowed_tools = tools_for_message(latest_user_message)
+            allowed_tools = tools_for_message(
+                latest_user_message,
+                str(settings.get("search_mode") or "off"),
+            )
             retry_approval_grants: set[str] = set()
 
             async def prepare_tools(ctx, tool_definitions):
@@ -753,6 +814,7 @@ class ChatRuntime:
                 "FL_MCP_SESSION_ID": state.session_id,
                 "FL_MCP_WS_URL": self._ws_url(),
                 "FL_MCP_CLIENT_ID": f"embedded-chat-{state.run_id}",
+                **web_search_environment(settings),
             })
             mcp_server = MCPServerStdio(
                 sys.executable,
@@ -870,7 +932,11 @@ class ChatRuntime:
                 "Install Claude Code and run `claude auth login`."
             )
 
-        prompt = PROMPT_PATH.read_text(encoding="utf-8")
+        prompt = (
+            PROMPT_PATH.read_text(encoding="utf-8")
+            + "\n\n"
+            + web_search_instructions(str(settings.get("search_mode") or "off"))
+        )
         claude_prompt = (
             f"{prompt}\n\n"
             "Claude Code integration rules:\n"
@@ -888,7 +954,10 @@ class ChatRuntime:
             ),
             "",
         )
-        allowed_tools = tools_for_message(latest_user_message)
+        allowed_tools = tools_for_message(
+            latest_user_message,
+            str(settings.get("search_mode") or "off"),
+        )
         claude_session_id = next(
             (
                 str(item["metadata"]["claudeSessionId"])
@@ -905,6 +974,7 @@ class ChatRuntime:
             "FL_MCP_WS_URL": self._ws_url(),
             "FL_MCP_CLIENT_ID": f"embedded-claude-{state.run_id}",
             "FL_MCP_ALLOWED_TOOLS": ",".join(sorted(allowed_tools)),
+            **web_search_environment(settings),
             "CLAUDE_AGENT_SDK_CLIENT_APP": "comfyui-fl-mcp/ren",
             # A configured Anthropic API key otherwise takes precedence over
             # the user's Claude Code subscription in non-interactive mode.
@@ -1233,7 +1303,11 @@ class ChatRuntime:
             TurnStatus,
         )
 
-        prompt = PROMPT_PATH.read_text(encoding="utf-8")
+        prompt = (
+            PROMPT_PATH.read_text(encoding="utf-8")
+            + "\n\n"
+            + web_search_instructions(str(settings.get("search_mode") or "off"))
+        )
         codex_prompt = (
             f"{prompt}\n\n"
             "Codex integration rules:\n"
@@ -1252,7 +1326,10 @@ class ChatRuntime:
             ),
             "",
         )
-        allowed_tools = tools_for_message(latest_user_message)
+        allowed_tools = tools_for_message(
+            latest_user_message,
+            str(settings.get("search_mode") or "off"),
+        )
         codex_thread_id = next(
             (
                 str(item["metadata"]["codexThreadId"])
@@ -1268,6 +1345,7 @@ class ChatRuntime:
             "FL_MCP_WS_URL": self._ws_url(),
             "FL_MCP_CLIENT_ID": f"embedded-codex-{state.run_id}",
             "FL_MCP_ALLOWED_TOOLS": ",".join(sorted(allowed_tools)),
+            **web_search_environment(settings),
         }
         ren_server = {
             "command": sys.executable,

@@ -101,6 +101,11 @@ from coding_tools import (
     write_file as coding_write_file,
 )
 from comfy_supervisor import comfy_supervisor
+from chat_config import DATA_DIR
+from web_cache import WebCache
+from web_fetcher import AsyncWebFetcher
+from web_search import WebSearchService
+from web_service import WebPageService
 
 # LOGGING
 
@@ -328,11 +333,28 @@ async def mcp_lifespan(server: FastMCP) -> AsyncIterator[Any]:
     except Exception as e:
         logger.warning(f"[MCP] Could not check Manager status: {e}")
 
+    web_cache = WebCache(DATA_DIR / "web_cache.sqlite3")
+    web_fetcher = AsyncWebFetcher()
+    web_pages = WebPageService(fetcher=web_fetcher, cache=web_cache)
+    web_search = WebSearchService(
+        mode=os.getenv("FL_MCP_WEB_SEARCH_MODE", "free"),
+        tavily_api_key=(
+            os.getenv("FL_MCP_TAVILY_API_KEY")
+            or os.getenv("TAVILY_API_KEY")
+        ),
+    )
+
+    async def close_web_resources() -> None:
+        await web_search.aclose()
+        await web_fetcher.aclose()
+        web_cache.close()
+
     if os.getenv('FL_MCP_MODE') == 'subprocess':
         session_id = os.getenv('FL_MCP_SESSION_ID')
         ws_url = os.getenv('FL_MCP_WS_URL')
         if not session_id or not ws_url:
             logger.error("Missing FL_MCP_SESSION_ID or FL_MCP_WS_URL environment variables")
+            await close_web_resources()
             raise RuntimeError("MCP subprocess not properly configured")
         
         logger.info(f"[MCP] Starting in subprocess mode for session: {session_id}")
@@ -344,24 +366,35 @@ async def mcp_lifespan(server: FastMCP) -> AsyncIterator[Any]:
             logger.info("[MCP] WebSocket client connected (persistent)")
         except Exception as e:
             logger.error(f"MCP Initialization Failed: {str(e)}")
+            await close_web_resources()
             raise
 
-        yield {
-            "client": _WS_CLIENT,
-            "manager_client": manager_client,
-            "manager_available": manager_available
-        }
+        try:
+            yield {
+                "client": _WS_CLIENT,
+                "manager_client": manager_client,
+                "manager_available": manager_available,
+                "web_search": web_search,
+                "web_pages": web_pages,
+            }
+        finally:
+            await close_web_resources()
 
         # NOTE: no disconnect/teardown here; keep WS open for the process lifetime.
         return
 
     # Standalone (no WebSocket bridge)
     logger.info("[MCP] Running in standalone mode (no WebSocket)")
-    yield {
-        "client": None,
-        "manager_client": manager_client,
-        "manager_available": manager_available
-    }
+    try:
+        yield {
+            "client": None,
+            "manager_client": manager_client,
+            "manager_available": manager_available,
+            "web_search": web_search,
+            "web_pages": web_pages,
+        }
+    finally:
+        await close_web_resources()
 
 # Initialize FastMCP server with lifespan
 mcp = FastMCP("ComfyUI FL-MCP", lifespan=mcp_lifespan)
@@ -1039,6 +1072,25 @@ class WaitRequest(BaseModel):
     delay: float = Field(..., description="Brief period of time to wait (keep between 5 and 20 seconds). Great for waiting a bit after the workflow is queued to show some result")
 
 
+class WebSearchRequest(BaseModel):
+    """Search the public web using the mode chosen in Ren's composer."""
+
+    query: str = Field(..., min_length=1, max_length=500, description="Focused search query")
+    max_results: int = Field(5, ge=1, le=10, description="Maximum ranked results")
+    time_range: Optional[Literal["day", "week", "month", "year"]] = Field(
+        None,
+        description="Optional freshness window",
+    )
+
+
+class WebFetchPageRequest(BaseModel):
+    """Fetch and locally extract one public result page."""
+
+    url: str = Field(..., min_length=1, max_length=2048, description="Public HTTP(S) URL")
+    max_chars: int = Field(12000, ge=1000, le=30000, description="Maximum extracted characters")
+    force_refresh: bool = Field(False, description="Ignore a cached extraction")
+
+
 class CustomNodesPathRequest(BaseModel):
     path: str = Field(".", description="Path inside ComfyUI/custom_nodes")
 
@@ -1318,6 +1370,56 @@ async def wait(request: WaitRequest, ctx: Context) -> Dict[str, Any]:
     
     await asyncio.sleep(float(request.delay))
     return {"waited_for": request.delay}
+
+
+@mcp.tool()
+async def web_search(request: WebSearchRequest, ctx: Context) -> Dict[str, Any]:
+    """Search the web with the user-selected Free, Tavily Basic, or Tavily Advanced mode.
+
+    The provider and Tavily depth are fixed by the current Ren message's composer action.
+    Results include titles, URLs, snippets, and actual Tavily credit usage when applicable.
+    """
+    await _report_tool_activity(ctx, "web_search")
+    service: WebSearchService = ctx.request_context.lifespan_context["web_search"]
+    response = await service.search(
+        request.query,
+        max_results=request.max_results,
+        time_range=request.time_range,
+    )
+    return {"success": True, **response.model_dump(mode="json")}
+
+
+@mcp.tool()
+async def web_fetch_page(request: WebFetchPageRequest, ctx: Context) -> Dict[str, Any]:
+    """Safely fetch and locally extract a public web page returned by search.
+
+    Private, loopback, metadata, unsafe-port, oversized, binary, and unsafe redirect targets
+    are rejected. Ordinary HTML is parsed locally and cached without Tavily credits.
+    """
+    await _report_tool_activity(ctx, "web_fetch_page")
+    service: WebPageService = ctx.request_context.lifespan_context["web_pages"]
+    page = await service.fetch_page(request.url, force_refresh=request.force_refresh)
+    content = page.markdown or page.text
+    truncated = len(content) > request.max_chars
+    return {
+        "success": True,
+        "requestedUrl": page.requested_url,
+        "finalUrl": page.final_url,
+        "canonicalUrl": page.canonical_url,
+        "title": page.title,
+        "description": page.description,
+        "language": page.language,
+        "content": content[:request.max_chars],
+        "contentLength": len(content),
+        "truncated": truncated,
+        "contentHash": page.content_hash,
+        "qualityScore": page.quality_score,
+        "requiresHostedFallback": page.requires_hosted_fallback,
+        "fromCache": page.from_cache,
+        "links": [item.model_dump(mode="json") for item in page.links[:25]],
+        "images": [item.model_dump(mode="json") for item in page.images[:10]],
+        "warnings": page.warnings,
+    }
 
 # ============================================================================
 # QUERY & ANALYSIS TOOLS

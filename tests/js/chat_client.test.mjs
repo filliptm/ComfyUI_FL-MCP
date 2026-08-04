@@ -25,7 +25,7 @@ test("SSE consumer handles chunk boundaries and multiple events", async () => {
 });
 
 
-test("run requests include the per-message reasoning level", async () => {
+test("run requests include per-message reasoning and search modes", async () => {
     const originalFetch = globalThis.fetch;
     let request;
     globalThis.fetch = async (url, options = {}) => {
@@ -44,6 +44,7 @@ test("run requests include the per-message reasoning level", async () => {
             sessionId: "session-1",
             message: "Inspect this workflow",
             reasoningEffort: "xhigh",
+            searchMode: "tavily_basic",
         });
     } finally {
         globalThis.fetch = originalFetch;
@@ -55,6 +56,7 @@ test("run requests include the per-message reasoning level", async () => {
         conversationId: null,
         message: "Inspect this workflow",
         reasoningEffort: "xhigh",
+        searchMode: "tavily_basic",
         editMessageId: null,
     });
 });

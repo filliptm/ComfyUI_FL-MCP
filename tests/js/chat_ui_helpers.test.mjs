@@ -123,6 +123,40 @@ test("image review and mask summaries report the visible outcome", () => {
     }), "Mask approved for workflow");
 });
 
+test("web research summaries identify provider, cost, and fetched content", () => {
+    assert.equal(summarizeToolStep({
+        name: "web_search",
+        status: "done",
+        result: JSON.stringify({
+            provider: "free",
+            results: [{}, {}, {}],
+            credits_used: 0,
+        }),
+    }), "Searched Free web · 3 sources");
+    assert.equal(summarizeToolStep({
+        name: "web_search",
+        status: "done",
+        result: JSON.stringify({
+            provider: "tavily",
+            results: [{}],
+            credits_used: 2,
+        }),
+    }), "Searched Tavily · 1 source · 2 credits");
+    assert.equal(summarizeToolStep({
+        name: "web_fetch_page",
+        status: "done",
+        result: JSON.stringify({
+            title: "Example reference",
+            contentLength: 12345,
+            fromCache: true,
+        }),
+    }), "Read Example reference from cache · 12,345 chars");
+    assert.equal(summarizeToolStep({
+        name: "web_search",
+        status: "failed",
+    }), "Couldn’t search the web");
+});
+
 test("consecutive identical tool calls stack and retain the strongest state", () => {
     assert.equal(
         canStackToolSteps({ name: "modify_layout" }, { name: "modify_layout" }),

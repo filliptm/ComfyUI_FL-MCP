@@ -15,9 +15,18 @@ extraction is only a fallback for pages that cannot be read reliably.
 
 ## Phase 2: search and fetch tools
 
-- Add Tavily-backed search and hosted extraction fallback.
-- Store the API credential in the existing persistent credential system.
-- Expose explicit read-only MCP tools with clear progress and error messages.
+- Add a no-key, no-credit search mode using DuckDuckGo's lightweight HTML results. This is
+  intentionally marked best-effort because the public endpoint can rate-limit or change.
+- Add optional Tavily Basic (one credit) and Tavily Advanced (two credits) modes through a
+  small REST adapter instead of pulling in Tavily's SDK and dependency tree.
+- Fetch selected pages with the safe local Phase 1 extractor, so ordinary page reads do not
+  consume Tavily credits.
+- Store the optional Tavily API credential in the existing OS-keychain-backed credential
+  system, never in the JSON settings file.
+- Let the user choose No web, Free web, Tavily Basic, or Tavily Deep for each message, with a
+  saved default in Settings.
+- Allow the composer search action to be hidden while keeping the saved default active.
+- Expose explicit read-only MCP tools with provider, credit, progress, and error messages.
 
 ## Phase 3: sources and citations
 

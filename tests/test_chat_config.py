@@ -34,6 +34,36 @@ def test_reasoning_effort_persists_and_validates(tmp_path):
         store.update({"reasoning_effort": "unlimited"})
 
 
+def test_search_mode_and_action_visibility_persist_and_validate(tmp_path):
+    store = ChatSettingsStore(tmp_path / "settings.json")
+
+    assert store.load()["search_mode"] == "free"
+    value = store.update({
+        "search_mode": "tavily_advanced",
+        "show_action_buttons": False,
+    })
+    assert value["search_mode"] == "tavily_advanced"
+    assert value["show_action_buttons"] is False
+
+    with pytest.raises(ValueError, match="web search mode"):
+        store.update({"search_mode": "surprise_me"})
+    with pytest.raises(ValueError, match="true or false"):
+        store.update({"show_action_buttons": "no"})
+
+
+def test_tavily_credentials_use_the_same_secure_store(monkeypatch):
+    store = CredentialStore()
+    monkeypatch.setattr("keyring.set_password", lambda *_args: None)
+    monkeypatch.setattr("keyring.get_password", lambda *_args: "tvly-secret")
+
+    result = store.set("tavily", "tvly-secret")
+
+    assert result["storage"] == "keychain"
+    assert store.get("tavily") == "tvly-secret"
+    with pytest.raises(ValueError, match="Unsupported provider"):
+        store.set("unknown-search", "secret")
+
+
 def test_approval_preferences_persist_and_validate(tmp_path):
     store = ChatSettingsStore(tmp_path / "settings.json")
     value = store.update({

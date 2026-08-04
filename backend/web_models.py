@@ -31,6 +31,29 @@ class WebImageCandidate(BaseModel):
     height: int | None = Field(default=None, ge=1)
 
 
+class WebSearchResult(BaseModel):
+    """One normalized result returned by a web search provider."""
+
+    model_config = ConfigDict(frozen=True)
+
+    title: str
+    url: str
+    snippet: str = ""
+    score: float | None = None
+    published_date: str | None = None
+
+
+class WebSearchResponse(BaseModel):
+    """Provider-neutral web search response exposed to Ren."""
+
+    query: str
+    provider: str
+    mode: str
+    results: list[WebSearchResult] = Field(default_factory=list)
+    credits_used: int = Field(default=0, ge=0)
+    warnings: list[str] = Field(default_factory=list)
+
+
 @dataclass(frozen=True, slots=True)
 class FetchedDocument:
     """A bounded HTTP response ready for local extraction."""

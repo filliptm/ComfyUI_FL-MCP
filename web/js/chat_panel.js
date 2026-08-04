@@ -21,6 +21,13 @@ const REASONING_LABELS = {
     ultra: "Ultra",
 };
 
+const SEARCH_MODE_OPTIONS = [
+    { id: "off", label: "No web", detail: "Do not expose web tools for this message." },
+    { id: "free", label: "Free web", detail: "No key or credits · best effort." },
+    { id: "tavily_basic", label: "Tavily basic", detail: "Managed search · 1 credit." },
+    { id: "tavily_advanced", label: "Tavily deep", detail: "Higher relevance · 2 credits." },
+];
+
 export class AssistantPanel {
     constructor(container, sessionManager, options = {}) {
         this.container = container;
@@ -54,6 +61,7 @@ export class AssistantPanel {
         this.undoTimer = null;
         this.lastFailedMessage = "";
         this.lastFailedEditMessageId = null;
+        this.lastFailedSearchMode = null;
         this.lastArchivedConversation = null;
         this.pendingDeleteConversationId = null;
         this.contextUnsubscribe = null;
@@ -144,11 +152,20 @@ export class AssistantPanel {
                                 <i class="pi pi-sitemap" aria-hidden="true"></i>
                                 <span>Checking canvas…</span>
                             </div>
-                            <label class="fl-reasoning-control" title="Reasoning level for the next message">
-                                <i class="pi pi-sparkles" aria-hidden="true"></i>
-                                <span class="fl-sr-only">Reasoning level</span>
-                                <select data-reasoning="composer" aria-label="Reasoning level for the next message"></select>
-                            </label>
+                            <div class="fl-composer-controls">
+                                <div class="fl-composer-actions">
+                                    <label class="fl-search-action-control" title="Web search for the next message">
+                                        <i class="pi pi-globe" aria-hidden="true"></i>
+                                        <span class="fl-sr-only">Web search</span>
+                                        <select data-search="composer" aria-label="Web search for the next message"></select>
+                                    </label>
+                                </div>
+                                <label class="fl-reasoning-control" title="Reasoning level for the next message">
+                                    <i class="pi pi-sparkles" aria-hidden="true"></i>
+                                    <span class="fl-sr-only">Reasoning level</span>
+                                    <select data-reasoning="composer" aria-label="Reasoning level for the next message"></select>
+                                </label>
+                            </div>
                         </div>
                         <div class="fl-composer-row">
                             <textarea class="fl-chat-input" rows="1" placeholder="Ask Ren about this workflow…" aria-label="Message"></textarea>
@@ -243,6 +260,41 @@ export class AssistantPanel {
                             <footer class="fl-settings-card-footer">
                                 <div class="fl-credential-status" role="status" aria-live="polite"></div>
                                 <button class="fl-primary-button fl-settings-save" data-action="save-settings" type="button">Save and test</button>
+                            </footer>
+                        </section>
+
+                        <section class="fl-settings-card fl-settings-card-search" data-settings-section="search" aria-labelledby="fl-settings-search-title">
+                            <header class="fl-settings-card-header">
+                                <div class="fl-settings-card-heading">
+                                    <span class="fl-settings-card-icon" aria-hidden="true"><i class="pi pi-globe"></i></span>
+                                    <div>
+                                        <h3 id="fl-settings-search-title">Web search</h3>
+                                        <p>Choose free search or Tavily for each request.</p>
+                                    </div>
+                                </div>
+                                <span class="fl-settings-state neutral" data-settings-state="search" role="status">Checking</span>
+                            </header>
+                            <div class="fl-settings-card-body">
+                                <label class="fl-field">
+                                    <span>Default search</span>
+                                    <select class="fl-provider-input" data-setting="search_mode"></select>
+                                    <small class="fl-search-mode-detail"></small>
+                                </label>
+                                <label class="fl-settings-toggle fl-search-actions-toggle">
+                                    <input data-setting="show_action_buttons" type="checkbox">
+                                    <span>
+                                        <strong>Show composer action buttons</strong>
+                                        <span>Turn off the web-search action selector for a cleaner composer. Ren will keep using the default search above.</span>
+                                    </span>
+                                </label>
+                                <label class="fl-field fl-tavily-credential-field">
+                                    <span>Tavily API key <em>optional</em></span>
+                                    <input class="fl-provider-input" data-setting="tavily_credential" type="password" autocomplete="off" placeholder="Stored in your OS keychain">
+                                </label>
+                            </div>
+                            <footer class="fl-settings-card-footer">
+                                <div class="fl-search-credential-status" role="status" aria-live="polite"></div>
+                                <button class="fl-primary-button" data-action="save-search-settings" type="button">Save search</button>
                             </footer>
                         </section>
 
@@ -353,6 +405,26 @@ export class AssistantPanel {
         this.composerReasoningSelect = this.container.querySelector(
             '[data-reasoning="composer"]',
         );
+        this.composerActions = this.container.querySelector(".fl-composer-actions");
+        this.composerSearchSelect = this.container.querySelector(
+            '[data-search="composer"]',
+        );
+        this.settingsSearchSelect = this.container.querySelector(
+            '[data-setting="search_mode"]',
+        );
+        this.searchModeDetail = this.container.querySelector(".fl-search-mode-detail");
+        this.showActionButtonsInput = this.container.querySelector(
+            '[data-setting="show_action_buttons"]',
+        );
+        this.tavilyCredentialInput = this.container.querySelector(
+            '[data-setting="tavily_credential"]',
+        );
+        this.searchCredentialStatus = this.container.querySelector(
+            ".fl-search-credential-status",
+        );
+        this.searchSettingsState = this.container.querySelector(
+            '[data-settings-state="search"]',
+        );
         this.credentialInput = this.container.querySelector('[data-setting="credential"]');
         this.credentialField = this.container.querySelector(".fl-credential-field");
         this.claudeSubscription = this.container.querySelector(".fl-claude-subscription");
@@ -414,6 +486,7 @@ export class AssistantPanel {
             if (action === "status-action") this.handleStatusAction();
             if (action === "discover-models") this.discoverModels();
             if (action === "save-settings") this.saveSettings();
+            if (action === "save-search-settings") this.saveSearchSettings();
             if (action === "claude-login") this.connectClaudeSubscription();
             if (action === "codex-login") this.connectCodexSubscription();
             if (action === "clear-always-allowed") this.clearAlwaysAllowedTools();
@@ -448,6 +521,14 @@ export class AssistantPanel {
         this.approvalBypassInput.addEventListener(
             "change",
             () => this.setApprovalBypass(),
+        );
+        this.settingsSearchSelect.addEventListener(
+            "change",
+            () => this.renderSearchSettings(),
+        );
+        this.showActionButtonsInput.addEventListener(
+            "change",
+            () => this.setComposerActionsVisibility(),
         );
         this.textarea.addEventListener("keydown", (event) => {
             if (
@@ -691,9 +772,103 @@ export class AssistantPanel {
             : []);
         this.renderProviderControls();
         this.renderReasoningControls({ resetComposer: true });
+        this.populateSearchControls({ resetComposer: true });
         this.updateCredentialField();
         this.updateProviderBadge();
+        this.renderSearchSettings();
         this.renderApprovalSettings();
+    }
+
+    populateSearchControls({ resetComposer = false } = {}) {
+        const selectedComposerMode = resetComposer
+            ? (this.settings?.search_mode || "free")
+            : (this.composerSearchSelect.value || this.settings?.search_mode || "free");
+        for (const select of [this.settingsSearchSelect, this.composerSearchSelect]) {
+            select.replaceChildren();
+            for (const mode of SEARCH_MODE_OPTIONS) {
+                const option = document.createElement("option");
+                option.value = mode.id;
+                option.textContent = mode.label;
+                option.title = mode.detail;
+                select.appendChild(option);
+            }
+        }
+        this.settingsSearchSelect.value = this.settings?.search_mode || "free";
+        this.composerSearchSelect.value = selectedComposerMode;
+        this.showActionButtonsInput.checked = this.settings?.show_action_buttons !== false;
+        this.composerActions.hidden = !this.showActionButtonsInput.checked;
+    }
+
+    renderSearchSettings() {
+        const mode = SEARCH_MODE_OPTIONS.find(
+            item => item.id === this.settingsSearchSelect.value,
+        ) || SEARCH_MODE_OPTIONS[1];
+        const tavilySelected = mode.id.startsWith("tavily_");
+        const configured = Boolean(this.settings?.searchCredential?.configured);
+        this.searchModeDetail.textContent = mode.detail;
+        this.searchCredentialStatus.classList.toggle(
+            "error",
+            tavilySelected && !configured,
+        );
+        this.searchCredentialStatus.textContent = configured
+            ? `Tavily credential ready · ${this.settings.searchCredential.source}`
+            : "Tavily is optional · Free web needs no API key";
+        if (mode.id === "off") {
+            this.setSettingsState(this.searchSettingsState, "Off", "neutral");
+        } else if (mode.id === "free") {
+            this.setSettingsState(this.searchSettingsState, "Free · no cost", "ready");
+        } else if (configured) {
+            this.setSettingsState(this.searchSettingsState, "Tavily ready", "ready");
+        } else {
+            this.setSettingsState(this.searchSettingsState, "API key needed", "warning");
+        }
+    }
+
+    async setComposerActionsVisibility() {
+        const previous = this.settings?.show_action_buttons !== false;
+        const visible = this.showActionButtonsInput.checked;
+        this.showActionButtonsInput.disabled = true;
+        this.composerActions.hidden = !visible;
+        try {
+            this.settings = await this.chat.updateSettings({
+                show_action_buttons: visible,
+            });
+            this.announce(visible
+                ? "Composer action buttons shown."
+                : "Composer action buttons hidden. Default search remains active.");
+        } catch (error) {
+            this.showActionButtonsInput.checked = previous;
+            this.composerActions.hidden = !previous;
+            this.showError(`Action buttons could not be changed: ${error.message}`);
+        } finally {
+            this.showActionButtonsInput.disabled = false;
+        }
+    }
+
+    async saveSearchSettings() {
+        const button = this.container.querySelector('[data-action="save-search-settings"]');
+        button.disabled = true;
+        button.textContent = "Saving…";
+        this.searchCredentialStatus.classList.remove("error");
+        try {
+            if (this.tavilyCredentialInput.value.trim()) {
+                await this.chat.setCredential("tavily", this.tavilyCredentialInput.value);
+                this.tavilyCredentialInput.value = "";
+            }
+            this.settings = await this.chat.updateSettings({
+                search_mode: this.settingsSearchSelect.value,
+                show_action_buttons: this.showActionButtonsInput.checked,
+            });
+            this.populateSearchControls({ resetComposer: true });
+            this.renderSearchSettings();
+            this.announce("Web search settings saved.");
+        } catch (error) {
+            this.searchCredentialStatus.textContent = error.message;
+            this.searchCredentialStatus.classList.add("error");
+        } finally {
+            button.disabled = false;
+            button.textContent = "Save search";
+        }
     }
 
     setSettingsState(element, label, tone = "neutral") {
@@ -2054,7 +2229,11 @@ export class AssistantPanel {
         await this.runMessage(message);
     }
 
-    async runMessage(message, editMessageId = null) {
+    async runMessage(
+        message,
+        editMessageId = null,
+        searchMode = this.composerSearchSelect.value,
+    ) {
         if (!message || this.running) return;
         if (!this.status?.configured) {
             this.openSheet("settings");
@@ -2064,6 +2243,7 @@ export class AssistantPanel {
         this.clearError();
         this.lastFailedMessage = message;
         this.lastFailedEditMessageId = editMessageId;
+        this.lastFailedSearchMode = searchMode;
         this.running = true;
         this.currentAssistant = null;
         this.followOutput = true;
@@ -2079,6 +2259,7 @@ export class AssistantPanel {
                 conversationId: this.conversationId,
                 message,
                 reasoningEffort: this.composerReasoningSelect.value,
+                searchMode,
                 editMessageId,
                 onReady: ({ conversationId }) => {
                     this.conversationId = conversationId;
@@ -2340,8 +2521,12 @@ export class AssistantPanel {
             this.runMessage(
                 this.lastFailedMessage,
                 this.lastFailedEditMessageId,
+                this.lastFailedSearchMode,
             );
             return;
+        }
+        if (this.lastFailedSearchMode) {
+            this.composerSearchSelect.value = this.lastFailedSearchMode;
         }
         this.textarea.value = this.lastFailedMessage;
         this.resizeComposer();

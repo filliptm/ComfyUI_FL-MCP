@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from typing import Literal
 
-
 ToolRisk = Literal["read_only", "canvas_edit", "approval_required"]
 
 CANVAS_EDIT_TOOLS = {
@@ -59,6 +58,8 @@ APPROVAL_REQUIRED_TOOLS = {
 }
 
 READ_ONLY_TOOLS = {
+    "web_search",
+    "web_fetch_page",
     "calculate_expressions",
     "wait",
     "query_workflow",

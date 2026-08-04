@@ -20,6 +20,8 @@ from chat_runtime import (
     tool_result_content,
     tools_for_message,
     wait_for_claude_mcp,
+    web_search_environment,
+    web_search_instructions,
 )
 from chat_store import ChatStore
 
@@ -49,6 +51,7 @@ async def test_starting_an_edit_creates_a_sibling_user_revision(tmp_path, monkey
         session_id="session-1",
         conversation_id=conversation["id"],
         message="edited",
+        search_mode="free",
         edit_message_id=original["id"],
     )
     await state.task
@@ -62,6 +65,7 @@ async def test_starting_an_edit_creates_a_sibling_user_revision(tmp_path, monkey
         "count": 2,
     }
     assert state.user_message_id == messages[0]["id"]
+    assert messages[0]["metadata"]["searchMode"] == "free"
 
 
 @pytest.mark.asyncio
@@ -299,7 +303,13 @@ def test_intent_tool_filter_keeps_core_and_adds_narrow_groups():
     assert "edit_node_mask" in basic
     assert "confirm_mask_review" in basic
     assert "get_execution_history" in basic
+    assert "web_search" not in basic
+    assert "web_fetch_page" not in basic
     assert "manager_queue_action" not in basic
+
+    free_web = tools_for_message("Research current ComfyUI nodes", "free")
+    assert "web_search" in free_web
+    assert "web_fetch_page" in free_web
 
     manager = tools_for_message("Install a missing custom node with Manager")
     assert "manager_search_nodes" in manager
@@ -312,6 +322,50 @@ def test_intent_tool_filter_keeps_core_and_adds_narrow_groups():
     review = tools_for_message("Review the final output image for distortion")
     assert "view_output_image" in review
     assert "get_execution_details" in review
+
+
+def test_web_search_prompt_explains_selected_cost_and_capability():
+    assert "no-cost and best-effort" in web_search_instructions("free")
+    assert "one Tavily credit" in web_search_instructions("tavily_basic")
+    assert "two Tavily credits" in web_search_instructions("tavily_advanced")
+    assert "Web access is off" in web_search_instructions("off")
+
+
+def test_free_search_does_not_read_the_optional_tavily_credential(monkeypatch):
+    def unexpected_keychain_read(_provider):
+        raise AssertionError("free search must not touch Tavily credentials")
+
+    monkeypatch.setattr(
+        chat_runtime_module.credential_store,
+        "get",
+        unexpected_keychain_read,
+    )
+
+    assert web_search_environment({"search_mode": "free"}) == {
+        "FL_MCP_WEB_SEARCH_MODE": "free",
+        "FL_MCP_TAVILY_API_KEY": "",
+    }
+
+
+@pytest.mark.asyncio
+async def test_tavily_run_requires_a_secure_api_key(tmp_path, monkeypatch):
+    settings = ChatSettingsStore(tmp_path / "settings.json")
+    settings.update({"provider": "ollama", "model": "qwen3"})
+    monkeypatch.setattr(chat_runtime_module, "chat_settings", settings)
+    monkeypatch.setattr(
+        chat_runtime_module.credential_store,
+        "get",
+        lambda provider: None if provider == "tavily" else None,
+    )
+    runtime = ChatRuntime(ChatStore(tmp_path / "chat.db", tmp_path / "missing.db"))
+
+    with pytest.raises(ValueError, match="Tavily search needs an API key"):
+        await runtime.start(
+            session_id="session-1",
+            conversation_id=None,
+            message="Search the web",
+            search_mode="tavily_basic",
+        )
 
 
 def test_tool_result_content_redacts_image_base64_from_chat_timeline():

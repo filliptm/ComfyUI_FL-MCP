@@ -20,6 +20,9 @@ def test_chat_settings_and_conversation_crud_use_http_api(tmp_path, monkeypatch)
         })
         assert response.status_code == 200
         assert response.json()["base_url"] == "http://127.0.0.1:11434/v1"
+        assert response.json()["search_mode"] == "free"
+        assert response.json()["show_action_buttons"] is True
+        assert "searchCredential" in response.json()
 
         created = client.post("/api/chat/conversations", json={})
         assert created.status_code == 201
@@ -95,6 +98,27 @@ def test_chat_settings_reject_secret_fields(tmp_path, monkeypatch):
 
     assert response.status_code == 400
     assert "credential endpoint" in response.json()["detail"]
+
+
+def test_tavily_credential_uses_dedicated_endpoint(tmp_path, monkeypatch):
+    settings = ChatSettingsStore(tmp_path / "settings.json")
+    credentials = CredentialStore()
+    monkeypatch.setattr(chat_routes, "chat_settings", settings)
+    monkeypatch.setattr(chat_routes, "credential_store", credentials)
+    monkeypatch.setattr(credentials, "set", lambda provider, credential: {
+        "stored": provider == "tavily" and credential == "tvly-test",
+        "storage": "keychain",
+        "persistent": True,
+    })
+
+    with TestClient(server.app) as client:
+        response = client.put(
+            "/api/chat/credentials/tavily",
+            json={"credential": "tvly-test"},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["stored"] is True
 
 
 def test_global_bypass_syncs_running_approvals(tmp_path, monkeypatch):

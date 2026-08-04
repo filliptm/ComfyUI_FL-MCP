@@ -152,6 +152,8 @@ export function summarizeToolStep(step, config = {}) {
             view_node_mask: "Couldn’t inspect image mask",
             edit_node_mask: "Couldn’t update image mask",
             confirm_mask_review: "Mask needs changes",
+            web_search: "Couldn’t search the web",
+            web_fetch_page: "Couldn’t read the web page",
         };
         return config.failureLabel
             || failureLabels[name]
@@ -191,6 +193,25 @@ export function summarizeToolStep(step, config = {}) {
         return coverage ? `${regionSummary} · ${coverage}` : regionSummary;
     }
     if (name === "confirm_mask_review") return "Mask approved for workflow";
+
+    if (name === "web_search") {
+        const count = Array.isArray(result?.results) ? result.results.length : 0;
+        const provider = result?.provider === "tavily" ? "Tavily" : "Free web";
+        const credits = Number(result?.credits_used ?? result?.creditsUsed ?? 0);
+        const summary = `Searched ${provider} · ${plural(count, "source")}`;
+        return Number.isFinite(credits) && credits > 0
+            ? `${summary} · ${plural(credits, "credit")}`
+            : summary;
+    }
+    if (name === "web_fetch_page") {
+        const title = String(result?.title || "web page").trim();
+        const length = Number(result?.contentLength);
+        const cacheLabel = result?.fromCache ? " from cache" : "";
+        const summary = `Read ${title}${cacheLabel}`;
+        return Number.isFinite(length) && length > 0
+            ? `${summary} · ${length.toLocaleString("en-US")} chars`
+            : summary;
+    }
 
     if (name === "create_nodes") {
         const count = countSuccessful(result)

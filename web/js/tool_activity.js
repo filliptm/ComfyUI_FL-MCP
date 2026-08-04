@@ -304,6 +304,18 @@ export const TOOL_CONFIG = {
         description: "Searching for models and resources"
     },
 
+    // Web Research
+    "web_search": {
+        icon: "🌐",
+        label: "Web Search",
+        description: "Searching the public web"
+    },
+    "web_fetch_page": {
+        icon: "📄",
+        label: "Fetch Page",
+        description: "Reading and extracting a web page"
+    },
+
     // Node Library
     "node_library_search": {
         icon: "🔍",
@@ -438,6 +450,8 @@ const TOOL_ICON_CLASSES = {
     workflow_load_json: "pi pi-upload",
     workflow_save_current: "pi pi-save",
     take_screenshot: "pi pi-camera",
+    web_search: "pi pi-globe",
+    web_fetch_page: "pi pi-file",
     node_library_search: "pi pi-search",
     node_library_get_details: "pi pi-info-circle",
     manager_check_updates: "pi pi-refresh",
@@ -465,6 +479,8 @@ const TOOL_RUNNING_LABELS = {
     edit_node_mask: "Saving mask edit",
     confirm_mask_review: "Waiting for mask approval",
     take_screenshot: "Capturing canvas",
+    web_search: "Searching the web",
+    web_fetch_page: "Reading web page",
     node_library_search: "Searching node library",
     manager_check_updates: "Checking for updates",
 };

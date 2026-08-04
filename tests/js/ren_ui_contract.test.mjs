@@ -52,6 +52,12 @@ test("settings use defined cards with live state and collapsed diagnostics", asy
     assert.match(panel, /<h2 id="fl-settings-title">Settings<\/h2>/);
     assert.match(panel, /fl-settings-card-model/);
     assert.match(panel, /Model &amp; provider/);
+    assert.match(panel, /fl-settings-card-search/);
+    assert.match(panel, /Free · no cost/);
+    assert.match(panel, /data-settings-state="search"/);
+    assert.match(panel, /data-setting="search_mode"/);
+    assert.match(panel, /data-setting="show_action_buttons"/);
+    assert.match(panel, /data-setting="tavily_credential"/);
     assert.match(panel, /fl-settings-card-approvals/);
     assert.match(panel, /Tool approvals/);
     assert.match(
@@ -203,6 +209,25 @@ test("reasoning can be set as a default and overridden in the composer", async (
     assert.match(panel, /reasoningEffort: this\.composerReasoningSelect\.value/);
     assert.match(panel, /ultra: "Ultra"/);
     assert.match(client, /reasoningEffort: reasoningEffort \|\| "default"/);
+});
+
+
+test("web search can be selected per message and its composer action can be hidden", async () => {
+    const panel = await readFile(new URL("web/js/chat_panel.js", root), "utf8");
+    const client = await readFile(new URL("web/js/chat_client.js", root), "utf8");
+    const tools = await readFile(new URL("web/js/tool_activity.js", root), "utf8");
+
+    assert.match(panel, /data-search="composer"/);
+    assert.match(panel, /Free web/);
+    assert.match(panel, /Tavily basic/);
+    assert.match(panel, /Tavily deep/);
+    assert.match(panel, /searchMode = this\.composerSearchSelect\.value/);
+    assert.match(panel, /reasoningEffort: this\.composerReasoningSelect\.value,\s*searchMode,/);
+    assert.match(panel, /this\.composerActions\.hidden = !visible/);
+    assert.match(panel, /Default search remains active/);
+    assert.match(client, /searchMode: searchMode \|\| "free"/);
+    assert.match(tools, /web_search: "Searching the web"/);
+    assert.match(tools, /web_fetch_page: "Reading web page"/);
 });
 
 

@@ -8,6 +8,7 @@ import httpx
 from chat_config import (
     PROVIDER_PRESETS,
     REASONING_EFFORTS,
+    SEARCH_MODES,
     chat_settings,
     credential_store,
 )
@@ -60,6 +61,7 @@ async def chat_status(session_id: str | None = Query(default=None)) -> dict[str,
 async def get_chat_settings() -> dict[str, Any]:
     settings = chat_settings.public()
     settings["credential"] = await _connection_status(settings["provider"])
+    settings["searchCredential"] = credential_store.status("tavily")
     return settings
 
 
@@ -72,6 +74,7 @@ async def update_chat_settings(request: Request) -> dict[str, Any]:
     value["resolvedApprovals"] = chat_runtime.sync_approval_settings(value)
     value["presets"] = PROVIDER_PRESETS
     value["credential"] = await _connection_status(value["provider"])
+    value["searchCredential"] = credential_store.status("tavily")
     return value
 
 
@@ -261,6 +264,11 @@ async def start_run(request: Request) -> StreamingResponse:
         ).strip().lower()
         if reasoning_effort not in REASONING_EFFORTS:
             raise ValueError(f"Unsupported reasoning effort: {reasoning_effort}")
+        search_mode = str(
+            data.get("searchMode") or chat_settings.load().get("search_mode") or "free"
+        ).strip().lower()
+        if search_mode not in SEARCH_MODES:
+            raise ValueError(f"Unsupported web search mode: {search_mode}")
         state = await chat_runtime.start(
             session_id=session_id,
             conversation_id=(
@@ -268,6 +276,7 @@ async def start_run(request: Request) -> StreamingResponse:
             ),
             message=str(data.get("message") or ""),
             reasoning_effort=reasoning_effort,
+            search_mode=search_mode,
             edit_message_id=(
                 str(data["editMessageId"]) if data.get("editMessageId") else None
             ),

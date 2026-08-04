@@ -16,6 +16,8 @@ SETTINGS_PATH = DATA_DIR / "chat_settings.json"
 KEYRING_SERVICE = "comfyui-fl-mcp"
 APPROVAL_MODES = {"autonomous_edits", "bypass_all"}
 REASONING_EFFORTS = {"default", "low", "medium", "high", "xhigh", "max", "ultra"}
+SEARCH_MODES = {"off", "free", "tavily_basic", "tavily_advanced"}
+SEARCH_CREDENTIAL_PROVIDERS = {"tavily"}
 TOOL_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 
 PROVIDER_PRESETS: dict[str, dict[str, Any]] = {
@@ -109,6 +111,7 @@ ENV_KEYS = {
     "openrouter": "OPENROUTER_API_KEY",
     "anthropic": "ANTHROPIC_API_KEY",
     "custom": "FL_MCP_CHAT_API_KEY",
+    "tavily": "TAVILY_API_KEY",
 }
 
 
@@ -120,6 +123,8 @@ def default_settings() -> dict[str, Any]:
         "approval_mode": "autonomous_edits",
         "always_allowed_tools": [],
         "reasoning_effort": "default",
+        "search_mode": "free",
+        "show_action_buttons": True,
         "temperature": 0.2,
     }
 
@@ -134,6 +139,8 @@ class ChatSettingsStore:
         "approval_mode",
         "always_allowed_tools",
         "reasoning_effort",
+        "search_mode",
+        "show_action_buttons",
         "temperature",
     }
 
@@ -210,6 +217,12 @@ class ChatSettingsStore:
         ).strip().lower()
         if reasoning_effort not in REASONING_EFFORTS:
             raise ValueError(f"Unsupported reasoning effort: {reasoning_effort}")
+        search_mode = str(value.get("search_mode") or "free").strip().lower()
+        if search_mode not in SEARCH_MODES:
+            raise ValueError(f"Unsupported web search mode: {search_mode}")
+        show_action_buttons = value.get("show_action_buttons", True)
+        if not isinstance(show_action_buttons, bool):
+            raise ValueError("show_action_buttons must be true or false")
         raw_allowed_tools = value.get("always_allowed_tools", [])
         if not isinstance(raw_allowed_tools, list):
             raise ValueError("always_allowed_tools must be a list.")
@@ -230,6 +243,8 @@ class ChatSettingsStore:
             "approval_mode": approval_mode,
             "always_allowed_tools": always_allowed_tools,
             "reasoning_effort": reasoning_effort,
+            "search_mode": search_mode,
+            "show_action_buttons": show_action_buttons,
             "temperature": temperature,
         }
 
@@ -258,9 +273,9 @@ class CredentialStore:
         return None
 
     def set(self, provider: str, credential: str) -> dict[str, Any]:
-        if provider not in PROVIDER_PRESETS:
+        if provider not in PROVIDER_PRESETS and provider not in SEARCH_CREDENTIAL_PROVIDERS:
             raise ValueError(f"Unsupported provider: {provider}")
-        provider_type = PROVIDER_PRESETS[provider]["type"]
+        provider_type = PROVIDER_PRESETS.get(provider, {}).get("type")
         if provider_type in {"claude_cli", "codex_cli"}:
             manager = "Claude Code" if provider_type == "claude_cli" else "Codex"
             raise ValueError(
