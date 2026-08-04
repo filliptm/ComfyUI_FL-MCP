@@ -23,8 +23,9 @@ async def test_web_image_preview_is_bounded_and_cached():
     requests = 0
     payload = image_bytes()
 
-    def handler(_request):
+    def handler(request):
         nonlocal requests
+        assert request.headers["accept"].startswith("image/webp,image/png,image/jpeg")
         requests += 1
         return httpx.Response(
             200,

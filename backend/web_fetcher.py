@@ -86,8 +86,9 @@ class AsyncWebFetcher:
         max_bytes: int = DEFAULT_MAX_BYTES,
         max_redirects: int = DEFAULT_MAX_REDIRECTS,
         allowed_content_types: frozenset[str] = DEFAULT_CONTENT_TYPES,
+        accept_header: str | None = None,
     ) -> FetchedDocument:
-        """Fetch one public text document while enforcing every resource budget."""
+        """Fetch one public document while enforcing every resource budget."""
 
         if max_bytes < 1:
             raise ValueError("max_bytes must be positive")
@@ -105,7 +106,12 @@ class AsyncWebFetcher:
 
         async with self._semaphore:
             for redirect_count in range(max_redirects + 1):
-                async with self._client.stream("GET", current_url) as response:
+                request_headers = {"Accept": accept_header} if accept_header else None
+                async with self._client.stream(
+                    "GET",
+                    current_url,
+                    headers=request_headers,
+                ) as response:
                     if response.status_code in REDIRECT_STATUSES:
                         location = response.headers.get("location")
                         if not location:

@@ -1716,8 +1716,14 @@ export class AssistantPanel {
     createMessageContent(content = "") {
         const body = document.createElement("div");
         body.className = "fl-message-content";
-        body.appendChild(renderMarkdown(content));
+        body.appendChild(this.renderChatMarkdown(content));
         return body;
+    }
+
+    renderChatMarkdown(content) {
+        return renderMarkdown(content, {
+            resolveImageUrl: url => this.chat.webImagePreviewUrl(url),
+        });
     }
 
     renderPersistedAssistantTimeline(timeline, content, toolSteps) {
@@ -1818,7 +1824,7 @@ export class AssistantPanel {
         } else {
             message.activeSource += delta;
         }
-        message.activeBody.replaceChildren(renderMarkdown(message.activeSource));
+        message.activeBody.replaceChildren(this.renderChatMarkdown(message.activeSource));
         message.body = message.activeBody;
     }
 
@@ -1979,7 +1985,7 @@ export class AssistantPanel {
         let grid = item.imageGrid;
         if (!grid?.isConnected) {
             grid = document.createElement("section");
-            grid.className = "fl-tool-image-grid";
+            grid.className = "fl-tool-image-grid fl-image-grid";
             grid.setAttribute("role", "list");
             item.after(grid);
             item.imageGrid = grid;
@@ -1998,7 +2004,7 @@ export class AssistantPanel {
 
         for (const [index, image] of images.entries()) {
             const figure = document.createElement("figure");
-            figure.className = "fl-tool-image-card";
+            figure.className = "fl-tool-image-card fl-image-card";
             figure.setAttribute("role", "listitem");
             const source = this.toolImageSource(image);
             const link = document.createElement("a");
@@ -2020,7 +2026,7 @@ export class AssistantPanel {
             if (index === 0) preview.fetchPriority = "high";
 
             const fallback = document.createElement("span");
-            fallback.className = "fl-tool-image-fallback";
+            fallback.className = "fl-tool-image-fallback fl-image-fallback";
             fallback.hidden = true;
             const fallbackIcon = document.createElement("i");
             fallbackIcon.className = "pi pi-image";
@@ -2048,7 +2054,7 @@ export class AssistantPanel {
 
         if (discovered.length > images.length) {
             const overflow = document.createElement("span");
-            overflow.className = "fl-tool-image-overflow";
+            overflow.className = "fl-tool-image-overflow fl-image-overflow";
             overflow.textContent = `+${discovered.length - images.length} more images`;
             grid.appendChild(overflow);
         }

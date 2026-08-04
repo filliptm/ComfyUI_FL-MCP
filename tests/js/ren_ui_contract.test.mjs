@@ -149,6 +149,7 @@ test("web and generated images render in ordered chat galleries", async () => {
     const panel = await readFile(new URL("web/js/chat_panel.js", root), "utf8");
     const helpers = await readFile(new URL("web/js/chat_ui_helpers.js", root), "utf8");
     const client = await readFile(new URL("web/js/chat_client.js", root), "utf8");
+    const markdown = await readFile(new URL("web/js/safe_markdown.js", root), "utf8");
     const styles = await readFile(new URL("web/js/style.css", root), "utf8");
     const routes = await readFile(new URL("backend/chat_routes.py", root), "utf8");
 
@@ -159,8 +160,11 @@ test("web and generated images render in ordered chat galleries", async () => {
     assert.match(panel, /preview\.referrerPolicy = "no-referrer"/);
     assert.match(helpers, /export function toolDisplayImages/);
     assert.match(client, /api\/chat\/web-images\/preview/);
+    assert.match(panel, /resolveImageUrl: url => this\.chat\.webImagePreviewUrl\(url\)/);
+    assert.match(markdown, /parseMarkdownImageLine/);
+    assert.match(markdown, /fl-chat-image-grid fl-image-grid/);
     assert.match(routes, /WebImagePreviewService/);
-    assert.match(styles, /\.fl-tool-image-grid\s*\{[^}]*grid-template-columns:\s*repeat\(2,/s);
+    assert.match(styles, /\.fl-image-grid\s*\{[^}]*grid-template-columns:\s*repeat\(2,/s);
     assert.match(styles, /data-layout="hero"[^}]*first-child/s);
     assert.match(styles, /object-fit:\s*contain/);
 });

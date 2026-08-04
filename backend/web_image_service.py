@@ -16,6 +16,7 @@ from web_security import canonicalize_web_url
 
 WEB_IMAGE_CONTENT_TYPES = frozenset({"image/jpeg", "image/png", "image/webp"})
 WEB_IMAGE_FORMATS = frozenset({"JPEG", "PNG", "WEBP"})
+WEB_IMAGE_ACCEPT = "image/webp,image/png,image/jpeg;q=0.9,*/*;q=0.1"
 DEFAULT_MAX_IMAGE_BYTES = 8 * 1024 * 1024
 DEFAULT_MAX_DECODED_PIXELS = 32_000_000
 
@@ -146,6 +147,7 @@ class WebImagePreviewService:
             normalized,
             max_bytes=self._max_image_bytes,
             allowed_content_types=WEB_IMAGE_CONTENT_TYPES,
+            accept_header=WEB_IMAGE_ACCEPT,
         )
         preview = await asyncio.to_thread(
             render_web_image_preview,
