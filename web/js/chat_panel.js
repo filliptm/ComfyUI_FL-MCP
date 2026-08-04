@@ -30,6 +30,9 @@ const SEARCH_MODE_OPTIONS = [
 ];
 
 const MAX_TOOL_GALLERY_IMAGES = 12;
+const MAX_CHAT_ATTACHMENTS = 8;
+const MAX_CHAT_ATTACHMENT_BYTES = 32 * 1024 * 1024;
+const CHAT_IMAGE_TYPES = new Set(["image/png", "image/jpeg", "image/webp", "image/gif"]);
 
 export class AssistantPanel {
     constructor(container, sessionManager, options = {}) {
@@ -43,6 +46,8 @@ export class AssistantPanel {
             selectedCount: 0,
         }));
         this.subscribeCanvasContext = options.subscribeCanvasContext;
+        this.uploadChatImage = options.uploadChatImage;
+        this.placeChatImageInSelectedNode = options.placeChatImageInSelectedNode;
         this.settings = null;
         this.status = null;
         this.conversations = [];
@@ -65,6 +70,10 @@ export class AssistantPanel {
         this.lastFailedMessage = "";
         this.lastFailedEditMessageId = null;
         this.lastFailedSearchMode = null;
+        this.lastFailedAttachments = [];
+        this.pendingAttachments = [];
+        this.uploadingAttachments = false;
+        this.composerDragDepth = 0;
         this.lastArchivedConversation = null;
         this.pendingDeleteConversationId = null;
         this.contextUnsubscribe = null;
@@ -170,7 +179,12 @@ export class AssistantPanel {
                                 </label>
                             </div>
                         </div>
+                        <div class="fl-composer-attachments" hidden></div>
                         <div class="fl-composer-row">
+                            <button class="fl-chat-attach" data-action="attach-images" type="button" title="Add images" aria-label="Add images">
+                                <i class="pi pi-paperclip" aria-hidden="true"></i>
+                            </button>
+                            <input class="fl-chat-file-input" type="file" accept="image/png,image/jpeg,image/webp,image/gif" multiple hidden>
                             <textarea class="fl-chat-input" rows="1" placeholder="Ask Ren about this workflow…" aria-label="Message"></textarea>
                             <button class="fl-chat-send" data-action="send" type="button" title="Send message (Enter)" aria-label="Send message" disabled>
                                 <i class="pi pi-arrow-up" aria-hidden="true"></i>
@@ -380,6 +394,9 @@ export class AssistantPanel {
         this.errorCopy = this.container.querySelector(".fl-chat-error-copy");
         this.errorActions = this.container.querySelector(".fl-chat-error-actions");
         this.textarea = this.container.querySelector(".fl-chat-input");
+        this.composerContainer = this.container.querySelector(".fl-chat-input-container");
+        this.attachmentInput = this.container.querySelector(".fl-chat-file-input");
+        this.attachmentTray = this.container.querySelector(".fl-composer-attachments");
         this.sendButton = this.container.querySelector('[data-action="send"]');
         this.runStatus = this.container.querySelector(".fl-run-status");
         this.runStatusText = this.runStatus.querySelector("span span");
@@ -484,6 +501,27 @@ export class AssistantPanel {
             if (action === "close-sheet") this.closeSheet();
             if (action === "new-chat") this.newConversation();
             if (action === "send") this.send();
+            if (action === "attach-images") this.attachmentInput.click();
+            if (action === "remove-pending-attachment") {
+                this.removePendingAttachment(Number(actionElement.dataset.attachmentIndex));
+            }
+            if (action === "use-pending-attachment") {
+                this.usePendingAttachment(Number(actionElement.dataset.attachmentIndex));
+            }
+            if (action === "use-message-attachment") {
+                const article = actionElement.closest(".fl-message.user");
+                this.useAttachment(
+                    article?.messageAttachments?.[
+                        Number(actionElement.dataset.attachmentIndex)
+                    ],
+                );
+            }
+            if (action === "attach-tool-image") {
+                this.attachToolImage(actionElement.toolImage);
+            }
+            if (action === "use-tool-image") {
+                this.useToolImage(actionElement.toolImage);
+            }
             if (action === "stop") this.stop();
             if (action === "jump-latest") this.jumpToLatest();
             if (action === "status-action") this.handleStatusAction();
@@ -547,6 +585,35 @@ export class AssistantPanel {
         this.textarea.addEventListener("input", () => this.resizeComposer());
         this.textarea.addEventListener("input", () => this.updateComposerState());
         this.textarea.addEventListener("focus", () => this.refreshCanvasContext());
+        this.textarea.addEventListener("paste", (event) => this.handleImagePaste(event));
+        this.attachmentInput.addEventListener("change", () => {
+            this.addImageFiles(this.attachmentInput.files);
+            this.attachmentInput.value = "";
+        });
+        this.composerContainer.addEventListener("dragenter", (event) => {
+            if (!this.dragHasFiles(event)) return;
+            event.preventDefault();
+            this.composerDragDepth += 1;
+            this.composerContainer.classList.add("drag-active");
+        });
+        this.composerContainer.addEventListener("dragover", (event) => {
+            if (!this.dragHasFiles(event)) return;
+            event.preventDefault();
+            event.dataTransfer.dropEffect = "copy";
+        });
+        this.composerContainer.addEventListener("dragleave", () => {
+            this.composerDragDepth = Math.max(0, this.composerDragDepth - 1);
+            if (this.composerDragDepth === 0) {
+                this.composerContainer.classList.remove("drag-active");
+            }
+        });
+        this.composerContainer.addEventListener("drop", (event) => {
+            if (!this.dragHasFiles(event)) return;
+            event.preventDefault();
+            this.composerDragDepth = 0;
+            this.composerContainer.classList.remove("drag-active");
+            this.addImageFiles(event.dataTransfer.files);
+        });
         this.scrollElement.addEventListener("scroll", () => this.handleThreadScroll());
         this.scrollElement.addEventListener("scrollend", () => {
             if (this.jumpingToLatest) this.finishJumpToLatest();
@@ -1633,6 +1700,9 @@ export class AssistantPanel {
         article.className = `fl-message ${role}`;
         if (metadata.messageId) article.dataset.messageId = metadata.messageId;
         article.messageContent = String(content || "");
+        article.messageAttachments = Array.isArray(metadata.attachments)
+            ? metadata.attachments.map(item => ({ ...item }))
+            : [];
         const header = document.createElement("div");
         header.className = "fl-message-header";
         const label = document.createElement("span");
@@ -1654,7 +1724,9 @@ export class AssistantPanel {
                 metadata?.toolSteps || [],
             );
         } else {
-            body = this.createMessageContent(content);
+            body = this.createMessageContent(content, article.messageAttachments, {
+                messageId: metadata.messageId,
+            });
             article.append(header, body);
             if (role === "user" && metadata.messageId) {
                 article.appendChild(this.createUserMessageActions(metadata));
@@ -1713,11 +1785,83 @@ export class AssistantPanel {
         return actions;
     }
 
-    createMessageContent(content = "") {
+    createMessageContent(content = "", attachments = [], options = {}) {
         const body = document.createElement("div");
         body.className = "fl-message-content";
-        body.appendChild(this.renderChatMarkdown(content));
+        if (String(content || "").trim()) {
+            body.appendChild(this.renderChatMarkdown(content));
+        }
+        if (attachments.length) {
+            body.appendChild(this.createAttachmentGrid(attachments, options));
+        }
         return body;
+    }
+
+    createAttachmentGrid(attachments, { pending = false, messageId = null } = {}) {
+        const grid = document.createElement("section");
+        grid.className = "fl-chat-attachment-grid fl-image-grid";
+        grid.dataset.count = String(attachments.length);
+        grid.dataset.layout = attachments.length === 1
+            ? "single"
+            : attachments.length % 2 === 1 ? "hero" : "grid";
+        grid.setAttribute("aria-label", `${attachments.length} attached ${attachments.length === 1 ? "image" : "images"}`);
+        for (const [index, attachment] of attachments.entries()) {
+            const figure = document.createElement("figure");
+            figure.className = "fl-chat-attachment fl-image-card";
+            const preview = document.createElement("img");
+            preview.src = this.toolImageSource({ ...attachment, kind: "comfy" });
+            preview.alt = attachment.originalName || `Attached image ${index + 1}`;
+            preview.loading = "lazy";
+            preview.decoding = "async";
+            const previewLink = document.createElement("a");
+            previewLink.href = preview.src;
+            previewLink.target = "_blank";
+            previewLink.rel = "noopener noreferrer";
+            previewLink.title = "Open attached image";
+            previewLink.appendChild(preview);
+            figure.appendChild(previewLink);
+
+            const caption = document.createElement("figcaption");
+            const name = document.createElement("span");
+            name.textContent = attachment.originalName || attachment.filename;
+            name.title = name.textContent;
+            caption.appendChild(name);
+            const actions = document.createElement("span");
+            actions.className = "fl-attachment-actions";
+            if (this.placeChatImageInSelectedNode) {
+                const useButton = document.createElement("button");
+                useButton.type = "button";
+                useButton.dataset.action = pending
+                    ? "use-pending-attachment"
+                    : "use-message-attachment";
+                useButton.dataset.attachmentIndex = String(index);
+                if (messageId) useButton.dataset.messageId = messageId;
+                useButton.title = "Use in selected Load Image node";
+                useButton.setAttribute("aria-label", "Use in selected Load Image node");
+                const useIcon = document.createElement("i");
+                useIcon.className = "pi pi-sign-in";
+                useIcon.setAttribute("aria-hidden", "true");
+                useButton.appendChild(useIcon);
+                actions.appendChild(useButton);
+            }
+            if (pending) {
+                const removeButton = document.createElement("button");
+                removeButton.type = "button";
+                removeButton.dataset.action = "remove-pending-attachment";
+                removeButton.dataset.attachmentIndex = String(index);
+                removeButton.title = "Remove attachment";
+                removeButton.setAttribute("aria-label", "Remove attachment");
+                const removeIcon = document.createElement("i");
+                removeIcon.className = "pi pi-times";
+                removeIcon.setAttribute("aria-hidden", "true");
+                removeButton.appendChild(removeIcon);
+                actions.appendChild(removeButton);
+            }
+            caption.appendChild(actions);
+            figure.appendChild(caption);
+            grid.appendChild(figure);
+        }
+        return grid;
     }
 
     renderChatMarkdown(content) {
@@ -2043,12 +2187,42 @@ export class AssistantPanel {
             figure.appendChild(link);
 
             const caption = this.toolImageCaption(image, index);
-            if (caption) {
-                const figcaption = document.createElement("figcaption");
-                figcaption.textContent = caption;
-                figcaption.title = caption;
-                figure.appendChild(figcaption);
+            const figcaption = document.createElement("figcaption");
+            const captionCopy = document.createElement("span");
+            captionCopy.textContent = caption || `Image ${index + 1}`;
+            captionCopy.title = captionCopy.textContent;
+            figcaption.appendChild(captionCopy);
+            if (this.uploadChatImage) {
+                const actions = document.createElement("span");
+                actions.className = "fl-attachment-actions";
+                const addImageAction = (action, iconClass, label) => {
+                    const button = document.createElement("button");
+                    button.type = "button";
+                    button.dataset.action = action;
+                    button.toolImage = image;
+                    button.title = label;
+                    button.setAttribute("aria-label", label);
+                    const actionIcon = document.createElement("i");
+                    actionIcon.className = iconClass;
+                    actionIcon.setAttribute("aria-hidden", "true");
+                    button.appendChild(actionIcon);
+                    return button;
+                };
+                actions.append(
+                    addImageAction(
+                        "attach-tool-image",
+                        "pi pi-paperclip",
+                        "Attach this image to a new request",
+                    ),
+                    addImageAction(
+                        "use-tool-image",
+                        "pi pi-sign-in",
+                        "Use in selected Load Image node",
+                    ),
+                );
+                figcaption.appendChild(actions);
             }
+            figure.appendChild(figcaption);
             grid.appendChild(figure);
         }
 
@@ -2353,24 +2527,28 @@ export class AssistantPanel {
 
     async send() {
         const message = this.textarea.value.trim();
-        if (!message || this.running) return;
+        const attachments = this.pendingAttachments.map(item => ({ ...item }));
+        if ((!message && !attachments.length) || this.running || this.uploadingAttachments) return;
         if (!this.status?.configured) {
             this.openSheet("settings");
             this.showError("Choose and test a model before sending a message.");
             return;
         }
         this.textarea.value = "";
+        this.pendingAttachments = [];
+        this.renderPendingAttachments();
         this.resizeComposer();
         this.updateComposerState();
-        await this.runMessage(message);
+        await this.runMessage(message, null, this.composerSearchSelect.value, attachments);
     }
 
     async runMessage(
         message,
         editMessageId = null,
         searchMode = this.composerSearchSelect.value,
+        attachments = [],
     ) {
-        if (!message || this.running) return;
+        if ((!message && !attachments.length) || this.running) return;
         if (!this.status?.configured) {
             this.openSheet("settings");
             this.showError("Choose and test a model before sending a message.");
@@ -2380,13 +2558,14 @@ export class AssistantPanel {
         this.lastFailedMessage = message;
         this.lastFailedEditMessageId = editMessageId;
         this.lastFailedSearchMode = searchMode;
+        this.lastFailedAttachments = attachments.map(item => ({ ...item }));
         this.running = true;
         this.currentAssistant = null;
         this.followOutput = true;
         if (editMessageId) {
-            this.renderOptimisticRevision(editMessageId, message);
+            this.renderOptimisticRevision(editMessageId, message, attachments);
         } else {
-            this.appendMessage("user", message);
+            this.appendMessage("user", message, { attachments });
         }
         this.updateComposerState();
         try {
@@ -2397,6 +2576,7 @@ export class AssistantPanel {
                 reasoningEffort: this.composerReasoningSelect.value,
                 searchMode,
                 editMessageId,
+                attachments,
                 onReady: ({ conversationId }) => {
                     this.conversationId = conversationId;
                 },
@@ -2413,12 +2593,12 @@ export class AssistantPanel {
         }
     }
 
-    renderOptimisticRevision(messageId, content) {
+    renderOptimisticRevision(messageId, content, attachments = []) {
         const article = this.messagesElement.querySelector(
             `.fl-message.user[data-message-id="${CSS.escape(messageId)}"]`,
         );
         if (!article) {
-            this.appendMessage("user", content);
+            this.appendMessage("user", content, { attachments });
             return;
         }
         let following = article.nextElementSibling;
@@ -2428,7 +2608,7 @@ export class AssistantPanel {
             following = next;
         }
         article.remove();
-        this.appendMessage("user", content);
+        this.appendMessage("user", content, { attachments });
     }
 
     startMessageEdit(messageId) {
@@ -2495,8 +2675,9 @@ export class AssistantPanel {
         );
         const content = article?.querySelector(".fl-message-edit-form textarea")
             ?.value.trim();
-        if (!content) return;
-        await this.runMessage(content, messageId);
+        const attachments = article?.messageAttachments || [];
+        if (!content && !attachments.length) return;
+        await this.runMessage(content, messageId, this.composerSearchSelect.value, attachments);
     }
 
     async resendMessage(messageId) {
@@ -2505,8 +2686,9 @@ export class AssistantPanel {
             `.fl-message.user[data-message-id="${CSS.escape(messageId)}"]`,
         );
         const content = article?.messageContent?.trim();
-        if (!content) return;
-        await this.runMessage(content, messageId);
+        const attachments = article?.messageAttachments || [];
+        if (!content && !attachments.length) return;
+        await this.runMessage(content, messageId, this.composerSearchSelect.value, attachments);
     }
 
     async changeMessageVersion(messageId, direction) {
@@ -2533,7 +2715,9 @@ export class AssistantPanel {
     }
 
     updateComposerState() {
-        this.sendButton.disabled = this.running || !this.textarea.value.trim();
+        this.sendButton.disabled = this.running
+            || this.uploadingAttachments
+            || (!this.textarea.value.trim() && !this.pendingAttachments.length);
         this.sendButton.title = this.running
             ? "Wait for the current response to finish"
             : "Send message (Enter)";
@@ -2652,12 +2836,13 @@ export class AssistantPanel {
     }
 
     retryLastMessage() {
-        if (!this.lastFailedMessage || this.running) return;
+        if ((!this.lastFailedMessage && !this.lastFailedAttachments.length) || this.running) return;
         if (this.lastFailedEditMessageId) {
             this.runMessage(
                 this.lastFailedMessage,
                 this.lastFailedEditMessageId,
                 this.lastFailedSearchMode,
+                this.lastFailedAttachments,
             );
             return;
         }
@@ -2665,9 +2850,223 @@ export class AssistantPanel {
             this.composerSearchSelect.value = this.lastFailedSearchMode;
         }
         this.textarea.value = this.lastFailedMessage;
+        this.pendingAttachments = this.lastFailedAttachments.map(item => ({ ...item }));
+        this.renderPendingAttachments();
         this.resizeComposer();
         this.updateComposerState();
         this.send();
+    }
+
+    dragHasFiles(event) {
+        return Array.from(event.dataTransfer?.types || []).includes("Files");
+    }
+
+    handleImagePaste(event) {
+        const files = Array.from(event.clipboardData?.files || []).filter(file => (
+            String(file.type || "").startsWith("image/")
+        ));
+        if (!files.length) return;
+        event.preventDefault();
+        this.addImageFiles(files);
+    }
+
+    async imageDimensions(file) {
+        try {
+            const bitmap = await createImageBitmap(file);
+            const dimensions = { width: bitmap.width, height: bitmap.height };
+            bitmap.close?.();
+            return dimensions;
+        } catch (_) {
+            return { width: 0, height: 0 };
+        }
+    }
+
+    async addImageFiles(fileList) {
+        if (this.uploadingAttachments) return;
+        if (!this.uploadChatImage) {
+            this.showError("Image upload is unavailable until the ComfyUI bridge loads.");
+            return;
+        }
+        const available = MAX_CHAT_ATTACHMENTS - this.pendingAttachments.length;
+        const files = Array.from(fileList || []).slice(0, Math.max(0, available));
+        if (!files.length) {
+            this.showError(`Attach at most ${MAX_CHAT_ATTACHMENTS} images per message.`);
+            return;
+        }
+        const invalid = files.find(file => (
+            !CHAT_IMAGE_TYPES.has(String(file.type || "").toLowerCase())
+            || file.size > MAX_CHAT_ATTACHMENT_BYTES
+        ));
+        if (invalid) {
+            this.showError(`${invalid.name}: use PNG, JPEG, WebP, or GIF up to 32 MB.`);
+            return;
+        }
+        this.clearError();
+        this.uploadingAttachments = true;
+        this.composerContainer.classList.add("uploading");
+        this.updateComposerState();
+        const session = String(this.sessionManager.getSessionId() || "session")
+            .replace(/[^a-zA-Z0-9_-]+/g, "-")
+            .slice(0, 80);
+        const subfolder = `ren-chat/${session}`;
+        try {
+            for (const file of files) {
+                const [image, dimensions] = await Promise.all([
+                    this.uploadChatImage(file, subfolder),
+                    this.imageDimensions(file),
+                ]);
+                this.pendingAttachments.push({
+                    ...image,
+                    originalName: file.name || image.filename,
+                    mimeType: file.type,
+                    sizeBytes: file.size,
+                    ...dimensions,
+                });
+                this.renderPendingAttachments();
+            }
+            this.announce(`${files.length} ${files.length === 1 ? "image" : "images"} attached.`);
+        } catch (error) {
+            this.showError(`Image could not be attached: ${error.message}`);
+        } finally {
+            this.uploadingAttachments = false;
+            this.composerContainer.classList.remove("uploading");
+            this.updateComposerState();
+        }
+    }
+
+    renderPendingAttachments() {
+        this.attachmentTray.replaceChildren();
+        this.attachmentTray.hidden = this.pendingAttachments.length === 0;
+        if (this.pendingAttachments.length) {
+            this.attachmentTray.appendChild(this.createAttachmentGrid(
+                this.pendingAttachments,
+                { pending: true },
+            ));
+        }
+        this.updateComposerState();
+    }
+
+    removePendingAttachment(index) {
+        if (!Number.isInteger(index) || index < 0 || index >= this.pendingAttachments.length) return;
+        this.pendingAttachments.splice(index, 1);
+        this.renderPendingAttachments();
+    }
+
+    async usePendingAttachment(index) {
+        await this.useAttachment(this.pendingAttachments[index]);
+    }
+
+    async useAttachment(attachment) {
+        if (!attachment || !this.placeChatImageInSelectedNode) return;
+        try {
+            const result = await this.placeChatImageInSelectedNode(attachment);
+            this.clearError();
+            this.announce(`Image placed in ${result.title || `node ${result.node_id}`}.`);
+        } catch (error) {
+            this.showError(`Image could not be placed: ${error.message}`);
+        }
+    }
+
+    importedImageName(image, mimeType) {
+        const extensions = {
+            "image/jpeg": ".jpg",
+            "image/png": ".png",
+            "image/webp": ".webp",
+            "image/gif": ".gif",
+        };
+        let name = String(image?.filename || "");
+        if (!name && image?.url) {
+            try {
+                name = decodeURIComponent(new URL(image.url).pathname.split("/").pop() || "");
+            } catch (_) {
+                name = "";
+            }
+        }
+        const base = (name || "chat-image").replace(/\.[^.]+$/, "");
+        return `${base}${extensions[mimeType] || ".png"}`;
+    }
+
+    async importToolImage(image) {
+        if (!image) throw new Error("This image is no longer available.");
+        if (
+            image.kind === "comfy"
+            && image.type === "input"
+            && (image.subfolder === "ren-chat" || image.subfolder?.startsWith("ren-chat/"))
+        ) {
+            return {
+                ...image,
+                originalName: image.title || image.filename,
+                mimeType: "",
+                sizeBytes: 0,
+                width: 0,
+                height: 0,
+            };
+        }
+        const response = await fetch(this.toolImageSource(image));
+        if (!response.ok) {
+            throw new Error(`Image download failed (${response.status}).`);
+        }
+        const blob = await response.blob();
+        const mimeType = String(blob.type || "").split(";")[0].toLowerCase();
+        if (!CHAT_IMAGE_TYPES.has(mimeType) || blob.size > MAX_CHAT_ATTACHMENT_BYTES) {
+            throw new Error("The image format or size cannot be imported.");
+        }
+        const originalName = this.importedImageName(image, mimeType);
+        const file = new File([blob], originalName, { type: mimeType });
+        const session = String(this.sessionManager.getSessionId() || "session")
+            .replace(/[^a-zA-Z0-9_-]+/g, "-")
+            .slice(0, 80);
+        const [uploaded, dimensions] = await Promise.all([
+            this.uploadChatImage(file, `ren-chat/${session}`),
+            this.imageDimensions(file),
+        ]);
+        return {
+            ...uploaded,
+            originalName,
+            mimeType,
+            sizeBytes: file.size,
+            ...dimensions,
+        };
+    }
+
+    async attachToolImage(image) {
+        if (this.uploadingAttachments || this.pendingAttachments.length >= MAX_CHAT_ATTACHMENTS) {
+            this.showError(`Attach at most ${MAX_CHAT_ATTACHMENTS} images per message.`);
+            return;
+        }
+        this.uploadingAttachments = true;
+        this.composerContainer.classList.add("uploading");
+        this.updateComposerState();
+        try {
+            const attachment = await this.importToolImage(image);
+            this.pendingAttachments.push(attachment);
+            this.renderPendingAttachments();
+            this.clearError();
+            this.announce("Image attached to the next request.");
+        } catch (error) {
+            this.showError(`Image could not be attached: ${error.message}`);
+        } finally {
+            this.uploadingAttachments = false;
+            this.composerContainer.classList.remove("uploading");
+            this.updateComposerState();
+        }
+    }
+
+    async useToolImage(image) {
+        if (this.uploadingAttachments) return;
+        this.uploadingAttachments = true;
+        this.composerContainer.classList.add("uploading");
+        this.updateComposerState();
+        try {
+            const attachment = await this.importToolImage(image);
+            await this.useAttachment(attachment);
+        } catch (error) {
+            this.showError(`Image could not be placed: ${error.message}`);
+        } finally {
+            this.uploadingAttachments = false;
+            this.composerContainer.classList.remove("uploading");
+            this.updateComposerState();
+        }
     }
 
     resizeComposer() {

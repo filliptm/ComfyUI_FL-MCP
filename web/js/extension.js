@@ -382,6 +382,12 @@ app.registerExtension({
                             ),
                             getCanvasContext,
                             subscribeCanvasContext,
+                            uploadChatImage: (file, subfolder) => (
+                                toolExecutor.flApi.uploadChatImage(file, subfolder)
+                            ),
+                            placeChatImageInSelectedNode: (image) => (
+                                toolExecutor.flApi.placeChatImageInNode(image)
+                            ),
                         },
                     );
                     window.FL_MCP.assistantPanel = assistantPanel;

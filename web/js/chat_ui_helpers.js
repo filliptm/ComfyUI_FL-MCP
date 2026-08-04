@@ -54,12 +54,14 @@ export function toolDisplayImages(step) {
         : [];
     if (name === "web_fetch_page" && Array.isArray(result?.images)) {
         candidates = result.images.map(image => ({ ...image, kind: "web" }));
-    } else if (name === "view_output_image" && result?.image) {
+    } else if (["view_output_image", "view_chat_image"].includes(name) && result?.image) {
         candidates = [{
             ...result.image,
             kind: "comfy",
-            title: "Generated output",
-            alt: "Generated ComfyUI output",
+            title: name === "view_chat_image" ? "Chat attachment" : "Generated output",
+            alt: name === "view_chat_image"
+                ? "User-attached ComfyUI image"
+                : "Generated ComfyUI output",
         }];
     }
 
@@ -213,6 +215,8 @@ export function summarizeToolStep(step, config = {}) {
     if (failed) {
         const failureLabels = {
             view_output_image: "Couldn’t review output image",
+            view_chat_image: "Couldn’t inspect attached image",
+            place_chat_image_in_node: "Couldn’t place attached image",
             view_node_mask: "Couldn’t inspect image mask",
             edit_node_mask: "Couldn’t update image mask",
             confirm_mask_review: "Mask needs changes",
@@ -235,6 +239,15 @@ export function summarizeToolStep(step, config = {}) {
                 : `Reviewed output ${selected + 1} of ${available}`;
         }
         return size ? `${summary} · ${size}` : summary;
+    }
+    if (name === "view_chat_image") {
+        const size = dimensionsLabel(result?.originalSize);
+        return size ? `Inspected attached image · ${size}` : "Inspected attached image";
+    }
+    if (name === "place_chat_image_in_node") {
+        const node = result?.title
+            || (result?.node_id !== undefined ? `node ${result.node_id}` : "selected node");
+        return `Placed attached image in ${node}`;
     }
     if (name === "view_node_mask") {
         const node = result?.title

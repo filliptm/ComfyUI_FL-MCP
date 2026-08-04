@@ -16,6 +16,8 @@ from chat_runtime import (
     install_codex_approval_handler,
     normalize_approval_decision,
     normalize_assistant_timeline,
+    message_content_for_model,
+    normalize_chat_attachments,
     should_request_approval,
     tool_result_content,
     tools_for_message,
@@ -29,6 +31,34 @@ from chat_store import ChatStore
 def _payload(raw: str):
     line = next(line for line in raw.splitlines() if line.startswith("data:"))
     return json.loads(line[5:].strip())
+
+
+def test_chat_attachments_are_validated_and_added_to_model_context():
+    attachments = normalize_chat_attachments([{
+        "filename": "reference.png",
+        "subfolder": "ren-chat/session-1",
+        "type": "input",
+        "originalName": "Reference.png",
+        "mimeType": "image/png",
+        "sizeBytes": 2048,
+        "width": 1024,
+        "height": 768,
+    }])
+    model_content = message_content_for_model({
+        "content": "Use this image",
+        "metadata": {"attachments": attachments},
+    })
+
+    assert attachments[0]["type"] == "input"
+    assert "Use this image" in model_content
+    assert "view_chat_image" in model_content
+    assert '"subfolder":"ren-chat/session-1"' in model_content
+    with pytest.raises(ValueError, match="outside Ren's upload folder"):
+        normalize_chat_attachments([{
+            "filename": "secret.png",
+            "subfolder": "../output",
+            "type": "input",
+        }])
 
 
 @pytest.mark.asyncio
@@ -66,6 +96,34 @@ async def test_starting_an_edit_creates_a_sibling_user_revision(tmp_path, monkey
     }
     assert state.user_message_id == messages[0]["id"]
     assert messages[0]["metadata"]["searchMode"] == "free"
+
+
+@pytest.mark.asyncio
+async def test_image_only_message_persists_attachments(tmp_path, monkeypatch):
+    settings = ChatSettingsStore(tmp_path / "settings.json")
+    settings.update({"provider": "ollama", "model": "qwen3"})
+    monkeypatch.setattr(chat_runtime_module, "chat_settings", settings)
+    store = ChatStore(tmp_path / "chat.db", tmp_path / "missing.db")
+    runtime = ChatRuntime(store)
+
+    async def finish_without_provider_call(state, _user_message_id):
+        state.done = True
+
+    monkeypatch.setattr(runtime, "_execute", finish_without_provider_call)
+    state = await runtime.start(
+        session_id="session-1",
+        conversation_id=None,
+        message="",
+        attachments=[{
+            "filename": "reference.png",
+            "subfolder": "ren-chat/session-1",
+            "type": "input",
+        }],
+    )
+    await state.task
+    message = store.list_messages(state.conversation_id)[0]
+    assert message["content"] == ""
+    assert message["metadata"]["attachments"][0]["filename"] == "reference.png"
 
 
 @pytest.mark.asyncio
@@ -299,6 +357,8 @@ def test_intent_tool_filter_keeps_core_and_adds_narrow_groups():
     basic = tools_for_message("Inspect the open graph")
     assert "workflow_overview" in basic
     assert "view_output_image" in basic
+    assert "view_chat_image" in basic
+    assert "place_chat_image_in_node" in basic
     assert "view_node_mask" in basic
     assert "edit_node_mask" in basic
     assert "confirm_mask_review" in basic

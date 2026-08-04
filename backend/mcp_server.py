@@ -1064,6 +1064,44 @@ class ViewOutputImageRequest(BaseModel):
         description="Maximum preview width or height sent to the vision model.",
     )
 
+
+class ChatImageReference(BaseModel):
+    """A browser-uploaded image inside Ren's ComfyUI input subfolder."""
+    filename: str = Field(..., min_length=1, max_length=255)
+    subfolder: str = Field(..., min_length=1, max_length=512)
+    type: Literal["input"] = "input"
+
+    @model_validator(mode="after")
+    def validate_ren_upload_path(self) -> "ChatImageReference":
+        filename_path = Path(self.filename)
+        subfolder = self.subfolder.replace("\\", "/")
+        subfolder_path = Path(subfolder)
+        if filename_path.name != self.filename or self.filename in {".", ".."}:
+            raise ValueError("Chat image filename must be a basename.")
+        if (
+            subfolder_path.is_absolute()
+            or ".." in subfolder_path.parts
+            or not (subfolder == "ren-chat" or subfolder.startswith("ren-chat/"))
+        ):
+            raise ValueError("Chat images must be inside the ren-chat input folder.")
+        self.subfolder = subfolder
+        return self
+
+
+class ViewChatImageRequest(BaseModel):
+    """Request a user-attached chat image as visual MCP content."""
+    image: ChatImageReference
+    max_dimension: int = Field(default=2048, ge=256, le=4096)
+
+
+class PlaceChatImageInNodeRequest(BaseModel):
+    """Assign a user-attached image to a Load Image-style canvas node."""
+    image: ChatImageReference
+    node_id: Optional[Union[int, str]] = Field(
+        default=None,
+        description="Target node ID/title. Omit to use exactly one selected image node.",
+    )
+
 class ClearErrorBufferRequest(BaseModel):
     """Request to clear the error buffer."""
     pass
@@ -3793,6 +3831,53 @@ async def view_output_image(request: ViewOutputImageRequest, ctx: Context) -> To
     return ToolResult(
         content=[result, MCPImage(data=preview, format=preview_format)],
         structured_content=result,
+    )
+
+
+@mcp.tool()
+async def view_chat_image(request: ViewChatImageRequest, ctx: Context) -> ToolResult:
+    """View an image the user attached to Ren as real visual MCP content.
+
+    Call this before describing, comparing, or editing an attached image. The
+    image reference is supplied in the user's attachment context and always
+    resolves inside ComfyUI's trusted Ren chat input folder.
+    """
+    await _report_tool_activity(ctx, "view_chat_image")
+    image_ref = request.image.model_dump()
+    path = _resolve_comfy_image_path(get_comfy_tools(), image_ref)
+    preview, preview_format, original_size, preview_size = _output_image_preview(
+        path,
+        request.max_dimension,
+    )
+    result = {
+        "success": True,
+        "image": image_ref,
+        "originalSize": {"width": original_size[0], "height": original_size[1]},
+        "previewSize": {"width": preview_size[0], "height": preview_size[1]},
+        "message": "The user's attached image follows as visual MCP content.",
+    }
+    return ToolResult(
+        content=[result, MCPImage(data=preview, format=preview_format)],
+        structured_content=result,
+    )
+
+
+@mcp.tool()
+async def place_chat_image_in_node(
+    request: PlaceChatImageInNodeRequest,
+    ctx: Context,
+) -> Dict[str, Any]:
+    """Put a user-attached image into a Load Image-style canvas node.
+
+    Omit node_id when the user selected exactly one compatible node. This only
+    updates the node's image widget and visible preview; it never queues a run.
+    """
+    if not settings.enable_workflow_writes:
+        return _disabled_by_config("FL_MCP_ENABLE_WORKFLOW_WRITES")
+    return await _execute_tool(
+        ctx,
+        "place_chat_image_in_node",
+        request.model_dump(),
     )
 
 @mcp.tool()

@@ -606,6 +606,111 @@ export class FL_API {
         };
     }
 
+    async uploadChatImage(file, subfolder) {
+        if (!(file instanceof Blob) || !String(file.type || "").startsWith("image/")) {
+            throw new Error("Choose a PNG, JPEG, or WebP image.");
+        }
+        const originalName = String(file.name || "image.png");
+        const safeName = originalName.replace(/[^a-zA-Z0-9._-]+/g, "-").slice(-160)
+            || "image.png";
+        const uploadName = `${Date.now()}-${crypto.randomUUID().slice(0, 8)}-${safeName}`;
+        const formData = new FormData();
+        formData.append("image", file, uploadName);
+        formData.append("type", "input");
+        formData.append("subfolder", subfolder);
+        formData.append("overwrite", "false");
+        const response = await api.fetchApi("/upload/image", {
+            method: "POST",
+            body: formData,
+        });
+        if (!response.ok) {
+            const detail = await response.text().catch(() => "");
+            throw new Error(
+                `Image upload failed (${response.status}${detail ? `: ${detail}` : ""})`
+            );
+        }
+        const uploaded = await response.json();
+        if (!uploaded?.name) {
+            throw new Error("Image upload response did not include a filename.");
+        }
+        return {
+            filename: uploaded.name,
+            subfolder: uploaded.subfolder || subfolder,
+            type: uploaded.type || "input",
+        };
+    }
+
+    placeChatImageInNode(image, nodeId = null) {
+        const hasExplicitNode = nodeId !== null && nodeId !== undefined;
+        let node = hasExplicitNode ? this._findNode(nodeId) : null;
+        if (hasExplicitNode && !node) {
+            throw new Error(`Node not found: ${nodeId}`);
+        }
+        if (!node) {
+            const selected = Object.values(app.canvas?.selected_nodes || {}).filter(
+                candidate => candidate.widgets?.some(widget => widget.name === "image")
+            );
+            if (selected.length !== 1) {
+                throw new Error(
+                    selected.length === 0
+                        ? "Select one Load Image node on the canvas first."
+                        : "Select only one Load Image node before placing the image."
+                );
+            }
+            [node] = selected;
+        }
+        const imageWidget = node.widgets?.find(widget => widget.name === "image");
+        if (!imageWidget) {
+            throw new Error(`Node ${node.id} has no image widget.`);
+        }
+        if (!image?.filename || (image.type || "input") !== "input") {
+            throw new Error("The chat attachment is not a valid ComfyUI input image.");
+        }
+        const normalized = {
+            filename: String(image.filename),
+            subfolder: String(image.subfolder || ""),
+            type: "input",
+        };
+        const widgetPath = [normalized.subfolder, normalized.filename]
+            .filter(Boolean)
+            .join("/");
+        const widgetValue = `${widgetPath} [input]`;
+        const previousImage = parseImageWidgetRef(imageWidget.value);
+        this._setWidgetValue(node, imageWidget, widgetValue);
+        node.images = [normalized];
+        node.imgs = undefined;
+        node.properties = node.properties || {};
+        node.properties.image = widgetValue;
+        if (node.widgets_values && node.widgets) {
+            const widgetIndex = node.widgets.indexOf(imageWidget);
+            if (widgetIndex >= 0) node.widgets_values[widgetIndex] = widgetValue;
+        }
+
+        const pendingEntry = [...this.pendingMaskReviews.entries()].find(
+            ([, value]) => nodeIdsEqual(value.nodeId, node.id)
+        );
+        if (pendingEntry) {
+            this.pendingMaskReviews.delete(pendingEntry[0]);
+            if (this.pendingMaskReviews.size === 0) {
+                this._restoreAutoQueueAfterMaskReview(this.maskReviewAutoQueueState);
+                this.maskReviewAutoQueueState = null;
+            }
+        }
+        app.canvas?.selectNodes?.([node]);
+        app.canvas?.centerOnNode?.(node);
+        this._markGraphChanged();
+        return {
+            success: true,
+            node_id: node.id,
+            node_type: node.comfyClass || node.type,
+            title: node.title,
+            image: normalized,
+            previous_image: previousImage,
+            queued: false,
+            message: "Image assigned to the node. The workflow was not queued.",
+        };
+    }
+
     async editNodeMask(nodeId, regions, coordinateSpace = "pixels", clearExisting = false) {
         const node = this._findNode(nodeId);
         if (!node) {

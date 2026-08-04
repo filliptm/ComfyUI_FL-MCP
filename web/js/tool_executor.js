@@ -63,6 +63,7 @@ export class ToolExecutor {
             // Node Manipulation
             "get_node_values": this._handleGetNodeValues.bind(this),
             "get_node_image_ref": this._handleGetNodeImageRef.bind(this),
+            "place_chat_image_in_node": this._handlePlaceChatImageInNode.bind(this),
             "edit_node_mask": this._handleEditNodeMask.bind(this),
             "confirm_mask_review": this._handleConfirmMaskReview.bind(this),
             "set_node_values": this._handleSetNodeValues.bind(this),
@@ -484,6 +485,10 @@ export class ToolExecutor {
 
     async _handleGetNodeImageRef(params) {
         return this.flApi.getNodeImageRef(params.node_id);
+    }
+
+    async _handlePlaceChatImageInNode(params) {
+        return this.flApi.placeChatImageInNode(params.image, params.node_id);
     }
 
     async _handleEditNodeMask(params) {

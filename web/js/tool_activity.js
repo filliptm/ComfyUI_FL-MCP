@@ -112,6 +112,16 @@ export const TOOL_CONFIG = {
         label: "Review Output",
         description: "Loading generated pixels for visual review"
     },
+    "view_chat_image": {
+        icon: "👁️",
+        label: "Inspect Attachment",
+        description: "Loading the attached image for visual review"
+    },
+    "place_chat_image_in_node": {
+        icon: "📥",
+        label: "Use Image",
+        description: "Putting the attached image into the selected node"
+    },
     "view_node_mask": {
         icon: "🎭",
         label: "Inspect Mask",
@@ -441,6 +451,8 @@ const TOOL_ICON_CLASSES = {
     get_layout: "pi pi-table",
     queue_workflow: "pi pi-play",
     view_output_image: "pi pi-image",
+    view_chat_image: "pi pi-eye",
+    place_chat_image_in_node: "pi pi-sign-in",
     view_node_mask: "pi pi-eye",
     edit_node_mask: "pi pi-pencil",
     confirm_mask_review: "pi pi-check-circle",
@@ -475,6 +487,8 @@ const TOOL_RUNNING_LABELS = {
     get_layout: "Reading layout",
     queue_workflow: "Queueing workflow",
     view_output_image: "Loading final output for review",
+    view_chat_image: "Inspecting attached image",
+    place_chat_image_in_node: "Placing image in selected node",
     view_node_mask: "Loading mask overlay",
     edit_node_mask: "Saving mask edit",
     confirm_mask_review: "Waiting for mask approval",

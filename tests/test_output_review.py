@@ -97,6 +97,32 @@ async def test_view_output_image_returns_bounded_visual_content(tmp_path, monkey
     assert len(result.content[1].data) > 100
 
 
+@pytest.mark.asyncio
+async def test_view_chat_image_returns_uploaded_input_as_visual_content(tmp_path, monkeypatch):
+    input_root = tmp_path / "input"
+    chat_folder = input_root / "ren-chat" / "session-1"
+    chat_folder.mkdir(parents=True)
+    Image.new("RGB", (800, 600), "#ef66aa").save(chat_folder / "reference.png")
+    monkeypatch.setattr(
+        mcp_server,
+        "get_comfy_tools",
+        lambda: FakeComfyTools(tmp_path / "output", {}, input_root=input_root),
+    )
+
+    result = await mcp_server.view_chat_image.fn(
+        mcp_server.ViewChatImageRequest(image={
+            "filename": "reference.png",
+            "subfolder": "ren-chat/session-1",
+            "type": "input",
+        }),
+        fake_context(),
+    )
+
+    assert result.structured_content["image"]["type"] == "input"
+    assert result.structured_content["originalSize"] == {"width": 800, "height": 600}
+    assert isinstance(result.content[1], ImageContent)
+
+
 def test_output_path_resolution_rejects_traversal(tmp_path):
     output_root = tmp_path / "output"
     output_root.mkdir()

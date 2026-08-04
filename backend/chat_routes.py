@@ -310,6 +310,7 @@ async def start_run(request: Request) -> StreamingResponse:
             edit_message_id=(
                 str(data["editMessageId"]) if data.get("editMessageId") else None
             ),
+            attachments=data.get("attachments"),
         )
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc

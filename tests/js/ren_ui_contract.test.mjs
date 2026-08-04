@@ -213,15 +213,42 @@ test("composer supports drafting during runs without queueing another message", 
     const panel = await readFile(new URL("web/js/chat_panel.js", root), "utf8");
     const styles = await readFile(new URL("web/js/style.css", root), "utf8");
 
-    assert.match(panel, /this\.sendButton\.disabled = this\.running/);
+    assert.match(panel, /this\.sendButton\.disabled = this\.running[\s\S]*this\.uploadingAttachments/);
     assert.match(panel, /this\.textarea\.disabled = false/);
-    assert.match(panel, /if \(!message \|\| this\.running\) return/);
+    assert.match(panel, /if \(\(!message && !attachments\.length\) \|\| this\.running/);
     assert.match(panel, /fl-run-status/);
     assert.doesNotMatch(panel, /messageQueue|queuedMessage/);
     assert.match(
         styles,
         /\.fl-chat-layout \.fl-chat-input:focus-visible\s*\{[^}]*outline:\s*0;[^}]*box-shadow:\s*inset 0 0 0 1px #b888ee/s,
     );
+});
+
+
+test("chat accepts local images and can place them into a selected image node", async () => {
+    const panel = await readFile(new URL("web/js/chat_panel.js", root), "utf8");
+    const api = await readFile(new URL("web/js/fl_api.js", root), "utf8");
+    const runtime = await readFile(new URL("backend/chat_runtime.py", root), "utf8");
+    const mcp = await readFile(new URL("backend/mcp_server.py", root), "utf8");
+    const styles = await readFile(new URL("web/js/style.css", root), "utf8");
+
+    assert.match(panel, /data-action="attach-images"/);
+    assert.match(panel, /multiple hidden/);
+    assert.match(panel, /addEventListener\("paste"/);
+    assert.match(panel, /addEventListener\("drop"/);
+    assert.match(panel, /pendingAttachments/);
+    assert.match(panel, /use-message-attachment/);
+    assert.match(panel, /attach-tool-image/);
+    assert.match(panel, /use-tool-image/);
+    assert.match(panel, /importToolImage/);
+    assert.match(api, /api\.fetchApi\("\/upload\/image"/);
+    assert.match(api, /placeChatImageInNode/);
+    assert.match(runtime, /message_content_for_model/);
+    assert.match(runtime, /"attachments": normalized_attachments/);
+    assert.match(mcp, /async def view_chat_image/);
+    assert.match(mcp, /async def place_chat_image_in_node/);
+    assert.match(styles, /\.fl-composer-attachments/);
+    assert.match(styles, /\.fl-chat-input-container\.drag-active/);
 });
 
 

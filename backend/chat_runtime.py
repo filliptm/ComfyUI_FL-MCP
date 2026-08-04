@@ -30,6 +30,8 @@ from config import settings as bridge_settings
 logger = logging.getLogger(__name__)
 PROMPT_PATH = Path(__file__).with_name("chat_prompt.md")
 MANDATORY_REVIEW_TOOLS = {"confirm_mask_review"}
+MAX_CHAT_ATTACHMENTS = 8
+MAX_CHAT_ATTACHMENT_BYTES = 32 * 1024 * 1024
 
 CORE_CHAT_TOOLS = {
     "workflow_overview",
@@ -52,9 +54,114 @@ CORE_CHAT_TOOLS = {
     "wait",
     "get_execution_history",
     "view_output_image",
+    "view_chat_image",
+    "place_chat_image_in_node",
     "get_queue_status",
     "mcp_capability_audit",
 }
+
+
+def normalize_chat_attachments(value: Any) -> list[dict[str, Any]]:
+    """Validate browser-uploaded ComfyUI input references for chat persistence."""
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ValueError("attachments must be a list.")
+    if len(value) > MAX_CHAT_ATTACHMENTS:
+        raise ValueError(f"Attach at most {MAX_CHAT_ATTACHMENTS} images per message.")
+
+    normalized: list[dict[str, Any]] = []
+    for index, item in enumerate(value, start=1):
+        if not isinstance(item, dict):
+            raise ValueError(f"Attachment {index} is invalid.")
+        filename = str(item.get("filename") or "").strip()
+        subfolder = str(item.get("subfolder") or "").strip().replace("\\", "/")
+        image_type = str(item.get("type") or "input").strip().lower()
+        if (
+            not filename
+            or len(filename) > 255
+            or Path(filename).name != filename
+            or filename in {".", ".."}
+        ):
+            raise ValueError(f"Attachment {index} has an invalid filename.")
+        subfolder_path = Path(subfolder)
+        if (
+            not subfolder
+            or len(subfolder) > 512
+            or subfolder_path.is_absolute()
+            or ".." in subfolder_path.parts
+            or not (subfolder == "ren-chat" or subfolder.startswith("ren-chat/"))
+        ):
+            raise ValueError(f"Attachment {index} is outside Ren's upload folder.")
+        if image_type != "input":
+            raise ValueError(f"Attachment {index} must be a ComfyUI input image.")
+
+        mime_type = str(item.get("mimeType") or "").strip().lower()
+        if mime_type and mime_type not in {
+            "image/gif", "image/jpeg", "image/png", "image/webp",
+        }:
+            raise ValueError(f"Attachment {index} is not an image.")
+        try:
+            size_bytes = int(item.get("sizeBytes") or 0)
+            width = int(item.get("width") or 0)
+            height = int(item.get("height") or 0)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(f"Attachment {index} has invalid metadata.") from exc
+        if size_bytes < 0 or size_bytes > MAX_CHAT_ATTACHMENT_BYTES:
+            raise ValueError(f"Attachment {index} exceeds the 32 MB limit.")
+        if width < 0 or height < 0 or width > 100_000 or height > 100_000:
+            raise ValueError(f"Attachment {index} has invalid dimensions.")
+
+        normalized.append({
+            "filename": filename,
+            "subfolder": subfolder,
+            "type": "input",
+            "originalName": str(item.get("originalName") or filename).strip()[:255],
+            "mimeType": mime_type,
+            "sizeBytes": size_bytes,
+            "width": width,
+            "height": height,
+        })
+    return normalized
+
+
+def message_content_for_model(message: dict[str, Any]) -> str:
+    """Add structured attachment references without exposing them in visible chat text."""
+    content = str(message.get("content") or "").strip()
+    try:
+        attachments = normalize_chat_attachments(
+            (message.get("metadata") or {}).get("attachments")
+        )
+    except (TypeError, ValueError):
+        attachments = []
+    if not attachments:
+        return content
+
+    references = []
+    for index, attachment in enumerate(attachments, start=1):
+        references.append(
+            f"Attachment {index}: "
+            + json.dumps(
+                {
+                    "filename": attachment["filename"],
+                    "subfolder": attachment["subfolder"],
+                    "type": "input",
+                    "originalName": attachment["originalName"],
+                    "width": attachment["width"],
+                    "height": attachment["height"],
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        )
+    attachment_context = (
+        "The user attached ComfyUI input image(s) to this message. "
+        "Call view_chat_image with a listed reference before making visual claims. "
+        "Use place_chat_image_in_node when the user asks to put one into a selected "
+        "Load Image node; assigning it does not queue the workflow.\n"
+        + "\n".join(references)
+    )
+    return f"{content}\n\n{attachment_context}" if content else attachment_context
 
 INTENT_TOOL_GROUPS = {
     "debug": {
@@ -440,10 +547,14 @@ class ChatRuntime:
         reasoning_effort: str = "default",
         search_mode: str | None = None,
         edit_message_id: str | None = None,
+        attachments: Any = None,
     ) -> ActiveRun:
         text = message.strip()
-        if not text:
-            raise ValueError("Message cannot be empty.")
+        normalized_attachments: list[dict[str, Any]] | None = None
+        if attachments is not None or not edit_message_id:
+            normalized_attachments = normalize_chat_attachments(attachments)
+            if not text and not normalized_attachments:
+                raise ValueError("Message cannot be empty.")
         settings = chat_settings.load()
         if reasoning_effort != "default":
             settings["reasoning_effort"] = reasoning_effort
@@ -475,13 +586,22 @@ class ChatRuntime:
                 or edit_source["role"] != "user"
             ):
                 raise ValueError("The message to edit was not found in this conversation.")
+        if edit_source and attachments is None:
+            attachments = (edit_source.get("metadata") or {}).get("attachments", [])
+        if normalized_attachments is None:
+            normalized_attachments = normalize_chat_attachments(attachments)
+        if not text and not normalized_attachments:
+            raise ValueError("Message cannot be empty.")
         self.store.update_conversation(
             identifier,
             provider=settings["provider"],
             model=settings["model"],
         )
         if conversation["title"] == "New chat":
-            title = " ".join(text.split())[:60] or "New chat"
+            title_source = text or "Attached " + ", ".join(
+                attachment["originalName"] for attachment in normalized_attachments
+            )
+            title = " ".join(title_source.split())[:60] or "New chat"
             self.store.update_conversation(identifier, title=title)
         async with self._lock:
             if any(
@@ -507,7 +627,10 @@ class ChatRuntime:
                 text,
                 provider=settings["provider"],
                 model=settings["model"],
-                metadata={"searchMode": settings.get("search_mode", "off")},
+                metadata={
+                    "searchMode": settings.get("search_mode", "off"),
+                    "attachments": normalized_attachments,
+                },
                 **message_options,
             )
             run_id = str(uuid.uuid4())
@@ -718,14 +841,15 @@ class ChatRuntime:
                 + "\n\n"
                 + web_search_instructions(str(settings.get("search_mode") or "off"))
             )
-            latest_user_message = next(
+            latest_user_item = next(
                 (
-                    item["content"]
+                    item
                     for item in reversed(self.store.list_messages(state.conversation_id))
                     if item["role"] == "user"
                 ),
-                "",
+                {},
             )
+            latest_user_message = message_content_for_model(latest_user_item)
             allowed_tools = tools_for_message(
                 latest_user_message,
                 str(settings.get("search_mode") or "off"),
@@ -841,7 +965,11 @@ class ChatRuntime:
                 {
                     "id": item["id"],
                     "role": item["role"],
-                    "content": item["content"],
+                    "content": (
+                        message_content_for_model(item)
+                        if item["role"] == "user"
+                        else item["content"]
+                    ),
                 }
                 for item in self.store.list_messages(state.conversation_id)
                 if item["role"] in {"user", "assistant"}
@@ -946,14 +1074,15 @@ class ChatRuntime:
             "- Do not claim a tool succeeded unless its MCP result confirms it."
         )
         messages = self.store.list_messages(state.conversation_id)
-        latest_user_message = next(
+        latest_user_item = next(
             (
-                item["content"]
+                item
                 for item in reversed(messages)
                 if item["role"] == "user"
             ),
-            "",
+            {},
         )
+        latest_user_message = message_content_for_model(latest_user_item)
         allowed_tools = tools_for_message(
             latest_user_message,
             str(settings.get("search_mode") or "off"),
@@ -1318,14 +1447,15 @@ class ChatRuntime:
             "- Do not claim a tool succeeded unless its MCP result confirms it."
         )
         messages = self.store.list_messages(state.conversation_id)
-        latest_user_message = next(
+        latest_user_item = next(
             (
-                item["content"]
+                item
                 for item in reversed(messages)
                 if item["role"] == "user"
             ),
-            "",
+            {},
         )
+        latest_user_message = message_content_for_model(latest_user_item)
         allowed_tools = tools_for_message(
             latest_user_message,
             str(settings.get("search_mode") or "off"),

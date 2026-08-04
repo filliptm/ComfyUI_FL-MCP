@@ -140,6 +140,7 @@ export class ChatClient {
         reasoningEffort,
         searchMode,
         editMessageId,
+        attachments = [],
         onEvent,
         onReady,
     }) {
@@ -154,6 +155,7 @@ export class ChatClient {
                 reasoningEffort: reasoningEffort || "default",
                 searchMode: searchMode || "free",
                 editMessageId: editMessageId || null,
+                attachments,
             }),
             signal: this.abortController.signal,
         });

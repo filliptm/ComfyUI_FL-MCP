@@ -58,7 +58,42 @@ test("run requests include per-message reasoning and search modes", async () => 
         reasoningEffort: "xhigh",
         searchMode: "tavily_basic",
         editMessageId: null,
+        attachments: [],
     });
+});
+
+
+test("run requests include uploaded ComfyUI image references", async () => {
+    const originalFetch = globalThis.fetch;
+    let payload;
+    globalThis.fetch = async (_url, options = {}) => {
+        payload = JSON.parse(options.body);
+        return new Response("", {
+            status: 200,
+            headers: {
+                "X-FL-MCP-Run-Id": "run-1",
+                "X-FL-MCP-Conversation-Id": "conversation-1",
+            },
+        });
+    };
+    try {
+        await new ChatClient().startRun({
+            sessionId: "session-1",
+            message: "Use this",
+            attachments: [{
+                filename: "reference.png",
+                subfolder: "ren-chat/session-1",
+                type: "input",
+            }],
+        });
+    } finally {
+        globalThis.fetch = originalFetch;
+    }
+    assert.deepEqual(payload.attachments, [{
+        filename: "reference.png",
+        subfolder: "ren-chat/session-1",
+        type: "input",
+    }]);
 });
 
 

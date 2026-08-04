@@ -700,6 +700,14 @@
     margin: 2px 0 8px;
 }
 
+.fl-chat-attachment-grid {
+    margin-top: 7px;
+}
+
+.fl-message.user .fl-chat-attachment-grid {
+    min-width: min(380px, 68vw);
+}
+
 .fl-image-grid[data-layout="single"] {
     grid-template-columns: minmax(0, 1fr);
 }
@@ -754,6 +762,46 @@
     line-height: 1.2;
     text-overflow: ellipsis;
     white-space: nowrap;
+}
+
+.fl-chat-attachment figcaption,
+.fl-tool-image-card figcaption {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 5px;
+}
+
+.fl-chat-attachment figcaption > span:first-child,
+.fl-tool-image-card figcaption > span:first-child {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.fl-attachment-actions {
+    display: flex;
+    flex: 0 0 auto;
+    gap: 2px;
+}
+
+.fl-attachment-actions button {
+    display: inline-flex;
+    width: 23px;
+    height: 23px;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+    border: 0;
+    border-radius: 5px;
+    background: rgba(255, 255, 255, 0.08);
+    color: inherit;
+    cursor: pointer;
+}
+
+.fl-attachment-actions button:hover {
+    background: rgba(153, 102, 217, 0.3);
+    color: #fff;
 }
 
 .fl-image-fallback {
@@ -1136,6 +1184,18 @@
     box-shadow: 0 0 0 1px rgba(153, 102, 217, 0.12);
 }
 
+.fl-chat-input-container.drag-active {
+    border-color: var(--ren-accent-hover);
+    box-shadow: 0 0 0 2px rgba(153, 102, 217, 0.24);
+}
+
+.fl-chat-input-container.uploading::after {
+    padding: 0 10px 7px;
+    color: var(--ren-text-muted);
+    content: "Uploading image…";
+    font-size: 10px;
+}
+
 .fl-composer-toolbar {
     display: flex;
     align-items: center;
@@ -1238,6 +1298,45 @@
     display: flex;
     align-items: flex-end;
     min-width: 0;
+}
+
+.fl-composer-attachments {
+    max-height: 220px;
+    overflow-y: auto;
+    padding: 5px 8px 2px;
+}
+
+.fl-composer-attachments[hidden] {
+    display: none;
+}
+
+.fl-composer-attachments .fl-chat-attachment-grid {
+    margin: 0;
+}
+
+.fl-composer-attachments .fl-image-card a {
+    max-height: 128px;
+}
+
+.fl-chat-attach {
+    display: flex;
+    width: 29px;
+    height: 29px;
+    flex: 0 0 auto;
+    align-items: center;
+    justify-content: center;
+    margin: 4px 0 6px 5px;
+    padding: 0;
+    border: 0;
+    border-radius: 7px;
+    background: transparent;
+    color: var(--ren-text-muted);
+    cursor: pointer;
+}
+
+.fl-chat-attach:hover {
+    background: rgba(255, 255, 255, 0.06);
+    color: var(--ren-accent-hover);
 }
 
 .fl-chat-input {
