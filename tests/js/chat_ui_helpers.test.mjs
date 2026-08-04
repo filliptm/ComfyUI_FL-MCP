@@ -227,6 +227,43 @@ test("tool image candidates preserve source order and reject unsafe URLs", () =>
     }]);
 });
 
+test("tool images survive Codex MCP wrappers with null outer structured content", () => {
+    const reviewedOutput = {
+        success: true,
+        selectedOutputIndex: 0,
+        availableOutputCount: 1,
+        image: { filename: "ComfyUI_00117.png", subfolder: "", type: "output" },
+        originalSize: { width: 6336, height: 2688 },
+    };
+    const result = JSON.stringify({
+        content: [{
+            type: "text",
+            text: JSON.stringify({
+                content: [
+                    { type: "text", text: JSON.stringify(reviewedOutput) },
+                    { type: "image", data: "[image content shown to Ren]" },
+                ],
+                structuredContent: reviewedOutput,
+            }),
+        }],
+        structuredContent: null,
+    });
+
+    assert.deepEqual(toolDisplayImages({ name: "view_output_image", result }), [{
+        kind: "comfy",
+        filename: "ComfyUI_00117.png",
+        subfolder: "",
+        type: "output",
+        title: "Generated output",
+        alt: "Generated ComfyUI output",
+    }]);
+    assert.equal(summarizeToolStep({
+        name: "view_output_image",
+        status: "done",
+        result,
+    }), "Reviewed final output · 6336×2688");
+});
+
 test("consecutive identical tool calls stack and retain the strongest state", () => {
     assert.equal(
         canStackToolSteps({ name: "modify_layout" }, { name: "modify_layout" }),

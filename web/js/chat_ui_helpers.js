@@ -18,19 +18,19 @@ function toolResultPayload(value) {
             if (item.type === "text") {
                 const textPayload = parsePayload(item.text);
                 if (textPayload && typeof textPayload === "object") {
-                    return textPayload;
+                    return toolResultPayload(textPayload);
                 }
             } else if (!item.type) {
-                return item;
+                return toolResultPayload(item);
             }
         }
         return parsed;
     }
     if (!parsed || typeof parsed !== "object") return parsed;
-    if (parsed.structuredContent !== undefined) {
+    if (parsed.structuredContent !== undefined && parsed.structuredContent !== null) {
         return parsePayload(parsed.structuredContent);
     }
-    if (parsed.structured_content !== undefined) {
+    if (parsed.structured_content !== undefined && parsed.structured_content !== null) {
         return parsePayload(parsed.structured_content);
     }
     if (Array.isArray(parsed.content)) return toolResultPayload(parsed.content);
