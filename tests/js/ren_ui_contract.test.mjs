@@ -209,15 +209,20 @@ test("mask edits show a live preview and block queueing until review", async () 
 });
 
 
-test("composer supports drafting during runs without queueing another message", async () => {
+test("composer can steer an active response and exposes real stop progress", async () => {
     const panel = await readFile(new URL("web/js/chat_panel.js", root), "utf8");
     const styles = await readFile(new URL("web/js/style.css", root), "utf8");
 
-    assert.match(panel, /this\.sendButton\.disabled = this\.running[\s\S]*this\.uploadingAttachments/);
+    assert.match(panel, /if \(this\.running\) \{\s*await this\.steer\(/);
+    assert.match(panel, /const cancelled = await this\.chat\.cancel\(\);/);
+    assert.match(panel, /if \(previousRun\) await previousRun;/);
+    assert.match(panel, /await this\.startRunMessage\(message, null, searchMode, attachments\);/);
+    assert.match(panel, /Steer Ren with this message \(Enter\)/);
+    assert.match(panel, /Stopping Ren…/);
+    assert.match(panel, /this\.stopButton\.disabled = this\.stopping \|\| this\.steering/);
     assert.match(panel, /this\.textarea\.disabled = false/);
-    assert.match(panel, /if \(\(!message && !attachments\.length\) \|\| this\.running/);
     assert.match(panel, /fl-run-status/);
-    assert.doesNotMatch(panel, /messageQueue|queuedMessage/);
+    assert.match(styles, /\.fl-inline-action:disabled/);
     assert.match(
         styles,
         /\.fl-chat-layout \.fl-chat-input:focus-visible\s*\{[^}]*outline:\s*0;[^}]*box-shadow:\s*inset 0 0 0 1px #b888ee/s,

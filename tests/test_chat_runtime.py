@@ -22,6 +22,7 @@ from chat_runtime import (
     tool_result_content,
     tools_for_message,
     wait_for_claude_mcp,
+    web_image_requested,
     web_search_environment,
     web_search_instructions,
 )
@@ -389,6 +390,15 @@ def test_web_search_prompt_explains_selected_cost_and_capability():
     assert "one Tavily credit" in web_search_instructions("tavily_basic")
     assert "two Tavily credits" in web_search_instructions("tavily_advanced")
     assert "Web access is off" in web_search_instructions("off")
+    assert "include_images=true" in web_search_instructions("free")
+
+
+def test_web_images_require_explicit_user_intent():
+    assert web_image_requested("Find image references for a retro school bus factory")
+    assert web_image_requested("Show me what a 1970s bus assembly line looks like")
+    assert web_image_requested("I need photos of vintage factory interiors")
+    assert not web_image_requested("Research the history of school bus factories")
+    assert not web_image_requested("How does image generation work in ComfyUI?")
 
 
 def test_free_search_does_not_read_the_optional_tavily_credential(monkeypatch):
@@ -404,7 +414,13 @@ def test_free_search_does_not_read_the_optional_tavily_credential(monkeypatch):
     assert web_search_environment({"search_mode": "free"}) == {
         "FL_MCP_WEB_SEARCH_MODE": "free",
         "FL_MCP_TAVILY_API_KEY": "",
+        "FL_MCP_WEB_IMAGES_ALLOWED": "0",
     }
+
+    assert web_search_environment(
+        {"search_mode": "free"},
+        "Find photos of vintage school buses",
+    )["FL_MCP_WEB_IMAGES_ALLOWED"] == "1"
 
 
 @pytest.mark.asyncio
@@ -509,9 +525,15 @@ async def test_cancel_expires_pending_approval_before_provider_interrupt(tmp_pat
     runtime = ChatRuntime(ChatStore(tmp_path / "chat.db", tmp_path / "missing.db"))
     state = ActiveRun("run-1", "conversation-1", "session-1")
     interrupted = False
+    settled = False
 
     async def active_task():
-        await asyncio.Event().wait()
+        nonlocal settled
+        try:
+            await asyncio.Event().wait()
+        finally:
+            await asyncio.sleep(0)
+            settled = True
 
     async def interrupt():
         nonlocal interrupted
@@ -527,9 +549,11 @@ async def test_cancel_expires_pending_approval_before_provider_interrupt(tmp_pat
     state.task = asyncio.create_task(active_task())
     state.cancel_callback = interrupt
     runtime.runs[state.run_id] = state
+    await asyncio.sleep(0)
 
     assert await runtime.cancel(state.run_id)
     assert interrupted is True
+    assert settled is True
     assert "approval-1" not in runtime.approvals
     with pytest.raises(asyncio.CancelledError):
         await state.task

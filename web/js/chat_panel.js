@@ -55,6 +55,9 @@ export class AssistantPanel {
         this.historyView = "active";
         this.conversationId = null;
         this.running = false;
+        this.stopping = false;
+        this.steering = false;
+        this.activeRunPromise = null;
         this.initializing = false;
         this.currentAssistant = null;
         this.availableModels = [];
@@ -400,6 +403,7 @@ export class AssistantPanel {
         this.sendButton = this.container.querySelector('[data-action="send"]');
         this.runStatus = this.container.querySelector(".fl-run-status");
         this.runStatusText = this.runStatus.querySelector("span span");
+        this.stopButton = this.runStatus.querySelector('[data-action="stop"]');
         this.jumpLatestButton = this.container.querySelector(".fl-jump-latest");
         this.conversationTitle = this.container.querySelector(".fl-conversation-title span");
         this.overflowButton = this.container.querySelector('[data-action="toggle-menu"]');
@@ -576,7 +580,6 @@ export class AssistantPanel {
                 event.key === "Enter"
                 && !event.shiftKey
                 && !event.isComposing
-                && !this.running
             ) {
                 event.preventDefault();
                 this.send();
@@ -2528,18 +2531,68 @@ export class AssistantPanel {
     async send() {
         const message = this.textarea.value.trim();
         const attachments = this.pendingAttachments.map(item => ({ ...item }));
-        if ((!message && !attachments.length) || this.running || this.uploadingAttachments) return;
+        if (
+            (!message && !attachments.length)
+            || this.uploadingAttachments
+            || this.stopping
+            || this.steering
+        ) return;
         if (!this.status?.configured) {
             this.openSheet("settings");
             this.showError("Choose and test a model before sending a message.");
             return;
         }
+        if (this.running) {
+            await this.steer(message, attachments, this.composerSearchSelect.value);
+            return;
+        }
+        this.clearComposerDraft();
+        await this.startRunMessage(
+            message,
+            null,
+            this.composerSearchSelect.value,
+            attachments,
+        );
+    }
+
+    clearComposerDraft() {
         this.textarea.value = "";
         this.pendingAttachments = [];
         this.renderPendingAttachments();
         this.resizeComposer();
         this.updateComposerState();
-        await this.runMessage(message, null, this.composerSearchSelect.value, attachments);
+    }
+
+    async startRunMessage(...args) {
+        const runPromise = this.runMessage(...args);
+        this.activeRunPromise = runPromise;
+        try {
+            await runPromise;
+        } finally {
+            if (this.activeRunPromise === runPromise) this.activeRunPromise = null;
+        }
+    }
+
+    async steer(message, attachments, searchMode) {
+        const previousRun = this.activeRunPromise;
+        this.steering = true;
+        this.runStatusText.textContent = "Steering Ren…";
+        this.updateComposerState();
+        try {
+            const cancelled = await this.chat.cancel();
+            if (!cancelled) {
+                throw new Error("The current response has not started yet.");
+            }
+            if (previousRun) await previousRun;
+            this.clearComposerDraft();
+            this.announce("Steering Ren with your new message.");
+            await this.startRunMessage(message, null, searchMode, attachments);
+        } catch (error) {
+            this.showError(`Message could not steer the response: ${error.message}`);
+        } finally {
+            this.steering = false;
+            this.updateComposerState();
+        }
     }
 
     async runMessage(
@@ -2677,7 +2730,12 @@ export class AssistantPanel {
             ?.value.trim();
         const attachments = article?.messageAttachments || [];
         if (!content && !attachments.length) return;
-        await this.runMessage(content, messageId, this.composerSearchSelect.value, attachments);
+        await this.startRunMessage(
+            content,
+            messageId,
+            this.composerSearchSelect.value,
+            attachments,
+        );
     }
 
     async resendMessage(messageId) {
@@ -2688,7 +2746,12 @@ export class AssistantPanel {
         const content = article?.messageContent?.trim();
         const attachments = article?.messageAttachments || [];
         if (!content && !attachments.length) return;
-        await this.runMessage(content, messageId, this.composerSearchSelect.value, attachments);
+        await this.startRunMessage(
+            content,
+            messageId,
+            this.composerSearchSelect.value,
+            attachments,
+        );
     }
 
     async changeMessageVersion(messageId, direction) {
@@ -2706,23 +2769,38 @@ export class AssistantPanel {
     }
 
     async stop() {
-        if (!this.running) return;
+        if (!this.running || this.stopping || this.steering) return;
+        const activeRun = this.activeRunPromise;
+        this.stopping = true;
+        this.runStatusText.textContent = "Stopping Ren…";
+        this.updateComposerState();
         try {
-            await this.chat.cancel();
+            const cancelled = await this.chat.cancel();
+            if (!cancelled) throw new Error("The current response has not started yet.");
+            if (activeRun) await activeRun;
         } catch (error) {
             this.showError(`Response could not be stopped: ${error.message}`);
+        } finally {
+            this.stopping = false;
+            this.updateComposerState();
         }
     }
 
     updateComposerState() {
-        this.sendButton.disabled = this.running
-            || this.uploadingAttachments
-            || (!this.textarea.value.trim() && !this.pendingAttachments.length);
+        const hasDraft = Boolean(
+            this.textarea.value.trim() || this.pendingAttachments.length
+        );
+        this.sendButton.disabled = this.uploadingAttachments
+            || this.stopping
+            || this.steering
+            || !hasDraft;
         this.sendButton.title = this.running
-            ? "Wait for the current response to finish"
+            ? "Steer Ren with this message (Enter)"
             : "Send message (Enter)";
         this.runStatus.hidden = !this.running;
         if (!this.running) this.runStatusText.textContent = "Ren is working…";
+        this.stopButton.disabled = this.stopping || this.steering;
+        this.stopButton.textContent = this.stopping ? "Stopping…" : "Stop";
         this.textarea.disabled = false;
         if (this.running) {
             this.textarea.setAttribute("aria-describedby", "fl-run-drafting-hint");
@@ -2838,7 +2916,7 @@ export class AssistantPanel {
     retryLastMessage() {
         if ((!this.lastFailedMessage && !this.lastFailedAttachments.length) || this.running) return;
         if (this.lastFailedEditMessageId) {
-            this.runMessage(
+            this.startRunMessage(
                 this.lastFailedMessage,
                 this.lastFailedEditMessageId,
                 this.lastFailedSearchMode,

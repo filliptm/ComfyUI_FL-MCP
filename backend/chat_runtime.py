@@ -33,6 +33,23 @@ MANDATORY_REVIEW_TOOLS = {"confirm_mask_review"}
 MAX_CHAT_ATTACHMENTS = 8
 MAX_CHAT_ATTACHMENT_BYTES = 32 * 1024 * 1024
 
+WEB_IMAGE_INTENT_PATTERNS = (
+    re.compile(
+        r"\b(?:find|show|fetch|get|pull|source|collect|browse\s+for|look\s+for|"
+        r"search(?:\s+the\s+web)?\s+for|need|want)\b.{0,100}"
+        r"\b(?:images?|photos?|pictures?|visuals?|illustrations?|artwork|mood\s*boards?)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:images?|photos?|pictures?|visuals?|illustrations?|artwork|mood\s*boards?)\b"
+        r".{0,80}\b(?:of|for|from|showing|references?)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\b(?:image|photo|picture|visual)\s+search\b", re.IGNORECASE),
+    re.compile(r"\bvisual\s+references?\b", re.IGNORECASE),
+    re.compile(r"\bwhat\b.{0,100}\blooks?\s+like\b", re.IGNORECASE),
+)
+
 CORE_CHAT_TOOLS = {
     "workflow_overview",
     "workflow_get_current_json",
@@ -366,6 +383,13 @@ def tools_for_message(message: str, search_mode: str = "off") -> set[str]:
     return selected
 
 
+def web_image_requested(message: str) -> bool:
+    """Return whether the user's raw message explicitly asks for web images."""
+
+    text = " ".join(str(message or "").split())
+    return any(pattern.search(text) for pattern in WEB_IMAGE_INTENT_PATTERNS)
+
+
 def web_search_instructions(search_mode: str) -> str:
     """Explain the user-selected, server-enforced web capability to the model."""
 
@@ -390,10 +414,23 @@ def web_search_instructions(search_mode: str) -> str:
             "uses two Tavily credits per query, so avoid redundant searches."
         ),
     }
-    return "Ren web-search selection:\n- " + descriptions.get(search_mode, descriptions["off"])
+    instructions = "Ren web-search selection:\n- " + descriptions.get(
+        search_mode,
+        descriptions["off"],
+    )
+    if search_mode != "off":
+        instructions += (
+            "\n- Web page images are opt-in. Set `include_images=true` on `web_fetch_page` "
+            "only when the user's current message explicitly asks for images, photos, visual "
+            "references, or to see what something looks like. Otherwise leave it false."
+        )
+    return instructions
 
 
-def web_search_environment(settings: dict[str, Any]) -> dict[str, str]:
+def web_search_environment(
+    settings: dict[str, Any],
+    user_message: str = "",
+) -> dict[str, str]:
     """Pass the selected mode and secret to the isolated Ren MCP subprocess."""
 
     mode = str(settings.get("search_mode") or "off")
@@ -401,6 +438,7 @@ def web_search_environment(settings: dict[str, Any]) -> dict[str, str]:
     return {
         "FL_MCP_WEB_SEARCH_MODE": mode,
         "FL_MCP_TAVILY_API_KEY": tavily_key or "",
+        "FL_MCP_WEB_IMAGES_ALLOWED": "1" if web_image_requested(user_message) else "0",
     }
 
 
@@ -725,12 +763,25 @@ class ChatRuntime:
         if not state or state.done or not state.task:
             return False
         self._expire_approvals(state.run_id)
+        interrupt_task = None
         if state.cancel_callback is not None:
+            interrupt_task = asyncio.create_task(state.cancel_callback())
+        state.task.cancel()
+        if interrupt_task is not None:
             try:
-                await state.cancel_callback()
+                await asyncio.wait_for(interrupt_task, timeout=3)
+            except TimeoutError:
+                logger.warning("Provider interrupt timed out for run %s", run_id)
             except Exception:
                 logger.debug("Provider interrupt failed for run %s", run_id, exc_info=True)
-        state.task.cancel()
+        try:
+            await asyncio.wait_for(asyncio.shield(state.task), timeout=10)
+        except asyncio.CancelledError:
+            pass
+        except TimeoutError as exc:
+            raise RuntimeError(
+                "The provider did not stop within 10 seconds. Please try Stop again."
+            ) from exc
         return True
 
     async def resolve_approval(
@@ -938,7 +989,10 @@ class ChatRuntime:
                 "FL_MCP_SESSION_ID": state.session_id,
                 "FL_MCP_WS_URL": self._ws_url(),
                 "FL_MCP_CLIENT_ID": f"embedded-chat-{state.run_id}",
-                **web_search_environment(settings),
+                **web_search_environment(
+                    settings,
+                    str(latest_user_item.get("content") or ""),
+                ),
             })
             mcp_server = MCPServerStdio(
                 sys.executable,
@@ -1103,7 +1157,10 @@ class ChatRuntime:
             "FL_MCP_WS_URL": self._ws_url(),
             "FL_MCP_CLIENT_ID": f"embedded-claude-{state.run_id}",
             "FL_MCP_ALLOWED_TOOLS": ",".join(sorted(allowed_tools)),
-            **web_search_environment(settings),
+            **web_search_environment(
+                settings,
+                str(latest_user_item.get("content") or ""),
+            ),
             "CLAUDE_AGENT_SDK_CLIENT_APP": "comfyui-fl-mcp/ren",
             # A configured Anthropic API key otherwise takes precedence over
             # the user's Claude Code subscription in non-interactive mode.
@@ -1252,6 +1309,9 @@ class ChatRuntime:
             client_factory = self.claude_client_factory or ClaudeSDKClient
             client = client_factory(options)
             await client.connect()
+            interrupt = getattr(client, "interrupt", None)
+            if callable(interrupt):
+                state.cancel_callback = interrupt
             await wait_for_claude_mcp(client)
             session_id = captured_session_id or state.conversation_id
             await client.query(prompt_stream(), session_id=session_id)
@@ -1352,6 +1412,7 @@ class ChatRuntime:
                 elif isinstance(message, ResultMessage):
                     result_message = message
         finally:
+            state.cancel_callback = None
             if client is not None:
                 await asyncio.shield(client.disconnect())
 
@@ -1475,7 +1536,10 @@ class ChatRuntime:
             "FL_MCP_WS_URL": self._ws_url(),
             "FL_MCP_CLIENT_ID": f"embedded-codex-{state.run_id}",
             "FL_MCP_ALLOWED_TOOLS": ",".join(sorted(allowed_tools)),
-            **web_search_environment(settings),
+            **web_search_environment(
+                settings,
+                str(latest_user_item.get("content") or ""),
+            ),
         }
         ren_server = {
             "command": sys.executable,

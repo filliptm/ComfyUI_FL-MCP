@@ -97,6 +97,51 @@ test("run requests include uploaded ComfyUI image references", async () => {
 });
 
 
+test("cancel waits for a starting run and targets its resolved run id", async () => {
+    const originalFetch = globalThis.fetch;
+    const requests = [];
+    let resolveStart;
+    globalThis.fetch = (url, options = {}) => {
+        requests.push({ url: String(url), options });
+        if (String(url).endsWith("/api/chat/runs")) {
+            return new Promise(resolve => {
+                resolveStart = () => resolve(new Response("", {
+                    status: 200,
+                    headers: {
+                        "X-FL-MCP-Run-Id": "run-starting",
+                        "X-FL-MCP-Conversation-Id": "conversation-1",
+                    },
+                }));
+            });
+        }
+        return Promise.resolve(new Response(JSON.stringify({ cancelled: true }), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+        }));
+    };
+    try {
+        const client = new ChatClient("http://127.0.0.1:18000");
+        const run = client.startRun({
+            sessionId: "session-1",
+            message: "Initial request",
+        });
+        const cancelled = client.cancel();
+        await Promise.resolve();
+        assert.equal(requests.length, 1);
+        resolveStart();
+        assert.equal(await cancelled, true);
+        await run;
+    } finally {
+        globalThis.fetch = originalFetch;
+    }
+
+    assert.equal(
+        requests[1].url,
+        "http://127.0.0.1:18000/api/chat/runs/run-starting/cancel",
+    );
+});
+
+
 test("web image previews stay on the local Ren backend", () => {
     const client = new ChatClient("http://127.0.0.1:18000");
 

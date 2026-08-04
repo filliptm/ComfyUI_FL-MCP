@@ -4,6 +4,7 @@ export class ChatClient {
         this.abortController = null;
         this.runId = null;
         this.conversationId = null;
+        this.runReady = Promise.resolve(null);
     }
 
     async request(path, options = {}) {
@@ -145,21 +146,33 @@ export class ChatClient {
         onReady,
     }) {
         this.abortController = new AbortController();
-        const response = await fetch(`${this.baseUrl}/api/chat/runs`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-                sessionId,
-                conversationId: conversationId || null,
-                message,
-                reasoningEffort: reasoningEffort || "default",
-                searchMode: searchMode || "free",
-                editMessageId: editMessageId || null,
-                attachments,
-            }),
-            signal: this.abortController.signal,
+        this.runId = null;
+        let resolveRunReady;
+        this.runReady = new Promise(resolve => {
+            resolveRunReady = resolve;
         });
+        let response;
+        try {
+            response = await fetch(`${this.baseUrl}/api/chat/runs`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    sessionId,
+                    conversationId: conversationId || null,
+                    message,
+                    reasoningEffort: reasoningEffort || "default",
+                    searchMode: searchMode || "free",
+                    editMessageId: editMessageId || null,
+                    attachments,
+                }),
+                signal: this.abortController.signal,
+            });
+        } catch (error) {
+            resolveRunReady(null);
+            throw error;
+        }
         if (!response.ok) {
+            resolveRunReady(null);
             let detail = `${response.status} ${response.statusText}`;
             try {
                 const payload = await response.json();
@@ -170,6 +183,7 @@ export class ChatClient {
             throw new Error(detail);
         }
         this.runId = response.headers.get("X-FL-MCP-Run-Id");
+        resolveRunReady(this.runId);
         this.conversationId = response.headers.get("X-FL-MCP-Conversation-Id");
         onReady?.({
             runId: this.runId,
@@ -216,8 +230,9 @@ export class ChatClient {
     }
 
     async cancel() {
-        if (!this.runId) return false;
-        await this.request(`/api/chat/runs/${encodeURIComponent(this.runId)}/cancel`, {
+        const runId = this.runId || await this.runReady;
+        if (!runId) return false;
+        await this.request(`/api/chat/runs/${encodeURIComponent(runId)}/cancel`, {
             method: "POST",
             body: JSON.stringify({}),
         });

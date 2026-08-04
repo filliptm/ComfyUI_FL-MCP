@@ -343,6 +343,11 @@ async def mcp_lifespan(server: FastMCP) -> AsyncIterator[Any]:
             or os.getenv("TAVILY_API_KEY")
         ),
     )
+    web_images_allowed = (
+        os.getenv("FL_MCP_MODE") != "subprocess"
+        or os.getenv("FL_MCP_WEB_IMAGES_ALLOWED", "").strip().lower()
+        in {"1", "true", "yes", "on"}
+    )
 
     async def close_web_resources() -> None:
         await web_search.aclose()
@@ -376,6 +381,7 @@ async def mcp_lifespan(server: FastMCP) -> AsyncIterator[Any]:
                 "manager_available": manager_available,
                 "web_search": web_search,
                 "web_pages": web_pages,
+                "web_images_allowed": web_images_allowed,
             }
         finally:
             await close_web_resources()
@@ -392,6 +398,7 @@ async def mcp_lifespan(server: FastMCP) -> AsyncIterator[Any]:
             "manager_available": manager_available,
             "web_search": web_search,
             "web_pages": web_pages,
+            "web_images_allowed": web_images_allowed,
         }
     finally:
         await close_web_resources()
@@ -1127,6 +1134,13 @@ class WebFetchPageRequest(BaseModel):
     url: str = Field(..., min_length=1, max_length=2048, description="Public HTTP(S) URL")
     max_chars: int = Field(12000, ge=1000, le=30000, description="Maximum extracted characters")
     force_refresh: bool = Field(False, description="Ignore a cached extraction")
+    include_images: bool = Field(
+        False,
+        description=(
+            "Return image candidates only when the current user explicitly asked for images "
+            "or visual references"
+        ),
+    )
 
 
 class CustomNodesPathRequest(BaseModel):
@@ -1439,6 +1453,16 @@ async def web_fetch_page(request: WebFetchPageRequest, ctx: Context) -> Dict[str
     page = await service.fetch_page(request.url, force_refresh=request.force_refresh)
     content = page.markdown or page.text
     truncated = len(content) > request.max_chars
+    images_allowed = bool(
+        ctx.request_context.lifespan_context.get("web_images_allowed", True)
+    )
+    include_images = request.include_images and images_allowed
+    warnings = list(page.warnings)
+    if request.include_images and not images_allowed:
+        warnings.append(
+            "Web images were omitted because the current user message did not explicitly "
+            "request them."
+        )
     return {
         "success": True,
         "requestedUrl": page.requested_url,
@@ -1455,8 +1479,13 @@ async def web_fetch_page(request: WebFetchPageRequest, ctx: Context) -> Dict[str
         "requiresHostedFallback": page.requires_hosted_fallback,
         "fromCache": page.from_cache,
         "links": [item.model_dump(mode="json") for item in page.links[:25]],
-        "images": [item.model_dump(mode="json") for item in page.images[:10]],
-        "warnings": page.warnings,
+        "images": (
+            [item.model_dump(mode="json") for item in page.images[:10]]
+            if include_images
+            else []
+        ),
+        "imagesIncluded": include_images,
+        "warnings": warnings,
     }
 
 # ============================================================================
