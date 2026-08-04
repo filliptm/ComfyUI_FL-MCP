@@ -248,6 +248,9 @@ test("chat accepts local images and can place them into a selected image node", 
     assert.match(mcp, /async def view_chat_image/);
     assert.match(mcp, /async def place_chat_image_in_node/);
     assert.match(styles, /\.fl-composer-attachments/);
+    assert.match(styles, /--fl-attachment-thumb-height:\s*48px/);
+    assert.match(styles, /--fl-attachment-thumb-width:\s*68px/);
+    assert.match(styles, /\.fl-chat-attachment\s*\{[^}]*border:\s*0;[^}]*background:\s*transparent;/s);
     assert.match(styles, /\.fl-chat-input-container\.drag-active/);
 });
 
