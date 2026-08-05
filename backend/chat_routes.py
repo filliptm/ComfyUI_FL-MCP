@@ -24,7 +24,7 @@ from web_image_service import WebImagePreviewError, WebImagePreviewService
 from web_security import WebUrlError
 
 router = APIRouter(prefix="/api/chat", tags=["chat"])
-web_image_previews = WebImagePreviewService()
+web_image_previews = WebImagePreviewService(max_dimension=192)
 
 
 async def _connection_status(provider: str, *, refresh: bool = False) -> dict[str, Any]:

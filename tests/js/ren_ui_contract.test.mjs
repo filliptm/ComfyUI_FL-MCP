@@ -185,9 +185,26 @@ test("web and generated images render in ordered chat galleries", async () => {
     assert.match(markdown, /parseMarkdownImageLine/);
     assert.match(markdown, /fl-chat-image-grid fl-image-grid/);
     assert.match(routes, /WebImagePreviewService/);
+    assert.match(routes, /WebImagePreviewService\(max_dimension=192\)/);
     assert.match(styles, /\.fl-image-grid\s*\{[^}]*grid-template-columns:\s*repeat\(2,/s);
     assert.match(styles, /data-layout="hero"[^}]*first-child/s);
     assert.match(styles, /object-fit:\s*contain/);
+    assert.match(
+        styles,
+        /\.fl-tool-image-grid\[data-layout\]\s*\{[^}]*repeat\(auto-fill, minmax\(96px, 128px\)\)/s,
+    );
+    assert.match(
+        styles,
+        /\.fl-tool-image-grid \.fl-tool-image-card\s*\{[^}]*border:\s*0;[^}]*background:\s*transparent/s,
+    );
+    assert.match(
+        styles,
+        /\.fl-tool-image-grid\[data-layout="single"\] \.fl-tool-image-card a\s*\{[^}]*width:\s*fit-content;[^}]*aspect-ratio:\s*auto;[^}]*background:\s*transparent/s,
+    );
+    assert.match(
+        styles,
+        /\.fl-tool-image-grid \.fl-tool-image-card img\s*\{[^}]*width:\s*auto;[^}]*height:\s*auto;[^}]*max-height:\s*96px;[^}]*object-fit:\s*contain/s,
+    );
 });
 
 
@@ -295,7 +312,12 @@ test("chat accepts local images and can place them into a selected image node", 
     assert.match(panel, /attach-tool-image/);
     assert.match(panel, /use-tool-image/);
     assert.match(panel, /importToolImage/);
+    assert.match(panel, /toolImagePreviewSource/);
+    assert.match(panel, /\/fl_mcp\/image\/thumbnail\?/);
+    assert.match(panel, /previewLink\.href = this\.toolImageOriginalSource\(image\)/);
+    assert.match(panel, /fetch\(this\.toolImageImportSource\(image\)\)/);
     assert.match(api, /api\.fetchApi\("\/upload\/image"/);
+    assert.match(api, /formData\.append\("image", file,/);
     assert.match(api, /placeChatImageInNode/);
     assert.match(runtime, /message_content_for_model/);
     assert.match(runtime, /"attachments": normalized_attachments/);
@@ -305,6 +327,7 @@ test("chat accepts local images and can place them into a selected image node", 
     assert.match(styles, /--fl-attachment-thumb-height:\s*48px/);
     assert.match(styles, /--fl-attachment-thumb-width:\s*68px/);
     assert.match(styles, /\.fl-chat-attachment\s*\{[^}]*border:\s*0;[^}]*background:\s*transparent;/s);
+    assert.match(styles, /\.fl-chat-attachment img\s*\{[^}]*width:\s*auto;[^}]*height:\s*auto;[^}]*object-fit:\s*contain/s);
     assert.match(styles, /\.fl-chat-input-container\.drag-active/);
 });
 

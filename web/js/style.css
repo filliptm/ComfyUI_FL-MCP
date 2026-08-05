@@ -722,6 +722,10 @@
 }
 
 .fl-tool-image-grid {
+    grid-template-columns: repeat(auto-fill, minmax(96px, 128px));
+    align-items: start;
+    justify-content: start;
+    gap: 8px;
     padding: 2px 0 5px;
 }
 
@@ -807,12 +811,54 @@
     gap: 5px;
 }
 
+.fl-tool-image-grid[data-layout] {
+    grid-template-columns: repeat(auto-fill, minmax(96px, 128px));
+}
+
+.fl-tool-image-grid[data-layout="hero"] .fl-tool-image-card:first-child {
+    grid-column: auto;
+}
+
+.fl-tool-image-grid .fl-tool-image-card {
+    justify-self: start;
+    overflow: visible;
+    border: 0;
+    border-radius: 0;
+    background: transparent;
+}
+
+.fl-tool-image-grid[data-layout] .fl-tool-image-card a,
+.fl-tool-image-grid[data-layout="hero"] .fl-tool-image-card:first-child a,
+.fl-tool-image-grid[data-layout="single"] .fl-tool-image-card a {
+    width: fit-content;
+    max-width: 100%;
+    min-height: 0;
+    aspect-ratio: auto;
+    border-radius: 6px;
+    background: transparent;
+}
+
+.fl-tool-image-grid .fl-tool-image-card img {
+    display: block;
+    width: auto;
+    height: auto;
+    max-width: 100%;
+    max-height: 96px;
+    border-radius: 6px;
+    object-fit: contain;
+}
+
+.fl-tool-image-grid .fl-tool-image-card figcaption {
+    padding: 4px 0 0;
+}
+
 .fl-chat-attachment {
     --fl-attachment-thumb-height: 68px;
     --fl-attachment-thumb-width: 96px;
     position: relative;
-    width: var(--fl-attachment-thumb-width);
-    flex: 0 0 var(--fl-attachment-thumb-width);
+    width: fit-content;
+    max-width: var(--fl-attachment-thumb-width);
+    flex: 0 0 auto;
     overflow: visible;
     border: 0;
     border-radius: 7px;
@@ -820,16 +866,23 @@
 }
 
 .fl-chat-attachment-grid.fl-image-grid[data-layout] .fl-chat-attachment a {
-    width: var(--fl-attachment-thumb-width);
-    height: var(--fl-attachment-thumb-height);
+    width: fit-content;
+    max-width: var(--fl-attachment-thumb-width);
+    height: auto;
+    max-height: var(--fl-attachment-thumb-height);
     aspect-ratio: auto;
     border-radius: 7px;
     background: transparent;
 }
 
 .fl-chat-attachment img {
+    display: block;
+    width: auto;
+    height: auto;
+    max-width: var(--fl-attachment-thumb-width);
+    max-height: var(--fl-attachment-thumb-height);
     border-radius: inherit;
-    object-fit: cover;
+    object-fit: contain;
 }
 
 .fl-chat-attachment figcaption {

@@ -1905,12 +1905,13 @@ export class AssistantPanel {
             const figure = document.createElement("figure");
             figure.className = "fl-chat-attachment fl-image-card";
             const preview = document.createElement("img");
-            preview.src = this.toolImageSource({ ...attachment, kind: "comfy" });
+            const image = { ...attachment, kind: "comfy" };
+            preview.src = this.toolImagePreviewSource(image);
             preview.alt = attachment.originalName || `Attached image ${index + 1}`;
             preview.loading = "lazy";
             preview.decoding = "async";
             const previewLink = document.createElement("a");
-            previewLink.href = preview.src;
+            previewLink.href = this.toolImageOriginalSource(image);
             previewLink.target = "_blank";
             previewLink.rel = "noopener noreferrer";
             previewLink.title = "Open attached image";
@@ -2338,7 +2339,7 @@ export class AssistantPanel {
             const figure = document.createElement("figure");
             figure.className = "fl-tool-image-card fl-image-card";
             figure.setAttribute("role", "listitem");
-            const source = this.toolImageSource(image);
+            const source = this.toolImageOriginalSource(image);
             const link = document.createElement("a");
             link.href = image.kind === "web"
                 ? (image.sourceUrl || image.url)
@@ -2350,7 +2351,7 @@ export class AssistantPanel {
                 : "Open full generated image";
 
             const preview = document.createElement("img");
-            preview.src = source;
+            preview.src = this.toolImagePreviewSource(image);
             preview.alt = image.alt || image.title || `Image ${index + 1}`;
             preview.loading = "lazy";
             preview.decoding = "async";
@@ -2422,7 +2423,17 @@ export class AssistantPanel {
         }
     }
 
-    toolImageSource(image) {
+    toolImageOriginalSource(image) {
+        if (image.kind === "web") return image.url;
+        const params = new URLSearchParams({
+            filename: image.filename,
+            type: image.type,
+        });
+        if (image.subfolder) params.set("subfolder", image.subfolder);
+        return `/api/view?${params.toString()}`;
+    }
+
+    toolImagePreviewSource(image) {
         if (image.kind === "web") {
             return this.chat.webImagePreviewUrl(image.url);
         }
@@ -2431,7 +2442,13 @@ export class AssistantPanel {
             type: image.type,
         });
         if (image.subfolder) params.set("subfolder", image.subfolder);
-        return `/api/view?${params.toString()}`;
+        return `/fl_mcp/image/thumbnail?${params.toString()}`;
+    }
+
+    toolImageImportSource(image) {
+        return image.kind === "web"
+            ? this.chat.webImagePreviewUrl(image.url)
+            : this.toolImageOriginalSource(image);
     }
 
     toolImageCaption(image, index) {
@@ -3322,7 +3339,7 @@ export class AssistantPanel {
                 height: 0,
             };
         }
-        const response = await fetch(this.toolImageSource(image));
+        const response = await fetch(this.toolImageImportSource(image));
         if (!response.ok) {
             throw new Error(`Image download failed (${response.status}).`);
         }
