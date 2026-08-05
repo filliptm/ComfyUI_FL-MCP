@@ -34,8 +34,14 @@ from backend.chat_image_preview import (  # noqa: E402
 )
 from backend.process_utils import daemon_process_kwargs, pid_is_running  # noqa: E402
 
+bridge_settings_payload = None
+bridge_settings_store = None
 try:
-    from backend.config import settings
+    from backend.config import (
+        bridge_settings_payload,
+        bridge_settings_store,
+        settings,
+    )
 
     AUTO_START = settings.auto_start_backend
     AUTO_RESTART = settings.auto_restart_backend
@@ -207,6 +213,20 @@ try:
     async def fl_mcp_launcher_stop(request):
         return web.json_response(await asyncio.to_thread(_stop_daemon))
 
+    if bridge_settings_payload is not None and bridge_settings_store is not None:
+        @PromptServer.instance.routes.get("/fl_mcp/settings")
+        async def fl_mcp_get_settings(request):
+            return web.json_response(bridge_settings_payload())
+
+        @PromptServer.instance.routes.patch("/fl_mcp/settings")
+        async def fl_mcp_update_settings(request):
+            try:
+                changes = await request.json()
+                bridge_settings_store.update(changes)
+            except (TypeError, ValueError) as exc:
+                return web.json_response({"error": str(exc)}, status=400)
+            return web.json_response(bridge_settings_payload())
+
     @PromptServer.instance.routes.get("/fl_mcp/image/thumbnail")
     async def fl_mcp_image_thumbnail(request):
         image_type = request.rel_url.query.get("type", "output")
@@ -242,7 +262,7 @@ try:
             },
         )
 
-    print("[FL-MCP] Registered launcher and image thumbnail routes")
+    print("[FL-MCP] Registered launcher, settings, and image thumbnail routes")
 except Exception as exc:
     print(f"[FL-MCP] Warning: could not register launcher routes: {exc}")
 

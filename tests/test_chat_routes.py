@@ -1,6 +1,7 @@
 import chat_routes
 import server
 from chat_config import ChatSettingsStore, CredentialStore
+from chat_runtime import ActiveRun
 from chat_store import ChatStore
 from fastapi.testclient import TestClient
 from web_image_service import WebImagePreview

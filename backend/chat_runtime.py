@@ -25,7 +25,11 @@ from chat_config import (
 )
 from chat_security import classify_tool, requires_approval
 from chat_store import ChatStore, chat_store
-from config import settings as bridge_settings
+from config import (
+    MAX_GENERATION_COMPLETION_TIMEOUT_SECONDS,
+    MCP_TOOL_TIMEOUT_BUFFER_SECONDS,
+    settings as bridge_settings,
+)
 
 logger = logging.getLogger(__name__)
 PROMPT_PATH = Path(__file__).with_name("chat_prompt.md")
@@ -36,6 +40,13 @@ CONTEXT_MAX_CHARS = 96_000
 CONTEXT_RECENT_CHARS = 64_000
 CONTEXT_CHECKPOINT_CHARS = 24_000
 CONTEXT_ROLLOVER_TOKENS = 64_000
+
+
+def mcp_tool_timeout_seconds() -> int:
+    return (
+        MAX_GENERATION_COMPLETION_TIMEOUT_SECONDS
+        + MCP_TOOL_TIMEOUT_BUFFER_SECONDS
+    )
 
 _DATA_IMAGE_URI = re.compile(
     r"data:image/[^;,\s]+;base64,[A-Za-z0-9+/=]+",
@@ -483,6 +494,19 @@ def tool_result_content(content: Any) -> str:
         content = content.model_dump(mode="json", by_alias=True)
     content = _redact_binary_tool_content(content)
     return json.dumps(content, ensure_ascii=False, separators=(",", ":"))
+
+
+def model_settings_for_provider(settings: dict[str, Any]) -> dict[str, Any]:
+    model_settings: dict[str, Any] = {
+        "temperature": settings["temperature"],
+    }
+    reasoning_effort = settings.get("reasoning_effort", "default")
+    reasoning_setting = PROVIDER_PRESETS[settings["provider"]].get(
+        "reasoning_setting"
+    )
+    if reasoning_effort != "default" and reasoning_setting:
+        model_settings[reasoning_setting] = reasoning_effort
+    return model_settings
 
 
 def codex_tool_name(params: dict[str, Any]) -> str | None:
@@ -1291,7 +1315,7 @@ class ChatRuntime:
                 cwd=PROJECT_ROOT,
                 env=environment,
                 process_tool_call=process_tool_call,
-                read_timeout=300,
+                read_timeout=mcp_tool_timeout_seconds(),
             )
             model_settings: dict[str, Any] = {
                 "temperature": settings["temperature"],
@@ -1877,7 +1901,7 @@ class ChatRuntime:
             "env": mcp_environment,
             "required": True,
             "startup_timeout_sec": 15,
-            "tool_timeout_sec": 300,
+            "tool_timeout_sec": mcp_tool_timeout_seconds(),
             "enabled_tools": sorted(allowed_tools),
             "default_tools_approval_mode": "approve",
             "tools": {

@@ -31,7 +31,7 @@ from process_utils import pid_is_running
 from version import __version__
 
 
-LOG_LEVEL = getattr(logging, os.getenv("LOG_LEVEL", settings.log_level).upper(), logging.INFO)
+LOG_LEVEL = getattr(logging, settings.log_level, logging.INFO)
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 WEB_JS_DIR = PROJECT_ROOT / "web" / "js"
 LOG_DIR = PROJECT_ROOT / "logs"
@@ -233,8 +233,12 @@ async def comfy_start() -> Dict[str, Any]:
     if not settings.enable_comfy_process_control:
         return {
             "success": False,
-            "error": "disabled_by_config: set FL_MCP_ENABLE_COMFY_PROCESS_CONTROL=true to enable this endpoint.",
+            "error": (
+                "disabled_by_config: enable Process control under "
+                "Ren > Settings > Bridge & safety, then restart ComfyUI."
+            ),
             "disabled_by_config": True,
+            "required_setting": "enable_comfy_process_control",
         }
     return comfy_supervisor.start()
 
@@ -244,8 +248,12 @@ async def comfy_stop() -> Dict[str, Any]:
     if not settings.enable_comfy_process_control:
         return {
             "success": False,
-            "error": "disabled_by_config: set FL_MCP_ENABLE_COMFY_PROCESS_CONTROL=true to enable this endpoint.",
+            "error": (
+                "disabled_by_config: enable Process control under "
+                "Ren > Settings > Bridge & safety, then restart ComfyUI."
+            ),
             "disabled_by_config": True,
+            "required_setting": "enable_comfy_process_control",
         }
     return comfy_supervisor.stop()
 
@@ -255,8 +263,12 @@ async def comfy_restart() -> Dict[str, Any]:
     if not settings.enable_comfy_process_control:
         return {
             "success": False,
-            "error": "disabled_by_config: set FL_MCP_ENABLE_COMFY_PROCESS_CONTROL=true to enable this endpoint.",
+            "error": (
+                "disabled_by_config: enable Process control under "
+                "Ren > Settings > Bridge & safety, then restart ComfyUI."
+            ),
             "disabled_by_config": True,
+            "required_setting": "enable_comfy_process_control",
         }
     return comfy_supervisor.restart()
 

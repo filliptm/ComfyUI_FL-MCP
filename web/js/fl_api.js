@@ -2421,8 +2421,7 @@ export class FL_API {
      * @private
      */
     _find(query) {
-        // if (query == null) return null;
-        if (typeof query === "object" && query.id !== undefined) {
+        if (typeof query === "object" && query?.id !== undefined && !query.by) {
             return query;
         }
 
@@ -2445,7 +2444,7 @@ export class FL_API {
      * @private
      */
     _findLast(query) {
-        if (typeof query === "object" && query.id !== undefined) {
+        if (typeof query === "object" && query?.id !== undefined && !query.by) {
             return query;
         }
 

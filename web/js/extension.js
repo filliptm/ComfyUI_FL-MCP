@@ -60,9 +60,28 @@ function subscribeCanvasContext(callback) {
 async function fetchJson(url, options = {}) {
     const response = await fetch(url, options);
     if (!response.ok) {
-        throw new Error(`${url} failed: ${response.status}`);
+        let detail = `${url} failed: ${response.status}`;
+        try {
+            const payload = await response.json();
+            detail = payload.error || payload.detail || detail;
+        } catch (_) {
+            // Keep the HTTP status when the response is not JSON.
+        }
+        throw new Error(detail);
     }
     return await response.json();
+}
+
+function loadBridgeSettings() {
+    return fetchJson("/fl_mcp/settings");
+}
+
+function updateBridgeSettings(changes) {
+    return fetchJson("/fl_mcp/settings", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(changes),
+    });
 }
 
 async function fetchClientConfig(baseUrl = "") {
@@ -382,6 +401,8 @@ app.registerExtension({
                             ),
                             getCanvasContext,
                             subscribeCanvasContext,
+                            loadBridgeSettings,
+                            updateBridgeSettings,
                             uploadChatImage: (file, subfolder) => (
                                 toolExecutor.flApi.uploadChatImage(file, subfolder)
                             ),

@@ -72,6 +72,65 @@ test("tool summaries expose human outcomes for core canvas operations", () => {
         status: "done",
         result: '{"node_count":12}',
     }), "Inspected 12 nodes");
+    assert.equal(summarizeToolStep({
+        name: "queue_workflow",
+        status: "done",
+        result: '{"status":"completed"}',
+    }), "Completed workflow");
+    assert.equal(summarizeToolStep({
+        name: "queue_workflow",
+        status: "done",
+        result: '{"status":"timeout"}',
+    }), "Workflow wait timed out");
+});
+
+test("image review and mask summaries report the visible outcome", () => {
+    assert.equal(summarizeToolStep({
+        name: "view_output_image",
+        status: "done",
+        result: JSON.stringify({
+            selectedOutputIndex: 3,
+            availableOutputCount: 4,
+            originalSize: { width: 768, height: 768 },
+        }),
+    }), "Reviewed final output · 768×768");
+
+    const maskResult = [{
+        type: "text",
+        text: JSON.stringify({
+            node_id: 12,
+            title: "LOAD & MASK IMAGE",
+            mask: { coveragePercent: 4 },
+        }),
+    }, {
+        type: "image",
+        data: "[image content shown to Ren]",
+    }];
+    assert.equal(summarizeToolStep({
+        name: "view_node_mask",
+        status: "done",
+        result: JSON.stringify(maskResult),
+    }), "Inspected mask on LOAD & MASK IMAGE · 4% covered");
+
+    assert.equal(summarizeToolStep({
+        name: "edit_node_mask",
+        status: "done",
+        arguments: JSON.stringify({ request: {
+            clear_existing: true,
+            regions: [{ operation: "paint" }, { operation: "paint" }],
+        } }),
+        result: JSON.stringify({ mask: { coveragePercent: 3.125 } }),
+    }), "Replaced mask with 2 mask regions · 3.13% covered");
+
+    assert.equal(summarizeToolStep({
+        name: "view_output_image",
+        status: "failed",
+    }), "Couldn’t review output image");
+
+    assert.equal(summarizeToolStep({
+        name: "confirm_mask_review",
+        status: "done",
+    }), "Mask approved for workflow");
 });
 
 test("image review and mask summaries report the visible outcome", () => {

@@ -16,6 +16,9 @@ SETTINGS_PATH = DATA_DIR / "chat_settings.json"
 KEYRING_SERVICE = "comfyui-fl-mcp"
 APPROVAL_MODES = {"autonomous_edits", "bypass_all"}
 REASONING_EFFORTS = {"default", "low", "medium", "high", "xhigh", "max", "ultra"}
+OPENAI_REASONING_EFFORTS = ["low", "medium", "high"]
+CLAUDE_REASONING_EFFORTS = ["low", "medium", "high", "xhigh", "max"]
+CODEX_REASONING_EFFORTS = [*CLAUDE_REASONING_EFFORTS, "ultra"]
 SEARCH_MODES = {"off", "free", "tavily_basic", "tavily_advanced"}
 SEARCH_CREDENTIAL_PROVIDERS = {"tavily"}
 TOOL_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
@@ -27,6 +30,8 @@ PROVIDER_PRESETS: dict[str, dict[str, Any]] = {
         "base_url": "http://127.0.0.1:1234/v1",
         "requires_key": False,
         "default_model": "",
+        "reasoning_efforts": OPENAI_REASONING_EFFORTS,
+        "reasoning_setting": "openai_reasoning_effort",
     },
     "ollama": {
         "label": "Ollama",
@@ -34,6 +39,8 @@ PROVIDER_PRESETS: dict[str, dict[str, Any]] = {
         "base_url": "http://127.0.0.1:11434/v1",
         "requires_key": False,
         "default_model": "",
+        "reasoning_efforts": OPENAI_REASONING_EFFORTS,
+        "reasoning_setting": "openai_reasoning_effort",
     },
     "openai": {
         "label": "OpenAI",
@@ -41,6 +48,8 @@ PROVIDER_PRESETS: dict[str, dict[str, Any]] = {
         "base_url": "https://api.openai.com/v1",
         "requires_key": True,
         "default_model": "gpt-5-mini",
+        "reasoning_efforts": OPENAI_REASONING_EFFORTS,
+        "reasoning_setting": "openai_reasoning_effort",
     },
     "openrouter": {
         "label": "OpenRouter",
@@ -48,6 +57,8 @@ PROVIDER_PRESETS: dict[str, dict[str, Any]] = {
         "base_url": "https://openrouter.ai/api/v1",
         "requires_key": True,
         "default_model": "openai/gpt-5-mini",
+        "reasoning_efforts": OPENAI_REASONING_EFFORTS,
+        "reasoning_setting": "openai_reasoning_effort",
     },
     "anthropic": {
         "label": "Anthropic",
@@ -55,6 +66,7 @@ PROVIDER_PRESETS: dict[str, dict[str, Any]] = {
         "base_url": "https://api.anthropic.com",
         "requires_key": True,
         "default_model": "claude-sonnet-4-5",
+        "reasoning_efforts": [],
     },
     "claude_subscription": {
         "label": "Claude subscription",
@@ -62,6 +74,7 @@ PROVIDER_PRESETS: dict[str, dict[str, Any]] = {
         "base_url": "",
         "requires_key": False,
         "default_model": "sonnet",
+        "reasoning_efforts": CLAUDE_REASONING_EFFORTS,
         "models": [
             {"id": "default", "label": "Account default"},
             {"id": "best", "label": "Best available (Fable or Opus)"},
@@ -83,6 +96,7 @@ PROVIDER_PRESETS: dict[str, dict[str, Any]] = {
         "base_url": "",
         "requires_key": False,
         "default_model": "gpt-5.6-sol",
+        "reasoning_efforts": CODEX_REASONING_EFFORTS,
         "models": [
             {"id": "gpt-5.6-sol", "label": "GPT-5.6-Sol (recommended)"},
             {
@@ -103,6 +117,8 @@ PROVIDER_PRESETS: dict[str, dict[str, Any]] = {
         "base_url": "",
         "requires_key": False,
         "default_model": "",
+        "reasoning_efforts": OPENAI_REASONING_EFFORTS,
+        "reasoning_setting": "openai_reasoning_effort",
     },
 }
 

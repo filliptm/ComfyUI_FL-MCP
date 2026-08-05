@@ -318,6 +318,8 @@ def _run_request_values(data: dict[str, Any]) -> dict[str, Any]:
 
 
 def _run_stream(state: Any) -> StreamingResponse:
+    user_message_id = getattr(state, "user_message_id", None) or ""
+    user_message_revision = getattr(state, "user_message_revision", None) or {}
     return StreamingResponse(
         chat_runtime.subscribe(state.run_id),
         media_type="text/event-stream",
@@ -326,6 +328,16 @@ def _run_stream(state: Any) -> StreamingResponse:
             "X-Accel-Buffering": "no",
             "X-FL-MCP-Run-Id": state.run_id,
             "X-FL-MCP-Conversation-Id": state.conversation_id,
+            "X-FL-MCP-User-Message-Id": user_message_id,
+            "X-FL-MCP-User-Revision-Root-Id": (
+                str(user_message_revision.get("rootId") or "")
+            ),
+            "X-FL-MCP-User-Revision-Index": (
+                str(user_message_revision.get("index") or 1)
+            ),
+            "X-FL-MCP-User-Revision-Count": (
+                str(user_message_revision.get("count") or 1)
+            ),
         },
     )
 

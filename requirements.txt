@@ -9,7 +9,6 @@ openai-codex==0.144.4
 pydantic-ai-slim[ag-ui,anthropic,mcp,openai]>=1.1,<1.2
 keyring>=25,<26
 pydantic
-pydantic-settings
 python-dotenv
 httpx
 selectolax>=0.4.11,<0.5

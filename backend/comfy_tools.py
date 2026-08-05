@@ -4,7 +4,6 @@ Provides secure, deterministic access to ComfyUI directory structure
 for MCP-based analysis and discovery.
 """
 
-import os
 import re
 import logging
 import httpx
@@ -12,8 +11,10 @@ from pathlib import Path
 from typing import List, Dict, Optional, Union, Any, Iterator
 from dataclasses import dataclass
 from enum import Enum
+from urllib.parse import quote
 
 from comfy_models import ComfyFolderType, ComfyFileInfo, ComfySearchResult
+from config import settings
 from extra_model_paths_loader import ExtraModelPathsLoader
 from path_resolver import PathResolver
 
@@ -87,7 +88,10 @@ class ComfyUITools:
         self._validate_comfyui_installation()
         
         # Load extra model paths and merge with defaults
-        loader = ExtraModelPathsLoader(self.comfyui_root)
+        loader = ExtraModelPathsLoader(
+            self.comfyui_root,
+            config_path=settings.extra_model_paths_path,
+        )
         extra_configs = loader.load()
         
         resolver = PathResolver(self.comfyui_root)
@@ -134,10 +138,8 @@ class ComfyUITools:
             Path("../../ComfyUI"),
         ]
         
-        # Add environment variable if set
-        env_path = os.environ.get("COMFYUI_PATH")
-        if env_path:
-            common_paths.insert(0, Path(env_path))
+        if settings.comfyui_path:
+            common_paths.insert(0, Path(settings.comfyui_path))
         
         for path in common_paths:
             if path.exists() and (path / "nodes.py").exists():
@@ -145,7 +147,7 @@ class ComfyUITools:
                 return path.resolve()
         
         raise ComfyUINotFoundError(
-            "ComfyUI installation not found. Set COMFYUI_PATH environment variable."
+            "ComfyUI installation not found. Set the ComfyUI path in Ren settings."
         )
     
     def _validate_comfyui_installation(self) -> None:
@@ -216,9 +218,14 @@ class ComfyUITools:
         """
         try:
             async with httpx.AsyncClient() as client:
+                history_path = (
+                    f"/history/{quote(prompt_id, safe='')}"
+                    if prompt_id
+                    else "/history"
+                )
                 response = await client.get(
-                    f"{self.comfy_url}/history",
-                    params={"max_items": max_items},
+                    f"{self.comfy_url}{history_path}",
+                    params=None if prompt_id else {"max_items": max_items},
                     timeout=10.0
                 )
                 response.raise_for_status()
