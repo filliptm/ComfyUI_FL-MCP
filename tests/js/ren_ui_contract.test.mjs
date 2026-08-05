@@ -320,6 +320,19 @@ test("composer can steer an active response and exposes real stop progress", asy
 });
 
 
+test("message sending has one attachment-aware run implementation", async () => {
+    const panel = await readFile(new URL("web/js/chat_panel.js", root), "utf8");
+    const runMethods = panel.match(/^    async runMessage\(/gm) || [];
+
+    assert.equal(runMethods.length, 1);
+    assert.match(panel, /const optimisticUser = editMessageId/);
+    assert.match(panel, /this\.appendMessage\("user", message, \{ attachments \}\)/);
+    assert.match(panel, /searchMode,[\s\S]*attachments,[\s\S]*steerRunId,/);
+    assert.match(panel, /onReady: \(\{ runId, conversationId, userMessage \}\)/);
+    assert.match(panel, /applyUserMessageMetadata\(article, message\)/);
+});
+
+
 test("chat accepts local images and can place them into a selected image node", async () => {
     const panel = await readFile(new URL("web/js/chat_panel.js", root), "utf8");
     const helpers = await readFile(new URL("web/js/chat_ui_helpers.js", root), "utf8");

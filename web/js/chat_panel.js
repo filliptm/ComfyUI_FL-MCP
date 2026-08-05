@@ -3079,19 +3079,6 @@ export class AssistantPanel {
             this.showError("Choose and test a model before sending a message.");
             return;
         }
-        this.textarea.value = "";
-        this.resizeComposer();
-        this.updateComposerState();
-        await this.runMessage(message);
-    }
-
-    async runMessage(message, editMessageId = null) {
-        if (!message || this.running) return;
-        if (!this.status?.configured) {
-            this.openSheet("settings");
-            this.showError("Choose and test a model before sending a message.");
-            return;
-        }
         this.clearError();
         this.lastFailedMessage = message;
         this.lastFailedEditMessageId = editMessageId;
@@ -3102,11 +3089,9 @@ export class AssistantPanel {
         this.currentRunContext = runContext;
         this.currentAssistant = null;
         this.followOutput = true;
-        if (editMessageId) {
-            this.renderOptimisticRevision(editMessageId, message, attachments);
-        } else {
-            this.appendMessage("user", message, { attachments });
-        }
+        const optimisticUser = editMessageId
+            ? this.renderOptimisticRevision(editMessageId, message, attachments)
+            : this.appendMessage("user", message, { attachments });
         this.updateComposerState();
         try {
             await this.chat.startRun({
@@ -3118,7 +3103,7 @@ export class AssistantPanel {
                 editMessageId,
                 attachments,
                 steerRunId,
-                onReady: ({ runId, conversationId }) => {
+                onReady: ({ runId, conversationId, userMessage }) => {
                     runContext.runId = runId;
                     this.conversationId = conversationId;
                     this.applyUserMessageMetadata(
@@ -3146,8 +3131,7 @@ export class AssistantPanel {
             `.fl-message.user[data-message-id="${CSS.escape(messageId)}"]`,
         );
         if (!article) {
-            this.appendMessage("user", content, { attachments });
-            return;
+            return this.appendMessage("user", content, { attachments });
         }
         let following = article.nextElementSibling;
         while (following) {
@@ -3156,7 +3140,17 @@ export class AssistantPanel {
             following = next;
         }
         article.remove();
-        this.appendMessage("user", content, { attachments });
+        return this.appendMessage("user", content, { attachments });
+    }
+
+    applyUserMessageMetadata(article, message) {
+        if (!article || !message?.id) return;
+        article.dataset.messageId = message.id;
+        article.querySelector(".fl-message-actions")?.remove();
+        article.appendChild(this.createUserMessageActions({
+            messageId: message.id,
+            revision: message.revision,
+        }));
     }
 
     startMessageEdit(messageId) {
