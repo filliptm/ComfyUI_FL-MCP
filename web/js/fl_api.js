@@ -14,6 +14,7 @@ import {
     findNonOverlappingPosition,
     getGraphInsertionOrigin,
 } from "./node_placement.js";
+import { nodeMatchesQuery } from "./node_identity.js";
 
 /**
  * FL_API class - Wrapper for workflow manipulation functions
@@ -1910,23 +1911,7 @@ export class FL_API {
      * @private
      */
     _findNode(query) {
-        if (typeof query === "object" && query.id !== undefined) {
-            return query;  // Already a node object
-        }
-
-        if (typeof query === "number") {
-            // Find by ID
-            return app.graph._nodes.find(n => n.id === query) || null;
-        }
-
-        if (typeof query === "string") {
-            // Try as title first, then type
-            return app.graph._nodes.find(n => n.title === query) ||
-                   app.graph._nodes.find(n => n.type === query || n.comfyClass === query) ||
-                   null;
-        }
-
-        return null;
+        return this._find(query);
     }
 
     /**
@@ -1934,22 +1919,11 @@ export class FL_API {
      * @private
      */
     _find(query) {
-        // if (query == null) return null;
-        if (typeof query === "object" && query.id !== undefined) {
+        if (typeof query === "object" && query?.id !== undefined && !query.by) {
             return query;
         }
 
-        if (typeof query === "number") {
-            return app.graph._nodes.find(n => n.id === query) || null;
-        }
-
-        if (typeof query === "string") {
-            return app.graph._nodes.find(n => n.title === query) ||
-                   app.graph._nodes.find(n => n.type === query || n.comfyClass === query) ||
-                   null;
-        }
-
-        return null;
+        return app.graph._nodes.find(node => nodeMatchesQuery(node, query)) || null;
     }
 
     /**
@@ -1957,31 +1931,15 @@ export class FL_API {
      * @private
      */
     _findLast(query) {
-        if (typeof query === "object" && query.id !== undefined) {
+        if (typeof query === "object" && query?.id !== undefined && !query.by) {
             return query;
         }
 
         const nodes = app.graph._nodes;
 
-        if (typeof query === "number") {
-            for (let i = nodes.length - 1; i >= 0; i--) {
-                if (nodes[i].id === query) return nodes[i];
-            }
-            return null;
+        for (let i = nodes.length - 1; i >= 0; i--) {
+            if (nodeMatchesQuery(nodes[i], query)) return nodes[i];
         }
-
-        if (typeof query === "string") {
-            // Try title first
-            for (let i = nodes.length - 1; i >= 0; i--) {
-                if (nodes[i].title === query) return nodes[i];
-            }
-            // Then type
-            for (let i = nodes.length - 1; i >= 0; i--) {
-                if (nodes[i].type === query || nodes[i].comfyClass === query) return nodes[i];
-            }
-            return null;
-        }
-
         return null;
     }
 }
