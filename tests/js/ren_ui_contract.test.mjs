@@ -405,6 +405,21 @@ test("workflow queueing preserves ComfyUI frontend authentication", async () => 
 });
 
 
+test("canvas screenshots wait for Fit View and thumbnails to settle", async () => {
+    const api = await readFile(new URL("web/js/fl_api.js", root), "utf8");
+    const executor = await readFile(new URL("web/js/tool_executor.js", root), "utf8");
+
+    assert.match(api, /await this\.waitForCanvasStable\(\)/);
+    assert.match(api, /stableFrames < 3/);
+    assert.match(api, /previewsReady\(\)/);
+    assert.match(api, /canvas\?\.draw\?\.\(true, true\)/);
+    assert.doesNotMatch(
+        executor,
+        /requestAnimationFrame\(\(\) => requestAnimationFrame\(finish\)\)/,
+    );
+});
+
+
 test("history uses archive-first deletion and an undo affordance", async () => {
     const panel = await readFile(new URL("web/js/chat_panel.js", root), "utf8");
     const routes = await readFile(new URL("backend/chat_routes.py", root), "utf8");

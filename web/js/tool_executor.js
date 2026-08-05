@@ -430,22 +430,6 @@ export class ToolExecutor {
             let fitResult = null;
             if (fit_view) {
                 fitResult = await this.flApi.fitView(node_ids);
-                await new Promise(resolve => {
-                    let resolved = false;
-                    const finish = () => {
-                        if (!resolved) {
-                            resolved = true;
-                            resolve();
-                        }
-                    };
-
-                    setTimeout(finish, 500);
-                    if (typeof requestAnimationFrame === "function") {
-                        requestAnimationFrame(() => requestAnimationFrame(finish));
-                    } else {
-                        finish();
-                    }
-                });
             }
             
             // Take screenshot

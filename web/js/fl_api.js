@@ -471,6 +471,8 @@ export class FL_API {
             if (!canvasElement) {
                 throw new Error('Canvas element not found');
             }
+
+            await this.waitForCanvasStable();
             
             console.log(`[FL_API] Taking screenshot (${format}, quality: ${quality})`);
             
@@ -516,6 +518,45 @@ export class FL_API {
             console.error('[FL_API] Screenshot error:', error);
             throw error;
         }
+    }
+
+    async waitForCanvasStable(timeoutMs = 1200) {
+        const canvas = app.canvas;
+        const nextFrame = () => new Promise(resolve => {
+            if (typeof requestAnimationFrame === "function") {
+                requestAnimationFrame(resolve);
+            } else {
+                setTimeout(resolve, 16);
+            }
+        });
+        const snapshot = () => [
+            Number(canvas?.ds?.scale || 0),
+            Number(canvas?.ds?.offset?.[0] || 0),
+            Number(canvas?.ds?.offset?.[1] || 0),
+        ];
+        const previewsReady = () => (app.graph?._nodes || []).every(node =>
+            (node.imgs || []).every(image => image.complete !== false)
+        );
+
+        const started = Date.now();
+        let previous = snapshot();
+        let stableFrames = 0;
+        while (Date.now() - started < timeoutMs && stableFrames < 3) {
+            await nextFrame();
+            const current = snapshot();
+            const transformStable = current.every(
+                (value, index) => Math.abs(value - previous[index]) < 0.0001
+            );
+            stableFrames = transformStable && previewsReady() ? stableFrames + 1 : 0;
+            previous = current;
+        }
+
+        // Force a complete foreground/background redraw so toBlob never sees
+        // stale frames left behind by Fit View's animated transform.
+        canvas?.setDirty?.(true, true);
+        canvas?.draw?.(true, true);
+        await nextFrame();
+        canvas?.draw?.(true, true);
     }
 
     // ==================== NODE MANIPULATION ====================
