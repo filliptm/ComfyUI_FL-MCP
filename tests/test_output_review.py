@@ -87,6 +87,42 @@ async def test_view_output_image_returns_bounded_visual_content(tmp_path, monkey
     assert len(result.content[1].data) > 100
 
 
+@pytest.mark.asyncio
+async def test_view_output_image_selects_newest_matching_history_entry(
+    tmp_path,
+    monkeypatch,
+):
+    output_root = tmp_path / "output"
+    output_root.mkdir()
+    Image.new("RGB", (32, 32), "#4d7cff").save(output_root / "latest.png")
+    history = {
+        "prompt-oldest": {
+            "status": {"status_str": "success", "completed": True},
+            "outputs": {
+                "1": {"images": [{"filename": "oldest.png", "type": "output"}]},
+            },
+        },
+        "prompt-newest": {
+            "status": {"status_str": "success", "completed": True},
+            "outputs": {
+                "2": {"images": [{"filename": "latest.png", "type": "output"}]},
+            },
+        },
+    }
+    monkeypatch.setattr(
+        mcp_server,
+        "get_comfy_tools",
+        lambda: FakeComfyTools(output_root, history),
+    )
+
+    result = await mcp_server.view_output_image.fn(
+        mcp_server.ViewOutputImageRequest(),
+        fake_context(),
+    )
+
+    assert result.structured_content["promptId"] == "prompt-newest"
+
+
 def test_output_path_resolution_rejects_traversal(tmp_path):
     output_root = tmp_path / "output"
     output_root.mkdir()

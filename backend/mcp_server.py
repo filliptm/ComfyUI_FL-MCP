@@ -3426,7 +3426,7 @@ async def view_output_image(request: ViewOutputImageRequest, ctx: Context) -> To
         prompt_id = None
         history_entry = None
         history = await comfy_tools.fetch_history(max_items=20)
-        for candidate_prompt_id, candidate_entry in history.items():
+        for candidate_prompt_id, candidate_entry in reversed(history.items()):
             status = candidate_entry.get("status", {})
             candidate_images = _output_image_candidates(
                 candidate_entry.get("outputs", {}),

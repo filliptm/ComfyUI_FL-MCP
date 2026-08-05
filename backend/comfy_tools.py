@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import List, Dict, Optional, Union, Any, Iterator
 from dataclasses import dataclass
 from enum import Enum
+from urllib.parse import quote
 
 from comfy_models import ComfyFolderType, ComfyFileInfo, ComfySearchResult
 from extra_model_paths_loader import ExtraModelPathsLoader
@@ -216,9 +217,14 @@ class ComfyUITools:
         """
         try:
             async with httpx.AsyncClient() as client:
+                history_path = (
+                    f"/history/{quote(prompt_id, safe='')}"
+                    if prompt_id
+                    else "/history"
+                )
                 response = await client.get(
-                    f"{self.comfy_url}/history",
-                    params={"max_items": max_items},
+                    f"{self.comfy_url}{history_path}",
+                    params=None if prompt_id else {"max_items": max_items},
                     timeout=10.0
                 )
                 response.raise_for_status()
