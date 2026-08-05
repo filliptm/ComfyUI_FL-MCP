@@ -273,11 +273,11 @@ export class ToolExecutor {
         
         let query;
         if (node_id !== undefined) {
-            query = node_id;
+            query = { by: "id", value: node_id };
         } else if (node_type !== undefined) {
-            query = node_type;
+            query = { by: "type", value: node_type };
         } else if (title !== undefined) {
-            query = title;
+            query = { by: "title", value: title };
         } else {
             throw new Error("Must provide node_id, node_type, or title");
         }
