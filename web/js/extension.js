@@ -388,6 +388,9 @@ app.registerExtension({
                             placeChatImageInSelectedNode: (image) => (
                                 toolExecutor.flApi.placeChatImageInNode(image)
                             ),
+                            discardMaskReviews: () => (
+                                toolExecutor.flApi.discardMaskReviews()
+                            ),
                         },
                     );
                     window.FL_MCP.assistantPanel = assistantPanel;

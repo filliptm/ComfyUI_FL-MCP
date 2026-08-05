@@ -48,6 +48,7 @@ export class AssistantPanel {
         this.subscribeCanvasContext = options.subscribeCanvasContext;
         this.uploadChatImage = options.uploadChatImage;
         this.placeChatImageInSelectedNode = options.placeChatImageInSelectedNode;
+        this.discardMaskReviews = options.discardMaskReviews;
         this.settings = null;
         this.status = null;
         this.conversations = [];
@@ -2994,7 +2995,9 @@ export class AssistantPanel {
         try {
             const cancelled = await this.chat.cancel();
             if (!cancelled) throw new Error("The current response has not started yet.");
+            this.discardMaskReviews?.();
             if (activeRun) await activeRun;
+            this.discardMaskReviews?.();
         } catch (error) {
             this.showError(`Response could not be stopped: ${error.message}`);
         } finally {

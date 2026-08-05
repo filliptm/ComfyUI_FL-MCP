@@ -217,14 +217,36 @@ test("action trail stays compact, visible, and visually quiet when complete", as
 test("mask edits show a live preview and block queueing until review", async () => {
     const api = await readFile(new URL("web/js/fl_api.js", root), "utf8");
     const executor = await readFile(new URL("web/js/tool_executor.js", root), "utf8");
+    const extension = await readFile(new URL("web/js/extension.js", root), "utf8");
+    const panel = await readFile(new URL("web/js/chat_panel.js", root), "utf8");
     const prompt = await readFile(new URL("backend/chat_prompt.md", root), "utf8");
+    const editImplementation = api.slice(
+        api.indexOf("async editNodeMask"),
+        api.indexOf("confirmMaskReview"),
+    );
+    const previewStart = api.indexOf("async _canvasToImage");
+    const previewImplementation = api.slice(
+        previewStart,
+        api.indexOf("_pauseAutoQueueForMaskReview", previewStart),
+    );
 
-    assert.match(api, /node\.imgs = \[reviewImage\]/);
+    assert.match(api, /node\.imgs = \[reviewPreview\.image\]/);
+    assert.match(api, /previewUrl: reviewPreview\.url/);
+    assert.match(api, /this\._assignImageToNode\(node, pending\.image\)/);
+    assert.match(api, /image\.src = api\.apiURL\(`\/view\?/);
+    assert.match(api, /_releaseMaskReviewPreview/);
+    assert.match(api, /discardMaskReviews\(\)/);
+    assert.doesNotMatch(editImplementation, /_assignImageToNode/);
+    assert.doesNotMatch(editImplementation, /_setWidgetValue/);
+    assert.doesNotMatch(previewImplementation, /finally/);
+    assert.match(previewImplementation, /catch \(error\)[\s\S]*URL\.revokeObjectURL\(url\)/);
     assert.match(api, /app\.canvas\?\.centerOnNode\?\.\(node\)/);
     assert.match(api, /this\.pendingMaskReviews/);
     assert.match(api, /Mask review required for node/);
     assert.match(api, /_pauseAutoQueueForMaskReview/);
     assert.match(executor, /confirm_mask_review/);
+    assert.match(extension, /toolExecutor\.flApi\.discardMaskReviews\(\)/);
+    assert.match(panel, /this\.discardMaskReviews\?\.\(\)/);
     assert.match(prompt, /Never queue until the latest mask is approved/);
 });
 

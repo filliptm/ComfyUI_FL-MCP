@@ -671,31 +671,20 @@ export class FL_API {
             subfolder: String(image.subfolder || ""),
             type: "input",
         };
-        const widgetPath = [normalized.subfolder, normalized.filename]
-            .filter(Boolean)
-            .join("/");
-        const widgetValue = `${widgetPath} [input]`;
         const previousImage = parseImageWidgetRef(imageWidget.value);
-        this._setWidgetValue(node, imageWidget, widgetValue);
-        node.images = [normalized];
-        node.imgs = undefined;
-        node.properties = node.properties || {};
-        node.properties.image = widgetValue;
-        if (node.widgets_values && node.widgets) {
-            const widgetIndex = node.widgets.indexOf(imageWidget);
-            if (widgetIndex >= 0) node.widgets_values[widgetIndex] = widgetValue;
-        }
 
         const pendingEntry = [...this.pendingMaskReviews.entries()].find(
             ([, value]) => nodeIdsEqual(value.nodeId, node.id)
         );
         if (pendingEntry) {
+            this._releaseMaskReviewPreview(pendingEntry[1]);
             this.pendingMaskReviews.delete(pendingEntry[0]);
             if (this.pendingMaskReviews.size === 0) {
                 this._restoreAutoQueueAfterMaskReview(this.maskReviewAutoQueueState);
                 this.maskReviewAutoQueueState = null;
             }
         }
+        this._assignImageToNode(node, normalized);
         app.canvas?.selectNodes?.([node]);
         app.canvas?.centerOnNode?.(node);
         this._markGraphChanged();
@@ -721,7 +710,13 @@ export class FL_API {
             throw new Error(`Node ${nodeId} has no image widget to receive the edited mask`);
         }
 
-        const source = this.getNodeImageRef(nodeId).image;
+        const existingReviewEntry = [...this.pendingMaskReviews.entries()].find(
+            ([, value]) => nodeIdsEqual(value.nodeId, node.id)
+        );
+        const existingReview = existingReviewEntry?.[1];
+        const originalImage = existingReview?.originalImage
+            || this.getNodeImageRef(nodeId).image;
+        const source = existingReview?.image || originalImage;
         const [rgbImage, alphaImage] = await Promise.all([
             this._loadComfyImage(source, "rgb"),
             this._loadComfyImage(source, "a"),
@@ -800,7 +795,6 @@ export class FL_API {
         highlightContext.drawImage(maskCanvas, 0, 0);
         reviewContext.globalAlpha = 0.62;
         reviewContext.drawImage(highlightCanvas, 0, 0);
-        const reviewImage = await this._canvasToImage(reviewCanvas);
         const uploadCanvas = document.createElement("canvas");
         uploadCanvas.width = rgbImage.width;
         uploadCanvas.height = rgbImage.height;
@@ -838,33 +832,26 @@ export class FL_API {
             subfolder: uploaded.subfolder || "",
             type: uploaded.type || "input",
         };
-        const widgetPath = [image.subfolder, image.filename].filter(Boolean).join("/");
-        const widgetValue = `${widgetPath} [${image.type}]`;
-        this._setWidgetValue(node, imageWidget, widgetValue);
-        node.images = [image];
-        node.imgs = undefined;
-        if (node.properties) {
-            node.properties.image = widgetValue;
-        }
-        if (node.widgets_values && node.widgets) {
-            const widgetIndex = node.widgets.indexOf(imageWidget);
-            if (widgetIndex >= 0) {
-                node.widgets_values[widgetIndex] = widgetValue;
-            }
-        }
+        const reviewPreview = await this._canvasToImage(reviewCanvas);
         const reviewToken = crypto.randomUUID();
         if (this.pendingMaskReviews.size === 0) {
             this.maskReviewAutoQueueState = this._pauseAutoQueueForMaskReview();
+        }
+        if (existingReviewEntry) {
+            this._releaseMaskReviewPreview(existingReview);
         }
         this.pendingMaskReviews.set(String(node.id), {
             token: reviewToken,
             nodeId: node.id,
             image,
+            originalImage,
+            previewUrl: reviewPreview.url,
         });
-        node.imgs = [reviewImage];
+        node.imgs = [reviewPreview.image];
+        node.imageIndex = 0;
         app.canvas?.selectNodes?.([node]);
         app.canvas?.centerOnNode?.(node);
-        this._markGraphChanged();
+        this._markCanvasDirty();
 
         return {
             success: true,
@@ -893,12 +880,18 @@ export class FL_API {
         if (pending.token !== reviewToken) {
             throw new Error("This mask review is stale; inspect the latest mask before approving it");
         }
+        const node = this._findNode(pending.nodeId);
+        if (!node) {
+            throw new Error(`Node not found: ${pending.nodeId}`);
+        }
+        this._assignImageToNode(node, pending.image);
+        this._releaseMaskReviewPreview(pending);
         this.pendingMaskReviews.delete(pendingEntry[0]);
         if (this.pendingMaskReviews.size === 0) {
             this._restoreAutoQueueAfterMaskReview(this.maskReviewAutoQueueState);
             this.maskReviewAutoQueueState = null;
         }
-        this._markCanvasDirty();
+        this._markGraphChanged();
         return {
             success: true,
             node_id: pending.nodeId,
@@ -907,6 +900,30 @@ export class FL_API {
             approved: true,
             message: "The user approved this mask for workflow execution.",
         };
+    }
+
+    discardMaskReviews() {
+        const reviews = [...this.pendingMaskReviews.values()];
+        for (const pending of reviews) {
+            const node = this._findNode(pending.nodeId);
+            if (node) {
+                const imageWidget = node.widgets?.find(widget => widget.name === "image");
+                const currentImage = parseImageWidgetRef(imageWidget?.value)
+                    || pending.originalImage;
+                if (currentImage) {
+                    node.imgs = [this._createComfyImage(currentImage)];
+                    node.imageIndex = 0;
+                }
+            }
+            this._releaseMaskReviewPreview(pending);
+        }
+        this.pendingMaskReviews.clear();
+        if (reviews.length > 0) {
+            this._restoreAutoQueueAfterMaskReview(this.maskReviewAutoQueueState);
+            this.maskReviewAutoQueueState = null;
+            this._markCanvasDirty();
+        }
+        return reviews.length;
     }
 
     /**
@@ -2223,6 +2240,42 @@ export class FL_API {
         return await createImageBitmap(blob);
     }
 
+    _assignImageToNode(node, image) {
+        const imageWidget = node.widgets?.find(widget => widget.name === "image");
+        if (!imageWidget) {
+            throw new Error(`Node ${node.id} has no image widget.`);
+        }
+        const widgetPath = [image.subfolder, image.filename].filter(Boolean).join("/");
+        const widgetValue = `${widgetPath} [${image.type || "input"}]`;
+        this._setWidgetValue(node, imageWidget, widgetValue);
+        node.images = [image];
+        node.imgs = [this._createComfyImage(image)];
+        node.imageIndex = 0;
+        node.properties = node.properties || {};
+        node.properties.image = widgetValue;
+        if (node.widgets_values && node.widgets) {
+            const widgetIndex = node.widgets.indexOf(imageWidget);
+            if (widgetIndex >= 0) node.widgets_values[widgetIndex] = widgetValue;
+        }
+    }
+
+    _createComfyImage(ref) {
+        const params = new URLSearchParams({
+            filename: ref.filename,
+            subfolder: ref.subfolder || "",
+            type: ref.type || "input",
+        });
+        params.set("rand", String(Date.now()));
+        const image = new Image();
+        image.onload = () => this._markCanvasDirty();
+        image.src = api.apiURL(`/view?${params.toString()}`);
+        return image;
+    }
+
+    _releaseMaskReviewPreview(review) {
+        if (review?.previewUrl) URL.revokeObjectURL(review.previewUrl);
+    }
+
     _canvasToBlob(canvas) {
         return new Promise((resolve, reject) => {
             canvas.toBlob(blob => {
@@ -2246,9 +2299,10 @@ export class FL_API {
                     image.onerror = () => reject(new Error("Failed to load mask review preview"));
                 });
             }
-            return image;
-        } finally {
+            return { image, url };
+        } catch (error) {
             URL.revokeObjectURL(url);
+            throw error;
         }
     }
 
