@@ -1,6 +1,5 @@
 import { ChatClient } from "./chat_client.js";
 import {
-    groupToolSteps,
     isNearBottom,
     modelProviderSummary,
     starterPrompts,
@@ -30,7 +29,7 @@ const SEARCH_MODE_OPTIONS = [
 ];
 
 const MAX_TOOL_GALLERY_IMAGES = 12;
-const TOOL_HISTORY_INITIAL_GROUPS = 60;
+const TOOL_HISTORY_INITIAL_STEPS = 60;
 const MAX_CHAT_ATTACHMENTS = 8;
 const MAX_CHAT_ATTACHMENT_BYTES = 32 * 1024 * 1024;
 const CHAT_IMAGE_TYPES = new Set(["image/png", "image/jpeg", "image/webp", "image/gif"]);
@@ -534,12 +533,6 @@ export class AssistantPanel {
             }
             if (action === "toggle-tool-history") {
                 this.toggleToolHistory(actionElement.closest(".fl-toolchain-breadcrumb"));
-            }
-            if (action === "select-tool-history") {
-                this.selectToolHistory(
-                    actionElement.closest(".fl-toolchain-breadcrumb"),
-                    Number(actionElement.dataset.groupIndex),
-                );
             }
             if (action === "load-tool-history") {
                 this.loadMoreToolHistory(actionElement.closest(".fl-toolchain-breadcrumb"));
@@ -2072,7 +2065,6 @@ export class AssistantPanel {
             cancelAnimationFrame(history.renderFrame);
             history.renderFrame = null;
             const renderImages = history.renderImages;
-            history.renderDetails = false;
             history.renderImages = false;
             this.renderToolHistory(history, { images: renderImages });
         }
@@ -2105,27 +2097,19 @@ export class AssistantPanel {
         const panel = document.createElement("div");
         panel.className = "fl-tool-history-panel";
         panel.hidden = true;
-        const chips = document.createElement("div");
-        chips.className = "fl-tool-history-chips";
-        chips.setAttribute("role", "list");
-        chips.setAttribute("aria-label", "Tool use history");
-        const technical = document.createElement("div");
-        technical.className = "fl-tool-technical";
-        technical.hidden = true;
-        const detailLabel = document.createElement("span");
-        detailLabel.textContent = "Technical details";
-        const pre = document.createElement("pre");
-        technical.append(detailLabel, pre);
-        panel.append(chips, technical);
+        const list = document.createElement("div");
+        list.className = "fl-tool-history-list";
+        list.setAttribute("role", "list");
+        list.setAttribute("aria-label", "Tool use history");
+        panel.appendChild(list);
         rail.append(toggle, panel);
         rail.toolHistory = {
             rail,
             steps: [...steps],
             expanded: false,
-            selectedGroupIndex: null,
-            visibleGroupCount: TOOL_HISTORY_INITIAL_GROUPS,
+            visibleStepCount: TOOL_HISTORY_INITIAL_STEPS,
+            cards: new Map(),
             renderFrame: null,
-            renderDetails: false,
             renderImages: false,
         };
         return rail;
@@ -2138,29 +2122,22 @@ export class AssistantPanel {
         return history;
     }
 
-    scheduleToolHistoryRender(history, { details = false, images = false } = {}) {
+    scheduleToolHistoryRender(history, { images = false } = {}) {
         if (!history) return;
-        history.renderDetails ||= details;
         history.renderImages ||= images;
         if (history.renderFrame !== null) return;
         history.renderFrame = requestAnimationFrame(() => {
             history.renderFrame = null;
-            const nextDetails = history.renderDetails;
             const nextImages = history.renderImages;
-            history.renderDetails = false;
             history.renderImages = false;
-            this.renderToolHistory(history, {
-                details: nextDetails,
-                images: nextImages,
-            });
+            this.renderToolHistory(history, { images: nextImages });
         });
     }
 
-    renderToolHistory(history, { details = false, images = false } = {}) {
+    renderToolHistory(history, { images = false } = {}) {
         if (!history) return;
         const { rail } = history;
         const summary = toolHistorySummary(history.steps);
-        const groups = groupToolSteps(history.steps);
         const active = summary.active;
         const representative = active || history.steps.at(-1) || {};
         const tool = getToolConfig(representative.name);
@@ -2182,8 +2159,9 @@ export class AssistantPanel {
         const current = toggle.querySelector(".fl-toolchain-current");
         current.textContent = active
             ? tool.runningLabel
-            : `${summary.total} ${summary.total === 1 ? "action" : "actions"}`;
+            : summarizeToolStep(representative, tool);
         const metaParts = [];
+        metaParts.push(`${summary.total} ${summary.total === 1 ? "action" : "actions"}`);
         if (!active && summary.done) metaParts.push(`${summary.done} done`);
         if (summary.retried) metaParts.push(`${summary.retried} retried`);
         if (summary.failed) metaParts.push(`${summary.failed} failed`);
@@ -2198,79 +2176,92 @@ export class AssistantPanel {
             : "pi pi-chevron-down";
         const panel = rail.querySelector(".fl-tool-history-panel");
         panel.hidden = !history.expanded;
-        if (history.expanded) this.renderToolHistoryChips(history, groups);
-        if (history.expanded && (details || history.selectedGroupIndex !== null)) {
-            this.renderToolHistoryDetail(history, groups);
-        }
+        if (history.expanded) this.renderToolHistoryCards(history);
         if (images) this.renderToolImages(rail, history.steps);
     }
 
-    renderToolHistoryChips(history, groups = groupToolSteps(history.steps)) {
-        const chips = history.rail.querySelector(".fl-tool-history-chips");
+    renderToolHistoryCards(history) {
+        const list = history.rail.querySelector(".fl-tool-history-list");
         const fragment = document.createDocumentFragment();
-        const visible = groups.slice(0, history.visibleGroupCount);
-        for (const group of visible) {
-            const representative = group.step;
-            const tool = getToolConfig(representative.name);
-            const visualStatus = this.toolVisualStatus(group.status);
-            const button = document.createElement("button");
-            button.type = "button";
-            button.className = `fl-tool-history-chip ${visualStatus}`;
-            button.dataset.action = "select-tool-history";
-            button.dataset.groupIndex = String(group.index);
-            button.setAttribute("role", "listitem");
-            button.title = summarizeToolStep(representative, tool);
-            button.setAttribute(
-                "aria-pressed",
-                String(history.selectedGroupIndex === group.index),
-            );
-            const icon = document.createElement("i");
-            icon.className = tool.iconClass || "pi pi-cog";
-            icon.setAttribute("aria-hidden", "true");
-            const label = document.createElement("span");
-            label.textContent = tool.label || representative.name || "Tool";
-            const count = document.createElement("em");
-            count.textContent = group.count > 1 ? `×${group.count}` : "";
-            button.append(icon, label, count);
-            fragment.appendChild(button);
-        }
-        if (groups.length > visible.length) {
+        const firstVisible = Math.max(0, history.steps.length - history.visibleStepCount);
+        if (firstVisible > 0) {
             const more = document.createElement("button");
             more.type = "button";
             more.className = "fl-tool-history-more";
             more.dataset.action = "load-tool-history";
-            more.textContent = `Show ${groups.length - visible.length} more`;
+            more.textContent = `Show ${firstVisible} earlier ${
+                firstVisible === 1 ? "action" : "actions"
+            }`;
             fragment.appendChild(more);
         }
-        chips.replaceChildren(fragment);
+        const visibleSteps = history.steps.slice(firstVisible);
+        for (const step of visibleSteps) {
+            let card = history.cards.get(step);
+            if (!card) {
+                card = this.createToolHistoryCard();
+                history.cards.set(step, card);
+            }
+            this.renderToolHistoryCard(card, step);
+            fragment.appendChild(card);
+        }
+        list.replaceChildren(fragment);
     }
 
-    renderToolHistoryDetail(history, groups = groupToolSteps(history.steps)) {
-        const technical = history.rail.querySelector(".fl-tool-technical");
-        const group = groups[history.selectedGroupIndex];
-        if (!group) {
-            technical.hidden = true;
-            technical.querySelector("pre").textContent = "";
-            return;
-        }
+    createToolHistoryCard() {
+        const card = document.createElement("details");
+        card.setAttribute("role", "listitem");
+        const summary = document.createElement("summary");
+        const icon = document.createElement("i");
+        icon.setAttribute("aria-hidden", "true");
+        const copy = document.createElement("span");
+        copy.className = "fl-crumb-copy";
+        const label = document.createElement("strong");
+        label.className = "fl-crumb-label";
+        const description = document.createElement("span");
+        description.className = "fl-crumb-description";
+        copy.append(label, description);
+        const status = document.createElement("em");
+        status.className = "fl-crumb-status";
+        summary.append(icon, copy, status);
+        const technical = document.createElement("div");
+        technical.className = "fl-tool-technical";
+        const detailLabel = document.createElement("span");
+        detailLabel.textContent = "Technical details";
+        const pre = document.createElement("pre");
+        technical.append(detailLabel, pre);
+        card.append(summary, technical);
+        return card;
+    }
+
+    renderToolHistoryCard(card, step) {
+        const visualStatus = this.toolVisualStatus(step.status);
+        const tool = getToolConfig(step.name);
+        card.className = `fl-toolchain-crumb ${visualStatus}`;
+        card.dataset.toolName = step.name || "";
+        const icon = card.querySelector("summary > i");
+        icon.className = `${tool.iconClass || "pi pi-cog"} fl-crumb-icon`;
+        card.querySelector(".fl-crumb-label").textContent = visualStatus === "loading"
+            ? tool.runningLabel
+            : summarizeToolStep(step, tool);
+        card.querySelector(".fl-crumb-description").textContent = visualStatus === "loading"
+            ? (tool.description || tool.label || step.name || "MCP tool")
+            : (tool.label || step.name || "MCP tool");
+        card.querySelector(".fl-crumb-status").textContent = {
+            loading: "Working",
+            completed: "Done",
+            retried: "Retried",
+            failed: "Failed",
+            cancelled: step.status === "interrupted" ? "Interrupted" : "Stopped",
+        }[visualStatus];
         const technicalSections = [];
-        for (const [index, currentStep] of group.steps.entries()) {
-            const callSections = [];
-            if (currentStep.arguments !== undefined && currentStep.arguments !== "") {
-                callSections.push(`Arguments\n${technicalText(currentStep.arguments)}`);
-            }
-            if (currentStep.result !== undefined && currentStep.result !== "") {
-                callSections.push(`Result\n${technicalText(currentStep.result)}`);
-            }
-            if (callSections.length) {
-                technicalSections.push(
-                    group.steps.length > 1
-                        ? `Call ${index + 1}\n${callSections.join("\n\n")}`
-                        : callSections.join("\n\n"),
-                );
-            }
+        if (step.arguments !== undefined && step.arguments !== "") {
+            technicalSections.push(`Arguments\n${technicalText(step.arguments)}`);
         }
-        technical.hidden = !technicalSections.length;
+        if (step.result !== undefined && step.result !== "") {
+            technicalSections.push(`Result\n${technicalText(step.result)}`);
+        }
+        const technical = card.querySelector(".fl-tool-technical");
+        technical.hidden = technicalSections.length === 0;
         technical.querySelector("pre").textContent = technicalText(
             technicalSections.join("\n\n"),
         );
@@ -2280,22 +2271,14 @@ export class AssistantPanel {
         const history = rail?.toolHistory;
         if (!history) return;
         history.expanded = !history.expanded;
-        this.renderToolHistory(history, { details: true });
-    }
-
-    selectToolHistory(rail, groupIndex) {
-        const history = rail?.toolHistory;
-        if (!history || !Number.isInteger(groupIndex)) return;
-        history.selectedGroupIndex = groupIndex;
-        history.expanded = true;
-        this.renderToolHistory(history, { details: true });
+        this.renderToolHistory(history);
     }
 
     loadMoreToolHistory(rail) {
         const history = rail?.toolHistory;
         if (!history) return;
-        history.visibleGroupCount += TOOL_HISTORY_INITIAL_GROUPS;
-        this.renderToolHistory(history, { details: true });
+        history.visibleStepCount += TOOL_HISTORY_INITIAL_STEPS;
+        this.renderToolHistory(history);
     }
 
     renderToolImages(item, steps) {

@@ -2,8 +2,6 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
-    canStackToolSteps,
-    groupToolSteps,
     isNearBottom,
     modelProviderSummary,
     starterPrompts,
@@ -11,7 +9,6 @@ import {
     technicalText,
     toolDisplayImages,
     toolHistorySummary,
-    toolStackState,
 } from "../../web/js/chat_ui_helpers.js";
 
 
@@ -266,35 +263,7 @@ test("tool images survive Codex MCP wrappers with null outer structured content"
     }), "Reviewed final output · 6336×2688");
 });
 
-test("consecutive identical tool calls stack and retain the strongest state", () => {
-    assert.equal(
-        canStackToolSteps({ name: "modify_layout" }, { name: "modify_layout" }),
-        true,
-    );
-    assert.equal(
-        canStackToolSteps({ name: "modify_layout" }, { name: "workflow_overview" }),
-        false,
-    );
-
-    const completed = toolStackState([
-        { name: "modify_layout", status: "done", result: "one" },
-        { name: "modify_layout", status: "done", result: "two" },
-        { name: "modify_layout", status: "done", result: "three" },
-    ]);
-    assert.equal(completed.count, 3);
-    assert.equal(completed.status, "done");
-    assert.equal(completed.step.result, "three");
-
-    const mixed = toolStackState([
-        { name: "modify_layout", status: "done" },
-        { name: "modify_layout", status: "failed" },
-        { name: "modify_layout", status: "running" },
-    ]);
-    assert.equal(mixed.status, "running");
-});
-
-
-test("large tool histories group horizontally and summarize without DOM state", () => {
+test("large tool histories summarize every individual call without grouping", () => {
     const steps = [
         { name: "find_node", status: "done" },
         { name: "find_node", status: "retried" },
@@ -303,10 +272,6 @@ test("large tool histories group horizontally and summarize without DOM state", 
         { name: "wait", status: "interrupted" },
     ];
 
-    const groups = groupToolSteps(steps);
-    assert.equal(groups.length, 4);
-    assert.equal(groups[0].count, 2);
-    assert.equal(groups[0].status, "retried");
     assert.deepEqual(toolHistorySummary(steps), {
         total: 5,
         running: 1,

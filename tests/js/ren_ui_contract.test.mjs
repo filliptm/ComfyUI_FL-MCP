@@ -138,7 +138,7 @@ test("fixed chat chrome casts inward depth shadows over the message viewport", a
 });
 
 
-test("tool calls use one lazy horizontal history renderer", async () => {
+test("tool calls use a compact summary with lazy vertical per-call cards", async () => {
     const panel = await readFile(new URL("web/js/chat_panel.js", root), "utf8");
     const runtime = await readFile(new URL("backend/chat_runtime.py", root), "utf8");
 
@@ -147,14 +147,16 @@ test("tool calls use one lazy horizontal history renderer", async () => {
     assert.match(panel, /appendAssistantDelta/);
     assert.match(panel, /toolRailAtCursor/);
     assert.match(panel, /renderToolHistory/);
-    assert.match(panel, /renderToolHistoryChips/);
-    assert.match(panel, /renderToolHistoryDetail/);
+    assert.match(panel, /renderToolHistoryCards/);
+    assert.match(panel, /createToolHistoryCard/);
+    assert.match(panel, /renderToolHistoryCard/);
     assert.match(panel, /summarizeToolStep/);
-    assert.match(panel, /groupToolSteps/);
-    assert.match(panel, /TOOL_HISTORY_INITIAL_GROUPS = 60/);
+    assert.doesNotMatch(panel, /groupToolSteps/);
+    assert.match(panel, /TOOL_HISTORY_INITIAL_STEPS = 60/);
     assert.match(panel, /history\.steps\.push\(step\)/);
-    assert.match(panel, /`×\$\{group\.count\}`/);
-    assert.match(panel, /`Call \$\{index \+ 1\}/);
+    assert.match(panel, /history\.cards\.get\(step\)/);
+    assert.match(panel, /history\.steps\.slice\(firstVisible\)/);
+    assert.match(panel, /card\.setAttribute\("role", "listitem"\)/);
     assert.match(panel, /event\.content/);
     assert.match(runtime, /"contentOffset": len\(state\.assistant_text\)/);
     assert.match(runtime, /normalize_assistant_timeline/);
@@ -193,8 +195,9 @@ test("action trail stays compact, visible, and visually quiet when complete", as
 
     assert.match(styles, /\.fl-message-timeline\s*\{[^}]*gap:\s*5px/s);
     assert.match(styles, /\.fl-toolchain-summary\s*\{[^}]*grid-template-columns:/s);
-    assert.match(styles, /\.fl-tool-history-chips\s*\{[^}]*overflow-x:\s*auto/s);
-    assert.match(styles, /\.fl-tool-history-chip[^}]*border-radius:\s*999px/s);
+    assert.match(styles, /\.fl-tool-history-list\s*\{[^}]*flex-direction:\s*column/s);
+    assert.match(styles, /\.fl-toolchain-crumb summary\s*\{[^}]*grid-template-columns:/s);
+    assert.doesNotMatch(styles, /\.fl-tool-history-chip/);
     assert.match(styles, /\.fl-toolchain-breadcrumb\.completed\s*\{[^}]*background:\s*rgba\(255, 255, 255, 0\.018\)/s);
     assert.match(styles, /content-visibility:\s*auto/);
     assert.match(tools, /TOOL_ICON_CLASSES/);

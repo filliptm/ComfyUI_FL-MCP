@@ -177,28 +177,6 @@ export function technicalText(value, limit = TECHNICAL_DETAIL_LIMIT) {
     return `${text.slice(0, limit)}\n\n… Result truncated in the interface.`;
 }
 
-export function canStackToolSteps(previous, next) {
-    const previousName = String(previous?.name || "");
-    return Boolean(previousName && previousName === String(next?.name || ""));
-}
-
-export function groupToolSteps(steps = []) {
-    const groups = [];
-    for (const step of steps.filter(Boolean)) {
-        const current = groups.at(-1);
-        if (current && canStackToolSteps(current.steps.at(-1), step)) {
-            current.steps.push(step);
-        } else {
-            groups.push({ steps: [step] });
-        }
-    }
-    return groups.map((group, index) => ({
-        index,
-        steps: group.steps,
-        ...toolStackState(group.steps),
-    }));
-}
-
 export function toolHistorySummary(steps = []) {
     const entries = steps.filter(Boolean);
     const counts = {
@@ -219,28 +197,6 @@ export function toolHistorySummary(steps = []) {
     }
     counts.active = entries.findLast(step => step?.status === "running") || null;
     return counts;
-}
-
-export function toolStackState(steps = []) {
-    const entries = steps.filter(Boolean);
-    const categories = [
-        { status: "running", values: new Set(["running"]) },
-        { status: "failed", values: new Set(["failed", "error"]) },
-        { status: "cancelled", values: new Set(["cancelled"]) },
-        { status: "retried", values: new Set(["retried"]) },
-        { status: "done", values: new Set(["done", "finished"]) },
-    ];
-    const category = categories.find(({ values }) => (
-        entries.some(step => values.has(step.status))
-    )) || categories.at(-1);
-    const representative = entries.findLast(step => (
-        category.values.has(step.status)
-    )) || entries.at(-1) || {};
-    return {
-        count: entries.length,
-        status: category.status,
-        step: representative,
-    };
 }
 
 export function summarizeToolStep(step, config = {}) {
