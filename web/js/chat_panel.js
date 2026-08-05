@@ -27,6 +27,7 @@ export class AssistantPanel {
         this.sessionManager = sessionManager;
         this.chat = new ChatClient(options.baseUrl || "");
         this.createDiagnostics = options.createDiagnostics;
+        this.discardMaskReview = options.discardMaskReview;
         this.getCanvasContext = options.getCanvasContext || (() => ({
             connected: Boolean(this.status?.bridgeConnected),
             nodeCount: 0,
@@ -1806,15 +1807,21 @@ export class AssistantPanel {
     renderApproval(value) {
         const message = this.ensureAssistantMessage();
         const copy = this.approvalCopy(value.toolName, value.arguments);
+        const isMaskReview = value.toolName === "confirm_mask_review";
         const card = document.createElement("section");
         card.className = "fl-approval-card";
         card.dataset.approvalId = value.approvalId;
+        card.dataset.toolName = value.toolName || "";
+        card.approvalValue = value;
         const eyebrow = document.createElement("span");
         eyebrow.className = "fl-approval-state";
         const shield = document.createElement("i");
         shield.className = "pi pi-shield";
         shield.setAttribute("aria-hidden", "true");
-        eyebrow.append(shield, document.createTextNode("Approval required"));
+        eyebrow.append(
+            shield,
+            document.createTextNode(isMaskReview ? "Mask review" : "Approval required"),
+        );
         const title = document.createElement("strong");
         title.textContent = copy.title;
         const consequence = document.createElement("p");
@@ -1831,11 +1838,11 @@ export class AssistantPanel {
         const deny = document.createElement("button");
         deny.type = "button";
         deny.className = "fl-secondary-button";
-        deny.textContent = "Deny";
+        deny.textContent = isMaskReview ? "Needs changes" : "Deny";
         const approve = document.createElement("button");
         approve.type = "button";
         approve.className = "fl-primary-button";
-        approve.textContent = "Allow once";
+        approve.textContent = isMaskReview ? "Use this mask" : "Allow once";
         const alwaysAllow = document.createElement("button");
         alwaysAllow.type = "button";
         alwaysAllow.className = "fl-secondary-button fl-always-allow-button";
@@ -1852,7 +1859,8 @@ export class AssistantPanel {
             "click",
             () => this.submitApproval(value.approvalId, "always_allow"),
         );
-        actions.append(deny, approve, alwaysAllow);
+        actions.append(deny, approve);
+        if (!isMaskReview) actions.appendChild(alwaysAllow);
         card.append(eyebrow, title, consequence, details, actions);
         this.finishActiveTextSegment(message, true);
         message.timeline.appendChild(card);
@@ -1861,8 +1869,23 @@ export class AssistantPanel {
 
     approvalCopy(toolName, argumentsValue) {
         const args = argumentsValue || {};
-        const nodeIds = args.node_ids || args.nodeIds;
+        const request = args.request && typeof args.request === "object"
+            ? args.request
+            : args;
+        const nodeIds = request.node_ids || request.nodeIds;
         const nodeCount = Array.isArray(nodeIds) ? nodeIds.length : null;
+        const maskRegions = Array.isArray(request.regions) ? request.regions : [];
+        const maskOperations = new Set(
+            maskRegions.map(region => region?.operation || "paint"),
+        );
+        const maskVerb = maskOperations.size === 1 && maskOperations.has("paint")
+            ? "paint"
+            : maskOperations.size === 1 && maskOperations.has("erase")
+                ? "erase"
+                : "apply";
+        const maskRegionCount = `${maskRegions.length} ${
+            maskRegions.length === 1 ? "region" : "regions"
+        }`;
         const copies = {
             queue_workflow: {
                 title: "Run this workflow?",
@@ -1881,6 +1904,18 @@ export class AssistantPanel {
             workflow_save_current: {
                 title: "Save this workflow?",
                 consequence: "This will write the current workflow to the requested file.",
+            },
+            edit_node_mask: {
+                title: request.clear_existing
+                    ? "Replace this image mask?"
+                    : "Edit this image mask?",
+                consequence: maskRegions.length
+                    ? `Ren will ${maskVerb} ${maskRegionCount} and stage a new mask for review. The image node will not change until you approve it.`
+                    : "Ren will stage a new mask for review. The image node will not change until you approve it.",
+            },
+            confirm_mask_review: {
+                title: "Use this mask?",
+                consequence: "Inspect the magenta mask on the canvas. Approve it to continue, or choose Needs changes and tell Ren what to revise.",
             },
             manager_queue_action: {
                 title: "Change installed custom nodes?",
@@ -1926,11 +1961,22 @@ export class AssistantPanel {
         if (!card) return;
         const resolution = value.resolution || (value.approved ? "approved" : "denied");
         card.classList.add(resolution);
+        const isMaskReview = card.dataset.toolName === "confirm_mask_review";
+        if (isMaskReview && !value.approved) {
+            const approval = card.approvalValue || {};
+            const request = approval.arguments?.request || approval.arguments || {};
+            Promise.resolve(this.discardMaskReview?.(
+                request.node_id,
+                request.review_token,
+            )).catch((error) => {
+                this.showError(`Mask preview could not be discarded: ${error.message}`);
+            });
+        }
         const labels = {
-            approved: "Approved",
+            approved: isMaskReview ? "Mask approved" : "Approved",
             always_allowed: "Always allowed",
-            denied: "Denied",
-            expired: "Approval expired",
+            denied: isMaskReview ? "Needs changes" : "Denied",
+            expired: isMaskReview ? "Mask review expired" : "Approval expired",
         };
         const state = card.querySelector(".fl-approval-state");
         state.replaceChildren(document.createTextNode(labels[resolution] || "Resolved"));

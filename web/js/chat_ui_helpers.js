@@ -10,6 +10,48 @@ function parsePayload(value) {
     }
 }
 
+function toolResultPayload(value) {
+    const parsed = parsePayload(value);
+    if (Array.isArray(parsed)) {
+        for (const item of parsed) {
+            if (!item || typeof item !== "object") continue;
+            if (item.type === "text") {
+                const textPayload = parsePayload(item.text);
+                if (textPayload && typeof textPayload === "object") {
+                    return textPayload;
+                }
+            } else if (!item.type) {
+                return item;
+            }
+        }
+        return parsed;
+    }
+    if (!parsed || typeof parsed !== "object") return parsed;
+    if (parsed.structuredContent !== undefined) {
+        return parsePayload(parsed.structuredContent);
+    }
+    if (parsed.structured_content !== undefined) {
+        return parsePayload(parsed.structured_content);
+    }
+    if (Array.isArray(parsed.content)) return toolResultPayload(parsed.content);
+    return parsed;
+}
+
+function dimensionsLabel(value) {
+    const width = Number(value?.width);
+    const height = Number(value?.height);
+    return Number.isFinite(width) && Number.isFinite(height)
+        ? `${width}×${height}`
+        : "";
+}
+
+function coverageLabel(result) {
+    const coverage = Number(result?.mask?.coveragePercent);
+    if (!Number.isFinite(coverage)) return "";
+    if (coverage === 0) return "empty mask";
+    return `${Number(coverage.toFixed(2))}% covered`;
+}
+
 function countSuccessful(value) {
     const parsed = parsePayload(value);
     const entries = Array.isArray(parsed)
@@ -99,9 +141,56 @@ export function toolStackState(steps = []) {
 export function summarizeToolStep(step, config = {}) {
     const name = step?.name || "";
     const args = parsePayload(step?.arguments);
-    const result = parsePayload(step?.result);
+    const request = args?.request && typeof args.request === "object"
+        ? args.request
+        : args;
+    const result = toolResultPayload(step?.result);
     const failed = ["failed", "error"].includes(step?.status);
-    if (failed) return config.failureLabel || `${config.label || name || "Action"} failed`;
+    if (failed) {
+        const failureLabels = {
+            view_output_image: "Couldn’t review output image",
+            view_node_mask: "Couldn’t inspect image mask",
+            edit_node_mask: "Couldn’t update image mask",
+            confirm_mask_review: "Mask needs changes",
+        };
+        return config.failureLabel
+            || failureLabels[name]
+            || `${config.label || name || "Action"} failed`;
+    }
+
+    if (name === "view_output_image") {
+        const selected = Number(result?.selectedOutputIndex);
+        const available = Number(result?.availableOutputCount);
+        const size = dimensionsLabel(result?.originalSize);
+        let summary = "Reviewed generated image";
+        if (Number.isInteger(selected) && Number.isInteger(available) && available > 0) {
+            summary = selected === available - 1
+                ? "Reviewed final output"
+                : `Reviewed output ${selected + 1} of ${available}`;
+        }
+        return size ? `${summary} · ${size}` : summary;
+    }
+    if (name === "view_node_mask") {
+        const node = result?.title
+            || (result?.node_id !== undefined ? `node ${result.node_id}` : "image");
+        const coverage = coverageLabel(result);
+        const summary = `Inspected mask on ${node}`;
+        return coverage ? `${summary} · ${coverage}` : summary;
+    }
+    if (name === "edit_node_mask") {
+        const regions = Array.isArray(request?.regions) ? request.regions : [];
+        const operations = new Set(regions.map(region => region?.operation || "paint"));
+        let action = "Edited";
+        if (request?.clear_existing) action = "Replaced mask with";
+        else if (operations.size === 1 && operations.has("paint")) action = "Painted";
+        else if (operations.size === 1 && operations.has("erase")) action = "Erased";
+        const regionSummary = regions.length
+            ? `${action} ${plural(regions.length, "mask region")}`
+            : "Updated image mask";
+        const coverage = coverageLabel(result);
+        return coverage ? `${regionSummary} · ${coverage}` : regionSummary;
+    }
+    if (name === "confirm_mask_review") return "Mask approved for workflow";
 
     if (name === "create_nodes") {
         const count = countSuccessful(result)

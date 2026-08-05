@@ -110,7 +110,22 @@ export const TOOL_CONFIG = {
     "view_output_image": {
         icon: "🖼️",
         label: "Review Output",
-        description: "Inspecting the generated image for visual issues"
+        description: "Loading generated pixels for visual review"
+    },
+    "view_node_mask": {
+        icon: "🎭",
+        label: "Inspect Mask",
+        description: "Highlighting masked pixels in magenta"
+    },
+    "edit_node_mask": {
+        icon: "🖌️",
+        label: "Edit Mask",
+        description: "Painting mask regions and staging a review preview"
+    },
+    "confirm_mask_review": {
+        icon: "✅",
+        label: "Mask Review",
+        description: "Waiting for you to approve the visible mask"
     },
     "enable_auto_queue": {
         icon: "🔄",
@@ -414,6 +429,9 @@ const TOOL_ICON_CLASSES = {
     get_layout: "pi pi-table",
     queue_workflow: "pi pi-play",
     view_output_image: "pi pi-image",
+    view_node_mask: "pi pi-eye",
+    edit_node_mask: "pi pi-pencil",
+    confirm_mask_review: "pi pi-check-circle",
     cancel_workflow: "pi pi-stop",
     get_queue_status: "pi pi-clock",
     workflow_get_current_json: "pi pi-code",
@@ -442,7 +460,10 @@ const TOOL_RUNNING_LABELS = {
     modify_layout: "Arranging workflow",
     get_layout: "Reading layout",
     queue_workflow: "Queueing workflow",
-    view_output_image: "Reviewing generated image",
+    view_output_image: "Loading final output for review",
+    view_node_mask: "Loading mask overlay",
+    edit_node_mask: "Staging mask edit",
+    confirm_mask_review: "Waiting for mask approval",
     take_screenshot: "Capturing canvas",
     node_library_search: "Searching node library",
     manager_check_updates: "Checking for updates",
