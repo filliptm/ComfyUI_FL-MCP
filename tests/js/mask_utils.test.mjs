@@ -2,7 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
-    imageRefsEqual,
+    formatImageWidgetRef,
+    nestedImageRefForNode,
     normalizeMaskRegion,
     parseImageWidgetRef,
     summarizeMaskPixels,
@@ -19,27 +20,26 @@ test("image widget references preserve ComfyUI type and subfolder", () => {
         { filename: "result.png", subfolder: "", type: "output" },
     );
     assert.equal(parseImageWidgetRef("$35-0"), null);
-    assert.deepEqual(
-        parseImageWidgetRef("blake3:abc123"),
-        { filename: "blake3:abc123", subfolder: "", type: "input" },
-    );
 });
 
 
-test("image references compare normalized type and subfolder defaults", () => {
+test("nested image references survive workflow node rehydration", () => {
+    const node = {
+        properties: { image: "ren-chat/session-1/reference.png [input]" },
+        widgets: [{ name: "image", value: "reference.png" }],
+        widgets_values: ["reference.png"],
+    };
+
+    const restored = nestedImageRefForNode(node);
+
+    assert.deepEqual(restored, {
+        filename: "reference.png",
+        subfolder: "ren-chat/session-1",
+        type: "input",
+    });
     assert.equal(
-        imageRefsEqual(
-            { filename: "mask.png" },
-            { filename: "mask.png", subfolder: "", type: "input" },
-        ),
-        true,
-    );
-    assert.equal(
-        imageRefsEqual(
-            { filename: "blake3:source" },
-            { filename: "fl-mcp-mask.png" },
-        ),
-        false,
+        formatImageWidgetRef(restored),
+        "ren-chat/session-1/reference.png [input]",
     );
 });
 

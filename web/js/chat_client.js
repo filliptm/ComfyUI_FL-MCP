@@ -4,6 +4,7 @@ export class ChatClient {
         this.abortController = null;
         this.runId = null;
         this.conversationId = null;
+        this.runReady = Promise.resolve(null);
     }
 
     async request(path, options = {}) {
@@ -94,8 +95,12 @@ export class ChatClient {
         );
     }
 
-    loadConversation(conversationId) {
-        return this.request(`/api/chat/conversations/${encodeURIComponent(conversationId)}`);
+    loadConversation(conversationId, { before = null, limit = 50 } = {}) {
+        const params = new URLSearchParams({ limit: String(limit) });
+        if (before) params.set("before", before);
+        return this.request(
+            `/api/chat/conversations/${encodeURIComponent(conversationId)}?${params}`,
+        );
     }
 
     createConversation() {
@@ -129,29 +134,65 @@ export class ChatClient {
         );
     }
 
+    webImagePreviewUrl(url) {
+        return `${this.baseUrl}/api/chat/web-images/preview?url=${encodeURIComponent(url)}`;
+    }
+
     async startRun({
         sessionId,
         conversationId,
         message,
         reasoningEffort,
+        searchMode,
         editMessageId,
+        attachments = [],
+        steerRunId = null,
         onEvent,
         onReady,
     }) {
         this.abortController = new AbortController();
-        const response = await fetch(`${this.baseUrl}/api/chat/runs`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-                sessionId,
-                conversationId: conversationId || null,
-                message,
-                reasoningEffort: reasoningEffort || "default",
-                editMessageId: editMessageId || null,
-            }),
-            signal: this.abortController.signal,
+        this.runId = null;
+        let resolveRunReady;
+        this.runReady = new Promise(resolve => {
+            resolveRunReady = resolve;
         });
+        let runReadyResolved = false;
+        const markRunReady = (runId, conversationId) => {
+            if (runId) this.runId = runId;
+            if (conversationId) this.conversationId = conversationId;
+            if (runReadyResolved || !this.runId) return;
+            runReadyResolved = true;
+            resolveRunReady(this.runId);
+            onReady?.({
+                runId: this.runId,
+                conversationId: this.conversationId,
+            });
+        };
+        let response;
+        try {
+            const runPath = steerRunId
+                ? `/api/chat/runs/${encodeURIComponent(steerRunId)}/steer`
+                : "/api/chat/runs";
+            response = await fetch(`${this.baseUrl}${runPath}`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    sessionId,
+                    conversationId: conversationId || null,
+                    message,
+                    reasoningEffort: reasoningEffort || "default",
+                    searchMode: searchMode || "free",
+                    editMessageId: editMessageId || null,
+                    attachments,
+                }),
+                signal: this.abortController.signal,
+            });
+        } catch (error) {
+            if (!runReadyResolved) resolveRunReady(null);
+            throw error;
+        }
         if (!response.ok) {
+            if (!runReadyResolved) resolveRunReady(null);
             let detail = `${response.status} ${response.statusText}`;
             try {
                 const payload = await response.json();
@@ -161,26 +202,25 @@ export class ChatClient {
             }
             throw new Error(detail);
         }
-        this.runId = response.headers.get("X-FL-MCP-Run-Id");
-        this.conversationId = response.headers.get("X-FL-MCP-Conversation-Id");
-        const userMessageId = response.headers.get("X-FL-MCP-User-Message-Id");
-        onReady?.({
-            runId: this.runId,
-            conversationId: this.conversationId,
-            userMessage: userMessageId ? {
-                id: userMessageId,
-                revision: {
-                    rootId: response.headers.get("X-FL-MCP-User-Revision-Root-Id"),
-                    index: Number(
-                        response.headers.get("X-FL-MCP-User-Revision-Index"),
-                    ) || 1,
-                    count: Number(
-                        response.headers.get("X-FL-MCP-User-Revision-Count"),
-                    ) || 1,
-                },
-            } : null,
-        });
-        await this.consumeSSE(response.body, onEvent);
+        markRunReady(
+            response.headers.get("X-FL-MCP-Run-Id"),
+            response.headers.get("X-FL-MCP-Conversation-Id"),
+        );
+        try {
+            await this.consumeSSE(response.body, event => {
+                if (event.type === "RUN_STARTED") {
+                    // Custom response headers can be hidden by CORS. The first
+                    // SSE event carries the same IDs and is always readable.
+                    markRunReady(event.runId, event.threadId);
+                }
+                onEvent?.(event);
+            });
+        } finally {
+            if (!runReadyResolved) {
+                runReadyResolved = true;
+                resolveRunReady(null);
+            }
+        }
     }
 
     async attach(runId, onEvent) {
@@ -221,8 +261,9 @@ export class ChatClient {
     }
 
     async cancel() {
-        if (!this.runId) return false;
-        await this.request(`/api/chat/runs/${encodeURIComponent(this.runId)}/cancel`, {
+        const runId = this.runId || await this.runReady;
+        if (!runId) return false;
+        await this.request(`/api/chat/runs/${encodeURIComponent(runId)}/cancel`, {
             method: "POST",
             body: JSON.stringify({}),
         });

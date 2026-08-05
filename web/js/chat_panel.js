@@ -1,12 +1,12 @@
 import { ChatClient } from "./chat_client.js";
 import {
-    canStackToolSteps,
     isNearBottom,
     modelProviderSummary,
     starterPrompts,
     summarizeToolStep,
     technicalText,
-    toolStackState,
+    toolDisplayImages,
+    toolHistorySummary,
 } from "./chat_ui_helpers.js";
 import { renderMarkdown } from "./safe_markdown.js";
 import { getToolConfig } from "./tool_activity.js";
@@ -20,6 +20,19 @@ const REASONING_LABELS = {
     max: "Max",
     ultra: "Ultra",
 };
+
+const SEARCH_MODE_OPTIONS = [
+    { id: "off", label: "No web", detail: "Do not expose web tools for this message." },
+    { id: "free", label: "Free web", detail: "No key or credits · best effort." },
+    { id: "tavily_basic", label: "Tavily basic", detail: "Managed search · 1 credit." },
+    { id: "tavily_advanced", label: "Tavily deep", detail: "Higher relevance · 2 credits." },
+];
+
+const MAX_TOOL_GALLERY_IMAGES = 12;
+const TOOL_HISTORY_INITIAL_STEPS = 60;
+const MAX_CHAT_ATTACHMENTS = 8;
+const MAX_CHAT_ATTACHMENT_BYTES = 32 * 1024 * 1024;
+const CHAT_IMAGE_TYPES = new Set(["image/png", "image/jpeg", "image/webp", "image/gif"]);
 
 export class AssistantPanel {
     constructor(container, sessionManager, options = {}) {
@@ -36,6 +49,9 @@ export class AssistantPanel {
         this.subscribeCanvasContext = options.subscribeCanvasContext;
         this.loadBridgeSettings = options.loadBridgeSettings;
         this.updateBridgeSettings = options.updateBridgeSettings;
+        this.uploadChatImage = options.uploadChatImage;
+        this.placeChatImageInSelectedNode = options.placeChatImageInSelectedNode;
+        this.discardMaskReviews = options.discardMaskReviews;
         this.settings = null;
         this.bridgeSettings = null;
         this.bridgeSettingsError = null;
@@ -45,8 +61,12 @@ export class AssistantPanel {
         this.historyView = "active";
         this.conversationId = null;
         this.running = false;
+        this.stopping = false;
+        this.steering = false;
+        this.activeRunPromise = null;
         this.initializing = false;
         this.currentAssistant = null;
+        this.currentRunContext = null;
         this.availableModels = [];
         this.diagnostics = null;
         this.backendRunning = null;
@@ -54,14 +74,23 @@ export class AssistantPanel {
         this.followOutput = true;
         this.jumpingToLatest = false;
         this.jumpScrollTimer = null;
+        this.followFrame = null;
         this.activeSheet = null;
         this.sheetReturnFocus = null;
         this.undoTimer = null;
         this.lastFailedMessage = "";
         this.lastFailedEditMessageId = null;
+        this.lastFailedSearchMode = null;
+        this.lastFailedAttachments = [];
+        this.pendingAttachments = [];
+        this.uploadingAttachments = false;
+        this.composerDragDepth = 0;
         this.lastArchivedConversation = null;
         this.pendingDeleteConversationId = null;
         this.contextUnsubscribe = null;
+        this.olderMessagesCursor = null;
+        this.hasOlderMessages = false;
+        this.loadingOlderMessages = false;
         this.render();
         this.bind();
         this.initialize();
@@ -139,7 +168,7 @@ export class AssistantPanel {
                     </div>
 
                     <div class="fl-run-status" id="fl-run-drafting-hint" hidden>
-                        <span class="fl-run-status-copy"><i class="pi pi-spin pi-spinner" aria-hidden="true"></i><span>Ren is working…</span></span>
+                        <span class="fl-run-status-copy"><i class="pi pi-spin pi-spinner fl-run-status-icon" aria-hidden="true"></i><span>Ren is working…</span></span>
                         <button class="fl-inline-action danger" data-action="stop" type="button">Stop</button>
                     </div>
 
@@ -149,13 +178,27 @@ export class AssistantPanel {
                                 <i class="pi pi-sitemap" aria-hidden="true"></i>
                                 <span>Checking canvas…</span>
                             </div>
-                            <label class="fl-reasoning-control" title="Reasoning level for the next message">
-                                <i class="pi pi-sparkles" aria-hidden="true"></i>
-                                <span class="fl-sr-only">Reasoning level</span>
-                                <select data-reasoning="composer" aria-label="Reasoning level for the next message"></select>
-                            </label>
+                            <div class="fl-composer-controls">
+                                <div class="fl-composer-actions">
+                                    <label class="fl-search-action-control" title="Web search for the next message">
+                                        <i class="pi pi-globe" aria-hidden="true"></i>
+                                        <span class="fl-sr-only">Web search</span>
+                                        <select data-search="composer" aria-label="Web search for the next message"></select>
+                                    </label>
+                                </div>
+                                <label class="fl-reasoning-control" title="Reasoning level for the next message">
+                                    <i class="pi pi-sparkles" aria-hidden="true"></i>
+                                    <span class="fl-sr-only">Reasoning level</span>
+                                    <select data-reasoning="composer" aria-label="Reasoning level for the next message"></select>
+                                </label>
+                            </div>
                         </div>
+                        <div class="fl-composer-attachments" hidden></div>
                         <div class="fl-composer-row">
+                            <button class="fl-chat-attach" data-action="attach-images" type="button" title="Add images" aria-label="Add images">
+                                <i class="pi pi-paperclip" aria-hidden="true"></i>
+                            </button>
+                            <input class="fl-chat-file-input" type="file" accept="image/png,image/jpeg,image/webp,image/gif" multiple hidden>
                             <textarea class="fl-chat-input" rows="1" placeholder="Ask Ren about this workflow…" aria-label="Message"></textarea>
                             <button class="fl-chat-send" data-action="send" type="button" title="Send message (Enter)" aria-label="Send message" disabled>
                                 <i class="pi pi-arrow-up" aria-hidden="true"></i>
@@ -248,6 +291,41 @@ export class AssistantPanel {
                             <footer class="fl-settings-card-footer">
                                 <div class="fl-credential-status" role="status" aria-live="polite"></div>
                                 <button class="fl-primary-button fl-settings-save" data-action="save-settings" type="button">Save and test</button>
+                            </footer>
+                        </section>
+
+                        <section class="fl-settings-card fl-settings-card-search" data-settings-section="search" aria-labelledby="fl-settings-search-title">
+                            <header class="fl-settings-card-header">
+                                <div class="fl-settings-card-heading">
+                                    <span class="fl-settings-card-icon" aria-hidden="true"><i class="pi pi-globe"></i></span>
+                                    <div>
+                                        <h3 id="fl-settings-search-title">Web search</h3>
+                                        <p>Choose free search or Tavily for each request.</p>
+                                    </div>
+                                </div>
+                                <span class="fl-settings-state neutral" data-settings-state="search" role="status">Checking</span>
+                            </header>
+                            <div class="fl-settings-card-body">
+                                <label class="fl-field">
+                                    <span>Default search</span>
+                                    <select class="fl-provider-input" data-setting="search_mode"></select>
+                                    <small class="fl-search-mode-detail"></small>
+                                </label>
+                                <label class="fl-settings-toggle fl-search-actions-toggle">
+                                    <input data-setting="show_action_buttons" type="checkbox">
+                                    <span>
+                                        <strong>Show composer action buttons</strong>
+                                        <span>Turn off the web-search action selector for a cleaner composer. Ren will keep using the default search above.</span>
+                                    </span>
+                                </label>
+                                <label class="fl-field fl-tavily-credential-field">
+                                    <span>Tavily API key <em>optional</em></span>
+                                    <input class="fl-provider-input" data-setting="tavily_credential" type="password" autocomplete="off" placeholder="Stored in your OS keychain">
+                                </label>
+                            </div>
+                            <footer class="fl-settings-card-footer">
+                                <div class="fl-search-credential-status" role="status" aria-live="polite"></div>
+                                <button class="fl-primary-button" data-action="save-search-settings" type="button">Save search</button>
                             </footer>
                         </section>
 
@@ -464,9 +542,14 @@ export class AssistantPanel {
         this.errorCopy = this.container.querySelector(".fl-chat-error-copy");
         this.errorActions = this.container.querySelector(".fl-chat-error-actions");
         this.textarea = this.container.querySelector(".fl-chat-input");
+        this.composerContainer = this.container.querySelector(".fl-chat-input-container");
+        this.attachmentInput = this.container.querySelector(".fl-chat-file-input");
+        this.attachmentTray = this.container.querySelector(".fl-composer-attachments");
         this.sendButton = this.container.querySelector('[data-action="send"]');
         this.runStatus = this.container.querySelector(".fl-run-status");
+        this.runStatusIcon = this.runStatus.querySelector(".fl-run-status-icon");
         this.runStatusText = this.runStatus.querySelector("span span");
+        this.stopButton = this.runStatus.querySelector('[data-action="stop"]');
         this.jumpLatestButton = this.container.querySelector(".fl-jump-latest");
         this.conversationTitle = this.container.querySelector(".fl-conversation-title span");
         this.overflowButton = this.container.querySelector('[data-action="toggle-menu"]');
@@ -491,6 +574,26 @@ export class AssistantPanel {
         );
         this.composerReasoningSelect = this.container.querySelector(
             '[data-reasoning="composer"]',
+        );
+        this.composerActions = this.container.querySelector(".fl-composer-actions");
+        this.composerSearchSelect = this.container.querySelector(
+            '[data-search="composer"]',
+        );
+        this.settingsSearchSelect = this.container.querySelector(
+            '[data-setting="search_mode"]',
+        );
+        this.searchModeDetail = this.container.querySelector(".fl-search-mode-detail");
+        this.showActionButtonsInput = this.container.querySelector(
+            '[data-setting="show_action_buttons"]',
+        );
+        this.tavilyCredentialInput = this.container.querySelector(
+            '[data-setting="tavily_credential"]',
+        );
+        this.searchCredentialStatus = this.container.querySelector(
+            ".fl-search-credential-status",
+        );
+        this.searchSettingsState = this.container.querySelector(
+            '[data-settings-state="search"]',
         );
         this.credentialInput = this.container.querySelector('[data-setting="credential"]');
         this.credentialField = this.container.querySelector(".fl-credential-field");
@@ -560,11 +663,40 @@ export class AssistantPanel {
             if (action === "close-sheet") this.closeSheet();
             if (action === "new-chat") this.newConversation();
             if (action === "send") this.send();
+            if (action === "attach-images") this.attachmentInput.click();
+            if (action === "remove-pending-attachment") {
+                this.removePendingAttachment(Number(actionElement.dataset.attachmentIndex));
+            }
+            if (action === "use-pending-attachment") {
+                this.usePendingAttachment(Number(actionElement.dataset.attachmentIndex));
+            }
+            if (action === "use-message-attachment") {
+                const article = actionElement.closest(".fl-message.user");
+                this.useAttachment(
+                    article?.messageAttachments?.[
+                        Number(actionElement.dataset.attachmentIndex)
+                    ],
+                );
+            }
+            if (action === "attach-tool-image") {
+                this.attachToolImage(actionElement.toolImage);
+            }
+            if (action === "use-tool-image") {
+                this.useToolImage(actionElement.toolImage);
+            }
+            if (action === "toggle-tool-history") {
+                this.toggleToolHistory(actionElement.closest(".fl-toolchain-breadcrumb"));
+            }
+            if (action === "load-tool-history") {
+                this.loadMoreToolHistory(actionElement.closest(".fl-toolchain-breadcrumb"));
+            }
+            if (action === "load-older-messages") this.loadOlderMessages();
             if (action === "stop") this.stop();
             if (action === "jump-latest") this.jumpToLatest();
             if (action === "status-action") this.handleStatusAction();
             if (action === "discover-models") this.discoverModels();
             if (action === "save-settings") this.saveSettings();
+            if (action === "save-search-settings") this.saveSearchSettings();
             if (action === "save-bridge-settings") this.saveBridgeSettings();
             if (action === "claude-login") this.connectClaudeSubscription();
             if (action === "codex-login") this.connectCodexSubscription();
@@ -608,12 +740,19 @@ export class AssistantPanel {
                     "Save these changes, then restart ComfyUI to apply them.";
             });
         });
+        this.settingsSearchSelect.addEventListener(
+            "change",
+            () => this.renderSearchSettings(),
+        );
+        this.showActionButtonsInput.addEventListener(
+            "change",
+            () => this.setComposerActionsVisibility(),
+        );
         this.textarea.addEventListener("keydown", (event) => {
             if (
                 event.key === "Enter"
                 && !event.shiftKey
                 && !event.isComposing
-                && !this.running
             ) {
                 event.preventDefault();
                 this.send();
@@ -622,6 +761,35 @@ export class AssistantPanel {
         this.textarea.addEventListener("input", () => this.resizeComposer());
         this.textarea.addEventListener("input", () => this.updateComposerState());
         this.textarea.addEventListener("focus", () => this.refreshCanvasContext());
+        this.textarea.addEventListener("paste", (event) => this.handleImagePaste(event));
+        this.attachmentInput.addEventListener("change", () => {
+            this.addImageFiles(this.attachmentInput.files);
+            this.attachmentInput.value = "";
+        });
+        this.composerContainer.addEventListener("dragenter", (event) => {
+            if (!this.dragHasFiles(event)) return;
+            event.preventDefault();
+            this.composerDragDepth += 1;
+            this.composerContainer.classList.add("drag-active");
+        });
+        this.composerContainer.addEventListener("dragover", (event) => {
+            if (!this.dragHasFiles(event)) return;
+            event.preventDefault();
+            event.dataTransfer.dropEffect = "copy";
+        });
+        this.composerContainer.addEventListener("dragleave", () => {
+            this.composerDragDepth = Math.max(0, this.composerDragDepth - 1);
+            if (this.composerDragDepth === 0) {
+                this.composerContainer.classList.remove("drag-active");
+            }
+        });
+        this.composerContainer.addEventListener("drop", (event) => {
+            if (!this.dragHasFiles(event)) return;
+            event.preventDefault();
+            this.composerDragDepth = 0;
+            this.composerContainer.classList.remove("drag-active");
+            this.addImageFiles(event.dataTransfer.files);
+        });
         this.scrollElement.addEventListener("scroll", () => this.handleThreadScroll());
         this.scrollElement.addEventListener("scrollend", () => {
             if (this.jumpingToLatest) this.finishJumpToLatest();
@@ -858,8 +1026,10 @@ export class AssistantPanel {
             : []);
         this.renderProviderControls();
         this.renderReasoningControls({ resetComposer: true });
+        this.populateSearchControls({ resetComposer: true });
         this.updateCredentialField();
         this.updateProviderBadge();
+        this.renderSearchSettings();
         this.renderApprovalSettings();
     }
 
@@ -931,6 +1101,98 @@ export class AssistantPanel {
         } finally {
             button.disabled = false;
             button.textContent = "Save bridge settings";
+        }
+    }
+
+    populateSearchControls({ resetComposer = false } = {}) {
+        const selectedComposerMode = resetComposer
+            ? (this.settings?.search_mode || "free")
+            : (this.composerSearchSelect.value || this.settings?.search_mode || "free");
+        for (const select of [this.settingsSearchSelect, this.composerSearchSelect]) {
+            select.replaceChildren();
+            for (const mode of SEARCH_MODE_OPTIONS) {
+                const option = document.createElement("option");
+                option.value = mode.id;
+                option.textContent = mode.label;
+                option.title = mode.detail;
+                select.appendChild(option);
+            }
+        }
+        this.settingsSearchSelect.value = this.settings?.search_mode || "free";
+        this.composerSearchSelect.value = selectedComposerMode;
+        this.showActionButtonsInput.checked = this.settings?.show_action_buttons !== false;
+        this.composerActions.hidden = !this.showActionButtonsInput.checked;
+    }
+
+    renderSearchSettings() {
+        const mode = SEARCH_MODE_OPTIONS.find(
+            item => item.id === this.settingsSearchSelect.value,
+        ) || SEARCH_MODE_OPTIONS[1];
+        const tavilySelected = mode.id.startsWith("tavily_");
+        const configured = Boolean(this.settings?.searchCredential?.configured);
+        this.searchModeDetail.textContent = mode.detail;
+        this.searchCredentialStatus.classList.toggle(
+            "error",
+            tavilySelected && !configured,
+        );
+        this.searchCredentialStatus.textContent = configured
+            ? `Tavily credential ready · ${this.settings.searchCredential.source}`
+            : "Tavily is optional · Free web needs no API key";
+        if (mode.id === "off") {
+            this.setSettingsState(this.searchSettingsState, "Off", "neutral");
+        } else if (mode.id === "free") {
+            this.setSettingsState(this.searchSettingsState, "Free · no cost", "ready");
+        } else if (configured) {
+            this.setSettingsState(this.searchSettingsState, "Tavily ready", "ready");
+        } else {
+            this.setSettingsState(this.searchSettingsState, "API key needed", "warning");
+        }
+    }
+
+    async setComposerActionsVisibility() {
+        const previous = this.settings?.show_action_buttons !== false;
+        const visible = this.showActionButtonsInput.checked;
+        this.showActionButtonsInput.disabled = true;
+        this.composerActions.hidden = !visible;
+        try {
+            this.settings = await this.chat.updateSettings({
+                show_action_buttons: visible,
+            });
+            this.announce(visible
+                ? "Composer action buttons shown."
+                : "Composer action buttons hidden. Default search remains active.");
+        } catch (error) {
+            this.showActionButtonsInput.checked = previous;
+            this.composerActions.hidden = !previous;
+            this.showError(`Action buttons could not be changed: ${error.message}`);
+        } finally {
+            this.showActionButtonsInput.disabled = false;
+        }
+    }
+
+    async saveSearchSettings() {
+        const button = this.container.querySelector('[data-action="save-search-settings"]');
+        button.disabled = true;
+        button.textContent = "Saving…";
+        this.searchCredentialStatus.classList.remove("error");
+        try {
+            if (this.tavilyCredentialInput.value.trim()) {
+                await this.chat.setCredential("tavily", this.tavilyCredentialInput.value);
+                this.tavilyCredentialInput.value = "";
+            }
+            this.settings = await this.chat.updateSettings({
+                search_mode: this.settingsSearchSelect.value,
+                show_action_buttons: this.showActionButtonsInput.checked,
+            });
+            this.populateSearchControls({ resetComposer: true });
+            this.renderSearchSettings();
+            this.announce("Web search settings saved.");
+        } catch (error) {
+            this.searchCredentialStatus.textContent = error.message;
+            this.searchCredentialStatus.classList.add("error");
+        } finally {
+            button.disabled = false;
+            button.textContent = "Save search";
         }
     }
 
@@ -1138,7 +1400,13 @@ export class AssistantPanel {
         if (Array.isArray(model?.reasoningEfforts) && model.reasoningEfforts.length) {
             return model.reasoningEfforts;
         }
-        return preset?.reasoning_efforts || [];
+        if (preset?.type === "codex_cli") {
+            return ["low", "medium", "high", "xhigh", "max", "ultra"];
+        }
+        if (preset?.type === "claude_cli" || preset?.type === "anthropic") {
+            return ["low", "medium", "high", "xhigh", "max"];
+        }
+        return ["low", "medium", "high"];
     }
 
     populateReasoningSelect(select, value, efforts) {
@@ -1401,6 +1669,8 @@ export class AssistantPanel {
         try {
             const result = await this.chat.loadConversation(conversationId);
             this.conversationId = conversationId;
+            this.olderMessagesCursor = result.nextBefore || null;
+            this.hasOlderMessages = Boolean(result.hasMore);
             this.updateConversationTitle();
             this.renderHistory();
             this.renderMessages(result.messages || []);
@@ -1664,29 +1934,107 @@ export class AssistantPanel {
     }
 
     renderMessages(messages) {
-        this.messagesElement.replaceChildren();
         this.currentAssistant = null;
+        const fragment = document.createDocumentFragment();
+        if (this.hasOlderMessages) fragment.appendChild(this.createOlderMessagesButton());
         for (const message of messages) {
             this.appendMessage(message.role, message.content, {
                 ...(message.metadata || {}),
                 messageId: message.id,
                 revision: message.revision,
                 createdAt: message.createdAt,
-            });
+            }, fragment, false);
         }
+        this.messagesElement.replaceChildren(fragment);
         const empty = messages.length === 0;
         this.welcomeElement.hidden = !empty;
         this.messagesElement.hidden = empty;
         if (!empty) this.scrollToBottom();
     }
 
-    appendMessage(role, content, metadata = {}) {
+    createOlderMessagesButton() {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "fl-load-older-messages";
+        button.dataset.action = "load-older-messages";
+        button.textContent = this.loadingOlderMessages
+            ? "Loading earlier messages…"
+            : "Load earlier messages";
+        button.disabled = this.loadingOlderMessages;
+        return button;
+    }
+
+    async loadOlderMessages() {
+        if (
+            this.loadingOlderMessages
+            || !this.hasOlderMessages
+            || !this.olderMessagesCursor
+            || !this.conversationId
+        ) return;
+        const conversationId = this.conversationId;
+        this.loadingOlderMessages = true;
+        const existingButton = this.messagesElement.querySelector(
+            ".fl-load-older-messages",
+        );
+        if (existingButton) {
+            existingButton.disabled = true;
+            existingButton.textContent = "Loading earlier messages…";
+        }
+        const previousHeight = this.scrollElement.scrollHeight;
+        const previousTop = this.scrollElement.scrollTop;
+        try {
+            const result = await this.chat.loadConversation(conversationId, {
+                before: this.olderMessagesCursor,
+            });
+            if (this.conversationId !== conversationId) return;
+            this.olderMessagesCursor = result.nextBefore || null;
+            this.hasOlderMessages = Boolean(result.hasMore);
+            const fragment = document.createDocumentFragment();
+            if (this.hasOlderMessages) {
+                fragment.appendChild(this.createOlderMessagesButton());
+            }
+            for (const message of result.messages || []) {
+                this.appendMessage(message.role, message.content, {
+                    ...(message.metadata || {}),
+                    messageId: message.id,
+                    revision: message.revision,
+                    createdAt: message.createdAt,
+                }, fragment, false);
+            }
+            existingButton?.remove();
+            this.messagesElement.prepend(fragment);
+            requestAnimationFrame(() => {
+                const addedHeight = this.scrollElement.scrollHeight - previousHeight;
+                this.scrollElement.scrollTop = previousTop + addedHeight;
+            });
+        } catch (error) {
+            this.showError(`Earlier messages could not load: ${error.message}`);
+        } finally {
+            this.loadingOlderMessages = false;
+            const button = this.messagesElement.querySelector(".fl-load-older-messages");
+            if (button) {
+                button.disabled = false;
+                button.textContent = "Load earlier messages";
+            }
+        }
+    }
+
+    appendMessage(
+        role,
+        content,
+        metadata = {},
+        target = this.messagesElement,
+        follow = true,
+    ) {
         this.welcomeElement.hidden = true;
         this.messagesElement.hidden = false;
         const article = document.createElement("article");
         article.className = `fl-message ${role}`;
         if (metadata.messageId) article.dataset.messageId = metadata.messageId;
         article.messageContent = String(content || "");
+        article.messageAttachments = Array.isArray(metadata.attachments)
+            ? metadata.attachments.map(item => ({ ...item }))
+            : [];
         const header = document.createElement("div");
         header.className = "fl-message-header";
         const label = document.createElement("span");
@@ -1698,25 +2046,29 @@ export class AssistantPanel {
         header.append(label, timestamp);
         let body = null;
         let timeline = null;
+        let toolHistory = null;
         if (role === "assistant") {
             timeline = document.createElement("div");
             timeline.className = "fl-message-timeline";
             article.append(header, timeline);
-            body = this.renderPersistedAssistantTimeline(
+            ({ body, toolHistory } = this.renderPersistedAssistantTimeline(
                 timeline,
                 content,
                 metadata?.toolSteps || [],
-            );
+            ));
+            if (metadata.interrupted) article.classList.add("interrupted");
         } else {
-            body = this.createMessageContent(content);
+            body = this.createMessageContent(content, article.messageAttachments, {
+                messageId: metadata.messageId,
+            });
             article.append(header, body);
             if (role === "user" && metadata.messageId) {
                 article.appendChild(this.createUserMessageActions(metadata));
             }
         }
-        this.messagesElement.appendChild(article);
-        this.maybeFollowOutput();
-        return { article, body, timeline };
+        target.appendChild(article);
+        if (follow) this.maybeFollowOutput();
+        return { article, body, timeline, toolHistory };
     }
 
     createUserMessageActions(metadata = {}) {
@@ -1767,64 +2119,103 @@ export class AssistantPanel {
         return actions;
     }
 
-    createMessageContent(content = "") {
+    createMessageContent(content = "", attachments = [], options = {}) {
         const body = document.createElement("div");
         body.className = "fl-message-content";
-        body.appendChild(renderMarkdown(content));
+        if (String(content || "").trim()) {
+            body.appendChild(this.renderChatMarkdown(content));
+        }
+        if (attachments.length) {
+            body.appendChild(this.createAttachmentGrid(attachments, options));
+        }
         return body;
     }
 
+    createAttachmentGrid(attachments, { pending = false, messageId = null } = {}) {
+        const grid = document.createElement("section");
+        grid.className = "fl-chat-attachment-grid fl-image-grid";
+        grid.dataset.count = String(attachments.length);
+        grid.dataset.layout = attachments.length === 1
+            ? "single"
+            : attachments.length % 2 === 1 ? "hero" : "grid";
+        grid.setAttribute("aria-label", `${attachments.length} attached ${attachments.length === 1 ? "image" : "images"}`);
+        for (const [index, attachment] of attachments.entries()) {
+            const figure = document.createElement("figure");
+            figure.className = "fl-chat-attachment fl-image-card";
+            const preview = document.createElement("img");
+            const image = { ...attachment, kind: "comfy" };
+            preview.src = this.toolImagePreviewSource(image);
+            preview.alt = attachment.originalName || `Attached image ${index + 1}`;
+            preview.loading = "lazy";
+            preview.decoding = "async";
+            const previewLink = document.createElement("a");
+            previewLink.href = this.toolImageOriginalSource(image);
+            previewLink.target = "_blank";
+            previewLink.rel = "noopener noreferrer";
+            previewLink.title = "Open attached image";
+            previewLink.appendChild(preview);
+            figure.appendChild(previewLink);
+
+            const caption = document.createElement("figcaption");
+            const name = document.createElement("span");
+            name.textContent = attachment.originalName || attachment.filename;
+            name.title = name.textContent;
+            caption.appendChild(name);
+            const actions = document.createElement("span");
+            actions.className = "fl-attachment-actions";
+            if (this.placeChatImageInSelectedNode) {
+                const useButton = document.createElement("button");
+                useButton.type = "button";
+                useButton.dataset.action = pending
+                    ? "use-pending-attachment"
+                    : "use-message-attachment";
+                useButton.dataset.attachmentIndex = String(index);
+                if (messageId) useButton.dataset.messageId = messageId;
+                useButton.title = "Use in selected Load Image node";
+                useButton.setAttribute("aria-label", "Use in selected Load Image node");
+                const useIcon = document.createElement("i");
+                useIcon.className = "pi pi-sign-in";
+                useIcon.setAttribute("aria-hidden", "true");
+                useButton.appendChild(useIcon);
+                actions.appendChild(useButton);
+            }
+            if (pending) {
+                const removeButton = document.createElement("button");
+                removeButton.type = "button";
+                removeButton.dataset.action = "remove-pending-attachment";
+                removeButton.dataset.attachmentIndex = String(index);
+                removeButton.title = "Remove attachment";
+                removeButton.setAttribute("aria-label", "Remove attachment");
+                const removeIcon = document.createElement("i");
+                removeIcon.className = "pi pi-times";
+                removeIcon.setAttribute("aria-hidden", "true");
+                removeButton.appendChild(removeIcon);
+                actions.appendChild(removeButton);
+            }
+            caption.appendChild(actions);
+            figure.appendChild(caption);
+            grid.appendChild(figure);
+        }
+        return grid;
+    }
+
+    renderChatMarkdown(content) {
+        return renderMarkdown(content, {
+            resolveImageUrl: url => this.chat.webImagePreviewUrl(url),
+        });
+    }
+
     renderPersistedAssistantTimeline(timeline, content, toolSteps) {
-        const characters = Array.from(String(content || ""));
-        const orderedSteps = toolSteps
-            .map((step, index) => {
-                const requestedOffset = Number(step.contentOffset);
-                const offset = Number.isFinite(requestedOffset)
-                    ? Math.max(0, Math.min(Math.floor(requestedOffset), characters.length))
-                    : characters.length;
-                return { step, offset, index };
-            })
-            .sort((left, right) => left.offset - right.offset || left.index - right.index);
-        let cursor = 0;
-        let lastBody = null;
-        let stepIndex = 0;
-
-        while (stepIndex < orderedSteps.length) {
-            const offset = orderedSteps[stepIndex].offset;
-            const precedingText = characters.slice(cursor, offset).join("");
-            const hasVisibleText = Boolean(precedingText.trim());
-            if (hasVisibleText) {
-                lastBody = this.appendTimelineText(
-                    timeline,
-                    precedingText,
-                );
-            }
-            const previousBlock = timeline.lastElementChild;
-            const rail = (
-                !hasVisibleText
-                && previousBlock?.classList.contains("fl-toolchain-breadcrumb")
-            )
-                ? previousBlock
-                : this.createToolRail();
-            while (
-                stepIndex < orderedSteps.length
-                && orderedSteps[stepIndex].offset === offset
-            ) {
-                this.addToolStep(rail, orderedSteps[stepIndex].step);
-                stepIndex += 1;
-            }
-            if (rail.parentElement !== timeline) timeline.appendChild(rail);
-            cursor = offset;
+        const steps = Array.isArray(toolSteps) ? toolSteps : [];
+        let toolHistory = null;
+        if (steps.length) {
+            const rail = this.createToolRail(steps);
+            timeline.appendChild(rail);
+            toolHistory = rail.toolHistory;
+            this.renderToolHistory(toolHistory, { images: true });
         }
-
-        const remainingText = characters.slice(cursor).join("");
-        if (remainingText.trim()) {
-            lastBody = this.appendTimelineText(
-                timeline,
-                remainingText,
-            );
-        }
-        return lastBody;
+        const body = this.appendTimelineText(timeline, content);
+        return { body, toolHistory };
     }
 
     appendTimelineText(timeline, content) {
@@ -1844,39 +2235,52 @@ export class AssistantPanel {
         return timestamp.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
     }
 
-    ensureAssistantMessage() {
-        if (this.currentAssistant) return this.currentAssistant;
+    ensureAssistantMessage(context = null) {
+        if (context?.assistant) return context.assistant;
+        if (!context && this.currentAssistant) return this.currentAssistant;
         const message = this.appendMessage("assistant", "");
         message.article.classList.add("streaming");
         message.source = "";
         message.activeBody = message.body;
         message.activeSource = "";
         message.pendingText = "";
+        message.textRenderFrame = null;
         if (message.activeBody) message.activeBody.classList.add("streaming-active");
         message.tools = new Map();
-        this.currentAssistant = message;
+        if (context) context.assistant = message;
+        if (!context || context === this.currentRunContext) this.currentAssistant = message;
         return message;
     }
 
     appendAssistantDelta(message, delta) {
+        message.pendingText += delta;
+        if (message.textRenderFrame !== null) return;
+        message.textRenderFrame = requestAnimationFrame(() => {
+            message.textRenderFrame = null;
+            this.flushAssistantText(message);
+        });
+    }
+
+    flushAssistantText(message) {
+        if (!message?.pendingText && message?.activeBody) return;
         if (!message.activeBody) {
-            message.pendingText += delta;
             if (!message.pendingText.trim()) return;
-            message.activeBody = this.appendTimelineText(
-                message.timeline,
-                message.pendingText,
-            );
+            message.activeBody = this.createMessageContent();
+            message.timeline.appendChild(message.activeBody);
             message.activeBody.classList.add("streaming-active");
-            message.activeSource = message.pendingText;
-            message.pendingText = "";
-        } else {
-            message.activeSource += delta;
         }
-        message.activeBody.replaceChildren(renderMarkdown(message.activeSource));
+        message.activeSource += message.pendingText;
+        message.pendingText = "";
+        message.activeBody.replaceChildren(this.renderChatMarkdown(message.activeSource));
         message.body = message.activeBody;
     }
 
     finishActiveTextSegment(message, discardEmpty = false) {
+        if (message?.textRenderFrame !== null && message?.textRenderFrame !== undefined) {
+            cancelAnimationFrame(message.textRenderFrame);
+            message.textRenderFrame = null;
+        }
+        this.flushAssistantText(message);
         if (discardEmpty && message.activeBody && !message.activeSource) {
             message.activeBody.remove();
         }
@@ -1887,123 +2291,415 @@ export class AssistantPanel {
     }
 
     toolRailAtCursor(message) {
-        this.finishActiveTextSegment(message, true);
-        const last = message.timeline.lastElementChild;
-        if (last?.classList.contains("fl-toolchain-breadcrumb")) return last;
+        if (message.toolHistory?.rail?.isConnected) return message.toolHistory.rail;
         const rail = this.createToolRail();
-        message.timeline.appendChild(rail);
+        message.timeline.prepend(rail);
+        message.toolHistory = rail.toolHistory;
         return rail;
     }
 
     finishAssistantMessage(message) {
         if (!message) return;
         this.finishActiveTextSegment(message, true);
+        const history = message.toolHistory;
+        if (history?.renderFrame !== null) {
+            cancelAnimationFrame(history.renderFrame);
+            history.renderFrame = null;
+            const renderImages = history.renderImages;
+            history.renderImages = false;
+            this.renderToolHistory(history, { images: renderImages });
+        }
         message.article.classList.remove("streaming");
     }
 
-    createToolRail() {
-        const rail = document.createElement("div");
+    createToolRail(steps = []) {
+        const rail = document.createElement("section");
         rail.className = "fl-toolchain-breadcrumb";
+        const toggle = document.createElement("button");
+        toggle.type = "button";
+        toggle.className = "fl-toolchain-summary";
+        toggle.dataset.action = "toggle-tool-history";
+        toggle.setAttribute("aria-expanded", "false");
+        const icon = document.createElement("i");
+        icon.className = "pi pi-cog fl-crumb-icon fl-toolchain-active-icon";
+        icon.setAttribute("aria-hidden", "true");
+        const current = document.createElement("strong");
+        current.className = "fl-toolchain-current";
+        const meta = document.createElement("span");
+        meta.className = "fl-toolchain-meta";
+        const disclosure = document.createElement("span");
+        disclosure.className = "fl-toolchain-disclosure";
+        disclosure.textContent = "Show history";
+        const chevron = document.createElement("i");
+        chevron.className = "pi pi-chevron-down";
+        chevron.setAttribute("aria-hidden", "true");
+        toggle.append(icon, current, meta, disclosure, chevron);
+
+        const panel = document.createElement("div");
+        panel.className = "fl-tool-history-panel";
+        panel.hidden = true;
+        const list = document.createElement("div");
+        list.className = "fl-tool-history-list";
+        list.setAttribute("role", "list");
+        list.setAttribute("aria-label", "Tool use history");
+        panel.appendChild(list);
+        rail.append(toggle, panel);
+        rail.toolHistory = {
+            rail,
+            steps: [...steps],
+            expanded: false,
+            visibleStepCount: TOOL_HISTORY_INITIAL_STEPS,
+            cards: new Map(),
+            renderFrame: null,
+            renderImages: false,
+        };
         return rail;
     }
 
     addToolStep(rail, step) {
-        const previousItem = rail.lastElementChild;
-        const previousSteps = previousItem?.toolSteps || [];
-        if (canStackToolSteps(previousSteps.at(-1), step)) {
-            previousSteps.push(step);
-            this.renderToolStep(previousItem);
-            return previousItem;
-        }
+        const history = rail.toolHistory;
+        history.steps.push(step);
+        this.scheduleToolHistoryRender(history);
+        return history;
+    }
 
-        const item = document.createElement("details");
+    scheduleToolHistoryRender(history, { images = false } = {}) {
+        if (!history) return;
+        history.renderImages ||= images;
+        if (history.renderFrame !== null) return;
+        history.renderFrame = requestAnimationFrame(() => {
+            history.renderFrame = null;
+            const nextImages = history.renderImages;
+            history.renderImages = false;
+            this.renderToolHistory(history, { images: nextImages });
+        });
+    }
+
+    renderToolHistory(history, { images = false } = {}) {
+        if (!history) return;
+        const { rail } = history;
+        const summary = toolHistorySummary(history.steps);
+        const active = summary.active;
+        const representative = active || history.steps.at(-1) || {};
+        const tool = getToolConfig(representative.name);
+        const visualStatus = active
+            ? "loading"
+            : summary.failed
+                ? "failed"
+                : summary.interrupted
+                    ? "cancelled"
+                    : "completed";
+        rail.className = `fl-toolchain-breadcrumb ${visualStatus}`;
+        rail.dataset.toolCount = String(summary.total);
+        rail.hidden = summary.total === 0;
+        const toggle = rail.querySelector(".fl-toolchain-summary");
+        toggle.setAttribute("aria-expanded", String(history.expanded));
+        toggle.querySelector(".fl-toolchain-active-icon").className = `${
+            tool.iconClass || "pi pi-cog"
+        } fl-crumb-icon fl-toolchain-active-icon`;
+        const current = toggle.querySelector(".fl-toolchain-current");
+        current.textContent = active
+            ? tool.runningLabel
+            : summarizeToolStep(representative, tool);
+        const metaParts = [];
+        metaParts.push(`${summary.total} ${summary.total === 1 ? "action" : "actions"}`);
+        if (!active && summary.done) metaParts.push(`${summary.done} done`);
+        if (summary.retried) metaParts.push(`${summary.retried} retried`);
+        if (summary.failed) metaParts.push(`${summary.failed} failed`);
+        if (summary.interrupted) metaParts.push(`${summary.interrupted} interrupted`);
+        if (active) metaParts.push(`${summary.total} ${summary.total === 1 ? "call" : "calls"}`);
+        toggle.querySelector(".fl-toolchain-meta").textContent = metaParts.join(" · ");
+        toggle.querySelector(".fl-toolchain-disclosure").textContent = history.expanded
+            ? "Hide history"
+            : "Show history";
+        toggle.querySelector(".pi-chevron-down, .pi-chevron-up").className = history.expanded
+            ? "pi pi-chevron-up"
+            : "pi pi-chevron-down";
+        const panel = rail.querySelector(".fl-tool-history-panel");
+        panel.hidden = !history.expanded;
+        if (history.expanded) this.renderToolHistoryCards(history);
+        if (images) this.renderToolImages(rail, history.steps);
+    }
+
+    renderToolHistoryCards(history) {
+        const list = history.rail.querySelector(".fl-tool-history-list");
+        const fragment = document.createDocumentFragment();
+        const firstVisible = Math.max(0, history.steps.length - history.visibleStepCount);
+        if (firstVisible > 0) {
+            const more = document.createElement("button");
+            more.type = "button";
+            more.className = "fl-tool-history-more";
+            more.dataset.action = "load-tool-history";
+            more.textContent = `Show ${firstVisible} earlier ${
+                firstVisible === 1 ? "action" : "actions"
+            }`;
+            fragment.appendChild(more);
+        }
+        const visibleSteps = history.steps.slice(firstVisible);
+        for (const step of visibleSteps) {
+            let card = history.cards.get(step);
+            if (!card) {
+                card = this.createToolHistoryCard();
+                history.cards.set(step, card);
+            }
+            this.renderToolHistoryCard(card, step);
+            fragment.appendChild(card);
+        }
+        list.replaceChildren(fragment);
+    }
+
+    createToolHistoryCard() {
+        const card = document.createElement("details");
+        card.setAttribute("role", "listitem");
         const summary = document.createElement("summary");
         const icon = document.createElement("i");
+        icon.className = "pi pi-bolt fl-crumb-icon fl-tool-history-icon";
         icon.setAttribute("aria-hidden", "true");
-        const name = document.createElement("span");
-        name.className = "fl-crumb-copy";
+        const copy = document.createElement("span");
+        copy.className = "fl-crumb-copy";
         const label = document.createElement("strong");
         label.className = "fl-crumb-label";
         const description = document.createElement("span");
         description.className = "fl-crumb-description";
-        name.append(label, description);
-        const count = document.createElement("span");
-        count.className = "fl-crumb-count";
-        count.hidden = true;
+        copy.append(label, description);
         const status = document.createElement("em");
         status.className = "fl-crumb-status";
-        summary.append(icon, name, count, status);
-        const detail = document.createElement("div");
-        detail.className = "fl-tool-technical";
+        summary.append(icon, copy, status);
+        const technical = document.createElement("div");
+        technical.className = "fl-tool-technical";
         const detailLabel = document.createElement("span");
         detailLabel.textContent = "Technical details";
         const pre = document.createElement("pre");
-        detail.append(detailLabel, pre);
-        item.append(summary, detail);
-        item.toolSteps = [step];
-        rail.appendChild(item);
-        this.renderToolStep(item);
-        return item;
+        technical.append(detailLabel, pre);
+        card.append(summary, technical);
+        return card;
     }
 
-    renderToolStep(item, step = null) {
-        const steps = item.toolSteps?.length ? item.toolSteps : [step].filter(Boolean);
-        const stack = toolStackState(steps);
-        const representative = stack.step;
-        const visualStatus = this.toolVisualStatus(stack.status);
-        const tool = getToolConfig(representative.name);
-        item.className = `fl-toolchain-crumb ${visualStatus}`;
-        item.dataset.toolName = representative.name || "";
-        item.dataset.toolCount = String(stack.count);
-        const icon = item.querySelector("summary > i");
-        icon.className = `${tool.iconClass} fl-crumb-icon`;
-        const label = item.querySelector(".fl-crumb-label");
-        label.textContent = visualStatus === "loading"
+    renderToolHistoryCard(card, step) {
+        const visualStatus = this.toolVisualStatus(step.status);
+        const tool = getToolConfig(step.name);
+        card.className = `fl-toolchain-crumb ${visualStatus}`;
+        card.dataset.toolName = step.name || "";
+        const icon = card.querySelector(".fl-tool-history-icon");
+        icon.className = `${
+            tool.iconClass || "pi pi-cog"
+        } fl-crumb-icon fl-tool-history-icon`;
+        card.querySelector(".fl-crumb-label").textContent = visualStatus === "loading"
             ? tool.runningLabel
-            : summarizeToolStep(representative, tool);
-        const description = item.querySelector(".fl-crumb-description");
-        description.textContent = visualStatus === "loading"
-            ? (tool.description || tool.label || representative.name || "MCP tool")
-            : (tool.label || representative.name || "MCP tool");
-        const count = item.querySelector(".fl-crumb-count");
-        count.hidden = stack.count < 2;
-        count.textContent = `×${stack.count}`;
-        count.setAttribute(
-            "aria-label",
-            `${stack.count} consecutive ${tool.label || representative.name || "tool"} calls`,
-        );
-        const status = item.querySelector(".fl-crumb-status");
-        const statusLabels = {
+            : summarizeToolStep(step, tool);
+        card.querySelector(".fl-crumb-description").textContent = visualStatus === "loading"
+            ? (tool.description || tool.label || step.name || "MCP tool")
+            : (tool.label || step.name || "MCP tool");
+        card.querySelector(".fl-crumb-status").textContent = {
             loading: "Working",
             completed: "Done",
             retried: "Retried",
             failed: "Failed",
-            cancelled: "Stopped",
-        };
-        status.textContent = statusLabels[visualStatus];
-
+            cancelled: step.status === "interrupted" ? "Interrupted" : "Stopped",
+        }[visualStatus];
         const technicalSections = [];
-        for (const [index, currentStep] of steps.entries()) {
-            const callSections = [];
-            if (currentStep.arguments !== undefined && currentStep.arguments !== "") {
-                callSections.push(`Arguments\n${technicalText(currentStep.arguments)}`);
-            }
-            if (currentStep.result !== undefined && currentStep.result !== "") {
-                callSections.push(`Result\n${technicalText(currentStep.result)}`);
-            }
-            if (callSections.length) {
-                technicalSections.push(
-                    steps.length > 1
-                        ? `Call ${index + 1}\n${callSections.join("\n\n")}`
-                        : callSections.join("\n\n"),
-                );
-            }
+        if (step.arguments !== undefined && step.arguments !== "") {
+            technicalSections.push(`Arguments\n${technicalText(step.arguments)}`);
         }
-        const technical = item.querySelector(".fl-tool-technical");
-        technical.hidden = !technicalSections.length;
+        if (step.result !== undefined && step.result !== "") {
+            technicalSections.push(`Result\n${technicalText(step.result)}`);
+        }
+        const technical = card.querySelector(".fl-tool-technical");
+        technical.hidden = technicalSections.length === 0;
         technical.querySelector("pre").textContent = technicalText(
             technicalSections.join("\n\n"),
         );
+    }
+
+    toggleToolHistory(rail) {
+        const history = rail?.toolHistory;
+        if (!history) return;
+        history.expanded = !history.expanded;
+        this.renderToolHistory(history);
+    }
+
+    loadMoreToolHistory(rail) {
+        const history = rail?.toolHistory;
+        if (!history) return;
+        history.visibleStepCount += TOOL_HISTORY_INITIAL_STEPS;
+        this.renderToolHistory(history);
+    }
+
+    renderToolImages(item, steps) {
+        const discovered = [];
+        const seen = new Set();
+        for (const step of steps) {
+            for (const image of toolDisplayImages(step)) {
+                const key = image.kind === "comfy"
+                    ? `${image.type}:${image.subfolder}:${image.filename}`
+                    : image.url;
+                if (seen.has(key)) continue;
+                seen.add(key);
+                discovered.push(image);
+            }
+        }
+        if (!discovered.length) {
+            item.imageGrid?.remove();
+            item.imageGrid = null;
+            item.imageSignature = "";
+            return;
+        }
+
+        const images = discovered.slice(0, MAX_TOOL_GALLERY_IMAGES);
+        const signature = JSON.stringify(images.map(image => (
+            image.kind === "comfy"
+                ? [image.kind, image.type, image.subfolder, image.filename]
+                : [image.kind, image.url]
+        )));
+        if (item.imageSignature === signature && item.imageGrid?.isConnected) return;
+        item.imageSignature = signature;
+        let grid = item.imageGrid;
+        if (!grid?.isConnected) {
+            grid = document.createElement("section");
+            grid.className = "fl-tool-image-grid fl-image-grid";
+            grid.setAttribute("role", "list");
+            item.after(grid);
+            item.imageGrid = grid;
+        }
+        grid.replaceChildren();
+        grid.dataset.count = String(images.length);
+        grid.dataset.layout = images.length === 1
+            ? "single"
+            : images.length % 2 === 1
+                ? "hero"
+                : "grid";
+        grid.setAttribute(
+            "aria-label",
+            `${images.length} ${images.length === 1 ? "image" : "images"}`,
+        );
+
+        for (const [index, image] of images.entries()) {
+            const figure = document.createElement("figure");
+            figure.className = "fl-tool-image-card fl-image-card";
+            figure.setAttribute("role", "listitem");
+            const source = this.toolImageOriginalSource(image);
+            const link = document.createElement("a");
+            link.href = image.kind === "web"
+                ? (image.sourceUrl || image.url)
+                : source;
+            link.target = "_blank";
+            link.rel = "noopener noreferrer";
+            link.title = image.kind === "web"
+                ? "Open original source"
+                : "Open full generated image";
+
+            const preview = document.createElement("img");
+            preview.src = this.toolImagePreviewSource(image);
+            preview.alt = image.alt || image.title || `Image ${index + 1}`;
+            preview.loading = "lazy";
+            preview.decoding = "async";
+            preview.referrerPolicy = "no-referrer";
+            preview.fetchPriority = "low";
+
+            const fallback = document.createElement("span");
+            fallback.className = "fl-tool-image-fallback fl-image-fallback";
+            fallback.hidden = true;
+            const fallbackIcon = document.createElement("i");
+            fallbackIcon.className = "pi pi-image";
+            fallbackIcon.setAttribute("aria-hidden", "true");
+            const fallbackCopy = document.createElement("span");
+            fallbackCopy.textContent = "Preview unavailable";
+            fallback.append(fallbackIcon, fallbackCopy);
+            preview.addEventListener("error", () => {
+                figure.classList.add("failed");
+                preview.hidden = true;
+                fallback.hidden = false;
+            }, { once: true });
+            link.append(preview, fallback);
+            figure.appendChild(link);
+
+            const caption = this.toolImageCaption(image, index);
+            const figcaption = document.createElement("figcaption");
+            const captionCopy = document.createElement("span");
+            captionCopy.textContent = caption || `Image ${index + 1}`;
+            captionCopy.title = captionCopy.textContent;
+            figcaption.appendChild(captionCopy);
+            if (this.uploadChatImage) {
+                const actions = document.createElement("span");
+                actions.className = "fl-attachment-actions";
+                const addImageAction = (action, iconClass, label) => {
+                    const button = document.createElement("button");
+                    button.type = "button";
+                    button.dataset.action = action;
+                    button.toolImage = image;
+                    button.title = label;
+                    button.setAttribute("aria-label", label);
+                    const actionIcon = document.createElement("i");
+                    actionIcon.className = iconClass;
+                    actionIcon.setAttribute("aria-hidden", "true");
+                    button.appendChild(actionIcon);
+                    return button;
+                };
+                actions.append(
+                    addImageAction(
+                        "attach-tool-image",
+                        "pi pi-paperclip",
+                        "Attach this image to a new request",
+                    ),
+                    addImageAction(
+                        "use-tool-image",
+                        "pi pi-sign-in",
+                        "Use in selected Load Image node",
+                    ),
+                );
+                figcaption.appendChild(actions);
+            }
+            figure.appendChild(figcaption);
+            grid.appendChild(figure);
+        }
+
+        if (discovered.length > images.length) {
+            const overflow = document.createElement("span");
+            overflow.className = "fl-tool-image-overflow fl-image-overflow";
+            overflow.textContent = `+${discovered.length - images.length} more images`;
+            grid.appendChild(overflow);
+        }
+    }
+
+    toolImageOriginalSource(image) {
+        if (image.kind === "web") return image.url;
+        const params = new URLSearchParams({
+            filename: image.filename,
+            type: image.type,
+        });
+        if (image.subfolder) params.set("subfolder", image.subfolder);
+        return `/api/view?${params.toString()}`;
+    }
+
+    toolImagePreviewSource(image) {
+        if (image.kind === "web") {
+            return this.chat.webImagePreviewUrl(image.url);
+        }
+        const params = new URLSearchParams({
+            filename: image.filename,
+            type: image.type,
+        });
+        if (image.subfolder) params.set("subfolder", image.subfolder);
+        return `/fl_mcp/image/thumbnail?${params.toString()}`;
+    }
+
+    toolImageImportSource(image) {
+        return image.kind === "web"
+            ? this.chat.webImagePreviewUrl(image.url)
+            : this.toolImageOriginalSource(image);
+    }
+
+    toolImageCaption(image, index) {
+        const explicit = String(image.title || image.alt || "").trim();
+        if (explicit && explicit !== "Web image") return explicit.slice(0, 120);
+        if (image.kind === "web") {
+            try {
+                return new URL(image.sourceUrl || image.url).hostname;
+            } catch (_) {
+                return `Web image ${index + 1}`;
+            }
+        }
+        return image.title || `Generated output ${index + 1}`;
     }
 
     toolVisualStatus(status) {
@@ -2014,22 +2710,31 @@ export class AssistantPanel {
             retried: "retried",
             failed: "failed",
             cancelled: "cancelled",
+            interrupted: "cancelled",
         }[status] || "completed";
     }
 
-    handleEvent(event) {
+    handleEvent(event, context = this.currentRunContext) {
         if (event.type === "RUN_STARTED") {
-            this.ensureAssistantMessage();
+            if (context) context.runId = event.runId || context.runId;
+            const message = this.ensureAssistantMessage(context);
+            message.runId = event.runId || message.runId || null;
+            if (message.runId) message.article.dataset.runId = message.runId;
+            if (context && context === this.currentRunContext && this.steering) {
+                this.steering = false;
+                this.setRunStatus("Ren is working…");
+                this.updateComposerState();
+            }
             this.announce("Ren started working.");
         } else if (event.type === "TEXT_MESSAGE_START") {
-            this.ensureAssistantMessage();
+            this.ensureAssistantMessage(context);
         } else if (event.type === "TEXT_MESSAGE_CONTENT") {
-            const message = this.ensureAssistantMessage();
+            const message = this.ensureAssistantMessage(context);
             const delta = event.delta || "";
             message.source += delta;
             this.appendAssistantDelta(message, delta);
         } else if (event.type === "TOOL_CALL_START") {
-            const message = this.ensureAssistantMessage();
+            const message = this.ensureAssistantMessage(context);
             const id = event.toolCallId || crypto.randomUUID();
             for (const tool of message.tools.values()) {
                 if (tool.name === event.toolCallName && tool.status === "running") {
@@ -2037,54 +2742,68 @@ export class AssistantPanel {
                     break;
                 }
             }
-            const item = this.addToolStep(this.toolRailAtCursor(message), {
-                name: event.toolCallName,
-                status: "running",
-            });
             const step = {
                 name: event.toolCallName,
                 status: "running",
                 arguments: "",
             };
+            const history = this.addToolStep(this.toolRailAtCursor(message), step);
             message.tools.set(id, {
-                item,
+                history,
                 name: event.toolCallName,
                 status: "running",
                 arguments: "",
                 step,
             });
-            this.runStatusText.textContent = getToolConfig(event.toolCallName).runningLabel;
+            const toolConfig = getToolConfig(event.toolCallName);
+            this.setRunStatus(toolConfig.runningLabel, toolConfig.iconClass);
         } else if (event.type === "TOOL_CALL_ARGS") {
-            const tool = this.currentAssistant?.tools.get(event.toolCallId);
+            const tool = (context?.assistant || this.currentAssistant)?.tools.get(
+                event.toolCallId,
+            );
             if (tool) {
                 tool.arguments += event.delta || "";
                 tool.step.arguments = tool.arguments;
-                this.renderToolStep(tool.item, tool.step);
+                if (tool.history.expanded) {
+                    this.scheduleToolHistoryRender(tool.history, { details: true });
+                }
             }
         } else if (event.type === "TOOL_CALL_RESULT") {
-            const tool = this.currentAssistant?.tools.get(event.toolCallId);
+            const tool = (context?.assistant || this.currentAssistant)?.tools.get(
+                event.toolCallId,
+            );
             if (tool) this.setToolStatus(tool, "done", event.content);
-            this.runStatusText.textContent = "Ren is working…";
+            this.setRunStatusForActiveTool(context?.assistant || this.currentAssistant);
         } else if (event.type === "CUSTOM" && event.name === "approval_required") {
-            this.renderApproval(event.value);
+            this.renderApproval(event.value, context);
         } else if (event.type === "CUSTOM" && event.name === "approval_resolved") {
             this.resolveApprovalCard(event.value);
         } else if (event.type === "RUN_ERROR") {
-            this.settleOpenTools(event.code === "cancelled" ? "cancelled" : "failed");
-            this.finishAssistantMessage(this.currentAssistant);
-            if (event.code === "cancelled") {
+            const interrupted = event.code === "steered";
+            this.settleOpenTools(
+                interrupted ? "interrupted" : event.code === "cancelled" ? "cancelled" : "failed",
+                context?.assistant || this.currentAssistant,
+            );
+            const assistant = context?.assistant || this.currentAssistant;
+            this.finishAssistantMessage(assistant);
+            if (interrupted) assistant?.article?.classList.add("interrupted");
+            if (event.code === "cancelled" || interrupted) {
                 this.clearError();
-                this.announce("Response stopped.");
+                this.announce(interrupted ? "Previous response interrupted." : "Response stopped.");
             } else {
                 this.showRunError(event.message || "The assistant run failed.");
             }
-            this.running = false;
-            this.updateComposerState();
+            if (!context || context === this.currentRunContext) {
+                this.running = false;
+                this.updateComposerState();
+            }
         } else if (event.type === "RUN_FINISHED") {
-            this.settleOpenTools("finished");
-            this.finishAssistantMessage(this.currentAssistant);
-            this.running = false;
-            this.updateComposerState();
+            this.settleOpenTools("finished", context?.assistant || this.currentAssistant);
+            this.finishAssistantMessage(context?.assistant || this.currentAssistant);
+            if (!context || context === this.currentRunContext) {
+                this.running = false;
+                this.updateComposerState();
+            }
             this.announce("Ren finished.");
         }
         this.maybeFollowOutput();
@@ -2094,24 +2813,26 @@ export class AssistantPanel {
         tool.status = status;
         tool.step.status = status;
         if (result !== undefined) tool.step.result = result;
-        this.renderToolStep(tool.item, tool.step);
+        this.scheduleToolHistoryRender(tool.history, {
+            details: tool.history.expanded,
+            images: result !== undefined,
+        });
     }
 
-    settleOpenTools(status) {
-        for (const tool of this.currentAssistant?.tools?.values() || []) {
+    settleOpenTools(status, message = this.currentAssistant) {
+        for (const tool of message?.tools?.values() || []) {
             if (tool.status === "running") this.setToolStatus(tool, status);
         }
     }
 
-    renderApproval(value) {
-        const message = this.ensureAssistantMessage();
+    renderApproval(value, context = this.currentRunContext) {
+        const message = this.ensureAssistantMessage(context);
         const copy = this.approvalCopy(value.toolName, value.arguments);
         const isMaskReview = value.toolName === "confirm_mask_review";
         const card = document.createElement("section");
         card.className = "fl-approval-card";
         card.dataset.approvalId = value.approvalId;
         card.dataset.toolName = value.toolName || "";
-        card.approvalValue = value;
         const eyebrow = document.createElement("span");
         eyebrow.className = "fl-approval-state";
         const shield = document.createElement("i");
@@ -2209,8 +2930,8 @@ export class AssistantPanel {
                     ? "Replace this image mask?"
                     : "Edit this image mask?",
                 consequence: maskRegions.length
-                    ? `Ren will ${maskVerb} ${maskRegionCount} and stage a new mask for review. The image node will not change until you approve it.`
-                    : "Ren will stage a new mask for review. The image node will not change until you approve it.",
+                    ? `Ren will ${maskVerb} ${maskRegionCount}, save a new mask image, and update the selected image node.`
+                    : "Ren will save a new mask image and update the selected image node.",
             },
             confirm_mask_review: {
                 title: "Use this mask?",
@@ -2261,16 +2982,6 @@ export class AssistantPanel {
         const resolution = value.resolution || (value.approved ? "approved" : "denied");
         card.classList.add(resolution);
         const isMaskReview = card.dataset.toolName === "confirm_mask_review";
-        if (isMaskReview && !value.approved) {
-            const approval = card.approvalValue || {};
-            const request = approval.arguments?.request || approval.arguments || {};
-            Promise.resolve(this.discardMaskReview?.(
-                request.node_id,
-                request.review_token,
-            )).catch((error) => {
-                this.showError(`Mask preview could not be discarded: ${error.message}`);
-            });
-        }
         const labels = {
             approved: isMaskReview ? "Mask approved" : "Approved",
             always_allowed: "Always allowed",
@@ -2285,20 +2996,84 @@ export class AssistantPanel {
 
     async send() {
         const message = this.textarea.value.trim();
-        if (!message || this.running) return;
+        const attachments = this.pendingAttachments.map(item => ({ ...item }));
+        if (
+            (!message && !attachments.length)
+            || this.uploadingAttachments
+            || this.stopping
+            || this.steering
+        ) return;
         if (!this.status?.configured) {
             this.openSheet("settings");
             this.showError("Choose and test a model before sending a message.");
             return;
         }
-        this.textarea.value = "";
-        this.resizeComposer();
-        this.updateComposerState();
-        await this.runMessage(message);
+        if (this.running) {
+            await this.steer(message, attachments, this.composerSearchSelect.value);
+            return;
+        }
+        this.clearComposerDraft();
+        await this.startRunMessage(
+            message,
+            null,
+            this.composerSearchSelect.value,
+            attachments,
+        );
     }
 
-    async runMessage(message, editMessageId = null) {
-        if (!message || this.running) return;
+    clearComposerDraft() {
+        this.textarea.value = "";
+        this.pendingAttachments = [];
+        this.renderPendingAttachments();
+        this.resizeComposer();
+        this.updateComposerState();
+    }
+
+    async startRunMessage(...args) {
+        const runPromise = this.runMessage(...args);
+        this.activeRunPromise = runPromise;
+        try {
+            await runPromise;
+        } finally {
+            if (this.activeRunPromise === runPromise) this.activeRunPromise = null;
+        }
+    }
+
+    async steer(message, attachments, searchMode) {
+        this.steering = true;
+        this.setRunStatus("Steering Ren…", "pi pi-send");
+        this.updateComposerState();
+        try {
+            const activeRunId = this.chat.runId || await this.chat.runReady;
+            if (!activeRunId) {
+                throw new Error("The current response has not started yet.");
+            }
+            this.clearComposerDraft();
+            this.announce("Steering Ren with your new message.");
+            await this.startRunMessage(
+                message,
+                null,
+                searchMode,
+                attachments,
+                activeRunId,
+            );
+        } catch (error) {
+            this.showError(`Message could not steer the response: ${error.message}`);
+        } finally {
+            this.steering = false;
+            if (this.running) this.setRunStatus("Ren is working…");
+            this.updateComposerState();
+        }
+    }
+
+    async runMessage(
+        message,
+        editMessageId = null,
+        searchMode = this.composerSearchSelect.value,
+        attachments = [],
+        steerRunId = null,
+    ) {
+        if ((!message && !attachments.length) || (this.running && !steerRunId)) return;
         if (!this.status?.configured) {
             this.openSheet("settings");
             this.showError("Choose and test a model before sending a message.");
@@ -2307,12 +3082,16 @@ export class AssistantPanel {
         this.clearError();
         this.lastFailedMessage = message;
         this.lastFailedEditMessageId = editMessageId;
+        this.lastFailedSearchMode = searchMode;
+        this.lastFailedAttachments = attachments.map(item => ({ ...item }));
         this.running = true;
+        const runContext = { runId: null, assistant: null };
+        this.currentRunContext = runContext;
         this.currentAssistant = null;
         this.followOutput = true;
         const optimisticUser = editMessageId
-            ? this.renderOptimisticRevision(editMessageId, message)
-            : this.appendMessage("user", message);
+            ? this.renderOptimisticRevision(editMessageId, message, attachments)
+            : this.appendMessage("user", message, { attachments });
         this.updateComposerState();
         try {
             await this.chat.startRun({
@@ -2320,33 +3099,39 @@ export class AssistantPanel {
                 conversationId: this.conversationId,
                 message,
                 reasoningEffort: this.composerReasoningSelect.value,
+                searchMode,
                 editMessageId,
-                onReady: ({ conversationId, userMessage }) => {
+                attachments,
+                steerRunId,
+                onReady: ({ runId, conversationId, userMessage }) => {
+                    runContext.runId = runId;
                     this.conversationId = conversationId;
                     this.applyUserMessageMetadata(
                         optimisticUser?.article,
                         userMessage,
                     );
                 },
-                onEvent: (event) => this.handleEvent(event),
+                onEvent: (event) => this.handleEvent(event, runContext),
             });
         } catch (error) {
             if (error.name !== "AbortError") {
                 this.showRunError(error.message);
             }
         } finally {
-            this.running = false;
-            this.updateComposerState();
+            if (this.currentRunContext === runContext) {
+                this.running = false;
+                this.updateComposerState();
+            }
             await this.refreshConversations(this.conversationId);
         }
     }
 
-    renderOptimisticRevision(messageId, content) {
+    renderOptimisticRevision(messageId, content, attachments = []) {
         const article = this.messagesElement.querySelector(
             `.fl-message.user[data-message-id="${CSS.escape(messageId)}"]`,
         );
         if (!article) {
-            return this.appendMessage("user", content);
+            return this.appendMessage("user", content, { attachments });
         }
         let following = article.nextElementSibling;
         while (following) {
@@ -2355,7 +3140,7 @@ export class AssistantPanel {
             following = next;
         }
         article.remove();
-        return this.appendMessage("user", content);
+        return this.appendMessage("user", content, { attachments });
     }
 
     applyUserMessageMetadata(article, message) {
@@ -2432,8 +3217,14 @@ export class AssistantPanel {
         );
         const content = article?.querySelector(".fl-message-edit-form textarea")
             ?.value.trim();
-        if (!content) return;
-        await this.runMessage(content, messageId);
+        const attachments = article?.messageAttachments || [];
+        if (!content && !attachments.length) return;
+        await this.startRunMessage(
+            content,
+            messageId,
+            this.composerSearchSelect.value,
+            attachments,
+        );
     }
 
     async resendMessage(messageId) {
@@ -2442,8 +3233,14 @@ export class AssistantPanel {
             `.fl-message.user[data-message-id="${CSS.escape(messageId)}"]`,
         );
         const content = article?.messageContent?.trim();
-        if (!content) return;
-        await this.runMessage(content, messageId);
+        const attachments = article?.messageAttachments || [];
+        if (!content && !attachments.length) return;
+        await this.startRunMessage(
+            content,
+            messageId,
+            this.composerSearchSelect.value,
+            attachments,
+        );
     }
 
     async changeMessageVersion(messageId, direction) {
@@ -2461,22 +3258,58 @@ export class AssistantPanel {
     }
 
     async stop() {
-        if (!this.running) return;
+        if (!this.running || this.stopping || this.steering) return;
+        const activeRun = this.activeRunPromise;
+        this.stopping = true;
+        this.setRunStatus("Stopping Ren…", "pi pi-stop-circle");
+        this.updateComposerState();
         try {
-            await this.chat.cancel();
+            const cancelled = await this.chat.cancel();
+            if (!cancelled) throw new Error("The current response has not started yet.");
+            this.discardMaskReviews?.();
+            if (activeRun) await activeRun;
+            this.discardMaskReviews?.();
         } catch (error) {
             this.showError(`Response could not be stopped: ${error.message}`);
+        } finally {
+            this.stopping = false;
+            if (this.running) this.setRunStatus("Ren is working…");
+            this.updateComposerState();
         }
     }
 
+    setRunStatus(text, iconClass = "pi pi-spin pi-spinner") {
+        this.runStatusText.textContent = text;
+        this.runStatusIcon.className = `${iconClass} fl-run-status-icon`;
+    }
+
+    setRunStatusForActiveTool(message) {
+        const tools = [...(message?.tools?.values() || [])];
+        for (let index = tools.length - 1; index >= 0; index--) {
+            if (tools[index].status !== "running") continue;
+            const config = getToolConfig(tools[index].name);
+            this.setRunStatus(config.runningLabel, config.iconClass);
+            return;
+        }
+        this.setRunStatus("Ren is working…");
+    }
+
     updateComposerState() {
-        this.sendButton.disabled = this.running || !this.textarea.value.trim();
+        const hasDraft = Boolean(
+            this.textarea.value.trim() || this.pendingAttachments.length
+        );
+        this.sendButton.disabled = this.uploadingAttachments
+            || this.stopping
+            || this.steering
+            || !hasDraft;
         this.sendButton.title = this.running
-            ? "Wait for the current response to finish"
+            ? "Steer Ren with this message (Enter)"
             : "Send message (Enter)";
         this.runStatus.hidden = !this.running;
-        if (!this.running) this.runStatusText.textContent = "Ren is working…";
+        this.stopButton.disabled = this.stopping || this.steering;
+        this.stopButton.textContent = this.stopping ? "Stopping…" : "Stop";
         this.textarea.disabled = false;
+        if (!this.running) this.setRunStatus("Ren is working…");
         if (this.running) {
             this.textarea.setAttribute("aria-describedby", "fl-run-drafting-hint");
         } else {
@@ -2589,18 +3422,237 @@ export class AssistantPanel {
     }
 
     retryLastMessage() {
-        if (!this.lastFailedMessage || this.running) return;
+        if ((!this.lastFailedMessage && !this.lastFailedAttachments.length) || this.running) return;
         if (this.lastFailedEditMessageId) {
-            this.runMessage(
+            this.startRunMessage(
                 this.lastFailedMessage,
                 this.lastFailedEditMessageId,
+                this.lastFailedSearchMode,
+                this.lastFailedAttachments,
             );
             return;
         }
+        if (this.lastFailedSearchMode) {
+            this.composerSearchSelect.value = this.lastFailedSearchMode;
+        }
         this.textarea.value = this.lastFailedMessage;
+        this.pendingAttachments = this.lastFailedAttachments.map(item => ({ ...item }));
+        this.renderPendingAttachments();
         this.resizeComposer();
         this.updateComposerState();
         this.send();
+    }
+
+    dragHasFiles(event) {
+        return Array.from(event.dataTransfer?.types || []).includes("Files");
+    }
+
+    handleImagePaste(event) {
+        const files = Array.from(event.clipboardData?.files || []).filter(file => (
+            String(file.type || "").startsWith("image/")
+        ));
+        if (!files.length) return;
+        event.preventDefault();
+        this.addImageFiles(files);
+    }
+
+    async imageDimensions(file) {
+        try {
+            const bitmap = await createImageBitmap(file);
+            const dimensions = { width: bitmap.width, height: bitmap.height };
+            bitmap.close?.();
+            return dimensions;
+        } catch (_) {
+            return { width: 0, height: 0 };
+        }
+    }
+
+    async addImageFiles(fileList) {
+        if (this.uploadingAttachments) return;
+        if (!this.uploadChatImage) {
+            this.showError("Image upload is unavailable until the ComfyUI bridge loads.");
+            return;
+        }
+        const available = MAX_CHAT_ATTACHMENTS - this.pendingAttachments.length;
+        const files = Array.from(fileList || []).slice(0, Math.max(0, available));
+        if (!files.length) {
+            this.showError(`Attach at most ${MAX_CHAT_ATTACHMENTS} images per message.`);
+            return;
+        }
+        const invalid = files.find(file => (
+            !CHAT_IMAGE_TYPES.has(String(file.type || "").toLowerCase())
+            || file.size > MAX_CHAT_ATTACHMENT_BYTES
+        ));
+        if (invalid) {
+            this.showError(`${invalid.name}: use PNG, JPEG, WebP, or GIF up to 32 MB.`);
+            return;
+        }
+        this.clearError();
+        this.uploadingAttachments = true;
+        this.composerContainer.classList.add("uploading");
+        this.updateComposerState();
+        const session = String(this.sessionManager.getSessionId() || "session")
+            .replace(/[^a-zA-Z0-9_-]+/g, "-")
+            .slice(0, 80);
+        const subfolder = `ren-chat/${session}`;
+        try {
+            for (const file of files) {
+                const [image, dimensions] = await Promise.all([
+                    this.uploadChatImage(file, subfolder),
+                    this.imageDimensions(file),
+                ]);
+                this.pendingAttachments.push({
+                    ...image,
+                    originalName: file.name || image.filename,
+                    mimeType: file.type,
+                    sizeBytes: file.size,
+                    ...dimensions,
+                });
+                this.renderPendingAttachments();
+            }
+            this.announce(`${files.length} ${files.length === 1 ? "image" : "images"} attached.`);
+        } catch (error) {
+            this.showError(`Image could not be attached: ${error.message}`);
+        } finally {
+            this.uploadingAttachments = false;
+            this.composerContainer.classList.remove("uploading");
+            this.updateComposerState();
+        }
+    }
+
+    renderPendingAttachments() {
+        this.attachmentTray.replaceChildren();
+        this.attachmentTray.hidden = this.pendingAttachments.length === 0;
+        if (this.pendingAttachments.length) {
+            this.attachmentTray.appendChild(this.createAttachmentGrid(
+                this.pendingAttachments,
+                { pending: true },
+            ));
+        }
+        this.updateComposerState();
+    }
+
+    removePendingAttachment(index) {
+        if (!Number.isInteger(index) || index < 0 || index >= this.pendingAttachments.length) return;
+        this.pendingAttachments.splice(index, 1);
+        this.renderPendingAttachments();
+    }
+
+    async usePendingAttachment(index) {
+        await this.useAttachment(this.pendingAttachments[index]);
+    }
+
+    async useAttachment(attachment) {
+        if (!attachment || !this.placeChatImageInSelectedNode) return;
+        try {
+            const result = await this.placeChatImageInSelectedNode(attachment);
+            this.clearError();
+            this.announce(`Image placed in ${result.title || `node ${result.node_id}`}.`);
+        } catch (error) {
+            this.showError(`Image could not be placed: ${error.message}`);
+        }
+    }
+
+    importedImageName(image, mimeType) {
+        const extensions = {
+            "image/jpeg": ".jpg",
+            "image/png": ".png",
+            "image/webp": ".webp",
+            "image/gif": ".gif",
+        };
+        let name = String(image?.filename || "");
+        if (!name && image?.url) {
+            try {
+                name = decodeURIComponent(new URL(image.url).pathname.split("/").pop() || "");
+            } catch (_) {
+                name = "";
+            }
+        }
+        const base = (name || "chat-image").replace(/\.[^.]+$/, "");
+        return `${base}${extensions[mimeType] || ".png"}`;
+    }
+
+    async importToolImage(image) {
+        if (!image) throw new Error("This image is no longer available.");
+        if (
+            image.kind === "comfy"
+            && image.type === "input"
+            && (image.subfolder === "ren-chat" || image.subfolder?.startsWith("ren-chat/"))
+        ) {
+            return {
+                ...image,
+                originalName: image.title || image.filename,
+                mimeType: "",
+                sizeBytes: 0,
+                width: 0,
+                height: 0,
+            };
+        }
+        const response = await fetch(this.toolImageImportSource(image));
+        if (!response.ok) {
+            throw new Error(`Image download failed (${response.status}).`);
+        }
+        const blob = await response.blob();
+        const mimeType = String(blob.type || "").split(";")[0].toLowerCase();
+        if (!CHAT_IMAGE_TYPES.has(mimeType) || blob.size > MAX_CHAT_ATTACHMENT_BYTES) {
+            throw new Error("The image format or size cannot be imported.");
+        }
+        const originalName = this.importedImageName(image, mimeType);
+        const file = new File([blob], originalName, { type: mimeType });
+        const session = String(this.sessionManager.getSessionId() || "session")
+            .replace(/[^a-zA-Z0-9_-]+/g, "-")
+            .slice(0, 80);
+        const [uploaded, dimensions] = await Promise.all([
+            this.uploadChatImage(file, `ren-chat/${session}`),
+            this.imageDimensions(file),
+        ]);
+        return {
+            ...uploaded,
+            originalName,
+            mimeType,
+            sizeBytes: file.size,
+            ...dimensions,
+        };
+    }
+
+    async attachToolImage(image) {
+        if (this.uploadingAttachments || this.pendingAttachments.length >= MAX_CHAT_ATTACHMENTS) {
+            this.showError(`Attach at most ${MAX_CHAT_ATTACHMENTS} images per message.`);
+            return;
+        }
+        this.uploadingAttachments = true;
+        this.composerContainer.classList.add("uploading");
+        this.updateComposerState();
+        try {
+            const attachment = await this.importToolImage(image);
+            this.pendingAttachments.push(attachment);
+            this.renderPendingAttachments();
+            this.clearError();
+            this.announce("Image attached to the next request.");
+        } catch (error) {
+            this.showError(`Image could not be attached: ${error.message}`);
+        } finally {
+            this.uploadingAttachments = false;
+            this.composerContainer.classList.remove("uploading");
+            this.updateComposerState();
+        }
+    }
+
+    async useToolImage(image) {
+        if (this.uploadingAttachments) return;
+        this.uploadingAttachments = true;
+        this.composerContainer.classList.add("uploading");
+        this.updateComposerState();
+        try {
+            const attachment = await this.importToolImage(image);
+            await this.useAttachment(attachment);
+        } catch (error) {
+            this.showError(`Image could not be placed: ${error.message}`);
+        } finally {
+            this.uploadingAttachments = false;
+            this.composerContainer.classList.remove("uploading");
+            this.updateComposerState();
+        }
     }
 
     resizeComposer() {
@@ -2630,7 +3682,9 @@ export class AssistantPanel {
             return;
         }
         this.jumpLatestButton.hidden = true;
-        requestAnimationFrame(() => {
+        if (this.followFrame !== null) return;
+        this.followFrame = requestAnimationFrame(() => {
+            this.followFrame = null;
             this.scrollElement.scrollTop = this.scrollElement.scrollHeight;
         });
     }
@@ -2681,6 +3735,13 @@ export class AssistantPanel {
         this.contextUnsubscribe = null;
         clearTimeout(this.undoTimer);
         clearTimeout(this.jumpScrollTimer);
+        if (this.followFrame !== null) cancelAnimationFrame(this.followFrame);
+        this.followFrame = null;
+        for (const history of this.container.querySelectorAll(".fl-toolchain-breadcrumb")) {
+            if (history.toolHistory?.renderFrame !== null) {
+                cancelAnimationFrame(history.toolHistory.renderFrame);
+            }
+        }
         document.removeEventListener("pointerdown", this.documentPointerHandler);
         this.container.replaceChildren();
         this.container.classList.remove("fl-chat-panel-host");

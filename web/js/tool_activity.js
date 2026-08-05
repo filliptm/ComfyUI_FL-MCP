@@ -112,6 +112,16 @@ export const TOOL_CONFIG = {
         label: "Review Output",
         description: "Loading generated pixels for visual review"
     },
+    "view_chat_image": {
+        icon: "👁️",
+        label: "Inspect Attachment",
+        description: "Loading the attached image for visual review"
+    },
+    "place_chat_image_in_node": {
+        icon: "📥",
+        label: "Use Image",
+        description: "Putting the attached image into the selected node"
+    },
     "view_node_mask": {
         icon: "🎭",
         label: "Inspect Mask",
@@ -120,7 +130,7 @@ export const TOOL_CONFIG = {
     "edit_node_mask": {
         icon: "🖌️",
         label: "Edit Mask",
-        description: "Painting mask regions and staging a review preview"
+        description: "Painting mask regions and updating the image node"
     },
     "confirm_mask_review": {
         icon: "✅",
@@ -304,6 +314,18 @@ export const TOOL_CONFIG = {
         description: "Searching for models and resources"
     },
 
+    // Web Research
+    "web_search": {
+        icon: "🌐",
+        label: "Web Search",
+        description: "Searching the public web"
+    },
+    "web_fetch_page": {
+        icon: "📄",
+        label: "Fetch Page",
+        description: "Reading and extracting a web page"
+    },
+
     // Node Library
     "node_library_search": {
         icon: "🔍",
@@ -429,6 +451,8 @@ const TOOL_ICON_CLASSES = {
     get_layout: "pi pi-table",
     queue_workflow: "pi pi-play",
     view_output_image: "pi pi-image",
+    view_chat_image: "pi pi-eye",
+    place_chat_image_in_node: "pi pi-sign-in",
     view_node_mask: "pi pi-eye",
     edit_node_mask: "pi pi-pencil",
     confirm_mask_review: "pi pi-check-circle",
@@ -438,6 +462,8 @@ const TOOL_ICON_CLASSES = {
     workflow_load_json: "pi pi-upload",
     workflow_save_current: "pi pi-save",
     take_screenshot: "pi pi-camera",
+    web_search: "pi pi-globe",
+    web_fetch_page: "pi pi-file",
     node_library_search: "pi pi-search",
     node_library_get_details: "pi pi-info-circle",
     manager_check_updates: "pi pi-refresh",
@@ -461,10 +487,14 @@ const TOOL_RUNNING_LABELS = {
     get_layout: "Reading layout",
     queue_workflow: "Queueing workflow",
     view_output_image: "Loading final output for review",
+    view_chat_image: "Inspecting attached image",
+    place_chat_image_in_node: "Placing image in selected node",
     view_node_mask: "Loading mask overlay",
-    edit_node_mask: "Staging mask edit",
+    edit_node_mask: "Saving mask edit",
     confirm_mask_review: "Waiting for mask approval",
     take_screenshot: "Capturing canvas",
+    web_search: "Searching the web",
+    web_fetch_page: "Reading web page",
     node_library_search: "Searching node library",
     manager_check_updates: "Checking for updates",
 };

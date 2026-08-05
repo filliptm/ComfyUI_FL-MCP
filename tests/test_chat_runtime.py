@@ -6,6 +6,7 @@ import chat_runtime as chat_runtime_module
 import pytest
 from chat_config import ChatSettingsStore
 from chat_runtime import (
+    CONTEXT_MAX_CHARS,
     ActiveRun,
     ChatRuntime,
     PendingApproval,
@@ -13,14 +14,22 @@ from chat_runtime import (
     bridge_settings,
     claude_tool_name,
     codex_tool_name,
+    compact_messages_for_model,
+    conversation_needs_compaction,
     install_codex_approval_handler,
-    model_settings_for_provider,
+    message_content_for_model,
+    native_prompt_with_compaction,
     normalize_approval_decision,
     normalize_assistant_timeline,
+    normalize_chat_attachments,
     should_request_approval,
     tool_result_content,
     tools_for_message,
     wait_for_claude_mcp,
+    wait_for_codex_mcp_status,
+    web_image_requested,
+    web_search_environment,
+    web_search_instructions,
 )
 from chat_store import ChatStore
 
@@ -30,20 +39,98 @@ def _payload(raw: str):
     return json.loads(line[5:].strip())
 
 
-def test_model_settings_only_send_supported_reasoning_parameter():
-    assert model_settings_for_provider({
-        "provider": "openai",
-        "reasoning_effort": "high",
-        "temperature": 0.2,
-    }) == {
-        "temperature": 0.2,
-        "openai_reasoning_effort": "high",
-    }
-    assert model_settings_for_provider({
-        "provider": "anthropic",
-        "reasoning_effort": "high",
-        "temperature": 0.2,
-    }) == {"temperature": 0.2}
+def test_chat_attachments_are_validated_and_added_to_model_context():
+    attachments = normalize_chat_attachments([{
+        "filename": "reference.png",
+        "subfolder": "ren-chat/session-1",
+        "type": "input",
+        "originalName": "Reference.png",
+        "mimeType": "image/png",
+        "sizeBytes": 2048,
+        "width": 1024,
+        "height": 768,
+    }])
+    model_content = message_content_for_model({
+        "content": "Use this image",
+        "metadata": {"attachments": attachments},
+    })
+
+    assert attachments[0]["type"] == "input"
+    assert "Use this image" in model_content
+    assert "view_chat_image" in model_content
+    assert '"subfolder":"ren-chat/session-1"' in model_content
+    with pytest.raises(ValueError, match="outside Ren's upload folder"):
+        normalize_chat_attachments([{
+            "filename": "secret.png",
+            "subfolder": "../output",
+            "type": "input",
+        }])
+
+
+def test_large_image_and_tool_history_compacts_to_a_bounded_checkpoint():
+    messages = []
+    for index in range(90):
+        messages.extend([
+            {
+                "id": f"user-{index}",
+                "role": "user",
+                "content": f"Request {index} " + ("detail " * 180),
+                "status": "complete",
+                "metadata": {},
+            },
+            {
+                "id": f"assistant-{index}",
+                "role": "assistant",
+                "content": f"Response {index} " + ("result " * 180),
+                "status": "interrupted" if index == 55 else "complete",
+                "metadata": {
+                    "toolSteps": [{
+                        "name": "workflow_overview",
+                        "status": "interrupted" if index == 55 else "done",
+                        "result": "data:image/png;base64," + ("A" * 8_000),
+                    }],
+                },
+            },
+        ])
+
+    compacted, did_compact = compact_messages_for_model(messages)
+
+    assert did_compact is True
+    assert compacted[0]["id"] == "context-checkpoint"
+    assert "interrupted" in compacted[0]["content"]
+    assert compacted[-1]["content"].startswith("Response 89")
+    assert "base64" not in "".join(item["content"] for item in compacted)
+    assert sum(len(item["content"]) + 64 for item in compacted) <= CONTEXT_MAX_CHARS
+
+
+def test_provider_usage_rolls_native_thread_into_bounded_prompt():
+    messages = [
+        {
+            "id": "assistant-old",
+            "role": "assistant",
+            "content": "Previous result",
+            "status": "complete",
+            "metadata": {"usage": {"total": {"totalTokens": 70_000}}},
+        },
+        {
+            "id": "user-new",
+            "role": "user",
+            "content": "Continue with the selected nodes",
+            "status": "complete",
+            "metadata": {},
+        },
+    ]
+
+    prompt, did_compact = native_prompt_with_compaction(
+        messages,
+        "Continue with the selected nodes",
+    )
+
+    assert conversation_needs_compaction(messages) is True
+    assert did_compact is True
+    assert "provider thread was rolled over" in prompt
+    assert prompt.endswith("Continue with the selected nodes")
+    assert len(prompt) <= CONTEXT_MAX_CHARS
 
 
 @pytest.mark.asyncio
@@ -66,6 +153,7 @@ async def test_starting_an_edit_creates_a_sibling_user_revision(tmp_path, monkey
         session_id="session-1",
         conversation_id=conversation["id"],
         message="edited",
+        search_mode="free",
         edit_message_id=original["id"],
     )
     await state.task
@@ -79,7 +167,40 @@ async def test_starting_an_edit_creates_a_sibling_user_revision(tmp_path, monkey
         "count": 2,
     }
     assert state.user_message_id == messages[0]["id"]
-    assert state.user_message_revision == messages[0]["revision"]
+    assert messages[0]["metadata"]["searchMode"] == "free"
+    assert _payload(state.events[0]) == {
+        "type": "RUN_STARTED",
+        "threadId": conversation["id"],
+        "runId": state.run_id,
+    }
+
+
+@pytest.mark.asyncio
+async def test_image_only_message_persists_attachments(tmp_path, monkeypatch):
+    settings = ChatSettingsStore(tmp_path / "settings.json")
+    settings.update({"provider": "ollama", "model": "qwen3"})
+    monkeypatch.setattr(chat_runtime_module, "chat_settings", settings)
+    store = ChatStore(tmp_path / "chat.db", tmp_path / "missing.db")
+    runtime = ChatRuntime(store)
+
+    async def finish_without_provider_call(state, _user_message_id):
+        state.done = True
+
+    monkeypatch.setattr(runtime, "_execute", finish_without_provider_call)
+    state = await runtime.start(
+        session_id="session-1",
+        conversation_id=None,
+        message="",
+        attachments=[{
+            "filename": "reference.png",
+            "subfolder": "ren-chat/session-1",
+            "type": "input",
+        }],
+    )
+    await state.task
+    message = store.list_messages(state.conversation_id)[0]
+    assert message["content"] == ""
+    assert message["metadata"]["attachments"][0]["filename"] == "reference.png"
 
 
 @pytest.mark.asyncio
@@ -127,6 +248,22 @@ async def test_run_events_track_text_tools_retries_and_replay(tmp_path):
     replay = [_payload(raw) async for raw in runtime.subscribe(state.run_id)]
     assert replay[0]["type"] == "TOOL_CALL_START"
     assert replay[-1]["type"] == "RUN_FINISHED"
+
+
+@pytest.mark.asyncio
+async def test_duplicate_run_started_events_are_suppressed(tmp_path):
+    runtime = ChatRuntime(ChatStore(tmp_path / "chat.db", tmp_path / "missing.db"))
+    state = ActiveRun("run-1", "conversation-1", "session-1")
+
+    event = {
+        "type": "RUN_STARTED",
+        "threadId": state.conversation_id,
+        "runId": state.run_id,
+    }
+    await runtime.publish(state, event)
+    await runtime.publish(state, event)
+
+    assert [_payload(raw) for raw in state.events] == [event]
 
 
 @pytest.mark.asyncio
@@ -313,11 +450,19 @@ def test_intent_tool_filter_keeps_core_and_adds_narrow_groups():
     basic = tools_for_message("Inspect the open graph")
     assert "workflow_overview" in basic
     assert "view_output_image" in basic
+    assert "view_chat_image" in basic
+    assert "place_chat_image_in_node" in basic
     assert "view_node_mask" in basic
     assert "edit_node_mask" in basic
     assert "confirm_mask_review" in basic
     assert "get_execution_history" in basic
+    assert "web_search" not in basic
+    assert "web_fetch_page" not in basic
     assert "manager_queue_action" not in basic
+
+    free_web = tools_for_message("Research current ComfyUI nodes", "free")
+    assert "web_search" in free_web
+    assert "web_fetch_page" in free_web
 
     manager = tools_for_message("Install a missing custom node with Manager")
     assert "manager_search_nodes" in manager
@@ -330,6 +475,65 @@ def test_intent_tool_filter_keeps_core_and_adds_narrow_groups():
     review = tools_for_message("Review the final output image for distortion")
     assert "view_output_image" in review
     assert "get_execution_details" in review
+
+
+def test_web_search_prompt_explains_selected_cost_and_capability():
+    assert "no-cost and best-effort" in web_search_instructions("free")
+    assert "one Tavily credit" in web_search_instructions("tavily_basic")
+    assert "two Tavily credits" in web_search_instructions("tavily_advanced")
+    assert "Web access is off" in web_search_instructions("off")
+    assert "include_images=true" in web_search_instructions("free")
+
+
+def test_web_images_require_explicit_user_intent():
+    assert web_image_requested("Find image references for a retro school bus factory")
+    assert web_image_requested("Show me what a 1970s bus assembly line looks like")
+    assert web_image_requested("I need photos of vintage factory interiors")
+    assert not web_image_requested("Research the history of school bus factories")
+    assert not web_image_requested("How does image generation work in ComfyUI?")
+
+
+def test_free_search_does_not_read_the_optional_tavily_credential(monkeypatch):
+    def unexpected_keychain_read(_provider):
+        raise AssertionError("free search must not touch Tavily credentials")
+
+    monkeypatch.setattr(
+        chat_runtime_module.credential_store,
+        "get",
+        unexpected_keychain_read,
+    )
+
+    assert web_search_environment({"search_mode": "free"}) == {
+        "FL_MCP_WEB_SEARCH_MODE": "free",
+        "FL_MCP_TAVILY_API_KEY": "",
+        "FL_MCP_WEB_IMAGES_ALLOWED": "0",
+    }
+
+    assert web_search_environment(
+        {"search_mode": "free"},
+        "Find photos of vintage school buses",
+    )["FL_MCP_WEB_IMAGES_ALLOWED"] == "1"
+
+
+@pytest.mark.asyncio
+async def test_tavily_run_requires_a_secure_api_key(tmp_path, monkeypatch):
+    settings = ChatSettingsStore(tmp_path / "settings.json")
+    settings.update({"provider": "ollama", "model": "qwen3"})
+    monkeypatch.setattr(chat_runtime_module, "chat_settings", settings)
+    monkeypatch.setattr(
+        chat_runtime_module.credential_store,
+        "get",
+        lambda provider: None if provider == "tavily" else None,
+    )
+    runtime = ChatRuntime(ChatStore(tmp_path / "chat.db", tmp_path / "missing.db"))
+
+    with pytest.raises(ValueError, match="Tavily search needs an API key"):
+        await runtime.start(
+            session_id="session-1",
+            conversation_id=None,
+            message="Search the web",
+            search_mode="tavily_basic",
+        )
 
 
 def test_tool_result_content_redacts_image_base64_from_chat_timeline():
@@ -415,9 +619,15 @@ async def test_cancel_expires_pending_approval_before_provider_interrupt(tmp_pat
     runtime = ChatRuntime(ChatStore(tmp_path / "chat.db", tmp_path / "missing.db"))
     state = ActiveRun("run-1", "conversation-1", "session-1")
     interrupted = False
+    settled = False
 
     async def active_task():
-        await asyncio.Event().wait()
+        nonlocal settled
+        try:
+            await asyncio.Event().wait()
+        finally:
+            await asyncio.sleep(0)
+            settled = True
 
     async def interrupt():
         nonlocal interrupted
@@ -433,12 +643,52 @@ async def test_cancel_expires_pending_approval_before_provider_interrupt(tmp_pat
     state.task = asyncio.create_task(active_task())
     state.cancel_callback = interrupt
     runtime.runs[state.run_id] = state
+    await asyncio.sleep(0)
 
     assert await runtime.cancel(state.run_id)
     assert interrupted is True
+    assert settled is True
     assert "approval-1" not in runtime.approvals
     with pytest.raises(asyncio.CancelledError):
         await state.task
+
+
+def test_interrupted_assistant_persists_partial_text_tools_and_provider_thread(tmp_path):
+    store = ChatStore(tmp_path / "chat.db", tmp_path / "missing.db")
+    conversation = store.create_conversation(provider="codex_subscription", model="model")
+    user = store.append_message(conversation["id"], "user", "initial request")
+    store.create_run("run-1", conversation["id"])
+    runtime = ChatRuntime(store)
+    state = ActiveRun(
+        "run-1",
+        conversation["id"],
+        "session-1",
+        settings={"provider": "codex_subscription", "model": "model"},
+        user_message_id=user["id"],
+        assistant_text="Partial answer",
+        tool_steps=[{
+            "id": "tool-1",
+            "name": "workflow_overview",
+            "status": "running",
+            "arguments": "{}",
+            "contentOffset": 0,
+        }],
+        interruption_reason="steered",
+        provider_metadata={"codexThreadId": "thread-1"},
+    )
+
+    runtime._persist_interrupted_assistant(state)
+    runtime._persist_interrupted_assistant(state)
+
+    messages = store.list_messages(conversation["id"])
+    assert len(messages) == 2
+    assistant = messages[-1]
+    assert assistant["status"] == "interrupted"
+    assert assistant["content"] == "Partial answer"
+    assert assistant["metadata"]["interrupted"] is True
+    assert assistant["metadata"]["interruptionReason"] == "steered"
+    assert assistant["metadata"]["codexThreadId"] == "thread-1"
+    assert assistant["metadata"]["toolSteps"][0]["status"] == "interrupted"
 
 
 @pytest.mark.asyncio
@@ -458,6 +708,21 @@ async def test_claude_waits_for_mcp_tool_discovery(monkeypatch):
     client = FakeClient()
     await wait_for_claude_mcp(client, timeout=1)
     assert client.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_codex_mcp_discovery_has_a_startup_timeout():
+    class HangingClient:
+        async def request(self, *_args, **_kwargs):
+            await asyncio.Event().wait()
+
+    with pytest.raises(RuntimeError, match="timed out while connecting"):
+        await wait_for_codex_mcp_status(
+            HangingClient(),
+            {"threadId": "thread-1"},
+            object,
+            timeout=0.01,
+        )
 
 
 @pytest.mark.asyncio

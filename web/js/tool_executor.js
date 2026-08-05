@@ -63,6 +63,7 @@ export class ToolExecutor {
             // Node Manipulation
             "get_node_values": this._handleGetNodeValues.bind(this),
             "get_node_image_ref": this._handleGetNodeImageRef.bind(this),
+            "place_chat_image_in_node": this._handlePlaceChatImageInNode.bind(this),
             "edit_node_mask": this._handleEditNodeMask.bind(this),
             "confirm_mask_review": this._handleConfirmMaskReview.bind(this),
             "set_node_values": this._handleSetNodeValues.bind(this),
@@ -429,22 +430,6 @@ export class ToolExecutor {
             let fitResult = null;
             if (fit_view) {
                 fitResult = await this.flApi.fitView(node_ids);
-                await new Promise(resolve => {
-                    let resolved = false;
-                    const finish = () => {
-                        if (!resolved) {
-                            resolved = true;
-                            resolve();
-                        }
-                    };
-
-                    setTimeout(finish, 500);
-                    if (typeof requestAnimationFrame === "function") {
-                        requestAnimationFrame(() => requestAnimationFrame(finish));
-                    } else {
-                        finish();
-                    }
-                });
             }
             
             // Take screenshot
@@ -484,6 +469,10 @@ export class ToolExecutor {
 
     async _handleGetNodeImageRef(params) {
         return this.flApi.getNodeImageRef(params.node_id);
+    }
+
+    async _handlePlaceChatImageInNode(params) {
+        return this.flApi.placeChatImageInNode(params.image, params.node_id);
     }
 
     async _handleEditNodeMask(params) {

@@ -19,6 +19,19 @@ test("sidebar keeps the stable Ren entry and reads live canvas context", async (
 });
 
 
+test("run identity remains available across CORS and provider startup", async () => {
+    const client = await readFile(new URL("web/js/chat_client.js", root), "utf8");
+    const runtime = await readFile(new URL("backend/chat_runtime.py", root), "utf8");
+    const server = await readFile(new URL("backend/server.py", root), "utf8");
+
+    assert.match(client, /event\.type === "RUN_STARTED"/);
+    assert.match(client, /markRunReady\(event\.runId, event\.threadId\)/);
+    assert.match(runtime, /Publish before provider setup/);
+    assert.match(runtime, /Codex timed out while connecting to the Ren MCP tools/);
+    assert.match(server, /expose_headers=/);
+});
+
+
 test("chat shell has compact two-row chrome and full-panel sheets", async () => {
     const panel = await readFile(new URL("web/js/chat_panel.js", root), "utf8");
 
@@ -52,6 +65,12 @@ test("settings use defined cards with live state and collapsed diagnostics", asy
     assert.match(panel, /<h2 id="fl-settings-title">Settings<\/h2>/);
     assert.match(panel, /fl-settings-card-model/);
     assert.match(panel, /Model &amp; provider/);
+    assert.match(panel, /fl-settings-card-search/);
+    assert.match(panel, /Free · no cost/);
+    assert.match(panel, /data-settings-state="search"/);
+    assert.match(panel, /data-setting="search_mode"/);
+    assert.match(panel, /data-setting="show_action_buttons"/);
+    assert.match(panel, /data-setting="tavily_credential"/);
     assert.match(panel, /fl-settings-card-approvals/);
     assert.match(panel, /Tool approvals/);
     assert.match(panel, /fl-settings-card-bridge/);
@@ -143,7 +162,7 @@ test("fixed chat chrome casts inward depth shadows over the message viewport", a
 });
 
 
-test("tool calls keep chronological placement and one shared renderer", async () => {
+test("tool calls use a compact summary with lazy vertical per-call cards", async () => {
     const panel = await readFile(new URL("web/js/chat_panel.js", root), "utf8");
     const runtime = await readFile(new URL("backend/chat_runtime.py", root), "utf8");
 
@@ -151,15 +170,65 @@ test("tool calls keep chronological placement and one shared renderer", async ()
     assert.match(panel, /renderPersistedAssistantTimeline/);
     assert.match(panel, /appendAssistantDelta/);
     assert.match(panel, /toolRailAtCursor/);
-    assert.match(panel, /renderToolStep/);
+    assert.match(panel, /renderToolHistory/);
+    assert.match(panel, /renderToolHistoryCards/);
+    assert.match(panel, /createToolHistoryCard/);
+    assert.match(panel, /renderToolHistoryCard/);
     assert.match(panel, /summarizeToolStep/);
-    assert.match(panel, /canStackToolSteps/);
-    assert.match(panel, /item\.toolSteps = \[step\]/);
-    assert.match(panel, /`×\$\{stack\.count\}`/);
-    assert.match(panel, /`Call \$\{index \+ 1\}/);
+    assert.doesNotMatch(panel, /groupToolSteps/);
+    assert.match(panel, /TOOL_HISTORY_INITIAL_STEPS = 60/);
+    assert.match(panel, /history\.steps\.push\(step\)/);
+    assert.match(panel, /history\.cards\.get\(step\)/);
+    assert.match(panel, /history\.steps\.slice\(firstVisible\)/);
+    assert.match(panel, /card\.setAttribute\("role", "listitem"\)/);
+    assert.match(panel, /fl-tool-history-icon/);
+    assert.match(panel, /tool\.iconClass \|\| "pi pi-cog"/);
+    assert.match(panel, /fl-toolchain-active-icon/);
     assert.match(panel, /event\.content/);
     assert.match(runtime, /"contentOffset": len\(state\.assistant_text\)/);
     assert.match(runtime, /normalize_assistant_timeline/);
+});
+
+
+test("web and generated images render in ordered chat galleries", async () => {
+    const panel = await readFile(new URL("web/js/chat_panel.js", root), "utf8");
+    const helpers = await readFile(new URL("web/js/chat_ui_helpers.js", root), "utf8");
+    const client = await readFile(new URL("web/js/chat_client.js", root), "utf8");
+    const markdown = await readFile(new URL("web/js/safe_markdown.js", root), "utf8");
+    const styles = await readFile(new URL("web/js/style.css", root), "utf8");
+    const routes = await readFile(new URL("backend/chat_routes.py", root), "utf8");
+
+    assert.match(panel, /renderToolImages/);
+    assert.match(panel, /MAX_TOOL_GALLERY_IMAGES = 12/);
+    assert.match(panel, /grid\.dataset\.layout = images\.length === 1/);
+    assert.match(panel, /image\.sourceUrl \|\| image\.url/);
+    assert.match(panel, /preview\.referrerPolicy = "no-referrer"/);
+    assert.match(helpers, /export function toolDisplayImages/);
+    assert.match(client, /api\/chat\/web-images\/preview/);
+    assert.match(panel, /resolveImageUrl: url => this\.chat\.webImagePreviewUrl\(url\)/);
+    assert.match(markdown, /parseMarkdownImageLine/);
+    assert.match(markdown, /fl-chat-image-grid fl-image-grid/);
+    assert.match(routes, /WebImagePreviewService/);
+    assert.match(routes, /WebImagePreviewService\(max_dimension=192\)/);
+    assert.match(styles, /\.fl-image-grid\s*\{[^}]*grid-template-columns:\s*repeat\(2,/s);
+    assert.match(styles, /data-layout="hero"[^}]*first-child/s);
+    assert.match(styles, /object-fit:\s*contain/);
+    assert.match(
+        styles,
+        /\.fl-tool-image-grid\[data-layout\]\s*\{[^}]*repeat\(auto-fill, minmax\(96px, 128px\)\)/s,
+    );
+    assert.match(
+        styles,
+        /\.fl-tool-image-grid \.fl-tool-image-card\s*\{[^}]*border:\s*0;[^}]*background:\s*transparent/s,
+    );
+    assert.match(
+        styles,
+        /\.fl-tool-image-grid\[data-layout="single"\] \.fl-tool-image-card a\s*\{[^}]*width:\s*fit-content;[^}]*aspect-ratio:\s*auto;[^}]*background:\s*transparent/s,
+    );
+    assert.match(
+        styles,
+        /\.fl-tool-image-grid \.fl-tool-image-card img\s*\{[^}]*width:\s*auto;[^}]*height:\s*auto;[^}]*max-height:\s*96px;[^}]*object-fit:\s*contain/s,
+    );
 });
 
 
@@ -169,18 +238,19 @@ test("action trail stays compact, visible, and visually quiet when complete", as
     const tools = await readFile(new URL("web/js/tool_activity.js", root), "utf8");
 
     assert.match(styles, /\.fl-message-timeline\s*\{[^}]*gap:\s*5px/s);
-    assert.match(styles, /\.fl-toolchain-breadcrumb\s*\{[^}]*gap:\s*3px/s);
-    assert.match(styles, /\.fl-toolchain-crumb summary\s*\{[^}]*min-height:\s*30px/s);
-    assert.match(styles, /\.fl-crumb-count\s*\{[^}]*border-radius:\s*999px/s);
-    assert.match(styles, /\.fl-toolchain-crumb\.completed\s*\{[^}]*background:\s*rgba\(255, 255, 255, 0\.018\)/s);
+    assert.match(styles, /\.fl-toolchain-summary\s*\{[^}]*grid-template-columns:/s);
+    assert.match(styles, /\.fl-tool-history-list\s*\{[^}]*flex-direction:\s*column/s);
+    assert.match(styles, /\.fl-toolchain-crumb summary\s*\{[^}]*grid-template-columns:/s);
+    assert.doesNotMatch(styles, /\.fl-tool-history-chip/);
+    assert.match(styles, /\.fl-toolchain-breadcrumb\.completed\s*\{[^}]*background:\s*rgba\(255, 255, 255, 0\.018\)/s);
+    assert.match(styles, /content-visibility:\s*auto/);
     assert.match(tools, /TOOL_ICON_CLASSES/);
     assert.match(tools, /pi pi-plus-circle/);
     assert.match(tools, /view_node_mask/);
     assert.match(tools, /edit_node_mask/);
     assert.match(tools, /confirm_mask_review/);
     assert.match(panel, /Replace this image mask\?/);
-    assert.match(panel, /stage a new mask for review/);
-    assert.match(panel, /image node will not change until you approve it/);
+    assert.match(panel, /save a new mask image, and update the selected image node/);
     assert.match(panel, /Use this mask\?/);
     assert.match(panel, /Needs changes/);
     assert.match(panel, /if \(!isMaskReview\) actions\.appendChild\(alwaysAllow\)/);
@@ -190,51 +260,122 @@ test("action trail stays compact, visible, and visually quiet when complete", as
 
 test("mask edits show a live preview and block queueing until review", async () => {
     const api = await readFile(new URL("web/js/fl_api.js", root), "utf8");
-    const panel = await readFile(new URL("web/js/chat_panel.js", root), "utf8");
     const executor = await readFile(new URL("web/js/tool_executor.js", root), "utf8");
+    const extension = await readFile(new URL("web/js/extension.js", root), "utf8");
+    const panel = await readFile(new URL("web/js/chat_panel.js", root), "utf8");
     const prompt = await readFile(new URL("backend/chat_prompt.md", root), "utf8");
-    const stagedEdit = api.slice(
+    const editImplementation = api.slice(
         api.indexOf("async editNodeMask"),
-        api.indexOf("    confirmMaskReview("),
+        api.indexOf("confirmMaskReview"),
     );
-    const approval = api.slice(
-        api.indexOf("    confirmMaskReview("),
-        api.indexOf("    discardMaskReview("),
+    const previewStart = api.indexOf("async _canvasToImage");
+    const previewImplementation = api.slice(
+        previewStart,
+        api.indexOf("_pauseAutoQueueForMaskReview", previewStart),
     );
 
-    assert.match(api, /node\.imgs = \[reviewImage\]/);
+    assert.match(api, /node\.imgs = \[reviewPreview\.image\]/);
+    assert.match(api, /previewUrl: reviewPreview\.url/);
+    assert.match(api, /this\._assignImageToNode\(node, pending\.image\)/);
+    assert.match(api, /preview\.src = api\.apiURL\(`\/fl_mcp\/image\/thumbnail\?/);
+    assert.match(api, /_releaseMaskReviewPreview/);
+    assert.match(api, /discardMaskReviews\(\)/);
+    assert.doesNotMatch(editImplementation, /_assignImageToNode/);
+    assert.doesNotMatch(editImplementation, /_setWidgetValue/);
+    assert.doesNotMatch(previewImplementation, /finally/);
+    assert.match(previewImplementation, /catch \(error\)[\s\S]*URL\.revokeObjectURL\(url\)/);
     assert.match(api, /app\.canvas\?\.centerOnNode\?\.\(node\)/);
     assert.match(api, /this\.pendingMaskReviews/);
-    assert.match(api, /api\.fetchApi\("\/upload\/image"/);
-    assert.doesNotMatch(api, /api\.fetchApi\("\/upload\/mask"/);
-    assert.doesNotMatch(api, /formData\.append\("original_ref"/);
     assert.match(api, /Mask review required for node/);
     assert.match(api, /_pauseAutoQueueForMaskReview/);
-    assert.match(api, /The node image changed after this mask was created/);
-    assert.match(api, /discardMaskReview\(nodeId, reviewToken\)/);
-    assert.match(api, /node\.imgs = undefined/);
-    assert.doesNotMatch(stagedEdit, /_setWidgetValue/);
-    assert.match(approval, /_setWidgetValue/);
-    assert.match(panel, /this\.discardMaskReview/);
-    assert.match(panel, /Mask preview could not be discarded/);
     assert.match(executor, /confirm_mask_review/);
+    assert.match(extension, /toolExecutor\.flApi\.discardMaskReviews\(\)/);
+    assert.match(panel, /this\.discardMaskReviews\?\.\(\)/);
     assert.match(prompt, /Never queue until the latest mask is approved/);
 });
 
 
-test("composer supports drafting during runs without queueing another message", async () => {
+test("composer can steer an active response and exposes real stop progress", async () => {
     const panel = await readFile(new URL("web/js/chat_panel.js", root), "utf8");
     const styles = await readFile(new URL("web/js/style.css", root), "utf8");
 
-    assert.match(panel, /this\.sendButton\.disabled = this\.running/);
+    assert.match(panel, /if \(this\.running\) \{\s*await this\.steer\(/);
+    assert.match(panel, /const cancelled = await this\.chat\.cancel\(\);/);
+    assert.match(panel, /const activeRunId = this\.chat\.runId \|\| await this\.chat\.runReady;/);
+    assert.match(panel, /attachments,\s*activeRunId,/);
+    assert.match(panel, /context === this\.currentRunContext && this\.steering/);
+    assert.match(panel, /Steer Ren with this message \(Enter\)/);
+    assert.match(panel, /Stopping Ren…/);
+    assert.match(panel, /fl-run-status-icon/);
+    assert.match(panel, /this\.setRunStatus\(toolConfig\.runningLabel, toolConfig\.iconClass\)/);
+    assert.match(panel, /setRunStatusForActiveTool/);
+    assert.match(panel, /this\.stopButton\.disabled = this\.stopping \|\| this\.steering/);
     assert.match(panel, /this\.textarea\.disabled = false/);
-    assert.match(panel, /if \(!message \|\| this\.running\) return/);
     assert.match(panel, /fl-run-status/);
-    assert.doesNotMatch(panel, /messageQueue|queuedMessage/);
+    assert.match(styles, /\.fl-inline-action:disabled/);
     assert.match(
         styles,
         /\.fl-chat-layout \.fl-chat-input:focus-visible\s*\{[^}]*outline:\s*0;[^}]*box-shadow:\s*inset 0 0 0 1px #b888ee/s,
     );
+});
+
+
+test("message sending has one attachment-aware run implementation", async () => {
+    const panel = await readFile(new URL("web/js/chat_panel.js", root), "utf8");
+    const runMethods = panel.match(/^    async runMessage\(/gm) || [];
+
+    assert.equal(runMethods.length, 1);
+    assert.match(panel, /const optimisticUser = editMessageId/);
+    assert.match(panel, /this\.appendMessage\("user", message, \{ attachments \}\)/);
+    assert.match(panel, /searchMode,[\s\S]*attachments,[\s\S]*steerRunId,/);
+    assert.match(panel, /onReady: \(\{ runId, conversationId, userMessage \}\)/);
+    assert.match(panel, /applyUserMessageMetadata\(article, message\)/);
+});
+
+
+test("chat accepts local images and can place them into a selected image node", async () => {
+    const panel = await readFile(new URL("web/js/chat_panel.js", root), "utf8");
+    const helpers = await readFile(new URL("web/js/chat_ui_helpers.js", root), "utf8");
+    const api = await readFile(new URL("web/js/fl_api.js", root), "utf8");
+    const extension = await readFile(new URL("web/js/extension.js", root), "utf8");
+    const runtime = await readFile(new URL("backend/chat_runtime.py", root), "utf8");
+    const mcp = await readFile(new URL("backend/mcp_server.py", root), "utf8");
+    const styles = await readFile(new URL("web/js/style.css", root), "utf8");
+
+    assert.match(panel, /data-action="attach-images"/);
+    assert.match(panel, /multiple hidden/);
+    assert.match(panel, /addEventListener\("paste"/);
+    assert.match(panel, /addEventListener\("drop"/);
+    assert.match(panel, /pendingAttachments/);
+    assert.match(panel, /use-message-attachment/);
+    assert.match(panel, /attach-tool-image/);
+    assert.match(panel, /use-tool-image/);
+    assert.match(panel, /importToolImage/);
+    assert.match(panel, /toolImagePreviewSource/);
+    assert.match(panel, /\/fl_mcp\/image\/thumbnail\?/);
+    assert.match(panel, /previewLink\.href = this\.toolImageOriginalSource\(image\)/);
+    assert.match(panel, /fetch\(this\.toolImageImportSource\(image\)\)/);
+    assert.match(helpers, /if \(name === "view_chat_image"\) return \[\];/);
+    assert.match(api, /api\.fetchApi\("\/upload\/image"/);
+    assert.match(api, /formData\.append\("image", file,/);
+    assert.match(api, /placeChatImageInNode/);
+    assert.match(api, /restoreNestedImageReferences/);
+    assert.match(api, /optionValues\.push\(widgetValue\)/);
+    assert.match(api, /\/fl_mcp\/image\/thumbnail\?/);
+    assert.match(api, /preview\.onload = \(\) => \{[\s\S]*node\.imgs = \[preview\]/);
+    assert.match(api, /preview\.onerror = \(\) =>/);
+    assert.match(api, /preview\.src = api\.apiURL\(`\/view\?/);
+    assert.match(extension, /afterConfigureGraph/);
+    assert.match(runtime, /message_content_for_model/);
+    assert.match(runtime, /"attachments": normalized_attachments/);
+    assert.match(mcp, /async def view_chat_image/);
+    assert.match(mcp, /async def place_chat_image_in_node/);
+    assert.match(styles, /\.fl-composer-attachments/);
+    assert.match(styles, /--fl-attachment-thumb-height:\s*48px/);
+    assert.match(styles, /--fl-attachment-thumb-width:\s*68px/);
+    assert.match(styles, /\.fl-chat-attachment\s*\{[^}]*border:\s*0;[^}]*background:\s*transparent;/s);
+    assert.match(styles, /\.fl-chat-attachment img\s*\{[^}]*width:\s*auto;[^}]*height:\s*auto;[^}]*object-fit:\s*contain/s);
+    assert.match(styles, /\.fl-chat-input-container\.drag-active/);
 });
 
 
@@ -246,20 +387,51 @@ test("reasoning can be set as a default and overridden in the composer", async (
     assert.match(panel, /data-reasoning="composer"/);
     assert.match(panel, /reasoningEffort: this\.composerReasoningSelect\.value/);
     assert.match(panel, /ultra: "Ultra"/);
-    assert.match(panel, /preset\?\.reasoning_efforts \|\| \[\]/);
     assert.match(client, /reasoningEffort: reasoningEffort \|\| "default"/);
+});
+
+
+test("web search can be selected per message and its composer action can be hidden", async () => {
+    const panel = await readFile(new URL("web/js/chat_panel.js", root), "utf8");
+    const client = await readFile(new URL("web/js/chat_client.js", root), "utf8");
+    const tools = await readFile(new URL("web/js/tool_activity.js", root), "utf8");
+
+    assert.match(panel, /data-search="composer"/);
+    assert.match(panel, /Free web/);
+    assert.match(panel, /Tavily basic/);
+    assert.match(panel, /Tavily deep/);
+    assert.match(panel, /searchMode = this\.composerSearchSelect\.value/);
+    assert.match(panel, /reasoningEffort: this\.composerReasoningSelect\.value,\s*searchMode,/);
+    assert.match(panel, /this\.composerActions\.hidden = !visible/);
+    assert.match(panel, /Default search remains active/);
+    assert.match(client, /searchMode: searchMode \|\| "free"/);
+    assert.match(tools, /web_search: "Searching the web"/);
+    assert.match(tools, /web_fetch_page: "Reading web page"/);
 });
 
 
 test("workflow queueing preserves ComfyUI frontend authentication", async () => {
     const api = await readFile(new URL("web/js/fl_api.js", root), "utf8");
-    const capture = await readFile(new URL("web/js/queue_capture.js", root), "utf8");
 
-    assert.match(api, /captureAuthenticatedQueue/);
-    assert.match(api, /\(\) => app\.queuePrompt\(0, effectiveBatchCount\)/);
-    assert.match(capture, /event\.detail\?\.requestId === requestId/);
-    assert.match(capture, /api\.queuePrompt === captureQueuePrompt/);
+    assert.match(api, /await app\.queuePrompt\(0, effectiveBatchCount\)/);
+    assert.match(api, /const originalQueuePrompt = api\.queuePrompt/);
+    assert.match(api, /api\.queuePrompt = originalQueuePrompt/);
     assert.match(api, /partner\/API nodes report "Please login first"/);
+});
+
+
+test("canvas screenshots wait for Fit View and thumbnails to settle", async () => {
+    const api = await readFile(new URL("web/js/fl_api.js", root), "utf8");
+    const executor = await readFile(new URL("web/js/tool_executor.js", root), "utf8");
+
+    assert.match(api, /await this\.waitForCanvasStable\(\)/);
+    assert.match(api, /stableFrames < 3/);
+    assert.match(api, /previewsReady\(\)/);
+    assert.match(api, /canvas\?\.draw\?\.\(true, true\)/);
+    assert.doesNotMatch(
+        executor,
+        /requestAnimationFrame\(\(\) => requestAnimationFrame\(finish\)\)/,
+    );
 });
 
 
@@ -313,9 +485,7 @@ test("sent requests can be edited, resent, and browsed by version", async () => 
     }
     assert.match(panel, /Send edited request/);
     assert.match(panel, /editMessageId/);
-    assert.match(panel, /applyUserMessageMetadata/);
     assert.match(panel, /selectMessageVersion/);
-    assert.match(client, /X-FL-MCP-User-Message-Id/);
     assert.match(client, /messages\/\$\{encodeURIComponent\(messageId\)\}\/version/);
     assert.match(styles, /\.fl-message-actions/);
     assert.match(styles, /\.fl-message-edit-form/);

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from typing import Literal
 
-
 ToolRisk = Literal["read_only", "canvas_edit", "approval_required"]
 
 CANVAS_EDIT_TOOLS = {
@@ -17,6 +16,7 @@ CANVAS_EDIT_TOOLS = {
     "select_nodes",
     "focus_on_nodes",
     "set_node_values",
+    "place_chat_image_in_node",
     "connect_nodes",
     "connect_nodes_batch",
     "auto_connect_workflow",
@@ -59,6 +59,8 @@ APPROVAL_REQUIRED_TOOLS = {
 }
 
 READ_ONLY_TOOLS = {
+    "web_search",
+    "web_fetch_page",
     "calculate_expressions",
     "wait",
     "query_workflow",
@@ -115,6 +117,7 @@ READ_ONLY_TOOLS = {
     "manager_search_external_models",
     "get_execution_history",
     "view_output_image",
+    "view_chat_image",
     "get_queue_status_details",
     "get_execution_details",
     "custom_nodes_list_packs",

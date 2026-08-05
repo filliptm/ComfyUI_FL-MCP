@@ -14,10 +14,10 @@ import {
     findNonOverlappingPosition,
     getGraphInsertionOrigin,
 } from "./node_placement.js";
-import { nodeIdsEqual, nodeMatchesQuery } from "./node_identity.js";
-import { captureAuthenticatedQueue } from "./queue_capture.js";
+import { nodeIdsEqual } from "./node_identity.js";
 import {
-    imageRefsEqual,
+    formatImageWidgetRef,
+    nestedImageRefForNode,
     normalizeMaskRegion,
     parseImageWidgetRef,
     summarizeMaskPixels,
@@ -471,6 +471,8 @@ export class FL_API {
             if (!canvasElement) {
                 throw new Error('Canvas element not found');
             }
+
+            await this.waitForCanvasStable();
             
             console.log(`[FL_API] Taking screenshot (${format}, quality: ${quality})`);
             
@@ -516,6 +518,45 @@ export class FL_API {
             console.error('[FL_API] Screenshot error:', error);
             throw error;
         }
+    }
+
+    async waitForCanvasStable(timeoutMs = 1200) {
+        const canvas = app.canvas;
+        const nextFrame = () => new Promise(resolve => {
+            if (typeof requestAnimationFrame === "function") {
+                requestAnimationFrame(resolve);
+            } else {
+                setTimeout(resolve, 16);
+            }
+        });
+        const snapshot = () => [
+            Number(canvas?.ds?.scale || 0),
+            Number(canvas?.ds?.offset?.[0] || 0),
+            Number(canvas?.ds?.offset?.[1] || 0),
+        ];
+        const previewsReady = () => (app.graph?._nodes || []).every(node =>
+            (node.imgs || []).every(image => image.complete !== false)
+        );
+
+        const started = Date.now();
+        let previous = snapshot();
+        let stableFrames = 0;
+        while (Date.now() - started < timeoutMs && stableFrames < 3) {
+            await nextFrame();
+            const current = snapshot();
+            const transformStable = current.every(
+                (value, index) => Math.abs(value - previous[index]) < 0.0001
+            );
+            stableFrames = transformStable && previewsReady() ? stableFrames + 1 : 0;
+            previous = current;
+        }
+
+        // Force a complete foreground/background redraw so toBlob never sees
+        // stale frames left behind by Fit View's animated transform.
+        canvas?.setDirty?.(true, true);
+        canvas?.draw?.(true, true);
+        await nextFrame();
+        canvas?.draw?.(true, true);
     }
 
     // ==================== NODE MANIPULATION ====================
@@ -608,6 +649,100 @@ export class FL_API {
         };
     }
 
+    async uploadChatImage(file, subfolder) {
+        if (!(file instanceof Blob) || !String(file.type || "").startsWith("image/")) {
+            throw new Error("Choose a PNG, JPEG, or WebP image.");
+        }
+        const originalName = String(file.name || "image.png");
+        const safeName = originalName.replace(/[^a-zA-Z0-9._-]+/g, "-").slice(-160)
+            || "image.png";
+        const uploadName = `${Date.now()}-${crypto.randomUUID().slice(0, 8)}-${safeName}`;
+        const formData = new FormData();
+        formData.append("image", file, uploadName);
+        formData.append("type", "input");
+        formData.append("subfolder", subfolder);
+        formData.append("overwrite", "false");
+        const response = await api.fetchApi("/upload/image", {
+            method: "POST",
+            body: formData,
+        });
+        if (!response.ok) {
+            const detail = await response.text().catch(() => "");
+            throw new Error(
+                `Image upload failed (${response.status}${detail ? `: ${detail}` : ""})`
+            );
+        }
+        const uploaded = await response.json();
+        if (!uploaded?.name) {
+            throw new Error("Image upload response did not include a filename.");
+        }
+        return {
+            filename: uploaded.name,
+            subfolder: uploaded.subfolder || subfolder,
+            type: uploaded.type || "input",
+        };
+    }
+
+    placeChatImageInNode(image, nodeId = null) {
+        const hasExplicitNode = nodeId !== null && nodeId !== undefined;
+        let node = hasExplicitNode ? this._findNode(nodeId) : null;
+        if (hasExplicitNode && !node) {
+            throw new Error(`Node not found: ${nodeId}`);
+        }
+        if (!node) {
+            const selected = Object.values(app.canvas?.selected_nodes || {}).filter(
+                candidate => candidate.widgets?.some(widget => widget.name === "image")
+            );
+            if (selected.length !== 1) {
+                throw new Error(
+                    selected.length === 0
+                        ? "Select one Load Image node on the canvas first."
+                        : "Select only one Load Image node before placing the image."
+                );
+            }
+            [node] = selected;
+        }
+        const imageWidget = node.widgets?.find(widget => widget.name === "image");
+        if (!imageWidget) {
+            throw new Error(`Node ${node.id} has no image widget.`);
+        }
+        if (!image?.filename || (image.type || "input") !== "input") {
+            throw new Error("The chat attachment is not a valid ComfyUI input image.");
+        }
+        const normalized = {
+            filename: String(image.filename),
+            subfolder: String(image.subfolder || ""),
+            type: "input",
+        };
+        const previousImage = parseImageWidgetRef(imageWidget.value);
+
+        const pendingEntry = [...this.pendingMaskReviews.entries()].find(
+            ([, value]) => nodeIdsEqual(value.nodeId, node.id)
+        );
+        if (pendingEntry) {
+            this._releaseMaskReviewPreview(pendingEntry[1]);
+            this.pendingMaskReviews.delete(pendingEntry[0]);
+            if (this.pendingMaskReviews.size === 0) {
+                this._restoreAutoQueueAfterMaskReview(this.maskReviewAutoQueueState);
+                this.maskReviewAutoQueueState = null;
+            }
+        }
+        this._assignImageToNode(node, normalized);
+        app.canvas?.selectNodes?.([node]);
+        app.canvas?.centerOnNode?.(node);
+        this._markGraphChanged();
+        return {
+            success: true,
+            node_id: node.id,
+            node_type: node.comfyClass || node.type,
+            title: node.title,
+            image: normalized,
+            previous_image: previousImage,
+            queued: false,
+            message: "Image assigned to the node. The workflow was not queued.",
+        };
+    }
+
     async editNodeMask(nodeId, regions, coordinateSpace = "pixels", clearExisting = false) {
         const node = this._findNode(nodeId);
         if (!node) {
@@ -618,10 +753,13 @@ export class FL_API {
             throw new Error(`Node ${nodeId} has no image widget to receive the edited mask`);
         }
 
-        const existingReview = this._findPendingMaskReview(node.id)?.[1];
-        const currentImage = this.getNodeImageRef(nodeId).image;
-        const source = existingReview?.image || currentImage;
-        const baseImage = existingReview?.baseImage || currentImage;
+        const existingReviewEntry = [...this.pendingMaskReviews.entries()].find(
+            ([, value]) => nodeIdsEqual(value.nodeId, node.id)
+        );
+        const existingReview = existingReviewEntry?.[1];
+        const originalImage = existingReview?.originalImage
+            || this.getNodeImageRef(nodeId).image;
+        const source = existingReview?.image || originalImage;
         const [rgbImage, alphaImage] = await Promise.all([
             this._loadComfyImage(source, "rgb"),
             this._loadComfyImage(source, "a"),
@@ -700,7 +838,6 @@ export class FL_API {
         highlightContext.drawImage(maskCanvas, 0, 0);
         reviewContext.globalAlpha = 0.62;
         reviewContext.drawImage(highlightCanvas, 0, 0);
-        const reviewImage = await this._canvasToImage(reviewCanvas);
         const uploadCanvas = document.createElement("canvas");
         uploadCanvas.width = rgbImage.width;
         uploadCanvas.height = rgbImage.height;
@@ -718,7 +855,8 @@ export class FL_API {
         formData.append("image", blob, filename);
         formData.append("type", "input");
         formData.append("subfolder", "fl_mcp_masks");
-        const response = await api.fetchApi("/upload/image", {
+        formData.append("original_ref", JSON.stringify(source));
+        const response = await api.fetchApi("/upload/mask", {
             method: "POST",
             body: formData,
         });
@@ -737,20 +875,23 @@ export class FL_API {
             subfolder: uploaded.subfolder || "",
             type: uploaded.type || "input",
         };
-        const widgetPath = [image.subfolder, image.filename].filter(Boolean).join("/");
-        const widgetValue = `${widgetPath} [${image.type}]`;
+        const reviewPreview = await this._canvasToImage(reviewCanvas);
         const reviewToken = crypto.randomUUID();
         if (this.pendingMaskReviews.size === 0) {
             this.maskReviewAutoQueueState = this._pauseAutoQueueForMaskReview();
+        }
+        if (existingReviewEntry) {
+            this._releaseMaskReviewPreview(existingReview);
         }
         this.pendingMaskReviews.set(String(node.id), {
             token: reviewToken,
             nodeId: node.id,
             image,
-            baseImage,
-            widgetValue,
+            originalImage,
+            previewUrl: reviewPreview.url,
         });
-        node.imgs = [reviewImage];
+        node.imgs = [reviewPreview.image];
+        node.imageIndex = 0;
         app.canvas?.selectNodes?.([node]);
         app.canvas?.centerOnNode?.(node);
         this._markCanvasDirty();
@@ -772,7 +913,9 @@ export class FL_API {
     }
 
     confirmMaskReview(nodeId, reviewToken) {
-        const pendingEntry = this._findPendingMaskReview(nodeId);
+        const pendingEntry = [...this.pendingMaskReviews.entries()].find(
+            ([, value]) => nodeIdsEqual(value.nodeId, nodeId)
+        );
         const pending = pendingEntry?.[1];
         if (!pending) {
             throw new Error(`There is no edited mask on node ${nodeId} waiting for review`);
@@ -782,32 +925,15 @@ export class FL_API {
         }
         const node = this._findNode(pending.nodeId);
         if (!node) {
-            this.discardMaskReview(pending.nodeId, pending.token);
-            throw new Error("The edited image node was removed before the mask was approved");
+            throw new Error(`Node not found: ${pending.nodeId}`);
         }
-        const currentImage = this.getNodeImageRef(pending.nodeId).image;
-        if (!imageRefsEqual(currentImage, pending.baseImage)) {
-            this.discardMaskReview(pending.nodeId, pending.token);
-            throw new Error("The node image changed after this mask was created; review the current mask before approving it");
+        this._assignImageToNode(node, pending.image);
+        this._releaseMaskReviewPreview(pending);
+        this.pendingMaskReviews.delete(pendingEntry[0]);
+        if (this.pendingMaskReviews.size === 0) {
+            this._restoreAutoQueueAfterMaskReview(this.maskReviewAutoQueueState);
+            this.maskReviewAutoQueueState = null;
         }
-        const imageWidget = node.widgets?.find(widget => widget.name === "image");
-        if (!imageWidget) {
-            this.discardMaskReview(pending.nodeId, pending.token);
-            throw new Error(`Node ${pending.nodeId} no longer has an image widget`);
-        }
-        this._setWidgetValue(node, imageWidget, pending.widgetValue);
-        node.images = [pending.image];
-        node.imgs = undefined;
-        if (node.properties) {
-            node.properties.image = pending.widgetValue;
-        }
-        if (node.widgets_values && node.widgets) {
-            const widgetIndex = node.widgets.indexOf(imageWidget);
-            if (widgetIndex >= 0) {
-                node.widgets_values[widgetIndex] = pending.widgetValue;
-            }
-        }
-        this._finishMaskReview(pendingEntry[0]);
         this._markGraphChanged();
         return {
             success: true,
@@ -819,27 +945,27 @@ export class FL_API {
         };
     }
 
-    discardMaskReview(nodeId, reviewToken) {
-        const pendingEntry = this._findPendingMaskReview(nodeId);
-        const pending = pendingEntry?.[1];
-        if (!pending) {
-            return { success: true, discarded: false };
+    discardMaskReviews() {
+        const reviews = [...this.pendingMaskReviews.values()];
+        for (const pending of reviews) {
+            const node = this._findNode(pending.nodeId);
+            if (node) {
+                const imageWidget = node.widgets?.find(widget => widget.name === "image");
+                const currentImage = parseImageWidgetRef(imageWidget?.value)
+                    || pending.originalImage;
+                if (currentImage) {
+                    this._loadNodeImagePreview(node, currentImage);
+                }
+            }
+            this._releaseMaskReviewPreview(pending);
         }
-        if (reviewToken && pending.token !== reviewToken) {
-            throw new Error("This mask review is stale; only the latest mask can be discarded");
+        this.pendingMaskReviews.clear();
+        if (reviews.length > 0) {
+            this._restoreAutoQueueAfterMaskReview(this.maskReviewAutoQueueState);
+            this.maskReviewAutoQueueState = null;
+            this._markCanvasDirty();
         }
-        const node = this._findNode(pending.nodeId);
-        if (node) {
-            node.imgs = undefined;
-        }
-        this._finishMaskReview(pendingEntry[0]);
-        this._markCanvasDirty();
-        return {
-            success: true,
-            discarded: true,
-            node_id: pending.nodeId,
-            review_token: pending.token,
-        };
+        return reviews.length;
     }
 
     /**
@@ -1757,6 +1883,7 @@ export class FL_API {
         }
 
         await app.loadGraphData(workflow, clean, restoreView, name || null);
+        this.restoreNestedImageReferences();
         this._markGraphChanged();
         return {
             success: true,
@@ -1853,11 +1980,6 @@ export class FL_API {
      */
     async queueWorkflow(batchCount = null) {
         try {
-            for (const pending of [...this.pendingMaskReviews.values()]) {
-                if (!this._findNode(pending.nodeId)) {
-                    this.discardMaskReview(pending.nodeId, pending.token);
-                }
-            }
             if (this.pendingMaskReviews.size > 0) {
                 const pending = this.pendingMaskReviews.values().next().value;
                 throw new Error(
@@ -1886,13 +2008,28 @@ export class FL_API {
                 if (app.processingQueue) {
                     throw new Error("ComfyUI is still preparing another queue request. Try again shortly.");
                 }
-                const capture = await captureAuthenticatedQueue(
-                    api,
-                    () => app.queuePrompt(0, effectiveBatchCount),
-                );
-                queueResult = capture.result;
-                if (!capture.accepted || !queueResult) {
-                    throw new Error("ComfyUI did not accept the workflow for queueing.");
+                const originalQueuePrompt = api.queuePrompt;
+                const capturedResults = [];
+                let capturedError = null;
+                api.queuePrompt = async (...args) => {
+                    try {
+                        const result = await originalQueuePrompt.apply(api, args);
+                        capturedResults.push(result);
+                        return result;
+                    } catch (error) {
+                        capturedError = error;
+                        throw error;
+                    }
+                };
+                try {
+                    const accepted = await app.queuePrompt(0, effectiveBatchCount);
+                    if (capturedError) throw capturedError;
+                    queueResult = capturedResults.at(-1) || null;
+                    if (!accepted || !queueResult) {
+                        throw new Error("ComfyUI did not accept the workflow for queueing.");
+                    }
+                } finally {
+                    api.queuePrompt = originalQueuePrompt;
                 }
             } else {
                 const prompt = await app.graphToPrompt();
@@ -2146,6 +2283,81 @@ export class FL_API {
         return await createImageBitmap(blob);
     }
 
+    restoreNestedImageReferences(nodes = app.graph?._nodes || []) {
+        let restored = 0;
+        for (const node of nodes) {
+            const image = nestedImageRefForNode(node);
+            if (!image) continue;
+            this._assignImageToNode(node, image, { notify: false });
+            restored++;
+        }
+        if (restored > 0) this._markCanvasDirty();
+        return restored;
+    }
+
+    _assignImageToNode(node, image, { notify = true } = {}) {
+        const imageWidget = node.widgets?.find(widget => widget.name === "image");
+        if (!imageWidget) {
+            throw new Error(`Node ${node.id} has no image widget.`);
+        }
+        const widgetValue = formatImageWidgetRef(image);
+        if (!widgetValue) {
+            throw new Error(`Node ${node.id} received an invalid image reference.`);
+        }
+        const optionValues = imageWidget.options?.values;
+        if (Array.isArray(optionValues) && !optionValues.includes(widgetValue)) {
+            // Nested inputs are executable but absent from ComfyUI's top-level
+            // Load Image choices, so keep the canonical value visibly valid.
+            optionValues.push(widgetValue);
+        }
+        if (notify) this._setWidgetValue(node, imageWidget, widgetValue);
+        else imageWidget.value = widgetValue;
+        node.images = [image];
+        this._loadNodeImagePreview(node, image);
+        node.properties = node.properties || {};
+        node.properties.image = widgetValue;
+        if (node.widgets_values && node.widgets) {
+            const widgetIndex = node.widgets.indexOf(imageWidget);
+            if (widgetIndex >= 0) node.widgets_values[widgetIndex] = widgetValue;
+        }
+    }
+
+    _loadNodeImagePreview(node, ref) {
+        const params = new URLSearchParams({
+            filename: ref.filename,
+            subfolder: ref.subfolder || "",
+            type: ref.type || "input",
+        });
+        const preview = new Image();
+        let usingOriginalFallback = false;
+        preview.onload = () => {
+            // Never attach an incomplete or failed image to LiteGraph. Some
+            // ComfyUI renderers retain stale canvas frames when drawing one.
+            node.imgs = [preview];
+            node.imageIndex = 0;
+            this._markCanvasDirty();
+        };
+        preview.onerror = () => {
+            if (usingOriginalFallback) {
+                console.warn(`[FL_API] Image preview failed for node ${node.id}`);
+                return;
+            }
+            // During plugin upgrades the refreshed frontend can briefly run
+            // against an older Python process without the thumbnail route.
+            usingOriginalFallback = true;
+            const originalParams = new URLSearchParams(params);
+            originalParams.set("rand", String(Date.now()));
+            preview.src = api.apiURL(`/view?${originalParams.toString()}`);
+        };
+        // Canvas rendering uses a bounded cached preview. The original path
+        // remains in the widget value above and is what graphToPrompt executes.
+        preview.src = api.apiURL(`/fl_mcp/image/thumbnail?${params.toString()}`);
+    }
+
+    _releaseMaskReviewPreview(review) {
+        if (review?.previewUrl) URL.revokeObjectURL(review.previewUrl);
+    }
+
     _canvasToBlob(canvas) {
         return new Promise((resolve, reject) => {
             canvas.toBlob(blob => {
@@ -2169,23 +2381,10 @@ export class FL_API {
                     image.onerror = () => reject(new Error("Failed to load mask review preview"));
                 });
             }
-            return image;
-        } finally {
+            return { image, url };
+        } catch (error) {
             URL.revokeObjectURL(url);
-        }
-    }
-
-    _findPendingMaskReview(nodeId) {
-        return [...this.pendingMaskReviews.entries()].find(
-            ([, value]) => nodeIdsEqual(value.nodeId, nodeId)
-        );
-    }
-
-    _finishMaskReview(key) {
-        this.pendingMaskReviews.delete(key);
-        if (this.pendingMaskReviews.size === 0) {
-            this._restoreAutoQueueAfterMaskReview(this.maskReviewAutoQueueState);
-            this.maskReviewAutoQueueState = null;
+            throw error;
         }
     }
 
@@ -2308,7 +2507,18 @@ export class FL_API {
             return query;
         }
 
-        return app.graph._nodes.find(node => nodeMatchesQuery(node, query)) || null;
+        if (typeof query === "number") {
+            return app.graph._nodes.find(n => nodeIdsEqual(n.id, query)) || null;
+        }
+
+        if (typeof query === "string") {
+            return app.graph._nodes.find(n => nodeIdsEqual(n.id, query)) ||
+                   app.graph._nodes.find(n => n.title === query) ||
+                   app.graph._nodes.find(n => n.type === query || n.comfyClass === query) ||
+                   null;
+        }
+
+        return null;
     }
 
     /**
@@ -2322,9 +2532,29 @@ export class FL_API {
 
         const nodes = app.graph._nodes;
 
-        for (let i = nodes.length - 1; i >= 0; i--) {
-            if (nodeMatchesQuery(nodes[i], query)) return nodes[i];
+        if (typeof query === "number") {
+            for (let i = nodes.length - 1; i >= 0; i--) {
+                if (nodeIdsEqual(nodes[i].id, query)) return nodes[i];
+            }
+            return null;
         }
+
+        if (typeof query === "string") {
+            // Try ID first so serialized string IDs remain addressable.
+            for (let i = nodes.length - 1; i >= 0; i--) {
+                if (nodeIdsEqual(nodes[i].id, query)) return nodes[i];
+            }
+            // Try title first
+            for (let i = nodes.length - 1; i >= 0; i--) {
+                if (nodes[i].title === query) return nodes[i];
+            }
+            // Then type
+            for (let i = nodes.length - 1; i >= 0; i--) {
+                if (nodes[i].type === query || nodes[i].comfyClass === query) return nodes[i];
+            }
+            return null;
+        }
+
         return null;
     }
 }

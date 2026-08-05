@@ -2,13 +2,13 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
-    canStackToolSteps,
     isNearBottom,
     modelProviderSummary,
     starterPrompts,
     summarizeToolStep,
     technicalText,
-    toolStackState,
+    toolDisplayImages,
+    toolHistorySummary,
 } from "../../web/js/chat_ui_helpers.js";
 
 
@@ -133,31 +133,212 @@ test("image review and mask summaries report the visible outcome", () => {
     }), "Mask approved for workflow");
 });
 
-test("consecutive identical tool calls stack and retain the strongest state", () => {
-    assert.equal(
-        canStackToolSteps({ name: "modify_layout" }, { name: "modify_layout" }),
-        true,
-    );
-    assert.equal(
-        canStackToolSteps({ name: "modify_layout" }, { name: "workflow_overview" }),
-        false,
-    );
+test("image review and mask summaries report the visible outcome", () => {
+    assert.equal(summarizeToolStep({
+        name: "view_output_image",
+        status: "done",
+        result: JSON.stringify({
+            selectedOutputIndex: 3,
+            availableOutputCount: 4,
+            originalSize: { width: 768, height: 768 },
+        }),
+    }), "Reviewed final output · 768×768");
 
-    const completed = toolStackState([
-        { name: "modify_layout", status: "done", result: "one" },
-        { name: "modify_layout", status: "done", result: "two" },
-        { name: "modify_layout", status: "done", result: "three" },
-    ]);
-    assert.equal(completed.count, 3);
-    assert.equal(completed.status, "done");
-    assert.equal(completed.step.result, "three");
+    const maskResult = [{
+        type: "text",
+        text: JSON.stringify({
+            node_id: 12,
+            title: "LOAD & MASK IMAGE",
+            mask: { coveragePercent: 4 },
+        }),
+    }, {
+        type: "image",
+        data: "[image content shown to Ren]",
+    }];
+    assert.equal(summarizeToolStep({
+        name: "view_node_mask",
+        status: "done",
+        result: JSON.stringify(maskResult),
+    }), "Inspected mask on LOAD & MASK IMAGE · 4% covered");
 
-    const mixed = toolStackState([
-        { name: "modify_layout", status: "done" },
-        { name: "modify_layout", status: "failed" },
-        { name: "modify_layout", status: "running" },
-    ]);
-    assert.equal(mixed.status, "running");
+    assert.equal(summarizeToolStep({
+        name: "edit_node_mask",
+        status: "done",
+        arguments: JSON.stringify({ request: {
+            clear_existing: true,
+            regions: [{ operation: "paint" }, { operation: "paint" }],
+        } }),
+        result: JSON.stringify({ mask: { coveragePercent: 3.125 } }),
+    }), "Replaced mask with 2 mask regions · 3.13% covered");
+
+    assert.equal(summarizeToolStep({
+        name: "view_output_image",
+        status: "failed",
+    }), "Couldn’t review output image");
+
+    assert.equal(summarizeToolStep({
+        name: "confirm_mask_review",
+        status: "done",
+    }), "Mask approved for workflow");
+});
+
+test("web research summaries identify provider, cost, and fetched content", () => {
+    assert.equal(summarizeToolStep({
+        name: "web_search",
+        status: "done",
+        result: JSON.stringify({
+            provider: "free",
+            results: [{}, {}, {}],
+            credits_used: 0,
+        }),
+    }), "Searched Free web · 3 sources");
+    assert.equal(summarizeToolStep({
+        name: "web_search",
+        status: "done",
+        result: JSON.stringify({
+            provider: "tavily",
+            results: [{}],
+            credits_used: 2,
+        }),
+    }), "Searched Tavily · 1 source · 2 credits");
+    assert.equal(summarizeToolStep({
+        name: "web_fetch_page",
+        status: "done",
+        result: JSON.stringify({
+            title: "Example reference",
+            contentLength: 12345,
+            fromCache: true,
+            images: [{ url: "https://example.com/one.png" }, { url: "https://example.com/two.png" }],
+        }),
+    }), "Read Example reference from cache · 12,345 chars · 2 images");
+    assert.equal(summarizeToolStep({
+        name: "web_search",
+        status: "failed",
+    }), "Couldn’t search the web");
+});
+
+test("tool image candidates preserve source order and reject unsafe URLs", () => {
+    assert.deepEqual(toolDisplayImages({
+        name: "web_fetch_page",
+        result: JSON.stringify({
+            images: [{
+                url: "https://images.example/hero.png",
+                source_url: "https://example.com/article",
+                alt: "Primary reference",
+                width: 1200,
+                height: 800,
+            }, {
+                url: "javascript:alert(1)",
+                alt: "Unsafe",
+            }, {
+                url: "https://images.example/hero.png",
+                alt: "Duplicate",
+            }, {
+                url: "https://images.example/detail.webp",
+                title: "Detail",
+            }],
+        }),
+    }), [{
+        kind: "web",
+        url: "https://images.example/hero.png",
+        sourceUrl: "https://example.com/article",
+        title: "",
+        alt: "Primary reference",
+        width: 1200,
+        height: 800,
+    }, {
+        kind: "web",
+        url: "https://images.example/detail.webp",
+        sourceUrl: "",
+        title: "Detail",
+        alt: "Detail",
+        width: null,
+        height: null,
+    }]);
+
+    assert.deepEqual(toolDisplayImages({
+        name: "view_output_image",
+        result: JSON.stringify({
+            image: { filename: "final.png", subfolder: "run", type: "output" },
+        }),
+    }), [{
+        kind: "comfy",
+        filename: "final.png",
+        subfolder: "run",
+        type: "output",
+        title: "Generated output",
+        alt: "Generated ComfyUI output",
+    }]);
+
+    assert.deepEqual(toolDisplayImages({
+        name: "view_chat_image",
+        result: JSON.stringify({
+            image: { filename: "reference.png", subfolder: "ren-chat/session", type: "input" },
+            displayImages: [{
+                kind: "comfy",
+                filename: "reference.png",
+                subfolder: "ren-chat/session",
+                type: "input",
+            }],
+        }),
+    }), []);
+});
+
+test("tool images survive Codex MCP wrappers with null outer structured content", () => {
+    const reviewedOutput = {
+        success: true,
+        selectedOutputIndex: 0,
+        availableOutputCount: 1,
+        image: { filename: "ComfyUI_00117.png", subfolder: "", type: "output" },
+        originalSize: { width: 6336, height: 2688 },
+    };
+    const result = JSON.stringify({
+        content: [{
+            type: "text",
+            text: JSON.stringify({
+                content: [
+                    { type: "text", text: JSON.stringify(reviewedOutput) },
+                    { type: "image", data: "[image content shown to Ren]" },
+                ],
+                structuredContent: reviewedOutput,
+            }),
+        }],
+        structuredContent: null,
+    });
+
+    assert.deepEqual(toolDisplayImages({ name: "view_output_image", result }), [{
+        kind: "comfy",
+        filename: "ComfyUI_00117.png",
+        subfolder: "",
+        type: "output",
+        title: "Generated output",
+        alt: "Generated ComfyUI output",
+    }]);
+    assert.equal(summarizeToolStep({
+        name: "view_output_image",
+        status: "done",
+        result,
+    }), "Reviewed final output · 6336×2688");
+});
+
+test("large tool histories summarize every individual call without grouping", () => {
+    const steps = [
+        { name: "find_node", status: "done" },
+        { name: "find_node", status: "retried" },
+        { name: "connect_nodes_batch", status: "running" },
+        { name: "queue_workflow", status: "failed" },
+        { name: "wait", status: "interrupted" },
+    ];
+
+    assert.deepEqual(toolHistorySummary(steps), {
+        total: 5,
+        running: 1,
+        done: 1,
+        retried: 1,
+        failed: 1,
+        interrupted: 1,
+        active: steps[2],
+    });
 });
 
 

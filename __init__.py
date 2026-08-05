@@ -18,7 +18,6 @@ import time
 from pathlib import Path
 from urllib.parse import urlsplit
 
-
 ROOT = Path(__file__).parent
 BACKEND_DIR = ROOT / "backend"
 STATE_DIR = ROOT / ".fl_mcp"
@@ -28,7 +27,12 @@ LAUNCH_LOG = ROOT / "logs" / "fl_mcp_launcher.log"
 sys.path.insert(0, str(BACKEND_DIR))
 sys.path.insert(0, str(ROOT))
 
-from backend.process_utils import daemon_process_kwargs, pid_is_running
+from backend.chat_image_preview import (  # noqa: E402
+    ChatImagePreviewError,
+    render_chat_image_preview,
+    resolve_chat_image_path,
+)
+from backend.process_utils import daemon_process_kwargs, pid_is_running  # noqa: E402
 
 bridge_settings_payload = None
 bridge_settings_store = None
@@ -194,6 +198,7 @@ try:
     if comfy_server_module is None or not hasattr(comfy_server_module, "PromptServer"):
         raise RuntimeError("ComfyUI PromptServer module is not available")
     PromptServer = comfy_server_module.PromptServer
+    import folder_paths
     from aiohttp import web
 
     @PromptServer.instance.routes.get("/fl_mcp/launcher/status")
@@ -222,9 +227,42 @@ try:
                 return web.json_response({"error": str(exc)}, status=400)
             return web.json_response(bridge_settings_payload())
 
-        print("[FL-MCP] Registered launcher and settings routes")
-    else:
-        print("[FL-MCP] Registered launcher routes")
+    @PromptServer.instance.routes.get("/fl_mcp/image/thumbnail")
+    async def fl_mcp_image_thumbnail(request):
+        image_type = request.rel_url.query.get("type", "output")
+        if image_type not in {"input", "output", "temp"}:
+            return web.Response(status=400, text="Invalid image type.")
+        root = folder_paths.get_directory_by_type(image_type)
+        if root is None:
+            return web.Response(status=400, text="Image directory is unavailable.")
+        try:
+            path = resolve_chat_image_path(
+                root,
+                request.rel_url.query.get("filename", ""),
+                request.rel_url.query.get("subfolder", ""),
+            )
+            preview = await asyncio.to_thread(
+                render_chat_image_preview,
+                path,
+                max_dimension=192,
+            )
+        except FileNotFoundError:
+            return web.Response(status=404, text="Image was not found.")
+        except (ChatImagePreviewError, ValueError) as exc:
+            return web.Response(status=400, text=str(exc))
+        return web.Response(
+            body=preview.content,
+            content_type=preview.media_type,
+            headers={
+                "Cache-Control": "private, max-age=3600",
+                "X-Content-Type-Options": "nosniff",
+                "X-FL-MCP-Original-Size": (
+                    f"{preview.original_size[0]}x{preview.original_size[1]}"
+                ),
+            },
+        )
+
+    print("[FL-MCP] Registered launcher, settings, and image thumbnail routes")
 except Exception as exc:
     print(f"[FL-MCP] Warning: could not register launcher routes: {exc}")
 

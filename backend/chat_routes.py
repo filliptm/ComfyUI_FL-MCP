@@ -8,6 +8,7 @@ import httpx
 from chat_config import (
     PROVIDER_PRESETS,
     REASONING_EFFORTS,
+    SEARCH_MODES,
     chat_settings,
     credential_store,
 )
@@ -16,10 +17,14 @@ from chat_store import chat_store
 from claude_subscription import claude_subscription
 from codex_subscription import codex_subscription
 from fastapi import APIRouter, HTTPException, Query, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from manager import manager
+from web_fetcher import WebFetchError
+from web_image_service import WebImagePreviewError, WebImagePreviewService
+from web_security import WebUrlError
 
 router = APIRouter(prefix="/api/chat", tags=["chat"])
+web_image_previews = WebImagePreviewService(max_dimension=192)
 
 
 async def _connection_status(provider: str, *, refresh: bool = False) -> dict[str, Any]:
@@ -60,6 +65,7 @@ async def chat_status(session_id: str | None = Query(default=None)) -> dict[str,
 async def get_chat_settings() -> dict[str, Any]:
     settings = chat_settings.public()
     settings["credential"] = await _connection_status(settings["provider"])
+    settings["searchCredential"] = credential_store.status("tavily")
     return settings
 
 
@@ -72,7 +78,34 @@ async def update_chat_settings(request: Request) -> dict[str, Any]:
     value["resolvedApprovals"] = chat_runtime.sync_approval_settings(value)
     value["presets"] = PROVIDER_PRESETS
     value["credential"] = await _connection_status(value["provider"])
+    value["searchCredential"] = credential_store.status("tavily")
     return value
+
+
+@router.get("/web-images/preview")
+async def web_image_preview(
+    url: str = Query(min_length=1, max_length=2048),
+) -> Response:
+    """Return a safe, bounded local preview for one public raster image."""
+
+    try:
+        preview = await web_image_previews.preview(url)
+    except (WebUrlError, WebImagePreviewError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except WebFetchError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return Response(
+        content=preview.content,
+        media_type=preview.media_type,
+        headers={
+            "Cache-Control": "private, max-age=1800",
+            "Content-Security-Policy": "default-src 'none'; sandbox",
+            "X-Content-Type-Options": "nosniff",
+            "X-FL-MCP-Original-Size": (
+                f"{preview.original_size[0]}x{preview.original_size[1]}"
+            ),
+        },
+    )
 
 
 @router.get("/models")
@@ -183,13 +216,25 @@ async def create_conversation(request: Request) -> JSONResponse:
 
 
 @router.get("/conversations/{conversation_id}")
-async def get_conversation(conversation_id: str) -> dict[str, Any]:
+async def get_conversation(
+    conversation_id: str,
+    limit: int = Query(default=50, ge=1, le=100),
+    before: str | None = Query(default=None),
+) -> dict[str, Any]:
     conversation = chat_store.get_conversation(conversation_id)
     if not conversation:
         raise HTTPException(status_code=404, detail="Conversation not found.")
+    try:
+        page = chat_store.list_messages_page(
+            conversation_id,
+            limit=limit,
+            before_message_id=before,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     return {
         "conversation": conversation,
-        "messages": chat_store.list_messages(conversation_id),
+        **page,
     }
 
 
@@ -249,31 +294,32 @@ async def delete_conversation(conversation_id: str) -> dict[str, bool]:
     return {"deleted": True}
 
 
-@router.post("/runs")
-async def start_run(request: Request) -> StreamingResponse:
-    data = await request.json()
+def _run_request_values(data: dict[str, Any]) -> dict[str, Any]:
     session_id = str(data.get("sessionId") or "").strip()
     if not session_id:
         raise HTTPException(status_code=400, detail="sessionId is required.")
-    try:
-        reasoning_effort = str(
-            data.get("reasoningEffort") or "default"
-        ).strip().lower()
-        if reasoning_effort not in REASONING_EFFORTS:
-            raise ValueError(f"Unsupported reasoning effort: {reasoning_effort}")
-        state = await chat_runtime.start(
-            session_id=session_id,
-            conversation_id=(
-                str(data["conversationId"]) if data.get("conversationId") else None
-            ),
-            message=str(data.get("message") or ""),
-            reasoning_effort=reasoning_effort,
-            edit_message_id=(
-                str(data["editMessageId"]) if data.get("editMessageId") else None
-            ),
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    reasoning_effort = str(
+        data.get("reasoningEffort") or "default"
+    ).strip().lower()
+    if reasoning_effort not in REASONING_EFFORTS:
+        raise ValueError(f"Unsupported reasoning effort: {reasoning_effort}")
+    search_mode = str(
+        data.get("searchMode") or chat_settings.load().get("search_mode") or "free"
+    ).strip().lower()
+    if search_mode not in SEARCH_MODES:
+        raise ValueError(f"Unsupported web search mode: {search_mode}")
+    return {
+        "session_id": session_id,
+        "message": str(data.get("message") or ""),
+        "reasoning_effort": reasoning_effort,
+        "search_mode": search_mode,
+        "attachments": data.get("attachments"),
+    }
+
+
+def _run_stream(state: Any) -> StreamingResponse:
+    user_message_id = getattr(state, "user_message_id", None) or ""
+    user_message_revision = getattr(state, "user_message_revision", None) or {}
     return StreamingResponse(
         chat_runtime.subscribe(state.run_id),
         media_type="text/event-stream",
@@ -282,18 +328,49 @@ async def start_run(request: Request) -> StreamingResponse:
             "X-Accel-Buffering": "no",
             "X-FL-MCP-Run-Id": state.run_id,
             "X-FL-MCP-Conversation-Id": state.conversation_id,
-            "X-FL-MCP-User-Message-Id": state.user_message_id or "",
+            "X-FL-MCP-User-Message-Id": user_message_id,
             "X-FL-MCP-User-Revision-Root-Id": (
-                str((state.user_message_revision or {}).get("rootId") or "")
+                str(user_message_revision.get("rootId") or "")
             ),
             "X-FL-MCP-User-Revision-Index": (
-                str((state.user_message_revision or {}).get("index") or 1)
+                str(user_message_revision.get("index") or 1)
             ),
             "X-FL-MCP-User-Revision-Count": (
-                str((state.user_message_revision or {}).get("count") or 1)
+                str(user_message_revision.get("count") or 1)
             ),
         },
     )
+
+
+@router.post("/runs")
+async def start_run(request: Request) -> StreamingResponse:
+    data = await request.json()
+    try:
+        values = _run_request_values(data)
+        state = await chat_runtime.start(
+            **values,
+            conversation_id=(
+                str(data["conversationId"]) if data.get("conversationId") else None
+            ),
+            edit_message_id=(
+                str(data["editMessageId"]) if data.get("editMessageId") else None
+            ),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return _run_stream(state)
+
+
+@router.post("/runs/{run_id}/steer")
+async def steer_run(run_id: str, request: Request) -> StreamingResponse:
+    try:
+        state = await chat_runtime.steer(
+            run_id,
+            **_run_request_values(await request.json()),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return _run_stream(state)
 
 
 @router.get("/runs/{run_id}/stream")

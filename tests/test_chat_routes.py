@@ -4,6 +4,7 @@ from chat_config import ChatSettingsStore, CredentialStore
 from chat_runtime import ActiveRun
 from chat_store import ChatStore
 from fastapi.testclient import TestClient
+from web_image_service import WebImagePreview
 
 
 def test_chat_settings_and_conversation_crud_use_http_api(tmp_path, monkeypatch):
@@ -21,6 +22,9 @@ def test_chat_settings_and_conversation_crud_use_http_api(tmp_path, monkeypatch)
         })
         assert response.status_code == 200
         assert response.json()["base_url"] == "http://127.0.0.1:11434/v1"
+        assert response.json()["search_mode"] == "free"
+        assert response.json()["show_action_buttons"] is True
+        assert "searchCredential" in response.json()
 
         created = client.post("/api/chat/conversations", json={})
         assert created.status_code == 201
@@ -98,43 +102,55 @@ def test_chat_settings_reject_secret_fields(tmp_path, monkeypatch):
     assert "credential endpoint" in response.json()["detail"]
 
 
-def test_run_headers_identify_the_persisted_user_message(monkeypatch):
-    class Runtime:
-        async def start(self, **_kwargs):
-            return ActiveRun(
-                "run-1",
-                "conversation-1",
-                "session-1",
-                user_message_id="message-2",
-                user_message_revision={
-                    "rootId": "message-1",
-                    "index": 2,
-                    "count": 2,
-                },
-            )
-
-        def subscribe(self, _run_id):
-            async def stream():
-                if False:
-                    yield ""
-
-            return stream()
-
-    monkeypatch.setattr(chat_routes, "chat_runtime", Runtime())
+def test_tavily_credential_uses_dedicated_endpoint(tmp_path, monkeypatch):
+    settings = ChatSettingsStore(tmp_path / "settings.json")
+    credentials = CredentialStore()
+    monkeypatch.setattr(chat_routes, "chat_settings", settings)
+    monkeypatch.setattr(chat_routes, "credential_store", credentials)
+    monkeypatch.setattr(credentials, "set", lambda provider, credential: {
+        "stored": provider == "tavily" and credential == "tvly-test",
+        "storage": "keychain",
+        "persistent": True,
+    })
 
     with TestClient(server.app) as client:
-        response = client.post("/api/chat/runs", json={
-            "sessionId": "session-1",
-            "conversationId": "conversation-1",
-            "message": "Revised request",
-            "editMessageId": "message-1",
-        })
+        response = client.put(
+            "/api/chat/credentials/tavily",
+            json={"credential": "tvly-test"},
+        )
 
     assert response.status_code == 200
-    assert response.headers["x-fl-mcp-user-message-id"] == "message-2"
-    assert response.headers["x-fl-mcp-user-revision-root-id"] == "message-1"
-    assert response.headers["x-fl-mcp-user-revision-index"] == "2"
-    assert response.headers["x-fl-mcp-user-revision-count"] == "2"
+    assert response.json()["stored"] is True
+
+
+def test_web_image_preview_route_returns_validated_local_bytes(monkeypatch):
+    class PreviewService:
+        async def preview(self, url):
+            assert url == "https://example.com/reference.png"
+            return WebImagePreview(
+                content=b"preview-bytes",
+                media_type="image/jpeg",
+                source_url=url,
+                original_size=(2000, 1000),
+                preview_size=(1400, 700),
+            )
+
+        async def aclose(self):
+            return None
+
+    monkeypatch.setattr(chat_routes, "web_image_previews", PreviewService())
+
+    with TestClient(server.app) as client:
+        response = client.get(
+            "/api/chat/web-images/preview",
+            params={"url": "https://example.com/reference.png"},
+        )
+
+    assert response.status_code == 200
+    assert response.content == b"preview-bytes"
+    assert response.headers["content-type"] == "image/jpeg"
+    assert response.headers["x-content-type-options"] == "nosniff"
+    assert response.headers["x-fl-mcp-original-size"] == "2000x1000"
 
 
 def test_global_bypass_syncs_running_approvals(tmp_path, monkeypatch):
@@ -188,6 +204,38 @@ def test_approval_route_accepts_always_allow_decision(monkeypatch):
         "resolution": "always_allowed",
     }
     assert decisions == [("approval-1", "always_allow")]
+
+
+def test_steer_route_atomically_replaces_the_active_run(monkeypatch):
+    calls = []
+
+    class State:
+        run_id = "run-new"
+        conversation_id = "conversation-1"
+
+    class Runtime:
+        async def steer(self, run_id, **values):
+            calls.append((run_id, values))
+            return State()
+
+        async def subscribe(self, run_id):
+            yield f'data: {{"type":"RUN_STARTED","runId":"{run_id}"}}\n\n'
+
+    monkeypatch.setattr(chat_routes, "chat_runtime", Runtime())
+
+    with TestClient(server.app) as client:
+        response = client.post("/api/chat/runs/run-old/steer", json={
+            "sessionId": "session-1",
+            "message": "new direction",
+            "reasoningEffort": "high",
+            "searchMode": "off",
+            "attachments": [],
+        })
+
+    assert response.status_code == 200
+    assert response.headers["x-fl-mcp-run-id"] == "run-new"
+    assert calls[0][0] == "run-old"
+    assert calls[0][1]["message"] == "new direction"
 
 
 def test_claude_subscription_status_and_models_use_cli_auth(tmp_path, monkeypatch):

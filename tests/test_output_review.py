@@ -1,4 +1,3 @@
-import io
 from types import SimpleNamespace
 
 import mcp_server
@@ -85,6 +84,11 @@ async def test_view_output_image_returns_bounded_visual_content(tmp_path, monkey
     assert result.structured_content["promptId"] == "prompt-newest"
     assert result.structured_content["nodeId"] == "29"
     assert result.structured_content["relativePath"] == "output/run/final.png"
+    assert result.structured_content["image"] == {
+        "filename": "final.png",
+        "subfolder": "run",
+        "type": "output",
+    }
     assert result.structured_content["originalSize"] == {"width": 3000, "height": 1500}
     assert result.structured_content["previewSize"] == {"width": 1024, "height": 512}
     assert isinstance(result.content[0], TextContent)
@@ -94,39 +98,29 @@ async def test_view_output_image_returns_bounded_visual_content(tmp_path, monkey
 
 
 @pytest.mark.asyncio
-async def test_view_output_image_selects_newest_matching_history_entry(
-    tmp_path,
-    monkeypatch,
-):
-    output_root = tmp_path / "output"
-    output_root.mkdir()
-    Image.new("RGB", (32, 32), "#4d7cff").save(output_root / "latest.png")
-    history = {
-        "prompt-oldest": {
-            "status": {"status_str": "success", "completed": True},
-            "outputs": {
-                "1": {"images": [{"filename": "oldest.png", "type": "output"}]},
-            },
-        },
-        "prompt-newest": {
-            "status": {"status_str": "success", "completed": True},
-            "outputs": {
-                "2": {"images": [{"filename": "latest.png", "type": "output"}]},
-            },
-        },
-    }
+async def test_view_chat_image_returns_uploaded_input_as_visual_content(tmp_path, monkeypatch):
+    input_root = tmp_path / "input"
+    chat_folder = input_root / "ren-chat" / "session-1"
+    chat_folder.mkdir(parents=True)
+    Image.new("RGB", (800, 600), "#ef66aa").save(chat_folder / "reference.png")
     monkeypatch.setattr(
         mcp_server,
         "get_comfy_tools",
-        lambda: FakeComfyTools(output_root, history),
+        lambda: FakeComfyTools(tmp_path / "output", {}, input_root=input_root),
     )
 
-    result = await mcp_server.view_output_image.fn(
-        mcp_server.ViewOutputImageRequest(),
+    result = await mcp_server.view_chat_image.fn(
+        mcp_server.ViewChatImageRequest(image={
+            "filename": "reference.png",
+            "subfolder": "ren-chat/session-1",
+            "type": "input",
+        }),
         fake_context(),
     )
 
-    assert result.structured_content["promptId"] == "prompt-newest"
+    assert result.structured_content["image"]["type"] == "input"
+    assert result.structured_content["originalSize"] == {"width": 800, "height": 600}
+    assert isinstance(result.content[1], ImageContent)
 
 
 def test_output_path_resolution_rejects_traversal(tmp_path):
@@ -141,47 +135,6 @@ def test_output_path_resolution_rejects_traversal(tmp_path):
             "subfolder": "",
             "type": "output",
         })
-
-
-@pytest.mark.asyncio
-async def test_asset_image_source_uses_comfy_view_route(monkeypatch):
-    image_data = io.BytesIO()
-    Image.new("RGBA", (8, 4), (20, 40, 60, 255)).save(image_data, format="PNG")
-    requests = []
-
-    class FakeResponse:
-        content = image_data.getvalue()
-
-        def raise_for_status(self):
-            return None
-
-    class FakeClient:
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, exc_type, exc, tb):
-            return False
-
-        async def get(self, url, params=None, timeout=None):
-            requests.append((url, params, timeout))
-            return FakeResponse()
-
-    monkeypatch.setattr(mcp_server.httpx, "AsyncClient", FakeClient)
-    source = await mcp_server._resolve_comfy_image_source(
-        SimpleNamespace(comfy_url="http://comfy"),
-        {
-            "filename": "blake3:abc123",
-            "subfolder": "",
-            "type": "input",
-        },
-    )
-
-    assert requests == [(
-        "http://comfy/view",
-        {"filename": "blake3:abc123", "subfolder": "", "type": "input"},
-        10.0,
-    )]
-    assert Image.open(source).size == (8, 4)
 
 
 def test_mask_overlay_preview_reports_coverage_and_bounds(tmp_path):

@@ -276,6 +276,10 @@ class BridgeStatusPanel {
 app.registerExtension({
     name: "fl_mcp.bridge",
 
+    afterConfigureGraph() {
+        toolExecutor?.flApi.restoreNestedImageReferences();
+    },
+
     async setup() {
         console.log("[FL-MCP] Initializing browser bridge");
 
@@ -293,6 +297,7 @@ app.registerExtension({
                 clientVersion: `${config.version}-frontend`,
             });
             toolExecutor = new ToolExecutor(wsClient);
+            toolExecutor.flApi.restoreNestedImageReferences();
 
             wsClient.on("connected", () => assistantPanel?.updateConnection());
             wsClient.on("disconnected", () => assistantPanel?.updateConnection());
@@ -401,11 +406,17 @@ app.registerExtension({
                             ),
                             getCanvasContext,
                             subscribeCanvasContext,
-                            discardMaskReview: (nodeId, reviewToken) => (
-                                toolExecutor.flApi.discardMaskReview(nodeId, reviewToken)
-                            ),
                             loadBridgeSettings,
                             updateBridgeSettings,
+                            uploadChatImage: (file, subfolder) => (
+                                toolExecutor.flApi.uploadChatImage(file, subfolder)
+                            ),
+                            placeChatImageInSelectedNode: (image) => (
+                                toolExecutor.flApi.placeChatImageInNode(image)
+                            ),
+                            discardMaskReviews: () => (
+                                toolExecutor.flApi.discardMaskReviews()
+                            ),
                         },
                     );
                     window.FL_MCP.assistantPanel = assistantPanel;

@@ -19,6 +19,7 @@ from typing import Any
 from chat_config import (
     PROJECT_ROOT,
     PROVIDER_PRESETS,
+    SEARCH_MODES,
     chat_settings,
     credential_store,
 )
@@ -33,6 +34,12 @@ from config import (
 logger = logging.getLogger(__name__)
 PROMPT_PATH = Path(__file__).with_name("chat_prompt.md")
 MANDATORY_REVIEW_TOOLS = {"confirm_mask_review"}
+MAX_CHAT_ATTACHMENTS = 8
+MAX_CHAT_ATTACHMENT_BYTES = 32 * 1024 * 1024
+CONTEXT_MAX_CHARS = 96_000
+CONTEXT_RECENT_CHARS = 64_000
+CONTEXT_CHECKPOINT_CHARS = 24_000
+CONTEXT_ROLLOVER_TOKENS = 64_000
 
 
 def mcp_tool_timeout_seconds() -> int:
@@ -41,6 +48,28 @@ def mcp_tool_timeout_seconds() -> int:
         + MCP_TOOL_TIMEOUT_BUFFER_SECONDS
     )
 
+_DATA_IMAGE_URI = re.compile(
+    r"data:image/[^;,\s]+;base64,[A-Za-z0-9+/=]+",
+    re.IGNORECASE,
+)
+_LONG_BASE64_VALUE = re.compile(r"[A-Za-z0-9+/]{2048,}={0,2}")
+
+WEB_IMAGE_INTENT_PATTERNS = (
+    re.compile(
+        r"\b(?:find|show|fetch|get|pull|source|collect|browse\s+for|look\s+for|"
+        r"search(?:\s+the\s+web)?\s+for|need|want)\b.{0,100}"
+        r"\b(?:images?|photos?|pictures?|visuals?|illustrations?|artwork|mood\s*boards?)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:images?|photos?|pictures?|visuals?|illustrations?|artwork|mood\s*boards?)\b"
+        r".{0,80}\b(?:of|for|from|showing|references?)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\b(?:image|photo|picture|visual)\s+search\b", re.IGNORECASE),
+    re.compile(r"\bvisual\s+references?\b", re.IGNORECASE),
+    re.compile(r"\bwhat\b.{0,100}\blooks?\s+like\b", re.IGNORECASE),
+)
 
 CORE_CHAT_TOOLS = {
     "workflow_overview",
@@ -63,9 +92,298 @@ CORE_CHAT_TOOLS = {
     "wait",
     "get_execution_history",
     "view_output_image",
+    "view_chat_image",
+    "place_chat_image_in_node",
     "get_queue_status",
     "mcp_capability_audit",
 }
+
+
+def normalize_chat_attachments(value: Any) -> list[dict[str, Any]]:
+    """Validate browser-uploaded ComfyUI input references for chat persistence."""
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ValueError("attachments must be a list.")
+    if len(value) > MAX_CHAT_ATTACHMENTS:
+        raise ValueError(f"Attach at most {MAX_CHAT_ATTACHMENTS} images per message.")
+
+    normalized: list[dict[str, Any]] = []
+    for index, item in enumerate(value, start=1):
+        if not isinstance(item, dict):
+            raise ValueError(f"Attachment {index} is invalid.")
+        filename = str(item.get("filename") or "").strip()
+        subfolder = str(item.get("subfolder") or "").strip().replace("\\", "/")
+        image_type = str(item.get("type") or "input").strip().lower()
+        if (
+            not filename
+            or len(filename) > 255
+            or Path(filename).name != filename
+            or filename in {".", ".."}
+        ):
+            raise ValueError(f"Attachment {index} has an invalid filename.")
+        subfolder_path = Path(subfolder)
+        if (
+            not subfolder
+            or len(subfolder) > 512
+            or subfolder_path.is_absolute()
+            or ".." in subfolder_path.parts
+            or not (subfolder == "ren-chat" or subfolder.startswith("ren-chat/"))
+        ):
+            raise ValueError(f"Attachment {index} is outside Ren's upload folder.")
+        if image_type != "input":
+            raise ValueError(f"Attachment {index} must be a ComfyUI input image.")
+
+        mime_type = str(item.get("mimeType") or "").strip().lower()
+        if mime_type and mime_type not in {
+            "image/gif", "image/jpeg", "image/png", "image/webp",
+        }:
+            raise ValueError(f"Attachment {index} is not an image.")
+        try:
+            size_bytes = int(item.get("sizeBytes") or 0)
+            width = int(item.get("width") or 0)
+            height = int(item.get("height") or 0)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(f"Attachment {index} has invalid metadata.") from exc
+        if size_bytes < 0 or size_bytes > MAX_CHAT_ATTACHMENT_BYTES:
+            raise ValueError(f"Attachment {index} exceeds the 32 MB limit.")
+        if width < 0 or height < 0 or width > 100_000 or height > 100_000:
+            raise ValueError(f"Attachment {index} has invalid dimensions.")
+
+        normalized.append({
+            "filename": filename,
+            "subfolder": subfolder,
+            "type": "input",
+            "originalName": str(item.get("originalName") or filename).strip()[:255],
+            "mimeType": mime_type,
+            "sizeBytes": size_bytes,
+            "width": width,
+            "height": height,
+        })
+    return normalized
+
+
+def message_content_for_model(message: dict[str, Any]) -> str:
+    """Add structured attachment references without exposing them in visible chat text."""
+    content = str(message.get("content") or "").strip()
+    try:
+        attachments = normalize_chat_attachments(
+            (message.get("metadata") or {}).get("attachments")
+        )
+    except (TypeError, ValueError):
+        attachments = []
+    if not attachments:
+        return content
+
+    references = []
+    for index, attachment in enumerate(attachments, start=1):
+        references.append(
+            f"Attachment {index}: "
+            + json.dumps(
+                {
+                    "filename": attachment["filename"],
+                    "subfolder": attachment["subfolder"],
+                    "type": "input",
+                    "originalName": attachment["originalName"],
+                    "width": attachment["width"],
+                    "height": attachment["height"],
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        )
+    attachment_context = (
+        "The user attached ComfyUI input image(s) to this message. "
+        "Call view_chat_image with a listed reference before making visual claims. "
+        "Use place_chat_image_in_node when the user asks to put one into a selected "
+        "Load Image node; assigning it does not queue the workflow.\n"
+        + "\n".join(references)
+    )
+    return f"{content}\n\n{attachment_context}" if content else attachment_context
+
+
+def _bounded_context_text(value: Any, limit: int) -> str:
+    """Strip accidental binary payloads and bound one context fragment."""
+    text = str(value or "").replace("\x00", "")
+    text = _DATA_IMAGE_URI.sub("[image data omitted; use its ComfyUI reference]", text)
+    text = _LONG_BASE64_VALUE.sub("[binary data omitted]", text)
+    if len(text) <= limit:
+        return text
+    if limit <= 80:
+        return text[:limit]
+    suffix_size = min(limit // 4, 2_000)
+    prefix_size = limit - suffix_size - 32
+    return (
+        text[:prefix_size]
+        + "\n… [older content truncated] …\n"
+        + text[-suffix_size:]
+    )
+
+
+def _message_for_context(message: dict[str, Any]) -> dict[str, str]:
+    role = str(message.get("role") or "assistant")
+    raw_content = (
+        message_content_for_model(message)
+        if role == "user"
+        else str(message.get("content") or "")
+    )
+    return {
+        "id": str(message.get("id") or uuid.uuid4()),
+        "role": role,
+        "content": _bounded_context_text(raw_content, CONTEXT_RECENT_CHARS),
+    }
+
+
+def _tool_checkpoint(message: dict[str, Any]) -> str:
+    steps = (message.get("metadata") or {}).get("toolSteps") or []
+    summaries = []
+    for step in steps[-12:]:
+        if not isinstance(step, dict):
+            continue
+        name = str(step.get("name") or "tool")
+        status = str(step.get("status") or "unknown")
+        summaries.append(f"{name}={status}")
+    if len(steps) > len(summaries):
+        summaries.insert(0, f"{len(steps) - len(summaries)} earlier calls")
+    return ", ".join(summaries)
+
+
+def build_conversation_checkpoint(
+    messages: list[dict[str, Any]],
+    *,
+    max_chars: int = CONTEXT_CHECKPOINT_CHARS,
+) -> str:
+    """Create a deterministic, status-preserving checkpoint for older turns."""
+    if not messages:
+        return ""
+    lines = [
+        "Conversation checkpoint (older turns were compacted for performance).",
+        "Tool statuses are historical facts; interrupted/failed calls did not succeed.",
+    ]
+    remaining = max_chars - sum(len(line) + 1 for line in lines)
+    selected: list[str] = []
+    omitted = 0
+    for message in reversed(messages):
+        role = str(message.get("role") or "assistant")
+        status = str(message.get("status") or "complete")
+        content = _message_for_context(message)["content"]
+        excerpt = " ".join(content.split())
+        excerpt = _bounded_context_text(excerpt, 700 if role == "user" else 520)
+        tools = _tool_checkpoint(message)
+        line = f"- {role} [{status}]: {excerpt or '(no text)'}"
+        if tools:
+            line += f" | tools: {tools}"
+        if len(line) + 1 > remaining:
+            omitted += 1
+            continue
+        selected.append(line)
+        remaining -= len(line) + 1
+    if omitted:
+        lines.append(f"- {omitted} earliest turn(s) omitted from this checkpoint.")
+    lines.extend(reversed(selected))
+    return _bounded_context_text("\n".join(lines), max_chars)
+
+
+def _usage_token_high_watermark(value: Any) -> int:
+    """Return the largest reported token counter in nested provider metadata."""
+    if isinstance(value, dict):
+        values = [
+            _usage_token_high_watermark(item)
+            for key, item in value.items()
+            if "token" in str(key).lower() or isinstance(item, (dict, list))
+        ]
+        return max(values, default=0)
+    if isinstance(value, list):
+        return max((_usage_token_high_watermark(item) for item in value), default=0)
+    if isinstance(value, (int, float)) and value >= 0:
+        return int(value)
+    return 0
+
+
+def conversation_needs_compaction(messages: list[dict[str, Any]]) -> bool:
+    """Detect large local histories or native threads near a costly context size."""
+    context_size = sum(
+        len(_message_for_context(message)["content"]) + 64
+        for message in messages
+        if message.get("role") in {"user", "assistant"}
+    )
+    provider_tokens = max(
+        (
+            _usage_token_high_watermark((message.get("metadata") or {}).get("usage"))
+            for message in messages
+        ),
+        default=0,
+    )
+    return (
+        context_size > CONTEXT_MAX_CHARS
+        or provider_tokens >= CONTEXT_ROLLOVER_TOKENS
+    )
+
+
+def compact_messages_for_model(
+    messages: list[dict[str, Any]],
+    *,
+    force: bool = False,
+) -> tuple[list[dict[str, str]], bool]:
+    """Bound model history while retaining recent turns and an older checkpoint."""
+    eligible = [
+        message
+        for message in messages
+        if message.get("role") in {"user", "assistant"}
+    ]
+    normalized = [_message_for_context(message) for message in eligible]
+    if not force and not conversation_needs_compaction(eligible):
+        return normalized, False
+    if not normalized:
+        return [], force
+
+    recent_reversed: list[dict[str, str]] = []
+    recent_chars = 0
+    for item in reversed(normalized):
+        cost = len(item["content"]) + 64
+        if recent_reversed and recent_chars + cost > CONTEXT_RECENT_CHARS:
+            break
+        if cost > CONTEXT_RECENT_CHARS:
+            item = {
+                **item,
+                "content": _bounded_context_text(
+                    item["content"],
+                    CONTEXT_RECENT_CHARS - 64,
+                ),
+            }
+            cost = len(item["content"]) + 64
+        recent_reversed.append(item)
+        recent_chars += cost
+    recent = list(reversed(recent_reversed))
+    older_count = len(normalized) - len(recent)
+    compacted: list[dict[str, str]] = []
+    if older_count:
+        compacted.append({
+            "id": "context-checkpoint",
+            "role": "assistant",
+            "content": build_conversation_checkpoint(eligible[:older_count]),
+        })
+    compacted.extend(recent)
+    return compacted, True
+
+
+def native_prompt_with_compaction(
+    messages: list[dict[str, Any]],
+    latest_user_message: str,
+) -> tuple[str, bool]:
+    """Prepare a bounded prompt when rolling over a native Claude/Codex thread."""
+    if not conversation_needs_compaction(messages):
+        return latest_user_message, False
+    compacted, _ = compact_messages_for_model(messages, force=True)
+    prior = compacted[:-1] if compacted else []
+    sections = [
+        "The provider thread was rolled over to keep this long chat responsive.",
+        "Use this bounded conversation context, then handle the current request.",
+    ]
+    for item in prior:
+        sections.append(f"\n[{item['role']}]\n{item['content']}")
+    sections.append(f"\n[current user request]\n{latest_user_message}")
+    return _bounded_context_text("\n".join(sections), CONTEXT_MAX_CHARS), True
 
 INTENT_TOOL_GROUPS = {
     "debug": {
@@ -253,7 +571,31 @@ async def wait_for_claude_mcp(
         await asyncio.sleep(0.1)
 
 
-def tools_for_message(message: str) -> set[str]:
+async def wait_for_codex_mcp_status(
+    client: Any,
+    status_params: dict[str, Any],
+    response_model: Any,
+    *,
+    timeout: float = 30,
+) -> Any:
+    """Bound Codex MCP discovery so a broken provider cannot freeze the chat."""
+    try:
+        return await asyncio.wait_for(
+            client.request(
+                "mcpServerStatus/list",
+                status_params,
+                response_model=response_model,
+            ),
+            timeout=timeout,
+        )
+    except TimeoutError as exc:
+        raise RuntimeError(
+            "Codex timed out while connecting to the Ren MCP tools. "
+            "Stop the response and retry."
+        ) from exc
+
+
+def tools_for_message(message: str, search_mode: str = "off") -> set[str]:
     text = message.lower()
     selected = set(CORE_CHAT_TOOLS)
     if any(
@@ -278,7 +620,68 @@ def tools_for_message(message: str) -> set[str]:
         for word in ("save workflow", "load workflow", "workflow file", "delete workflow")
     ):
         selected.update(INTENT_TOOL_GROUPS["files"])
+    if search_mode != "off":
+        selected.update({"web_search", "web_fetch_page"})
     return selected
+
+
+def web_image_requested(message: str) -> bool:
+    """Return whether the user's raw message explicitly asks for web images."""
+
+    text = " ".join(str(message or "").split())
+    return any(pattern.search(text) for pattern in WEB_IMAGE_INTENT_PATTERNS)
+
+
+def web_search_instructions(search_mode: str) -> str:
+    """Explain the user-selected, server-enforced web capability to the model."""
+
+    descriptions = {
+        "off": (
+            "Web access is off for this message. Do not claim to search or fetch the web; "
+            "ask the user to choose a web-search action if current sources are required."
+        ),
+        "free": (
+            "Free web search is enabled for this message. Use `web_search` when external or "
+            "current information is needed, then use `web_fetch_page` on the most relevant "
+            "results. This provider is no-cost and best-effort, so report rate limits clearly."
+        ),
+        "tavily_basic": (
+            "Tavily Basic search is enabled for this message. Use `web_search` when external "
+            "or current information is needed and `web_fetch_page` for full source text. "
+            "Basic search uses one Tavily credit per query."
+        ),
+        "tavily_advanced": (
+            "Tavily Advanced search is enabled for this message. Use `web_search` for higher-"
+            "relevance research and `web_fetch_page` for full source text. Advanced search "
+            "uses two Tavily credits per query, so avoid redundant searches."
+        ),
+    }
+    instructions = "Ren web-search selection:\n- " + descriptions.get(
+        search_mode,
+        descriptions["off"],
+    )
+    if search_mode != "off":
+        instructions += (
+            "\n- Web page images are opt-in. Set `include_images=true` on `web_fetch_page` "
+            "only when the user's current message explicitly asks for images, photos, visual "
+            "references, or to see what something looks like. Otherwise leave it false."
+        )
+    return instructions
+
+
+def web_search_environment(
+    settings: dict[str, Any],
+    user_message: str = "",
+) -> dict[str, str]:
+    """Pass the selected mode and secret to the isolated Ren MCP subprocess."""
+
+    mode = str(settings.get("search_mode") or "off")
+    tavily_key = credential_store.get("tavily") if mode.startswith("tavily_") else None
+    return {
+        "FL_MCP_WEB_SEARCH_MODE": mode,
+        "FL_MCP_TAVILY_API_KEY": tavily_key or "",
+        "FL_MCP_WEB_IMAGES_ALLOWED": "1" if web_image_requested(user_message) else "0",
+    }
 
 
 def approval_fingerprint(tool_name: str, tool_args: dict[str, Any]) -> str:
@@ -369,7 +772,6 @@ class ActiveRun:
     session_id: str
     settings: dict[str, Any] | None = None
     user_message_id: str | None = None
-    user_message_revision: dict[str, Any] | None = None
     events: list[str] = field(default_factory=list)
     subscribers: list[asyncio.Queue[str | None]] = field(default_factory=list)
     task: asyncio.Task[None] | None = None
@@ -377,6 +779,10 @@ class ActiveRun:
     assistant_text: str = ""
     tool_steps: list[dict[str, Any]] = field(default_factory=list)
     error_emitted: bool = False
+    started_emitted: bool = False
+    assistant_persisted: bool = False
+    interruption_reason: str = "stopped"
+    provider_metadata: dict[str, Any] = field(default_factory=dict)
     cancel_callback: Callable[[], Awaitable[Any]] | None = None
 
 
@@ -423,14 +829,30 @@ class ChatRuntime:
         conversation_id: str | None,
         message: str,
         reasoning_effort: str = "default",
+        search_mode: str | None = None,
         edit_message_id: str | None = None,
+        attachments: Any = None,
     ) -> ActiveRun:
         text = message.strip()
-        if not text:
-            raise ValueError("Message cannot be empty.")
+        normalized_attachments: list[dict[str, Any]] | None = None
+        if attachments is not None or not edit_message_id:
+            normalized_attachments = normalize_chat_attachments(attachments)
+            if not text and not normalized_attachments:
+                raise ValueError("Message cannot be empty.")
         settings = chat_settings.load()
         if reasoning_effort != "default":
             settings["reasoning_effort"] = reasoning_effort
+        if search_mode is not None:
+            normalized_search_mode = str(search_mode).strip().lower()
+            if normalized_search_mode not in SEARCH_MODES:
+                raise ValueError(f"Unsupported web search mode: {normalized_search_mode}")
+            settings["search_mode"] = normalized_search_mode
+        if str(settings.get("search_mode") or "").startswith("tavily_"):
+            if not credential_store.get("tavily"):
+                raise ValueError(
+                    "Tavily search needs an API key. Add one in Ren Settings → Web search, "
+                    "or choose Free web."
+                )
         if not settings["model"]:
             raise ValueError("Choose a model before sending a message.")
         identifier = conversation_id or str(uuid.uuid4())
@@ -448,13 +870,22 @@ class ChatRuntime:
                 or edit_source["role"] != "user"
             ):
                 raise ValueError("The message to edit was not found in this conversation.")
+        if edit_source and attachments is None:
+            attachments = (edit_source.get("metadata") or {}).get("attachments", [])
+        if normalized_attachments is None:
+            normalized_attachments = normalize_chat_attachments(attachments)
+        if not text and not normalized_attachments:
+            raise ValueError("Message cannot be empty.")
         self.store.update_conversation(
             identifier,
             provider=settings["provider"],
             model=settings["model"],
         )
         if conversation["title"] == "New chat":
-            title = " ".join(text.split())[:60] or "New chat"
+            title_source = text or "Attached " + ", ".join(
+                attachment["originalName"] for attachment in normalized_attachments
+            )
+            title = " ".join(title_source.split())[:60] or "New chat"
             self.store.update_conversation(identifier, title=title)
         async with self._lock:
             if any(
@@ -480,6 +911,10 @@ class ChatRuntime:
                 text,
                 provider=settings["provider"],
                 model=settings["model"],
+                metadata={
+                    "searchMode": settings.get("search_mode", "off"),
+                    "attachments": normalized_attachments,
+                },
                 **message_options,
             )
             run_id = str(uuid.uuid4())
@@ -489,11 +924,17 @@ class ChatRuntime:
                 session_id,
                 settings=settings,
                 user_message_id=user_message["id"],
-                user_message_revision=user_message["revision"],
             )
             self.runs[run_id] = state
             self._prune_completed_runs()
             self.store.create_run(run_id, identifier)
+            # Publish before provider setup so StreamingResponse can flush its
+            # headers and the browser can stop or steer a run immediately.
+            await self.publish(state, {
+                "type": "RUN_STARTED",
+                "threadId": state.conversation_id,
+                "runId": state.run_id,
+            })
             state.task = asyncio.create_task(
                 self._execute(state, user_message["id"]),
                 name=f"fl-mcp-chat-{run_id}",
@@ -526,9 +967,13 @@ class ChatRuntime:
 
     async def publish(self, state: ActiveRun, event: str | dict[str, Any]) -> None:
         raw = _sse(event) if isinstance(event, dict) else event
+        payload = _event_payload(raw)
+        if payload and payload.get("type") == "RUN_STARTED":
+            if state.started_emitted:
+                return
+            state.started_emitted = True
         if len(state.events) < self.MAX_EVENTS:
             state.events.append(raw)
-        payload = _event_payload(raw)
         if payload:
             event_type = payload.get("type")
             if event_type == "RUN_ERROR":
@@ -570,18 +1015,89 @@ class ChatRuntime:
         for subscriber in list(state.subscribers):
             subscriber.put_nowait(raw)
 
-    async def cancel(self, run_id: str) -> bool:
+    async def cancel(self, run_id: str, *, reason: str = "stopped") -> bool:
         state = self.runs.get(run_id)
         if not state or state.done or not state.task:
             return False
+        state.interruption_reason = "steered" if reason == "steered" else "stopped"
         self._expire_approvals(state.run_id)
+        interrupt_task = None
         if state.cancel_callback is not None:
+            interrupt_task = asyncio.create_task(state.cancel_callback())
+        state.task.cancel()
+        if interrupt_task is not None:
             try:
-                await state.cancel_callback()
+                await asyncio.wait_for(interrupt_task, timeout=3)
+            except TimeoutError:
+                logger.warning("Provider interrupt timed out for run %s", run_id)
             except Exception:
                 logger.debug("Provider interrupt failed for run %s", run_id, exc_info=True)
-        state.task.cancel()
+        try:
+            await asyncio.wait_for(asyncio.shield(state.task), timeout=10)
+        except asyncio.CancelledError:
+            pass
+        except TimeoutError as exc:
+            raise RuntimeError(
+                "The provider did not stop within 10 seconds. Please try Stop again."
+            ) from exc
         return True
+
+    async def steer(
+        self,
+        run_id: str,
+        *,
+        session_id: str,
+        message: str,
+        reasoning_effort: str = "default",
+        search_mode: str | None = None,
+        attachments: Any = None,
+    ) -> ActiveRun:
+        previous = self.runs.get(run_id)
+        if not previous or previous.done:
+            raise ValueError("The response is no longer active.")
+        conversation_id = previous.conversation_id
+        if not await self.cancel(run_id, reason="steered"):
+            raise ValueError("The response could not be interrupted.")
+        return await self.start(
+            session_id=session_id,
+            conversation_id=conversation_id,
+            message=message,
+            reasoning_effort=reasoning_effort,
+            search_mode=search_mode,
+            attachments=attachments,
+        )
+
+    def _persist_interrupted_assistant(self, state: ActiveRun) -> None:
+        if state.assistant_persisted:
+            return
+        status = "interrupted" if state.interruption_reason == "steered" else "cancelled"
+        for step in state.tool_steps:
+            if step.get("status") == "running":
+                step["status"] = status
+        assistant_content, persisted_tool_steps = normalize_assistant_timeline(
+            state.assistant_text,
+            state.tool_steps,
+        )
+        if not assistant_content and not persisted_tool_steps:
+            return
+        self.store.append_message(
+            state.conversation_id,
+            "assistant",
+            assistant_content,
+            status="interrupted",
+            provider=(state.settings or {}).get("provider"),
+            model=(state.settings or {}).get("model"),
+            metadata={
+                "toolSteps": persisted_tool_steps,
+                "runId": state.run_id,
+                "interrupted": True,
+                "interruptionReason": state.interruption_reason,
+                **state.provider_metadata,
+            },
+            parent_message_id=state.user_message_id,
+            branch_from_active=False,
+        )
+        state.assistant_persisted = True
 
     async def resolve_approval(
         self,
@@ -686,16 +1202,24 @@ class ChatRuntime:
                 if self.model_factory is not None
                 else self._build_model(settings)
             )
-            prompt = PROMPT_PATH.read_text(encoding="utf-8")
-            latest_user_message = next(
+            prompt = (
+                PROMPT_PATH.read_text(encoding="utf-8")
+                + "\n\n"
+                + web_search_instructions(str(settings.get("search_mode") or "off"))
+            )
+            latest_user_item = next(
                 (
-                    item["content"]
+                    item
                     for item in reversed(self.store.list_messages(state.conversation_id))
                     if item["role"] == "user"
                 ),
-                "",
+                {},
             )
-            allowed_tools = tools_for_message(latest_user_message)
+            latest_user_message = message_content_for_model(latest_user_item)
+            allowed_tools = tools_for_message(
+                latest_user_message,
+                str(settings.get("search_mode") or "off"),
+            )
             retry_approval_grants: set[str] = set()
 
             async def prepare_tools(ctx, tool_definitions):
@@ -780,6 +1304,10 @@ class ChatRuntime:
                 "FL_MCP_SESSION_ID": state.session_id,
                 "FL_MCP_WS_URL": self._ws_url(),
                 "FL_MCP_CLIENT_ID": f"embedded-chat-{state.run_id}",
+                **web_search_environment(
+                    settings,
+                    str(latest_user_item.get("content") or ""),
+                ),
             })
             mcp_server = MCPServerStdio(
                 sys.executable,
@@ -789,22 +1317,23 @@ class ChatRuntime:
                 process_tool_call=process_tool_call,
                 read_timeout=mcp_tool_timeout_seconds(),
             )
+            model_settings: dict[str, Any] = {
+                "temperature": settings["temperature"],
+            }
+            reasoning_effort = settings.get("reasoning_effort", "default")
+            if reasoning_effort != "default":
+                model_settings["openai_reasoning_effort"] = reasoning_effort
             agent = Agent(
                 model,
                 instructions=prompt,
                 toolsets=[mcp_server],
-                model_settings=model_settings_for_provider(settings),
+                model_settings=model_settings,
                 prepare_tools=prepare_tools,
             )
-            messages = [
-                {
-                    "id": item["id"],
-                    "role": item["role"],
-                    "content": item["content"],
-                }
-                for item in self.store.list_messages(state.conversation_id)
-                if item["role"] in {"user", "assistant"}
-            ]
+            stored_messages = self.store.list_messages(state.conversation_id)
+            messages, context_compacted = compact_messages_for_model(stored_messages)
+            if context_compacted:
+                state.provider_metadata["contextCompacted"] = True
             run_input = RunAgentInput.model_validate({
                 "threadId": state.conversation_id,
                 "runId": state.run_id,
@@ -837,17 +1366,34 @@ class ChatRuntime:
                 provider=settings["provider"],
                 model=settings["model"],
                 serialized=serialized,
-                metadata={"toolSteps": persisted_tool_steps, "runId": state.run_id},
+                metadata={
+                    "toolSteps": persisted_tool_steps,
+                    "runId": state.run_id,
+                    **state.provider_metadata,
+                },
                 parent_message_id=user_message_id,
                 branch_from_active=False,
             )
+            state.assistant_persisted = True
             self.store.finish_run(state.run_id, "complete")
         except asyncio.CancelledError:
-            self.store.finish_run(state.run_id, "cancelled")
+            self._persist_interrupted_assistant(state)
+            self.store.finish_run(
+                state.run_id,
+                "interrupted" if state.interruption_reason == "steered" else "cancelled",
+            )
             await self.publish(state, {
                 "type": "RUN_ERROR",
-                "message": "Response stopped.",
-                "code": "cancelled",
+                "message": (
+                    "Response continued with the new message."
+                    if state.interruption_reason == "steered"
+                    else "Response stopped."
+                ),
+                "code": (
+                    "steered"
+                    if state.interruption_reason == "steered"
+                    else "cancelled"
+                ),
             })
         except Exception as exc:
             logger.error("Embedded chat run failed: %s", exc, exc_info=True)
@@ -891,7 +1437,11 @@ class ChatRuntime:
                 "Install Claude Code and run `claude auth login`."
             )
 
-        prompt = PROMPT_PATH.read_text(encoding="utf-8")
+        prompt = (
+            PROMPT_PATH.read_text(encoding="utf-8")
+            + "\n\n"
+            + web_search_instructions(str(settings.get("search_mode") or "off"))
+        )
         claude_prompt = (
             f"{prompt}\n\n"
             "Claude Code integration rules:\n"
@@ -901,15 +1451,23 @@ class ChatRuntime:
             "- Do not claim a tool succeeded unless its MCP result confirms it."
         )
         messages = self.store.list_messages(state.conversation_id)
-        latest_user_message = next(
+        latest_user_item = next(
             (
-                item["content"]
+                item
                 for item in reversed(messages)
                 if item["role"] == "user"
             ),
-            "",
+            {},
         )
-        allowed_tools = tools_for_message(latest_user_message)
+        latest_user_message = message_content_for_model(latest_user_item)
+        provider_user_message, context_compacted = native_prompt_with_compaction(
+            messages,
+            latest_user_message,
+        )
+        allowed_tools = tools_for_message(
+            latest_user_message,
+            str(settings.get("search_mode") or "off"),
+        )
         claude_session_id = next(
             (
                 str(item["metadata"]["claudeSessionId"])
@@ -919,6 +1477,12 @@ class ChatRuntime:
             ),
             None,
         )
+        if context_compacted:
+            claude_session_id = None
+            state.provider_metadata.update({
+                "contextCompacted": True,
+                "providerThreadRolledOver": True,
+            })
         environment = os.environ.copy()
         environment.update({
             "FL_MCP_MODE": "subprocess",
@@ -926,7 +1490,10 @@ class ChatRuntime:
             "FL_MCP_WS_URL": self._ws_url(),
             "FL_MCP_CLIENT_ID": f"embedded-claude-{state.run_id}",
             "FL_MCP_ALLOWED_TOOLS": ",".join(sorted(allowed_tools)),
-            "MCP_TOOL_TIMEOUT": str(mcp_tool_timeout_seconds() * 1000),
+            **web_search_environment(
+                settings,
+                str(latest_user_item.get("content") or ""),
+            ),
             "CLAUDE_AGENT_SDK_CLIENT_APP": "comfyui-fl-mcp/ren",
             # A configured Anthropic API key otherwise takes precedence over
             # the user's Claude Code subscription in non-interactive mode.
@@ -1004,7 +1571,7 @@ class ChatRuntime:
                 "type": "user",
                 "message": {
                     "role": "user",
-                    "content": latest_user_message,
+                    "content": provider_user_message,
                 },
             }
 
@@ -1046,6 +1613,8 @@ class ChatRuntime:
             option_values["effort"] = reasoning_effort
         if claude_session_id:
             option_values["resume"] = claude_session_id
+        elif context_compacted:
+            option_values["session_id"] = state.run_id
         else:
             try:
                 uuid.UUID(state.conversation_id)
@@ -1057,6 +1626,8 @@ class ChatRuntime:
         block_tools: dict[int, str] = {}
         seen_tool_ids: set[str] = set()
         captured_session_id = claude_session_id
+        if captured_session_id:
+            state.provider_metadata["claudeSessionId"] = captured_session_id
         result_message = None
         text_started = False
 
@@ -1075,8 +1646,14 @@ class ChatRuntime:
             client_factory = self.claude_client_factory or ClaudeSDKClient
             client = client_factory(options)
             await client.connect()
+            interrupt = getattr(client, "interrupt", None)
+            if callable(interrupt):
+                state.cancel_callback = interrupt
             await wait_for_claude_mcp(client)
-            session_id = captured_session_id or state.conversation_id
+            session_id = (
+                captured_session_id
+                or (state.run_id if context_compacted else state.conversation_id)
+            )
             await client.query(prompt_stream(), session_id=session_id)
             message_stream = client.receive_response()
 
@@ -1085,6 +1662,7 @@ class ChatRuntime:
                 message_session_id = getattr(message, "session_id", None)
                 if message_session_id:
                     captured_session_id = str(message_session_id)
+                    state.provider_metadata["claudeSessionId"] = captured_session_id
 
                 if isinstance(message, StreamEvent):
                     event = message.event
@@ -1175,6 +1753,7 @@ class ChatRuntime:
                 elif isinstance(message, ResultMessage):
                     result_message = message
         finally:
+            state.cancel_callback = None
             if client is not None:
                 await asyncio.shield(client.disconnect())
 
@@ -1215,6 +1794,7 @@ class ChatRuntime:
             "runId": state.run_id,
             "claudeSessionId": captured_session_id,
             "usage": result_message.usage or {},
+            **state.provider_metadata,
         }
         self.store.append_message(
             state.conversation_id,
@@ -1226,6 +1806,7 @@ class ChatRuntime:
             parent_message_id=state.user_message_id,
             branch_from_active=False,
         )
+        state.assistant_persisted = True
         self.store.finish_run(state.run_id, "complete")
 
     async def _execute_codex_subscription(
@@ -1255,7 +1836,11 @@ class ChatRuntime:
             TurnStatus,
         )
 
-        prompt = PROMPT_PATH.read_text(encoding="utf-8")
+        prompt = (
+            PROMPT_PATH.read_text(encoding="utf-8")
+            + "\n\n"
+            + web_search_instructions(str(settings.get("search_mode") or "off"))
+        )
         codex_prompt = (
             f"{prompt}\n\n"
             "Codex integration rules:\n"
@@ -1266,15 +1851,23 @@ class ChatRuntime:
             "- Do not claim a tool succeeded unless its MCP result confirms it."
         )
         messages = self.store.list_messages(state.conversation_id)
-        latest_user_message = next(
+        latest_user_item = next(
             (
-                item["content"]
+                item
                 for item in reversed(messages)
                 if item["role"] == "user"
             ),
-            "",
+            {},
         )
-        allowed_tools = tools_for_message(latest_user_message)
+        latest_user_message = message_content_for_model(latest_user_item)
+        provider_user_message, context_compacted = native_prompt_with_compaction(
+            messages,
+            latest_user_message,
+        )
+        allowed_tools = tools_for_message(
+            latest_user_message,
+            str(settings.get("search_mode") or "off"),
+        )
         codex_thread_id = next(
             (
                 str(item["metadata"]["codexThreadId"])
@@ -1284,12 +1877,22 @@ class ChatRuntime:
             ),
             None,
         )
+        if context_compacted:
+            codex_thread_id = None
+            state.provider_metadata.update({
+                "contextCompacted": True,
+                "providerThreadRolledOver": True,
+            })
         mcp_environment = {
             "FL_MCP_MODE": "subprocess",
             "FL_MCP_SESSION_ID": state.session_id,
             "FL_MCP_WS_URL": self._ws_url(),
             "FL_MCP_CLIENT_ID": f"embedded-codex-{state.run_id}",
             "FL_MCP_ALLOWED_TOOLS": ",".join(sorted(allowed_tools)),
+            **web_search_environment(
+                settings,
+                str(latest_user_item.get("content") or ""),
+            ),
         }
         ren_server = {
             "command": sys.executable,
@@ -1520,23 +2123,29 @@ class ChatRuntime:
                 ))
                 thread = AsyncThread(codex, started.thread.id)
                 codex_thread_id = thread.id
+            if codex_thread_id:
+                state.provider_metadata["codexThreadId"] = codex_thread_id
 
             status_params = ListMcpServerStatusParams(
                 thread_id=thread.id,
                 detail="full",
             ).model_dump(mode="json", by_alias=True, exclude_none=True)
-            server_status = await codex._client.request(
-                "mcpServerStatus/list",
+            server_status = await wait_for_codex_mcp_status(
+                codex._client,
                 status_params,
-                response_model=ListMcpServerStatusResponse,
+                ListMcpServerStatusResponse,
             )
             unexpected_servers = [
                 item.name
                 for item in server_status.data
-                # This first-party picker can remain advertised by the host even
+                # First-party UI helpers can remain advertised by the host even
                 # with apps/plugins disabled. Client-side dynamic tool calls are
-                # denied by approval_handler above, so it is not executable.
-                if item.name not in {"ren", "sites-design-picker"} and item.tools
+                # denied by approval_handler above, so they are not executable.
+                if item.name not in {
+                    "ren",
+                    "sites-design-picker",
+                    "dataAnalyticsWidgets",
+                } and item.tools
             ]
             if unexpected_servers:
                 raise RuntimeError(
@@ -1544,7 +2153,7 @@ class ChatRuntime:
                 )
 
             turn = await thread.turn(
-                latest_user_message,
+                provider_user_message,
                 effort=(
                     None
                     if settings.get("reasoning_effort", "default") == "default"
@@ -1676,10 +2285,12 @@ class ChatRuntime:
                 "runId": state.run_id,
                 "codexThreadId": codex_thread_id,
                 "usage": usage,
+                **state.provider_metadata,
             },
             parent_message_id=state.user_message_id,
             branch_from_active=False,
         )
+        state.assistant_persisted = True
         self.store.finish_run(state.run_id, "complete")
 
     @staticmethod

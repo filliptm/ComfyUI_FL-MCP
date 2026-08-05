@@ -101,6 +101,11 @@ from coding_tools import (
     write_file as coding_write_file,
 )
 from comfy_supervisor import comfy_supervisor
+from chat_config import DATA_DIR
+from web_cache import WebCache
+from web_fetcher import AsyncWebFetcher
+from web_search import WebSearchService
+from web_service import WebPageService
 
 # LOGGING
 
@@ -328,11 +333,33 @@ async def mcp_lifespan(server: FastMCP) -> AsyncIterator[Any]:
     except Exception as e:
         logger.warning(f"[MCP] Could not check Manager status: {e}")
 
+    web_cache = WebCache(DATA_DIR / "web_cache.sqlite3")
+    web_fetcher = AsyncWebFetcher()
+    web_pages = WebPageService(fetcher=web_fetcher, cache=web_cache)
+    web_search = WebSearchService(
+        mode=os.getenv("FL_MCP_WEB_SEARCH_MODE", "free"),
+        tavily_api_key=(
+            os.getenv("FL_MCP_TAVILY_API_KEY")
+            or os.getenv("TAVILY_API_KEY")
+        ),
+    )
+    web_images_allowed = (
+        os.getenv("FL_MCP_MODE") != "subprocess"
+        or os.getenv("FL_MCP_WEB_IMAGES_ALLOWED", "").strip().lower()
+        in {"1", "true", "yes", "on"}
+    )
+
+    async def close_web_resources() -> None:
+        await web_search.aclose()
+        await web_fetcher.aclose()
+        web_cache.close()
+
     if os.getenv('FL_MCP_MODE') == 'subprocess':
         session_id = os.getenv('FL_MCP_SESSION_ID')
         ws_url = os.getenv('FL_MCP_WS_URL')
         if not session_id or not ws_url:
             logger.error("Missing FL_MCP_SESSION_ID or FL_MCP_WS_URL environment variables")
+            await close_web_resources()
             raise RuntimeError("MCP subprocess not properly configured")
         
         logger.info(f"[MCP] Starting in subprocess mode for session: {session_id}")
@@ -344,24 +371,37 @@ async def mcp_lifespan(server: FastMCP) -> AsyncIterator[Any]:
             logger.info("[MCP] WebSocket client connected (persistent)")
         except Exception as e:
             logger.error(f"MCP Initialization Failed: {str(e)}")
+            await close_web_resources()
             raise
 
-        yield {
-            "client": _WS_CLIENT,
-            "manager_client": manager_client,
-            "manager_available": manager_available
-        }
+        try:
+            yield {
+                "client": _WS_CLIENT,
+                "manager_client": manager_client,
+                "manager_available": manager_available,
+                "web_search": web_search,
+                "web_pages": web_pages,
+                "web_images_allowed": web_images_allowed,
+            }
+        finally:
+            await close_web_resources()
 
         # NOTE: no disconnect/teardown here; keep WS open for the process lifetime.
         return
 
     # Standalone (no WebSocket bridge)
     logger.info("[MCP] Running in standalone mode (no WebSocket)")
-    yield {
-        "client": None,
-        "manager_client": manager_client,
-        "manager_available": manager_available
-    }
+    try:
+        yield {
+            "client": None,
+            "manager_client": manager_client,
+            "manager_available": manager_available,
+            "web_search": web_search,
+            "web_pages": web_pages,
+            "web_images_allowed": web_images_allowed,
+        }
+    finally:
+        await close_web_resources()
 
 # Initialize FastMCP server with lifespan
 mcp = FastMCP("ComfyUI FL-MCP", lifespan=mcp_lifespan)
@@ -1221,12 +1261,76 @@ class ViewOutputImageRequest(BaseModel):
         description="Maximum preview width or height sent to the vision model.",
     )
 
+
+class ChatImageReference(BaseModel):
+    """A browser-uploaded image inside Ren's ComfyUI input subfolder."""
+    filename: str = Field(..., min_length=1, max_length=255)
+    subfolder: str = Field(..., min_length=1, max_length=512)
+    type: Literal["input"] = "input"
+
+    @model_validator(mode="after")
+    def validate_ren_upload_path(self) -> "ChatImageReference":
+        filename_path = Path(self.filename)
+        subfolder = self.subfolder.replace("\\", "/")
+        subfolder_path = Path(subfolder)
+        if filename_path.name != self.filename or self.filename in {".", ".."}:
+            raise ValueError("Chat image filename must be a basename.")
+        if (
+            subfolder_path.is_absolute()
+            or ".." in subfolder_path.parts
+            or not (subfolder == "ren-chat" or subfolder.startswith("ren-chat/"))
+        ):
+            raise ValueError("Chat images must be inside the ren-chat input folder.")
+        self.subfolder = subfolder
+        return self
+
+
+class ViewChatImageRequest(BaseModel):
+    """Request a user-attached chat image as visual MCP content."""
+    image: ChatImageReference
+    max_dimension: int = Field(default=2048, ge=256, le=4096)
+
+
+class PlaceChatImageInNodeRequest(BaseModel):
+    """Assign a user-attached image to a Load Image-style canvas node."""
+    image: ChatImageReference
+    node_id: Optional[Union[int, str]] = Field(
+        default=None,
+        description="Target node ID/title. Omit to use exactly one selected image node.",
+    )
+
 class ClearErrorBufferRequest(BaseModel):
     """Request to clear the error buffer."""
     pass
 
 class WaitRequest(BaseModel):
     delay: float = Field(..., description="Brief period of time to wait (keep between 5 and 20 seconds). Great for waiting a bit after the workflow is queued to show some result")
+
+
+class WebSearchRequest(BaseModel):
+    """Search the public web using the mode chosen in Ren's composer."""
+
+    query: str = Field(..., min_length=1, max_length=500, description="Focused search query")
+    max_results: int = Field(5, ge=1, le=10, description="Maximum ranked results")
+    time_range: Optional[Literal["day", "week", "month", "year"]] = Field(
+        None,
+        description="Optional freshness window",
+    )
+
+
+class WebFetchPageRequest(BaseModel):
+    """Fetch and locally extract one public result page."""
+
+    url: str = Field(..., min_length=1, max_length=2048, description="Public HTTP(S) URL")
+    max_chars: int = Field(12000, ge=1000, le=30000, description="Maximum extracted characters")
+    force_refresh: bool = Field(False, description="Ignore a cached extraction")
+    include_images: bool = Field(
+        False,
+        description=(
+            "Return image candidates only when the current user explicitly asked for images "
+            "or visual references"
+        ),
+    )
 
 
 class CustomNodesPathRequest(BaseModel):
@@ -1508,6 +1612,71 @@ async def wait(request: WaitRequest, ctx: Context) -> Dict[str, Any]:
     
     await asyncio.sleep(float(request.delay))
     return {"waited_for": request.delay}
+
+
+@mcp.tool()
+async def web_search(request: WebSearchRequest, ctx: Context) -> Dict[str, Any]:
+    """Search the web with the user-selected Free, Tavily Basic, or Tavily Advanced mode.
+
+    The provider and Tavily depth are fixed by the current Ren message's composer action.
+    Results include titles, URLs, snippets, and actual Tavily credit usage when applicable.
+    """
+    await _report_tool_activity(ctx, "web_search")
+    service: WebSearchService = ctx.request_context.lifespan_context["web_search"]
+    response = await service.search(
+        request.query,
+        max_results=request.max_results,
+        time_range=request.time_range,
+    )
+    return {"success": True, **response.model_dump(mode="json")}
+
+
+@mcp.tool()
+async def web_fetch_page(request: WebFetchPageRequest, ctx: Context) -> Dict[str, Any]:
+    """Safely fetch and locally extract a public web page returned by search.
+
+    Private, loopback, metadata, unsafe-port, oversized, binary, and unsafe redirect targets
+    are rejected. Ordinary HTML is parsed locally and cached without Tavily credits.
+    """
+    await _report_tool_activity(ctx, "web_fetch_page")
+    service: WebPageService = ctx.request_context.lifespan_context["web_pages"]
+    page = await service.fetch_page(request.url, force_refresh=request.force_refresh)
+    content = page.markdown or page.text
+    truncated = len(content) > request.max_chars
+    images_allowed = bool(
+        ctx.request_context.lifespan_context.get("web_images_allowed", True)
+    )
+    include_images = request.include_images and images_allowed
+    warnings = list(page.warnings)
+    if request.include_images and not images_allowed:
+        warnings.append(
+            "Web images were omitted because the current user message did not explicitly "
+            "request them."
+        )
+    return {
+        "success": True,
+        "requestedUrl": page.requested_url,
+        "finalUrl": page.final_url,
+        "canonicalUrl": page.canonical_url,
+        "title": page.title,
+        "description": page.description,
+        "language": page.language,
+        "content": content[:request.max_chars],
+        "contentLength": len(content),
+        "truncated": truncated,
+        "contentHash": page.content_hash,
+        "qualityScore": page.quality_score,
+        "requiresHostedFallback": page.requires_hosted_fallback,
+        "fromCache": page.from_cache,
+        "links": [item.model_dump(mode="json") for item in page.links[:25]],
+        "images": (
+            [item.model_dump(mode="json") for item in page.images[:10]]
+            if include_images
+            else []
+        ),
+        "imagesIncluded": include_images,
+        "warnings": warnings,
+    }
 
 # ============================================================================
 # QUERY & ANALYSIS TOOLS
@@ -1834,9 +2003,9 @@ async def view_node_mask(request: ViewNodeMaskRequest, ctx: Context) -> ToolResu
         {"node_id": request.node_id},
     )
     image_ref = node_result["image"]
-    image_source = await _resolve_comfy_image_source(get_comfy_tools(), image_ref)
+    path = _resolve_comfy_image_path(get_comfy_tools(), image_ref)
     preview, preview_format, original_size, preview_size, mask_info = _mask_overlay_preview(
-        image_source,
+        path,
         request.max_dimension,
     )
     result = {
@@ -1858,9 +2027,9 @@ async def view_node_mask(request: ViewNodeMaskRequest, ctx: Context) -> ToolResu
 async def edit_node_mask(request: EditNodeMaskRequest, ctx: Context) -> ToolResult:
     """Paint or erase rectangular/elliptical regions in a node's image mask.
 
-    This uses ComfyUI's authenticated browser upload path and stages a masked
-    image without changing the node's image widget. Use normalized coordinates
-    for resolution-independent edits. Set clear_existing=true when the supplied
+    This uses ComfyUI's authenticated browser upload path and updates the node's
+    image widget to the newly saved masked image. Use normalized coordinates for
+    resolution-independent edits. Set clear_existing=true when the supplied
     regions should be the only masked areas.
     """
     if not settings.enable_workflow_writes:
@@ -1872,9 +2041,9 @@ async def edit_node_mask(request: EditNodeMaskRequest, ctx: Context) -> ToolResu
         request.model_dump(),
     )
     image_ref = edit_result["image"]
-    image_source = await _resolve_comfy_image_source(get_comfy_tools(), image_ref)
+    path = _resolve_comfy_image_path(get_comfy_tools(), image_ref)
     preview, preview_format, original_size, preview_size, mask_info = _mask_overlay_preview(
-        image_source,
+        path,
         2048,
     )
     result = {
@@ -1883,9 +2052,9 @@ async def edit_node_mask(request: EditNodeMaskRequest, ctx: Context) -> ToolResu
         "previewSize": {"width": preview_size[0], "height": preview_size[1]},
         "mask": mask_info,
         "message": (
-            "Mask staged and shown in magenta on the canvas. Call "
+            "Mask saved and shown in magenta on the canvas. Call "
             "confirm_mask_review with the returned review token so the user "
-            "can apply it to the node before queueing."
+            "can approve it before queueing."
         ),
     }
     return ToolResult(
@@ -1902,8 +2071,8 @@ async def confirm_mask_review(
     """Ask the user to approve the visible mask before workflow execution.
 
     Call this immediately after every successful edit_node_mask. The user must
-    explicitly accept the magenta canvas preview before it is applied to the
-    node; this review cannot be bypassed or remembered for future masks.
+    explicitly accept the magenta canvas preview; this review cannot be bypassed
+    or remembered for future masks. Queueing remains blocked until it succeeds.
     """
     return await _execute_tool(ctx, "confirm_mask_review", request.model_dump())
 
@@ -3663,45 +3832,14 @@ def _resolve_comfy_image_path(comfy_tools: Any, image: Dict[str, Any]) -> Path:
     )
 
 
-async def _resolve_comfy_image_source(
-    comfy_tools: Any,
-    image: Dict[str, Any],
-) -> Any:
-    if not str(image["filename"]).startswith("blake3:"):
-        return _resolve_comfy_image_path(comfy_tools, image)
-    try:
-        async with httpx.AsyncClient() as client:
-            response = await client.get(
-                f"{comfy_tools.comfy_url}/view",
-                params={
-                    "filename": image["filename"],
-                    "subfolder": image.get("subfolder") or "",
-                    "type": image.get("type") or "input",
-                },
-                timeout=10.0,
-            )
-            response.raise_for_status()
-            return io.BytesIO(response.content)
-    except httpx.HTTPError as exc:
-        raise ComfyUIError(
-            f"Failed to load ComfyUI asset image: {image['filename']}"
-        ) from exc
-
-
-def _image_source_name(source: Any) -> str:
-    return Path(getattr(source, "name", "image")).name
-
-
-def _output_image_preview(source_ref: Any, max_dimension: int) -> tuple[bytes, str, tuple[int, int], tuple[int, int]]:
+def _output_image_preview(path: Path, max_dimension: int) -> tuple[bytes, str, tuple[int, int], tuple[int, int]]:
     """Create a bounded visual-review image while preserving transparency."""
     try:
-        with PILImage.open(source_ref) as source:
+        with PILImage.open(path) as source:
             source.seek(0)
             image = ImageOps.exif_transpose(source).copy()
     except (OSError, UnidentifiedImageError) as exc:
-        raise ComfyUIError(
-            f"Output is not a readable image: {_image_source_name(source_ref)}"
-        ) from exc
+        raise ComfyUIError(f"Output is not a readable image: {path.name}") from exc
 
     original_size = image.size
     image.thumbnail((max_dimension, max_dimension), PILImage.Resampling.LANCZOS)
@@ -3725,18 +3863,16 @@ def _output_image_preview(source_ref: Any, max_dimension: int) -> tuple[bytes, s
 
 
 def _mask_overlay_preview(
-    source_ref: Any,
+    path: Path,
     max_dimension: int,
 ) -> tuple[bytes, str, tuple[int, int], tuple[int, int], Dict[str, Any]]:
     """Render masked pixels as a magenta overlay for visual verification."""
     try:
-        with PILImage.open(source_ref) as source:
+        with PILImage.open(path) as source:
             source.seek(0)
             image = ImageOps.exif_transpose(source).convert("RGBA")
     except (OSError, UnidentifiedImageError) as exc:
-        raise ComfyUIError(
-            f"Mask source is not a readable image: {_image_source_name(source_ref)}"
-        ) from exc
+        raise ComfyUIError(f"Mask source is not a readable image: {path.name}") from exc
 
     original_size = image.size
     mask = ImageOps.invert(image.getchannel("A"))
@@ -3783,7 +3919,7 @@ async def view_output_image(request: ViewOutputImageRequest, ctx: Context) -> To
         prompt_id = None
         history_entry = None
         history = await comfy_tools.fetch_history(max_items=20)
-        for candidate_prompt_id, candidate_entry in reversed(history.items()):
+        for candidate_prompt_id, candidate_entry in history.items():
             status = candidate_entry.get("status", {})
             candidate_images = _output_image_candidates(
                 candidate_entry.get("outputs", {}),
@@ -3833,9 +3969,9 @@ async def view_output_image(request: ViewOutputImageRequest, ctx: Context) -> To
 
     selected_index = request.output_index if request.output_index >= 0 else len(images) - 1
     selected = images[selected_index]
-    image_source = await _resolve_comfy_image_source(comfy_tools, selected)
+    path = _resolve_comfy_image_path(comfy_tools, selected)
     preview, preview_format, original_size, preview_size = _output_image_preview(
-        image_source,
+        path,
         request.max_dimension,
     )
     relative_path = "/".join(filter(None, (
@@ -3852,6 +3988,11 @@ async def view_output_image(request: ViewOutputImageRequest, ctx: Context) -> To
         "nodeId": selected["nodeId"],
         "nodeImageIndex": selected["nodeImageIndex"],
         "relativePath": relative_path,
+        "image": {
+            "filename": selected["filename"],
+            "subfolder": selected["subfolder"],
+            "type": selected["type"],
+        },
         "originalSize": {"width": original_size[0], "height": original_size[1]},
         "previewSize": {"width": preview_size[0], "height": preview_size[1]},
         "message": "The generated image follows as visual MCP content. Inspect the pixels before judging the result.",
@@ -3859,6 +4000,53 @@ async def view_output_image(request: ViewOutputImageRequest, ctx: Context) -> To
     return ToolResult(
         content=[result, MCPImage(data=preview, format=preview_format)],
         structured_content=result,
+    )
+
+
+@mcp.tool()
+async def view_chat_image(request: ViewChatImageRequest, ctx: Context) -> ToolResult:
+    """View an image the user attached to Ren as real visual MCP content.
+
+    Call this before describing, comparing, or editing an attached image. The
+    image reference is supplied in the user's attachment context and always
+    resolves inside ComfyUI's trusted Ren chat input folder.
+    """
+    await _report_tool_activity(ctx, "view_chat_image")
+    image_ref = request.image.model_dump()
+    path = _resolve_comfy_image_path(get_comfy_tools(), image_ref)
+    preview, preview_format, original_size, preview_size = _output_image_preview(
+        path,
+        request.max_dimension,
+    )
+    result = {
+        "success": True,
+        "image": image_ref,
+        "originalSize": {"width": original_size[0], "height": original_size[1]},
+        "previewSize": {"width": preview_size[0], "height": preview_size[1]},
+        "message": "The user's attached image follows as visual MCP content.",
+    }
+    return ToolResult(
+        content=[result, MCPImage(data=preview, format=preview_format)],
+        structured_content=result,
+    )
+
+
+@mcp.tool()
+async def place_chat_image_in_node(
+    request: PlaceChatImageInNodeRequest,
+    ctx: Context,
+) -> Dict[str, Any]:
+    """Put a user-attached image into a Load Image-style canvas node.
+
+    Omit node_id when the user selected exactly one compatible node. This only
+    updates the node's image widget and visible preview; it never queues a run.
+    """
+    if not settings.enable_workflow_writes:
+        return _disabled_by_config("FL_MCP_ENABLE_WORKFLOW_WRITES")
+    return await _execute_tool(
+        ctx,
+        "place_chat_image_in_node",
+        request.model_dump(),
     )
 
 @mcp.tool()

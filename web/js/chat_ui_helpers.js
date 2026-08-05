@@ -18,23 +18,91 @@ function toolResultPayload(value) {
             if (item.type === "text") {
                 const textPayload = parsePayload(item.text);
                 if (textPayload && typeof textPayload === "object") {
-                    return textPayload;
+                    return toolResultPayload(textPayload);
                 }
             } else if (!item.type) {
-                return item;
+                return toolResultPayload(item);
             }
         }
         return parsed;
     }
     if (!parsed || typeof parsed !== "object") return parsed;
-    if (parsed.structuredContent !== undefined) {
+    if (parsed.structuredContent !== undefined && parsed.structuredContent !== null) {
         return parsePayload(parsed.structuredContent);
     }
-    if (parsed.structured_content !== undefined) {
+    if (parsed.structured_content !== undefined && parsed.structured_content !== null) {
         return parsePayload(parsed.structured_content);
     }
     if (Array.isArray(parsed.content)) return toolResultPayload(parsed.content);
     return parsed;
+}
+
+function publicHttpUrl(value) {
+    try {
+        const parsed = new URL(String(value || ""));
+        return ["http:", "https:"].includes(parsed.protocol) ? parsed.href : "";
+    } catch (_) {
+        return "";
+    }
+}
+
+export function toolDisplayImages(step) {
+    const name = step?.name || "";
+    const result = toolResultPayload(step?.result);
+    // The user's message already owns the visible attachment thumbnail. The
+    // inspection tool still receives the original image, but must not add a
+    // second copy to long chat histories.
+    if (name === "view_chat_image") return [];
+    let candidates = Array.isArray(result?.displayImages)
+        ? result.displayImages
+        : [];
+    if (name === "web_fetch_page" && Array.isArray(result?.images)) {
+        candidates = result.images.map(image => ({ ...image, kind: "web" }));
+    } else if (name === "view_output_image" && result?.image) {
+        candidates = [{
+            ...result.image,
+            kind: "comfy",
+            title: "Generated output",
+            alt: "Generated ComfyUI output",
+        }];
+    }
+
+    const images = [];
+    const seen = new Set();
+    for (const candidate of candidates) {
+        if (!candidate || typeof candidate !== "object") continue;
+        if (candidate.kind === "comfy") {
+            const filename = String(candidate.filename || "").trim();
+            const subfolder = String(candidate.subfolder || "").trim();
+            const type = String(candidate.type || "output").toLowerCase();
+            if (!filename || !["input", "output", "temp"].includes(type)) continue;
+            const key = `comfy:${type}:${subfolder}:${filename}`;
+            if (seen.has(key)) continue;
+            seen.add(key);
+            images.push({
+                kind: "comfy",
+                filename,
+                subfolder,
+                type,
+                title: String(candidate.title || "Generated output").trim(),
+                alt: String(candidate.alt || candidate.title || "Generated output").trim(),
+            });
+            continue;
+        }
+        const url = publicHttpUrl(candidate.url);
+        if (!url || seen.has(url)) continue;
+        seen.add(url);
+        images.push({
+            kind: "web",
+            url,
+            sourceUrl: publicHttpUrl(candidate.source_url || candidate.sourceUrl),
+            title: String(candidate.title || "").trim(),
+            alt: String(candidate.alt || candidate.title || "Web image").trim(),
+            width: Number(candidate.width) || null,
+            height: Number(candidate.height) || null,
+        });
+    }
+    return images;
 }
 
 function dimensionsLabel(value) {
@@ -111,31 +179,26 @@ export function technicalText(value, limit = TECHNICAL_DETAIL_LIMIT) {
     return `${text.slice(0, limit)}\n\n… Result truncated in the interface.`;
 }
 
-export function canStackToolSteps(previous, next) {
-    const previousName = String(previous?.name || "");
-    return Boolean(previousName && previousName === String(next?.name || ""));
-}
-
-export function toolStackState(steps = []) {
+export function toolHistorySummary(steps = []) {
     const entries = steps.filter(Boolean);
-    const categories = [
-        { status: "running", values: new Set(["running"]) },
-        { status: "failed", values: new Set(["failed", "error"]) },
-        { status: "cancelled", values: new Set(["cancelled"]) },
-        { status: "retried", values: new Set(["retried"]) },
-        { status: "done", values: new Set(["done", "finished"]) },
-    ];
-    const category = categories.find(({ values }) => (
-        entries.some(step => values.has(step.status))
-    )) || categories.at(-1);
-    const representative = entries.findLast(step => (
-        category.values.has(step.status)
-    )) || entries.at(-1) || {};
-    return {
-        count: entries.length,
-        status: category.status,
-        step: representative,
+    const counts = {
+        total: entries.length,
+        running: 0,
+        done: 0,
+        retried: 0,
+        failed: 0,
+        interrupted: 0,
     };
+    for (const step of entries) {
+        const status = String(step?.status || "").toLowerCase();
+        if (status === "running") counts.running += 1;
+        else if (["failed", "error"].includes(status)) counts.failed += 1;
+        else if (status === "retried") counts.retried += 1;
+        else if (["cancelled", "interrupted"].includes(status)) counts.interrupted += 1;
+        else counts.done += 1;
+    }
+    counts.active = entries.findLast(step => step?.status === "running") || null;
+    return counts;
 }
 
 export function summarizeToolStep(step, config = {}) {
@@ -149,9 +212,13 @@ export function summarizeToolStep(step, config = {}) {
     if (failed) {
         const failureLabels = {
             view_output_image: "Couldn’t review output image",
+            view_chat_image: "Couldn’t inspect attached image",
+            place_chat_image_in_node: "Couldn’t place attached image",
             view_node_mask: "Couldn’t inspect image mask",
             edit_node_mask: "Couldn’t update image mask",
             confirm_mask_review: "Mask needs changes",
+            web_search: "Couldn’t search the web",
+            web_fetch_page: "Couldn’t read the web page",
         };
         return config.failureLabel
             || failureLabels[name]
@@ -169,6 +236,15 @@ export function summarizeToolStep(step, config = {}) {
                 : `Reviewed output ${selected + 1} of ${available}`;
         }
         return size ? `${summary} · ${size}` : summary;
+    }
+    if (name === "view_chat_image") {
+        const size = dimensionsLabel(result?.originalSize);
+        return size ? `Inspected attached image · ${size}` : "Inspected attached image";
+    }
+    if (name === "place_chat_image_in_node") {
+        const node = result?.title
+            || (result?.node_id !== undefined ? `node ${result.node_id}` : "selected node");
+        return `Placed attached image in ${node}`;
     }
     if (name === "view_node_mask") {
         const node = result?.title
@@ -191,6 +267,27 @@ export function summarizeToolStep(step, config = {}) {
         return coverage ? `${regionSummary} · ${coverage}` : regionSummary;
     }
     if (name === "confirm_mask_review") return "Mask approved for workflow";
+
+    if (name === "web_search") {
+        const count = Array.isArray(result?.results) ? result.results.length : 0;
+        const provider = result?.provider === "tavily" ? "Tavily" : "Free web";
+        const credits = Number(result?.credits_used ?? result?.creditsUsed ?? 0);
+        const summary = `Searched ${provider} · ${plural(count, "source")}`;
+        return Number.isFinite(credits) && credits > 0
+            ? `${summary} · ${plural(credits, "credit")}`
+            : summary;
+    }
+    if (name === "web_fetch_page") {
+        const title = String(result?.title || "web page").trim();
+        const length = Number(result?.contentLength);
+        const imageCount = Array.isArray(result?.images) ? result.images.length : 0;
+        const cacheLabel = result?.fromCache ? " from cache" : "";
+        const summary = `Read ${title}${cacheLabel}`;
+        const sized = Number.isFinite(length) && length > 0
+            ? `${summary} · ${length.toLocaleString("en-US")} chars`
+            : summary;
+        return imageCount > 0 ? `${sized} · ${plural(imageCount, "image")}` : sized;
+    }
 
     if (name === "create_nodes") {
         const count = countSuccessful(result)

@@ -413,6 +413,84 @@ class ChatStore:
             for row in rows
         ]
 
+    def list_messages_page(
+        self,
+        conversation_id: str,
+        *,
+        limit: int = 50,
+        before_message_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Return the newest bounded slice of the active branch before a cursor."""
+        page_limit = max(1, min(int(limit), 100))
+        with self._lock, self._connect() as connection:
+            conversation = connection.execute(
+                "SELECT active_leaf_message_id FROM conversations WHERE id = ?",
+                (conversation_id,),
+            ).fetchone()
+            if not conversation or not conversation["active_leaf_message_id"]:
+                return {"messages": [], "hasMore": False, "nextBefore": None}
+            if before_message_id:
+                cursor = connection.execute(
+                    """
+                    SELECT parent_message_id FROM messages
+                    WHERE id = ? AND conversation_id = ?
+                    """,
+                    (before_message_id, conversation_id),
+                ).fetchone()
+                if not cursor:
+                    raise ValueError("Message cursor was not found in this conversation.")
+                anchor_id = cursor["parent_message_id"]
+            else:
+                anchor_id = conversation["active_leaf_message_id"]
+            if not anchor_id:
+                return {"messages": [], "hasMore": False, "nextBefore": None}
+            rows = connection.execute(
+                """
+                WITH RECURSIVE active_path AS (
+                    SELECT messages.*, 0 AS path_depth
+                    FROM messages WHERE id = ? AND conversation_id = ?
+                    UNION ALL
+                    SELECT parent.*, active_path.path_depth + 1
+                    FROM messages AS parent
+                    JOIN active_path ON active_path.parent_message_id = parent.id
+                ), page AS (
+                    SELECT * FROM active_path
+                    ORDER BY path_depth ASC LIMIT ?
+                )
+                SELECT * FROM page ORDER BY path_depth DESC
+                """,
+                (anchor_id, conversation_id, page_limit),
+            ).fetchall()
+            roots = {
+                str(row["revision_root_id"])
+                for row in rows
+                if row["role"] == "user" and row["revision_root_id"]
+            }
+            counts = {}
+            for root_id in roots:
+                count_row = connection.execute(
+                    """
+                    SELECT COUNT(*) AS count FROM messages
+                    WHERE conversation_id = ? AND revision_root_id = ?
+                          AND role = 'user'
+                    """,
+                    (conversation_id, root_id),
+                ).fetchone()
+                counts[root_id] = int(count_row["count"])
+        messages = [
+            self._message(
+                row,
+                revision_count=counts.get(str(row["revision_root_id"]), 1),
+            )
+            for row in rows
+        ]
+        has_more = bool(rows and rows[0]["parent_message_id"])
+        return {
+            "messages": messages,
+            "hasMore": has_more,
+            "nextBefore": messages[0]["id"] if has_more and messages else None,
+        }
+
     def get_message(self, message_id: str) -> Optional[Dict[str, Any]]:
         with self._lock, self._connect() as connection:
             row = connection.execute(
