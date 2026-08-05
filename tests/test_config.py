@@ -67,11 +67,15 @@ def test_bridge_settings_updates_are_validated_and_atomic(tmp_path):
         "ws_port": 9100,
         "public_url": "",
         "comfyui_path": "",
+        "wait_for_generation_completion": True,
+        "generation_completion_timeout": 600,
     })
 
     assert value.ws_port == 9100
     assert value.public_url == ""
     assert value.comfyui_path is None
+    assert value.wait_for_generation_completion is True
+    assert value.generation_completion_timeout == 600
     assert path.with_suffix(".json.tmp").exists() is False
 
     before = path.read_text(encoding="utf-8")
@@ -79,6 +83,8 @@ def test_bridge_settings_updates_are_validated_and_atomic(tmp_path):
         store.update({"api_key": "not-allowed"})
     with pytest.raises(ValueError, match="less than or equal to 65535"):
         store.update({"ws_port": 70000})
+    with pytest.raises(ValueError, match="less than or equal to 3600"):
+        store.update({"generation_completion_timeout": 3601})
     assert path.read_text(encoding="utf-8") == before
 
 

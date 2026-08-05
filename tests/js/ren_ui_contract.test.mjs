@@ -58,6 +58,8 @@ test("settings use defined cards with live state and collapsed diagnostics", asy
     assert.match(panel, /Bridge &amp; safety/);
     assert.match(panel, /data-bridge-setting="ws_port"/);
     assert.match(panel, /data-bridge-setting="enable_workflow_writes"/);
+    assert.match(panel, /data-bridge-setting="wait_for_generation_completion"/);
+    assert.match(panel, /data-bridge-setting="generation_completion_timeout"/);
     assert.match(panel, /saveBridgeSettings/);
     assert.match(panel, /pendingRestartFields/);
     assert.match(

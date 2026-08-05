@@ -63,7 +63,8 @@ Restart ComfyUI. The sidebar should show a `Ren` tab with a chat-bubble icon. In
 
 The local defaults work for a standard ComfyUI install. To change the backend
 launch mode, bind address, ports, ComfyUI path, extra model paths file, logging,
-or server-side safety gates, open **Ren → Settings → Bridge & safety**.
+generation waiting behavior, or server-side safety gates, open **Ren → Settings
+→ Bridge & safety**.
 
 Bridge settings are validated and stored locally in
 `.fl_mcp/bridge_settings.json`. Changes take effect after restarting ComfyUI.
@@ -120,6 +121,7 @@ Routine canvas edits can run without an extra prompt. Queueing, workflow deletio
 - Tool calls stay at their chronological position in the conversation. Consecutive identical calls collapse into a single row with an `×N` count while retaining each call's details.
 - Approval cards support **Deny**, **Allow once**, and persistent per-tool **Always allow** decisions. Saved rules can be cleared from **Settings → Tool approvals**.
 - **Bypass all approval prompts** disables the chat approval layer globally. It does not override the server-side workflow, file, Git, Manager, or process safety gates.
+- **Wait for generation completion by default** keeps a single `queue_workflow` tool call open while ComfyUI runs, avoiding repeated model-driven status requests. Each call can override the saved behavior and timeout.
 - The composer remains fixed below the scrollable conversation. **Jump to present** scrolls smoothly when new activity arrives out of view.
 - ComfyUI's native Fit View accounts for the visible canvas beside the open chat panel.
 - Automatic node insertion uses real node bounds and graph extents to avoid stacking new nodes on top of existing nodes.
@@ -301,7 +303,7 @@ These generally require the browser bridge.
 
 | Tool | What it does |
 |---|---|
-| `queue_workflow` | Queues the current workflow |
+| `queue_workflow` | Queues the current workflow and optionally waits for a terminal result |
 | `cancel_workflow` | Cancels current execution |
 | `enable_auto_queue` | Enables auto-queue |
 | `disable_auto_queue` | Disables auto-queue |

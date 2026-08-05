@@ -72,6 +72,16 @@ test("tool summaries expose human outcomes for core canvas operations", () => {
         status: "done",
         result: '{"node_count":12}',
     }), "Inspected 12 nodes");
+    assert.equal(summarizeToolStep({
+        name: "queue_workflow",
+        status: "done",
+        result: '{"status":"completed"}',
+    }), "Completed workflow");
+    assert.equal(summarizeToolStep({
+        name: "queue_workflow",
+        status: "done",
+        result: '{"status":"timeout"}',
+    }), "Workflow wait timed out");
 });
 
 test("image review and mask summaries report the visible outcome", () => {

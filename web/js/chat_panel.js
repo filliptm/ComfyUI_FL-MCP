@@ -320,6 +320,10 @@ export class AssistantPanel {
                                                 <option value="ERROR">Error</option>
                                             </select>
                                         </label>
+                                        <label class="fl-field">
+                                            <span>Generation wait timeout (seconds)</span>
+                                            <input data-bridge-setting="generation_completion_timeout" type="number" min="1" max="3600" step="1">
+                                        </label>
                                     </div>
                                     <div class="fl-bridge-toggle-grid">
                                         <label class="fl-bridge-toggle">
@@ -333,6 +337,10 @@ export class AssistantPanel {
                                         <label class="fl-bridge-toggle">
                                             <input data-bridge-setting="log_backend_to_file" type="checkbox">
                                             <span>Write backend log file</span>
+                                        </label>
+                                        <label class="fl-bridge-toggle">
+                                            <input data-bridge-setting="wait_for_generation_completion" type="checkbox">
+                                            <span>Wait for generation completion by default</span>
                                         </label>
                                     </div>
                                 </fieldset>
