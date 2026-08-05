@@ -298,6 +298,7 @@ test("composer can steer an active response and exposes real stop progress", asy
 
 test("chat accepts local images and can place them into a selected image node", async () => {
     const panel = await readFile(new URL("web/js/chat_panel.js", root), "utf8");
+    const helpers = await readFile(new URL("web/js/chat_ui_helpers.js", root), "utf8");
     const api = await readFile(new URL("web/js/fl_api.js", root), "utf8");
     const runtime = await readFile(new URL("backend/chat_runtime.py", root), "utf8");
     const mcp = await readFile(new URL("backend/mcp_server.py", root), "utf8");
@@ -316,6 +317,7 @@ test("chat accepts local images and can place them into a selected image node", 
     assert.match(panel, /\/fl_mcp\/image\/thumbnail\?/);
     assert.match(panel, /previewLink\.href = this\.toolImageOriginalSource\(image\)/);
     assert.match(panel, /fetch\(this\.toolImageImportSource\(image\)\)/);
+    assert.match(helpers, /if \(name === "view_chat_image"\) return \[\];/);
     assert.match(api, /api\.fetchApi\("\/upload\/image"/);
     assert.match(api, /formData\.append\("image", file,/);
     assert.match(api, /placeChatImageInNode/);

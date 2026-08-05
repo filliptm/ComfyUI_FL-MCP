@@ -49,19 +49,21 @@ function publicHttpUrl(value) {
 export function toolDisplayImages(step) {
     const name = step?.name || "";
     const result = toolResultPayload(step?.result);
+    // The user's message already owns the visible attachment thumbnail. The
+    // inspection tool still receives the original image, but must not add a
+    // second copy to long chat histories.
+    if (name === "view_chat_image") return [];
     let candidates = Array.isArray(result?.displayImages)
         ? result.displayImages
         : [];
     if (name === "web_fetch_page" && Array.isArray(result?.images)) {
         candidates = result.images.map(image => ({ ...image, kind: "web" }));
-    } else if (["view_output_image", "view_chat_image"].includes(name) && result?.image) {
+    } else if (name === "view_output_image" && result?.image) {
         candidates = [{
             ...result.image,
             kind: "comfy",
-            title: name === "view_chat_image" ? "Chat attachment" : "Generated output",
-            alt: name === "view_chat_image"
-                ? "User-attached ComfyUI image"
-                : "Generated ComfyUI output",
+            title: "Generated output",
+            alt: "Generated ComfyUI output",
         }];
     }
 

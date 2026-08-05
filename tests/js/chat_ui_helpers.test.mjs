@@ -215,15 +215,14 @@ test("tool image candidates preserve source order and reject unsafe URLs", () =>
         name: "view_chat_image",
         result: JSON.stringify({
             image: { filename: "reference.png", subfolder: "ren-chat/session", type: "input" },
+            displayImages: [{
+                kind: "comfy",
+                filename: "reference.png",
+                subfolder: "ren-chat/session",
+                type: "input",
+            }],
         }),
-    }), [{
-        kind: "comfy",
-        filename: "reference.png",
-        subfolder: "ren-chat/session",
-        type: "input",
-        title: "Chat attachment",
-        alt: "User-attached ComfyUI image",
-    }]);
+    }), []);
 });
 
 test("tool images survive Codex MCP wrappers with null outer structured content", () => {
