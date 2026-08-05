@@ -79,6 +79,7 @@ async def test_starting_an_edit_creates_a_sibling_user_revision(tmp_path, monkey
         "count": 2,
     }
     assert state.user_message_id == messages[0]["id"]
+    assert state.user_message_revision == messages[0]["revision"]
 
 
 @pytest.mark.asyncio

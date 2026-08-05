@@ -282,6 +282,16 @@ async def start_run(request: Request) -> StreamingResponse:
             "X-Accel-Buffering": "no",
             "X-FL-MCP-Run-Id": state.run_id,
             "X-FL-MCP-Conversation-Id": state.conversation_id,
+            "X-FL-MCP-User-Message-Id": state.user_message_id or "",
+            "X-FL-MCP-User-Revision-Root-Id": (
+                str((state.user_message_revision or {}).get("rootId") or "")
+            ),
+            "X-FL-MCP-User-Revision-Index": (
+                str((state.user_message_revision or {}).get("index") or 1)
+            ),
+            "X-FL-MCP-User-Revision-Count": (
+                str((state.user_message_revision or {}).get("count") or 1)
+            ),
         },
     )
 

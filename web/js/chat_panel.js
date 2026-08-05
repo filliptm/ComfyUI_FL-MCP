@@ -2073,11 +2073,9 @@ export class AssistantPanel {
         this.running = true;
         this.currentAssistant = null;
         this.followOutput = true;
-        if (editMessageId) {
-            this.renderOptimisticRevision(editMessageId, message);
-        } else {
-            this.appendMessage("user", message);
-        }
+        const optimisticUser = editMessageId
+            ? this.renderOptimisticRevision(editMessageId, message)
+            : this.appendMessage("user", message);
         this.updateComposerState();
         try {
             await this.chat.startRun({
@@ -2086,8 +2084,12 @@ export class AssistantPanel {
                 message,
                 reasoningEffort: this.composerReasoningSelect.value,
                 editMessageId,
-                onReady: ({ conversationId }) => {
+                onReady: ({ conversationId, userMessage }) => {
                     this.conversationId = conversationId;
+                    this.applyUserMessageMetadata(
+                        optimisticUser?.article,
+                        userMessage,
+                    );
                 },
                 onEvent: (event) => this.handleEvent(event),
             });
@@ -2107,8 +2109,7 @@ export class AssistantPanel {
             `.fl-message.user[data-message-id="${CSS.escape(messageId)}"]`,
         );
         if (!article) {
-            this.appendMessage("user", content);
-            return;
+            return this.appendMessage("user", content);
         }
         let following = article.nextElementSibling;
         while (following) {
@@ -2117,7 +2118,17 @@ export class AssistantPanel {
             following = next;
         }
         article.remove();
-        this.appendMessage("user", content);
+        return this.appendMessage("user", content);
+    }
+
+    applyUserMessageMetadata(article, message) {
+        if (!article || !message?.id) return;
+        article.dataset.messageId = message.id;
+        article.querySelector(".fl-message-actions")?.remove();
+        article.appendChild(this.createUserMessageActions({
+            messageId: message.id,
+            revision: message.revision,
+        }));
     }
 
     startMessageEdit(messageId) {

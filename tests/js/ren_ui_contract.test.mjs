@@ -289,7 +289,9 @@ test("sent requests can be edited, resent, and browsed by version", async () => 
     }
     assert.match(panel, /Send edited request/);
     assert.match(panel, /editMessageId/);
+    assert.match(panel, /applyUserMessageMetadata/);
     assert.match(panel, /selectMessageVersion/);
+    assert.match(client, /X-FL-MCP-User-Message-Id/);
     assert.match(client, /messages\/\$\{encodeURIComponent\(messageId\)\}\/version/);
     assert.match(styles, /\.fl-message-actions/);
     assert.match(styles, /\.fl-message-edit-form/);

@@ -28,6 +28,7 @@ test("SSE consumer handles chunk boundaries and multiple events", async () => {
 test("run requests include the per-message reasoning level", async () => {
     const originalFetch = globalThis.fetch;
     let request;
+    let ready;
     globalThis.fetch = async (url, options = {}) => {
         request = { url: String(url), options };
         return new Response("", {
@@ -35,6 +36,10 @@ test("run requests include the per-message reasoning level", async () => {
             headers: {
                 "X-FL-MCP-Run-Id": "run-1",
                 "X-FL-MCP-Conversation-Id": "conversation-1",
+                "X-FL-MCP-User-Message-Id": "message-1",
+                "X-FL-MCP-User-Revision-Root-Id": "message-1",
+                "X-FL-MCP-User-Revision-Index": "1",
+                "X-FL-MCP-User-Revision-Count": "1",
             },
         });
     };
@@ -44,6 +49,9 @@ test("run requests include the per-message reasoning level", async () => {
             sessionId: "session-1",
             message: "Inspect this workflow",
             reasoningEffort: "xhigh",
+            onReady: (value) => {
+                ready = value;
+            },
         });
     } finally {
         globalThis.fetch = originalFetch;
@@ -56,6 +64,18 @@ test("run requests include the per-message reasoning level", async () => {
         message: "Inspect this workflow",
         reasoningEffort: "xhigh",
         editMessageId: null,
+    });
+    assert.deepEqual(ready, {
+        runId: "run-1",
+        conversationId: "conversation-1",
+        userMessage: {
+            id: "message-1",
+            revision: {
+                rootId: "message-1",
+                index: 1,
+                count: 1,
+            },
+        },
     });
 });
 

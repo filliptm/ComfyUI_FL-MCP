@@ -163,9 +163,22 @@ export class ChatClient {
         }
         this.runId = response.headers.get("X-FL-MCP-Run-Id");
         this.conversationId = response.headers.get("X-FL-MCP-Conversation-Id");
+        const userMessageId = response.headers.get("X-FL-MCP-User-Message-Id");
         onReady?.({
             runId: this.runId,
             conversationId: this.conversationId,
+            userMessage: userMessageId ? {
+                id: userMessageId,
+                revision: {
+                    rootId: response.headers.get("X-FL-MCP-User-Revision-Root-Id"),
+                    index: Number(
+                        response.headers.get("X-FL-MCP-User-Revision-Index"),
+                    ) || 1,
+                    count: Number(
+                        response.headers.get("X-FL-MCP-User-Revision-Count"),
+                    ) || 1,
+                },
+            } : null,
         });
         await this.consumeSSE(response.body, onEvent);
     }

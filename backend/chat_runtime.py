@@ -357,6 +357,7 @@ class ActiveRun:
     session_id: str
     settings: dict[str, Any] | None = None
     user_message_id: str | None = None
+    user_message_revision: dict[str, Any] | None = None
     events: list[str] = field(default_factory=list)
     subscribers: list[asyncio.Queue[str | None]] = field(default_factory=list)
     task: asyncio.Task[None] | None = None
@@ -476,6 +477,7 @@ class ChatRuntime:
                 session_id,
                 settings=settings,
                 user_message_id=user_message["id"],
+                user_message_revision=user_message["revision"],
             )
             self.runs[run_id] = state
             self._prune_completed_runs()
