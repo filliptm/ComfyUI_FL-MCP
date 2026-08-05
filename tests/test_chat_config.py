@@ -23,6 +23,26 @@ def test_settings_reject_secret_fields(tmp_path):
         store.update({"api_key": "secret"})
 
 
+def test_reasoning_effort_persists_and_validates(tmp_path):
+    store = ChatSettingsStore(tmp_path / "settings.json")
+
+    assert store.load()["reasoning_effort"] == "default"
+    assert store.update({"reasoning_effort": "xhigh"})["reasoning_effort"] == "xhigh"
+    assert store.load()["reasoning_effort"] == "xhigh"
+
+    with pytest.raises(ValueError, match="reasoning effort"):
+        store.update({"reasoning_effort": "unlimited"})
+
+
+def test_provider_reasoning_capabilities_are_explicit():
+    assert PROVIDER_PRESETS["anthropic"]["reasoning_efforts"] == []
+    assert PROVIDER_PRESETS["openai"]["reasoning_setting"] == (
+        "openai_reasoning_effort"
+    )
+    assert "ultra" in PROVIDER_PRESETS["codex_subscription"]["reasoning_efforts"]
+    assert "ultra" not in PROVIDER_PRESETS["claude_subscription"]["reasoning_efforts"]
+
+
 def test_approval_preferences_persist_and_validate(tmp_path):
     store = ChatSettingsStore(tmp_path / "settings.json")
     value = store.update({

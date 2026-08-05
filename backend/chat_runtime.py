@@ -142,6 +142,19 @@ def tool_result_content(content: Any) -> str:
     return json.dumps(content, ensure_ascii=False, separators=(",", ":"))
 
 
+def model_settings_for_provider(settings: dict[str, Any]) -> dict[str, Any]:
+    model_settings: dict[str, Any] = {
+        "temperature": settings["temperature"],
+    }
+    reasoning_effort = settings.get("reasoning_effort", "default")
+    reasoning_setting = PROVIDER_PRESETS[settings["provider"]].get(
+        "reasoning_setting"
+    )
+    if reasoning_effort != "default" and reasoning_setting:
+        model_settings[reasoning_setting] = reasoning_effort
+    return model_settings
+
+
 def codex_tool_name(params: dict[str, Any]) -> str | None:
     """Extract the Ren tool name from a Codex MCP approval request."""
     metadata = params.get("_meta")
@@ -363,11 +376,14 @@ class ChatRuntime:
         session_id: str,
         conversation_id: str | None,
         message: str,
+        reasoning_effort: str = "default",
     ) -> ActiveRun:
         text = message.strip()
         if not text:
             raise ValueError("Message cannot be empty.")
         settings = chat_settings.load()
+        if reasoning_effort != "default":
+            settings["reasoning_effort"] = reasoning_effort
         if not settings["model"]:
             raise ValueError("Choose a model before sending a message.")
         identifier = conversation_id or str(uuid.uuid4())
@@ -695,7 +711,7 @@ class ChatRuntime:
                 model,
                 instructions=prompt,
                 toolsets=[mcp_server],
-                model_settings={"temperature": settings["temperature"]},
+                model_settings=model_settings_for_provider(settings),
                 prepare_tools=prepare_tools,
             )
             messages = [
@@ -938,6 +954,11 @@ class ChatRuntime:
             "setting_sources": [],
             "skills": [],
         }
+        reasoning_effort = settings.get("reasoning_effort", "default")
+        if reasoning_effort != "default":
+            if reasoning_effort == "ultra":
+                raise ValueError("Claude does not support Ultra reasoning.")
+            option_values["effort"] = reasoning_effort
         if claude_session_id:
             option_values["resume"] = claude_session_id
         else:
@@ -1437,6 +1458,11 @@ class ChatRuntime:
 
             turn = await thread.turn(
                 latest_user_message,
+                effort=(
+                    None
+                    if settings.get("reasoning_effort", "default") == "default"
+                    else settings["reasoning_effort"]
+                ),
                 model=settings["model"],
                 sandbox=None,
             )

@@ -118,7 +118,7 @@ export class ChatClient {
         });
     }
 
-    async startRun({ sessionId, conversationId, message, onEvent, onReady }) {
+    async startRun({ sessionId, conversationId, message, reasoningEffort, onEvent, onReady }) {
         this.abortController = new AbortController();
         const response = await fetch(`${this.baseUrl}/api/chat/runs`, {
             method: "POST",
@@ -127,6 +127,7 @@ export class ChatClient {
                 sessionId,
                 conversationId: conversationId || null,
                 message,
+                reasoningEffort: reasoningEffort || "default",
             }),
             signal: this.abortController.signal,
         });

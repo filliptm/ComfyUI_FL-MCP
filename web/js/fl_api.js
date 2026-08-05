@@ -15,6 +15,7 @@ import {
     getGraphInsertionOrigin,
 } from "./node_placement.js";
 import { nodeMatchesQuery } from "./node_identity.js";
+import { captureAuthenticatedQueue } from "./queue_capture.js";
 
 /**
  * FL_API class - Wrapper for workflow manipulation functions
@@ -1592,11 +1593,34 @@ export class FL_API {
             }
 
             const effectiveBatchCount = queueSettings?.batchCount || parseInt(app.ui?.batchCount?.value || "1", 10) || 1;
-            const prompt = await app.graphToPrompt();
             let queueResult = null;
 
-            for (let i = 0; i < effectiveBatchCount; i++) {
-                queueResult = await api.queuePrompt(0, prompt);
+            // Modern ComfyUI injects the signed-in user's auth token in
+            // app.queuePrompt(), immediately before it calls api.queuePrompt().
+            // Calling the lower-level API directly skips that step and makes
+            // partner/API nodes report "Please login first" even when the user
+            // is already signed in. Capture the response while retaining the
+            // official authenticated queue path.
+            if (typeof app.queuePrompt === "function") {
+                for (let attempt = 0; app.processingQueue && attempt < 200; attempt++) {
+                    await new Promise(resolve => setTimeout(resolve, 25));
+                }
+                if (app.processingQueue) {
+                    throw new Error("ComfyUI is still preparing another queue request. Try again shortly.");
+                }
+                const capture = await captureAuthenticatedQueue(
+                    api,
+                    () => app.queuePrompt(0, effectiveBatchCount),
+                );
+                queueResult = capture.result;
+                if (!capture.accepted || !queueResult) {
+                    throw new Error("ComfyUI did not accept the workflow for queueing.");
+                }
+            } else {
+                const prompt = await app.graphToPrompt();
+                for (let i = 0; i < effectiveBatchCount; i++) {
+                    queueResult = await api.queuePrompt(0, prompt);
+                }
             }
 
             console.log(`[FL_API] Queued workflow (batch: ${effectiveBatchCount})`);

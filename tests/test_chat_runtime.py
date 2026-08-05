@@ -14,6 +14,7 @@ from chat_runtime import (
     claude_tool_name,
     codex_tool_name,
     install_codex_approval_handler,
+    model_settings_for_provider,
     normalize_approval_decision,
     normalize_assistant_timeline,
     should_request_approval,
@@ -27,6 +28,22 @@ from chat_store import ChatStore
 def _payload(raw: str):
     line = next(line for line in raw.splitlines() if line.startswith("data:"))
     return json.loads(line[5:].strip())
+
+
+def test_model_settings_only_send_supported_reasoning_parameter():
+    assert model_settings_for_provider({
+        "provider": "openai",
+        "reasoning_effort": "high",
+        "temperature": 0.2,
+    }) == {
+        "temperature": 0.2,
+        "openai_reasoning_effort": "high",
+    }
+    assert model_settings_for_provider({
+        "provider": "anthropic",
+        "reasoning_effort": "high",
+        "temperature": 0.2,
+    }) == {"temperature": 0.2}
 
 
 @pytest.mark.asyncio
@@ -617,8 +634,9 @@ async def test_codex_subscription_streams_ren_tools_and_persists_thread(
             self.codex = codex
             self.id = thread_id
 
-        async def turn(self, input_text, **_kwargs):
+        async def turn(self, input_text, **kwargs):
             assert input_text == "Inspect the open workflow."
+            assert kwargs["effort"] == "high"
             return FakeTurn()
 
     class FakeSyncClient:
@@ -674,6 +692,7 @@ async def test_codex_subscription_streams_ren_tools_and_persists_thread(
         {
             "provider": "codex_subscription",
             "model": "gpt-5.6-sol",
+            "reasoning_effort": "high",
             "temperature": 0.2,
         },
     )

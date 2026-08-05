@@ -11,6 +11,16 @@ import {
 import { renderMarkdown } from "./safe_markdown.js";
 import { getToolConfig } from "./tool_activity.js";
 
+const REASONING_LABELS = {
+    default: "Model default",
+    low: "Low",
+    medium: "Medium",
+    high: "High",
+    xhigh: "Extra high",
+    max: "Max",
+    ultra: "Ultra",
+};
+
 export class AssistantPanel {
     constructor(container, sessionManager, options = {}) {
         this.container = container;
@@ -128,9 +138,16 @@ export class AssistantPanel {
                     </div>
 
                     <footer class="fl-chat-input-container">
-                        <div class="fl-canvas-context">
-                            <i class="pi pi-sitemap" aria-hidden="true"></i>
-                            <span>Checking canvas…</span>
+                        <div class="fl-composer-toolbar">
+                            <div class="fl-canvas-context">
+                                <i class="pi pi-sitemap" aria-hidden="true"></i>
+                                <span>Checking canvas…</span>
+                            </div>
+                            <label class="fl-reasoning-control" title="Reasoning level for the next message">
+                                <i class="pi pi-sparkles" aria-hidden="true"></i>
+                                <span class="fl-sr-only">Reasoning level</span>
+                                <select data-reasoning="composer" aria-label="Reasoning level for the next message"></select>
+                            </label>
                         </div>
                         <div class="fl-composer-row">
                             <textarea class="fl-chat-input" rows="1" placeholder="Ask Ren about this workflow…" aria-label="Message"></textarea>
@@ -196,6 +213,10 @@ export class AssistantPanel {
                                             <select class="fl-provider-input" data-setting="subscription_model" aria-label="Subscription model" hidden></select>
                                             <button class="fl-secondary-button" data-action="discover-models" type="button">Refresh</button>
                                         </span>
+                                    </label>
+                                    <label class="fl-field">
+                                        <span>Default reasoning level</span>
+                                        <select class="fl-provider-input" data-setting="reasoning_effort"></select>
                                     </label>
                                     <datalist id="fl-mcp-model-options"></datalist>
                                     <label class="fl-field fl-credential-field">
@@ -325,6 +346,12 @@ export class AssistantPanel {
         this.subscriptionModelSelect = this.container.querySelector(
             '[data-setting="subscription_model"]',
         );
+        this.settingsReasoningSelect = this.container.querySelector(
+            '[data-setting="reasoning_effort"]',
+        );
+        this.composerReasoningSelect = this.container.querySelector(
+            '[data-reasoning="composer"]',
+        );
         this.credentialInput = this.container.querySelector('[data-setting="credential"]');
         this.credentialField = this.container.querySelector(".fl-credential-field");
         this.claudeSubscription = this.container.querySelector(".fl-claude-subscription");
@@ -404,9 +431,13 @@ export class AssistantPanel {
         this.providerSelect.addEventListener("change", () => this.applyProviderPreset());
         this.subscriptionModelSelect.addEventListener("change", () => {
             this.modelInput.value = this.subscriptionModelSelect.value;
+            this.renderReasoningControls();
             this.updateModelSettingsState();
         });
-        this.modelInput.addEventListener("input", () => this.updateModelSettingsState());
+        this.modelInput.addEventListener("input", () => {
+            this.renderReasoningControls();
+            this.updateModelSettingsState();
+        });
         this.approvalBypassInput.addEventListener(
             "change",
             () => this.setApprovalBypass(),
@@ -652,6 +683,7 @@ export class AssistantPanel {
             ? [{ id: this.settings.model, label: this.settings.model }]
             : []);
         this.renderProviderControls();
+        this.renderReasoningControls({ resetComposer: true });
         this.updateCredentialField();
         this.updateProviderBadge();
         this.renderApprovalSettings();
@@ -793,6 +825,7 @@ export class AssistantPanel {
                     provider: this.providerSelect.value,
                     base_url: "",
                     model: this.modelInput.value,
+                    reasoning_effort: this.settingsReasoningSelect.value,
                 });
                 this.status = await this.chat.status(this.sessionManager.getSessionId());
                 this.populateSettings();
@@ -812,6 +845,7 @@ export class AssistantPanel {
                 provider: this.providerSelect.value,
                 base_url: this.baseUrlInput.value,
                 model: this.modelInput.value,
+                reasoning_effort: this.settingsReasoningSelect.value,
             });
             this.status = await this.chat.status(this.sessionManager.getSessionId());
             this.updateCredentialField();
@@ -849,6 +883,39 @@ export class AssistantPanel {
             this.subscriptionModelSelect.value = currentModel;
             this.modelInput.value = this.subscriptionModelSelect.value;
         }
+        this.renderReasoningControls();
+    }
+
+    supportedReasoningEfforts() {
+        const preset = this.settings?.presets?.[this.providerSelect.value];
+        const modelId = this.modelInput.value || this.settings?.model || "";
+        const model = this.availableModels.find((item) => item.id === modelId);
+        if (Array.isArray(model?.reasoningEfforts) && model.reasoningEfforts.length) {
+            return model.reasoningEfforts;
+        }
+        return preset?.reasoning_efforts || [];
+    }
+
+    populateReasoningSelect(select, value, efforts) {
+        select.replaceChildren();
+        for (const effort of ["default", ...efforts]) {
+            const option = document.createElement("option");
+            option.value = effort;
+            option.textContent = REASONING_LABELS[effort] || effort;
+            select.appendChild(option);
+        }
+        select.value = efforts.includes(value) ? value : "default";
+    }
+
+    renderReasoningControls({ resetComposer = false } = {}) {
+        if (!this.settingsReasoningSelect || !this.composerReasoningSelect) return;
+        const efforts = this.supportedReasoningEfforts();
+        const saved = this.settings?.reasoning_effort || "default";
+        const composer = resetComposer
+            ? saved
+            : (this.composerReasoningSelect.value || saved);
+        this.populateReasoningSelect(this.settingsReasoningSelect, saved, efforts);
+        this.populateReasoningSelect(this.composerReasoningSelect, composer, efforts);
     }
 
     updateProviderBadge() {
@@ -1037,6 +1104,7 @@ export class AssistantPanel {
                 provider,
                 base_url: this.baseUrlInput.value,
                 model: this.modelInput.value,
+                reasoning_effort: this.settingsReasoningSelect.value,
                 approval_mode: this.approvalBypassInput.checked
                     ? "bypass_all"
                     : "autonomous_edits",
@@ -1892,6 +1960,7 @@ export class AssistantPanel {
                 sessionId: this.sessionManager.getSessionId(),
                 conversationId: this.conversationId,
                 message,
+                reasoningEffort: this.composerReasoningSelect.value,
                 onReady: ({ conversationId }) => {
                     this.conversationId = conversationId;
                 },

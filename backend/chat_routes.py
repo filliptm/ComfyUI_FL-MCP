@@ -5,7 +5,12 @@ from __future__ import annotations
 from typing import Any, Literal
 
 import httpx
-from chat_config import PROVIDER_PRESETS, chat_settings, credential_store
+from chat_config import (
+    PROVIDER_PRESETS,
+    REASONING_EFFORTS,
+    chat_settings,
+    credential_store,
+)
 from chat_runtime import chat_runtime, normalize_approval_decision
 from chat_store import chat_store
 from claude_subscription import claude_subscription
@@ -230,12 +235,18 @@ async def start_run(request: Request) -> StreamingResponse:
     if not session_id:
         raise HTTPException(status_code=400, detail="sessionId is required.")
     try:
+        reasoning_effort = str(
+            data.get("reasoningEffort") or "default"
+        ).strip().lower()
+        if reasoning_effort not in REASONING_EFFORTS:
+            raise ValueError(f"Unsupported reasoning effort: {reasoning_effort}")
         state = await chat_runtime.start(
             session_id=session_id,
             conversation_id=(
                 str(data["conversationId"]) if data.get("conversationId") else None
             ),
             message=str(data.get("message") or ""),
+            reasoning_effort=reasoning_effort,
         )
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc

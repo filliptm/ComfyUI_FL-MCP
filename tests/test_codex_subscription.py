@@ -102,6 +102,12 @@ async def test_models_returns_every_visible_cli_catalog_entry(monkeypatch):
                 "display_name": "GPT-5.6-Sol",
                 "description": "Frontier model",
                 "visibility": "list",
+                "default_reasoning_level": "low",
+                "supported_reasoning_levels": [
+                    {"effort": "low"},
+                    {"effort": "high"},
+                    {"effort": "ultra"},
+                ],
             },
             {
                 "slug": "codex-auto-review",
@@ -140,5 +146,7 @@ async def test_models_returns_every_visible_cli_catalog_entry(monkeypatch):
         "gpt-5.6-terra",
     ]
     assert models[0]["description"] == "Frontier model"
+    assert models[0]["defaultReasoningEffort"] == "low"
+    assert models[0]["reasoningEfforts"] == ["low", "high", "ultra"]
     assert models[1]["label"] == "GPT-5.6-Terra · Auto Review"
     assert models[2]["label"] == "GPT-5.6-Terra · Standard"

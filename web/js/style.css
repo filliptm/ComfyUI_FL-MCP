@@ -960,14 +960,27 @@
     box-shadow: 0 0 0 1px rgba(153, 102, 217, 0.12);
 }
 
-.fl-canvas-context {
+.fl-composer-toolbar {
     display: flex;
     align-items: center;
+    justify-content: space-between;
     min-height: 25px;
+    padding: 3px 7px 0 9px;
+}
+
+.fl-canvas-context {
+    display: flex;
+    min-width: 0;
+    align-items: center;
     gap: 6px;
-    padding: 4px 9px 2px;
     color: var(--ren-text-muted);
     font-size: 11px;
+}
+
+.fl-canvas-context span {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
 }
 
 .fl-canvas-context i {
@@ -978,6 +991,29 @@
 .fl-canvas-context.disconnected,
 .fl-canvas-context.disconnected i {
     color: var(--ren-warning);
+}
+
+.fl-reasoning-control {
+    display: flex;
+    flex: 0 0 auto;
+    align-items: center;
+    gap: 3px;
+    color: var(--ren-text-muted);
+}
+
+.fl-reasoning-control select {
+    max-width: 92px;
+    height: 24px;
+    padding: 0 2px;
+    border: 0;
+    outline: 0;
+    background: transparent;
+    color: var(--ren-text-muted);
+    font-size: 10px;
+}
+
+.fl-reasoning-control select:focus-visible {
+    box-shadow: 0 0 0 1px var(--ren-accent-hover);
 }
 
 .fl-composer-row {

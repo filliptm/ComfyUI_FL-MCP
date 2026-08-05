@@ -15,6 +15,10 @@ DATA_DIR = Path(os.getenv("FL_MCP_DATA_DIR", PROJECT_ROOT / ".fl_mcp"))
 SETTINGS_PATH = DATA_DIR / "chat_settings.json"
 KEYRING_SERVICE = "comfyui-fl-mcp"
 APPROVAL_MODES = {"autonomous_edits", "bypass_all"}
+REASONING_EFFORTS = {"default", "low", "medium", "high", "xhigh", "max", "ultra"}
+OPENAI_REASONING_EFFORTS = ["low", "medium", "high"]
+CLAUDE_REASONING_EFFORTS = ["low", "medium", "high", "xhigh", "max"]
+CODEX_REASONING_EFFORTS = [*CLAUDE_REASONING_EFFORTS, "ultra"]
 TOOL_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 
 PROVIDER_PRESETS: dict[str, dict[str, Any]] = {
@@ -24,6 +28,8 @@ PROVIDER_PRESETS: dict[str, dict[str, Any]] = {
         "base_url": "http://127.0.0.1:1234/v1",
         "requires_key": False,
         "default_model": "",
+        "reasoning_efforts": OPENAI_REASONING_EFFORTS,
+        "reasoning_setting": "openai_reasoning_effort",
     },
     "ollama": {
         "label": "Ollama",
@@ -31,6 +37,8 @@ PROVIDER_PRESETS: dict[str, dict[str, Any]] = {
         "base_url": "http://127.0.0.1:11434/v1",
         "requires_key": False,
         "default_model": "",
+        "reasoning_efforts": OPENAI_REASONING_EFFORTS,
+        "reasoning_setting": "openai_reasoning_effort",
     },
     "openai": {
         "label": "OpenAI",
@@ -38,6 +46,8 @@ PROVIDER_PRESETS: dict[str, dict[str, Any]] = {
         "base_url": "https://api.openai.com/v1",
         "requires_key": True,
         "default_model": "gpt-5-mini",
+        "reasoning_efforts": OPENAI_REASONING_EFFORTS,
+        "reasoning_setting": "openai_reasoning_effort",
     },
     "openrouter": {
         "label": "OpenRouter",
@@ -45,6 +55,8 @@ PROVIDER_PRESETS: dict[str, dict[str, Any]] = {
         "base_url": "https://openrouter.ai/api/v1",
         "requires_key": True,
         "default_model": "openai/gpt-5-mini",
+        "reasoning_efforts": OPENAI_REASONING_EFFORTS,
+        "reasoning_setting": "openai_reasoning_effort",
     },
     "anthropic": {
         "label": "Anthropic",
@@ -52,6 +64,7 @@ PROVIDER_PRESETS: dict[str, dict[str, Any]] = {
         "base_url": "https://api.anthropic.com",
         "requires_key": True,
         "default_model": "claude-sonnet-4-5",
+        "reasoning_efforts": [],
     },
     "claude_subscription": {
         "label": "Claude subscription",
@@ -59,6 +72,7 @@ PROVIDER_PRESETS: dict[str, dict[str, Any]] = {
         "base_url": "",
         "requires_key": False,
         "default_model": "sonnet",
+        "reasoning_efforts": CLAUDE_REASONING_EFFORTS,
         "models": [
             {"id": "default", "label": "Account default"},
             {"id": "best", "label": "Best available (Fable or Opus)"},
@@ -80,6 +94,7 @@ PROVIDER_PRESETS: dict[str, dict[str, Any]] = {
         "base_url": "",
         "requires_key": False,
         "default_model": "gpt-5.6-sol",
+        "reasoning_efforts": CODEX_REASONING_EFFORTS,
         "models": [
             {"id": "gpt-5.6-sol", "label": "GPT-5.6-Sol (recommended)"},
             {
@@ -100,6 +115,8 @@ PROVIDER_PRESETS: dict[str, dict[str, Any]] = {
         "base_url": "",
         "requires_key": False,
         "default_model": "",
+        "reasoning_efforts": OPENAI_REASONING_EFFORTS,
+        "reasoning_setting": "openai_reasoning_effort",
     },
 }
 
@@ -118,6 +135,7 @@ def default_settings() -> dict[str, Any]:
         "base_url": PROVIDER_PRESETS["lmstudio"]["base_url"],
         "approval_mode": "autonomous_edits",
         "always_allowed_tools": [],
+        "reasoning_effort": "default",
         "temperature": 0.2,
     }
 
@@ -131,6 +149,7 @@ class ChatSettingsStore:
         "base_url",
         "approval_mode",
         "always_allowed_tools",
+        "reasoning_effort",
         "temperature",
     }
 
@@ -202,6 +221,11 @@ class ChatSettingsStore:
         ).strip().lower()
         if approval_mode not in APPROVAL_MODES:
             raise ValueError(f"Unsupported approval mode: {approval_mode}")
+        reasoning_effort = str(
+            value.get("reasoning_effort") or "default"
+        ).strip().lower()
+        if reasoning_effort not in REASONING_EFFORTS:
+            raise ValueError(f"Unsupported reasoning effort: {reasoning_effort}")
         raw_allowed_tools = value.get("always_allowed_tools", [])
         if not isinstance(raw_allowed_tools, list):
             raise ValueError("always_allowed_tools must be a list.")
@@ -221,6 +245,7 @@ class ChatSettingsStore:
             "base_url": base_url,
             "approval_mode": approval_mode,
             "always_allowed_tools": always_allowed_tools,
+            "reasoning_effort": reasoning_effort,
             "temperature": temperature,
         }
 
