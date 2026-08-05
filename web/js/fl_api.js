@@ -16,6 +16,8 @@ import {
 } from "./node_placement.js";
 import { nodeIdsEqual } from "./node_identity.js";
 import {
+    formatImageWidgetRef,
+    nestedImageRefForNode,
     normalizeMaskRegion,
     parseImageWidgetRef,
     summarizeMaskPixels,
@@ -1841,6 +1843,7 @@ export class FL_API {
         }
 
         await app.loadGraphData(workflow, clean, restoreView, name || null);
+        this.restoreNestedImageReferences();
         this._markGraphChanged();
         return {
             success: true,
@@ -2240,14 +2243,35 @@ export class FL_API {
         return await createImageBitmap(blob);
     }
 
-    _assignImageToNode(node, image) {
+    restoreNestedImageReferences(nodes = app.graph?._nodes || []) {
+        let restored = 0;
+        for (const node of nodes) {
+            const image = nestedImageRefForNode(node);
+            if (!image) continue;
+            this._assignImageToNode(node, image, { notify: false });
+            restored++;
+        }
+        if (restored > 0) this._markCanvasDirty();
+        return restored;
+    }
+
+    _assignImageToNode(node, image, { notify = true } = {}) {
         const imageWidget = node.widgets?.find(widget => widget.name === "image");
         if (!imageWidget) {
             throw new Error(`Node ${node.id} has no image widget.`);
         }
-        const widgetPath = [image.subfolder, image.filename].filter(Boolean).join("/");
-        const widgetValue = `${widgetPath} [${image.type || "input"}]`;
-        this._setWidgetValue(node, imageWidget, widgetValue);
+        const widgetValue = formatImageWidgetRef(image);
+        if (!widgetValue) {
+            throw new Error(`Node ${node.id} received an invalid image reference.`);
+        }
+        const optionValues = imageWidget.options?.values;
+        if (Array.isArray(optionValues) && !optionValues.includes(widgetValue)) {
+            // Nested inputs are executable but absent from ComfyUI's top-level
+            // Load Image choices, so keep the canonical value visibly valid.
+            optionValues.push(widgetValue);
+        }
+        if (notify) this._setWidgetValue(node, imageWidget, widgetValue);
+        else imageWidget.value = widgetValue;
         node.images = [image];
         node.imgs = [this._createComfyImage(image)];
         node.imageIndex = 0;
@@ -2265,10 +2289,11 @@ export class FL_API {
             subfolder: ref.subfolder || "",
             type: ref.type || "input",
         });
-        params.set("rand", String(Date.now()));
         const image = new Image();
         image.onload = () => this._markCanvasDirty();
-        image.src = api.apiURL(`/view?${params.toString()}`);
+        // Canvas rendering uses a bounded cached preview. The original path
+        // remains in the widget value above and is what graphToPrompt executes.
+        image.src = api.apiURL(`/fl_mcp/image/thumbnail?${params.toString()}`);
         return image;
     }
 

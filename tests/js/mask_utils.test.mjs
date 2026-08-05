@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+    formatImageWidgetRef,
+    nestedImageRefForNode,
     normalizeMaskRegion,
     parseImageWidgetRef,
     summarizeMaskPixels,
@@ -18,6 +20,27 @@ test("image widget references preserve ComfyUI type and subfolder", () => {
         { filename: "result.png", subfolder: "", type: "output" },
     );
     assert.equal(parseImageWidgetRef("$35-0"), null);
+});
+
+
+test("nested image references survive workflow node rehydration", () => {
+    const node = {
+        properties: { image: "ren-chat/session-1/reference.png [input]" },
+        widgets: [{ name: "image", value: "reference.png" }],
+        widgets_values: ["reference.png"],
+    };
+
+    const restored = nestedImageRefForNode(node);
+
+    assert.deepEqual(restored, {
+        filename: "reference.png",
+        subfolder: "ren-chat/session-1",
+        type: "input",
+    });
+    assert.equal(
+        formatImageWidgetRef(restored),
+        "ren-chat/session-1/reference.png [input]",
+    );
 });
 
 

@@ -276,6 +276,10 @@ class BridgeStatusPanel {
 app.registerExtension({
     name: "fl_mcp.bridge",
 
+    afterConfigureGraph() {
+        toolExecutor?.flApi.restoreNestedImageReferences();
+    },
+
     async setup() {
         console.log("[FL-MCP] Initializing browser bridge");
 
@@ -293,6 +297,7 @@ app.registerExtension({
                 clientVersion: `${config.version}-frontend`,
             });
             toolExecutor = new ToolExecutor(wsClient);
+            toolExecutor.flApi.restoreNestedImageReferences();
 
             wsClient.on("connected", () => assistantPanel?.updateConnection());
             wsClient.on("disconnected", () => assistantPanel?.updateConnection());

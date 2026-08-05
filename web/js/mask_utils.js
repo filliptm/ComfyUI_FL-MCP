@@ -24,6 +24,30 @@ export function parseImageWidgetRef(value, defaultType = "input") {
     };
 }
 
+export function formatImageWidgetRef(ref) {
+    const image = parseImageWidgetRef(ref);
+    if (!image) return null;
+    const path = [image.subfolder, image.filename].filter(Boolean).join("/");
+    return `${path} [${image.type}]`;
+}
+
+export function nestedImageRefForNode(node) {
+    const imageWidgetIndex = node?.widgets?.findIndex(widget => widget.name === "image") ?? -1;
+    if (imageWidgetIndex < 0) return null;
+
+    const candidates = [
+        node?.properties?.image,
+        node?.widgets_values?.[imageWidgetIndex],
+        node?.widgets?.[imageWidgetIndex]?.value,
+        node?.images?.[0],
+    ];
+    for (const candidate of candidates) {
+        const ref = parseImageWidgetRef(candidate);
+        if (ref?.subfolder) return ref;
+    }
+    return null;
+}
+
 export function normalizeMaskRegion(region, coordinateSpace, imageWidth, imageHeight) {
     const scaleX = coordinateSpace === "normalized" ? imageWidth : 1;
     const scaleY = coordinateSpace === "normalized" ? imageHeight : 1;
