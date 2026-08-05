@@ -24,6 +24,15 @@ export function parseImageWidgetRef(value, defaultType = "input") {
     };
 }
 
+export function imageRefsEqual(left, right) {
+    return Boolean(
+        left && right
+        && left.filename === right.filename
+        && (left.subfolder || "") === (right.subfolder || "")
+        && (left.type || "input") === (right.type || "input")
+    );
+}
+
 export function normalizeMaskRegion(region, coordinateSpace, imageWidth, imageHeight) {
     const scaleX = coordinateSpace === "normalized" ? imageWidth : 1;
     const scaleY = coordinateSpace === "normalized" ? imageHeight : 1;

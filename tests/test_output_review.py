@@ -1,3 +1,4 @@
+import io
 from types import SimpleNamespace
 
 import mcp_server
@@ -140,6 +141,47 @@ def test_output_path_resolution_rejects_traversal(tmp_path):
             "subfolder": "",
             "type": "output",
         })
+
+
+@pytest.mark.asyncio
+async def test_asset_image_source_uses_comfy_view_route(monkeypatch):
+    image_data = io.BytesIO()
+    Image.new("RGBA", (8, 4), (20, 40, 60, 255)).save(image_data, format="PNG")
+    requests = []
+
+    class FakeResponse:
+        content = image_data.getvalue()
+
+        def raise_for_status(self):
+            return None
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def get(self, url, params=None, timeout=None):
+            requests.append((url, params, timeout))
+            return FakeResponse()
+
+    monkeypatch.setattr(mcp_server.httpx, "AsyncClient", FakeClient)
+    source = await mcp_server._resolve_comfy_image_source(
+        SimpleNamespace(comfy_url="http://comfy"),
+        {
+            "filename": "blake3:abc123",
+            "subfolder": "",
+            "type": "input",
+        },
+    )
+
+    assert requests == [(
+        "http://comfy/view",
+        {"filename": "blake3:abc123", "subfolder": "", "type": "input"},
+        10.0,
+    )]
+    assert Image.open(source).size == (8, 4)
 
 
 def test_mask_overlay_preview_reports_coverage_and_bounds(tmp_path):

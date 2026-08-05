@@ -155,7 +155,8 @@ test("action trail stays compact, visible, and visually quiet when complete", as
     assert.match(tools, /edit_node_mask/);
     assert.match(tools, /confirm_mask_review/);
     assert.match(panel, /Replace this image mask\?/);
-    assert.match(panel, /save a new mask image, and update the selected image node/);
+    assert.match(panel, /stage a new mask for review/);
+    assert.match(panel, /image node will not change until you approve it/);
     assert.match(panel, /Use this mask\?/);
     assert.match(panel, /Needs changes/);
     assert.match(panel, /if \(!isMaskReview\) actions\.appendChild\(alwaysAllow\)/);
@@ -165,16 +166,33 @@ test("action trail stays compact, visible, and visually quiet when complete", as
 
 test("mask edits show a live preview and block queueing until review", async () => {
     const api = await readFile(new URL("web/js/fl_api.js", root), "utf8");
+    const panel = await readFile(new URL("web/js/chat_panel.js", root), "utf8");
     const executor = await readFile(new URL("web/js/tool_executor.js", root), "utf8");
     const prompt = await readFile(new URL("backend/chat_prompt.md", root), "utf8");
+    const stagedEdit = api.slice(
+        api.indexOf("async editNodeMask"),
+        api.indexOf("    confirmMaskReview("),
+    );
+    const approval = api.slice(
+        api.indexOf("    confirmMaskReview("),
+        api.indexOf("    discardMaskReview("),
+    );
 
     assert.match(api, /node\.imgs = \[reviewImage\]/);
     assert.match(api, /app\.canvas\?\.centerOnNode\?\.\(node\)/);
     assert.match(api, /this\.pendingMaskReviews/);
+    assert.match(api, /api\.fetchApi\("\/upload\/image"/);
+    assert.doesNotMatch(api, /api\.fetchApi\("\/upload\/mask"/);
+    assert.doesNotMatch(api, /formData\.append\("original_ref"/);
     assert.match(api, /Mask review required for node/);
     assert.match(api, /_pauseAutoQueueForMaskReview/);
     assert.match(api, /The node image changed after this mask was created/);
+    assert.match(api, /discardMaskReview\(nodeId, reviewToken\)/);
     assert.match(api, /node\.imgs = undefined/);
+    assert.doesNotMatch(stagedEdit, /_setWidgetValue/);
+    assert.match(approval, /_setWidgetValue/);
+    assert.match(panel, /this\.discardMaskReview/);
+    assert.match(panel, /Mask preview could not be discarded/);
     assert.match(executor, /confirm_mask_review/);
     assert.match(prompt, /Never queue until the latest mask is approved/);
 });

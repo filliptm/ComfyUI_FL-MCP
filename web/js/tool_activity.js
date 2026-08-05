@@ -120,7 +120,7 @@ export const TOOL_CONFIG = {
     "edit_node_mask": {
         icon: "🖌️",
         label: "Edit Mask",
-        description: "Painting mask regions and updating the image node"
+        description: "Painting mask regions and staging a review preview"
     },
     "confirm_mask_review": {
         icon: "✅",
@@ -462,7 +462,7 @@ const TOOL_RUNNING_LABELS = {
     queue_workflow: "Queueing workflow",
     view_output_image: "Loading final output for review",
     view_node_mask: "Loading mask overlay",
-    edit_node_mask: "Saving mask edit",
+    edit_node_mask: "Staging mask edit",
     confirm_mask_review: "Waiting for mask approval",
     take_screenshot: "Capturing canvas",
     node_library_search: "Searching node library",

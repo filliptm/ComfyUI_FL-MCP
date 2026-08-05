@@ -1644,9 +1644,9 @@ async def view_node_mask(request: ViewNodeMaskRequest, ctx: Context) -> ToolResu
         {"node_id": request.node_id},
     )
     image_ref = node_result["image"]
-    path = _resolve_comfy_image_path(get_comfy_tools(), image_ref)
+    image_source = await _resolve_comfy_image_source(get_comfy_tools(), image_ref)
     preview, preview_format, original_size, preview_size, mask_info = _mask_overlay_preview(
-        path,
+        image_source,
         request.max_dimension,
     )
     result = {
@@ -1668,9 +1668,9 @@ async def view_node_mask(request: ViewNodeMaskRequest, ctx: Context) -> ToolResu
 async def edit_node_mask(request: EditNodeMaskRequest, ctx: Context) -> ToolResult:
     """Paint or erase rectangular/elliptical regions in a node's image mask.
 
-    This uses ComfyUI's authenticated browser upload path and updates the node's
-    image widget to the newly saved masked image. Use normalized coordinates for
-    resolution-independent edits. Set clear_existing=true when the supplied
+    This uses ComfyUI's authenticated browser upload path and stages a masked
+    image without changing the node's image widget. Use normalized coordinates
+    for resolution-independent edits. Set clear_existing=true when the supplied
     regions should be the only masked areas.
     """
     if not settings.enable_workflow_writes:
@@ -1682,9 +1682,9 @@ async def edit_node_mask(request: EditNodeMaskRequest, ctx: Context) -> ToolResu
         request.model_dump(),
     )
     image_ref = edit_result["image"]
-    path = _resolve_comfy_image_path(get_comfy_tools(), image_ref)
+    image_source = await _resolve_comfy_image_source(get_comfy_tools(), image_ref)
     preview, preview_format, original_size, preview_size, mask_info = _mask_overlay_preview(
-        path,
+        image_source,
         2048,
     )
     result = {
@@ -1693,9 +1693,9 @@ async def edit_node_mask(request: EditNodeMaskRequest, ctx: Context) -> ToolResu
         "previewSize": {"width": preview_size[0], "height": preview_size[1]},
         "mask": mask_info,
         "message": (
-            "Mask saved and shown in magenta on the canvas. Call "
+            "Mask staged and shown in magenta on the canvas. Call "
             "confirm_mask_review with the returned review token so the user "
-            "can approve it before queueing."
+            "can apply it to the node before queueing."
         ),
     }
     return ToolResult(
@@ -1712,8 +1712,8 @@ async def confirm_mask_review(
     """Ask the user to approve the visible mask before workflow execution.
 
     Call this immediately after every successful edit_node_mask. The user must
-    explicitly accept the magenta canvas preview; this review cannot be bypassed
-    or remembered for future masks. Queueing remains blocked until it succeeds.
+    explicitly accept the magenta canvas preview before it is applied to the
+    node; this review cannot be bypassed or remembered for future masks.
     """
     return await _execute_tool(ctx, "confirm_mask_review", request.model_dump())
 
@@ -3523,14 +3523,45 @@ def _resolve_comfy_image_path(comfy_tools: Any, image: Dict[str, Any]) -> Path:
     )
 
 
-def _output_image_preview(path: Path, max_dimension: int) -> tuple[bytes, str, tuple[int, int], tuple[int, int]]:
+async def _resolve_comfy_image_source(
+    comfy_tools: Any,
+    image: Dict[str, Any],
+) -> Any:
+    if not str(image["filename"]).startswith("blake3:"):
+        return _resolve_comfy_image_path(comfy_tools, image)
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                f"{comfy_tools.comfy_url}/view",
+                params={
+                    "filename": image["filename"],
+                    "subfolder": image.get("subfolder") or "",
+                    "type": image.get("type") or "input",
+                },
+                timeout=10.0,
+            )
+            response.raise_for_status()
+            return io.BytesIO(response.content)
+    except httpx.HTTPError as exc:
+        raise ComfyUIError(
+            f"Failed to load ComfyUI asset image: {image['filename']}"
+        ) from exc
+
+
+def _image_source_name(source: Any) -> str:
+    return Path(getattr(source, "name", "image")).name
+
+
+def _output_image_preview(source_ref: Any, max_dimension: int) -> tuple[bytes, str, tuple[int, int], tuple[int, int]]:
     """Create a bounded visual-review image while preserving transparency."""
     try:
-        with PILImage.open(path) as source:
+        with PILImage.open(source_ref) as source:
             source.seek(0)
             image = ImageOps.exif_transpose(source).copy()
     except (OSError, UnidentifiedImageError) as exc:
-        raise ComfyUIError(f"Output is not a readable image: {path.name}") from exc
+        raise ComfyUIError(
+            f"Output is not a readable image: {_image_source_name(source_ref)}"
+        ) from exc
 
     original_size = image.size
     image.thumbnail((max_dimension, max_dimension), PILImage.Resampling.LANCZOS)
@@ -3554,16 +3585,18 @@ def _output_image_preview(path: Path, max_dimension: int) -> tuple[bytes, str, t
 
 
 def _mask_overlay_preview(
-    path: Path,
+    source_ref: Any,
     max_dimension: int,
 ) -> tuple[bytes, str, tuple[int, int], tuple[int, int], Dict[str, Any]]:
     """Render masked pixels as a magenta overlay for visual verification."""
     try:
-        with PILImage.open(path) as source:
+        with PILImage.open(source_ref) as source:
             source.seek(0)
             image = ImageOps.exif_transpose(source).convert("RGBA")
     except (OSError, UnidentifiedImageError) as exc:
-        raise ComfyUIError(f"Mask source is not a readable image: {path.name}") from exc
+        raise ComfyUIError(
+            f"Mask source is not a readable image: {_image_source_name(source_ref)}"
+        ) from exc
 
     original_size = image.size
     mask = ImageOps.invert(image.getchannel("A"))
@@ -3660,9 +3693,9 @@ async def view_output_image(request: ViewOutputImageRequest, ctx: Context) -> To
 
     selected_index = request.output_index if request.output_index >= 0 else len(images) - 1
     selected = images[selected_index]
-    path = _resolve_comfy_image_path(comfy_tools, selected)
+    image_source = await _resolve_comfy_image_source(comfy_tools, selected)
     preview, preview_format, original_size, preview_size = _output_image_preview(
-        path,
+        image_source,
         request.max_dimension,
     )
     relative_path = "/".join(filter(None, (

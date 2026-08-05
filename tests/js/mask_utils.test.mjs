@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+    imageRefsEqual,
     normalizeMaskRegion,
     parseImageWidgetRef,
     summarizeMaskPixels,
@@ -18,6 +19,28 @@ test("image widget references preserve ComfyUI type and subfolder", () => {
         { filename: "result.png", subfolder: "", type: "output" },
     );
     assert.equal(parseImageWidgetRef("$35-0"), null);
+    assert.deepEqual(
+        parseImageWidgetRef("blake3:abc123"),
+        { filename: "blake3:abc123", subfolder: "", type: "input" },
+    );
+});
+
+
+test("image references compare normalized type and subfolder defaults", () => {
+    assert.equal(
+        imageRefsEqual(
+            { filename: "mask.png" },
+            { filename: "mask.png", subfolder: "", type: "input" },
+        ),
+        true,
+    );
+    assert.equal(
+        imageRefsEqual(
+            { filename: "blake3:source" },
+            { filename: "fl-mcp-mask.png" },
+        ),
+        false,
+    );
 });
 
 

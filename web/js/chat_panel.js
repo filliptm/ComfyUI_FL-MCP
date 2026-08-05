@@ -27,6 +27,7 @@ export class AssistantPanel {
         this.sessionManager = sessionManager;
         this.chat = new ChatClient(options.baseUrl || "");
         this.createDiagnostics = options.createDiagnostics;
+        this.discardMaskReview = options.discardMaskReview;
         this.getCanvasContext = options.getCanvasContext || (() => ({
             connected: Boolean(this.status?.bridgeConnected),
             nodeCount: 0,
@@ -1811,6 +1812,7 @@ export class AssistantPanel {
         card.className = "fl-approval-card";
         card.dataset.approvalId = value.approvalId;
         card.dataset.toolName = value.toolName || "";
+        card.approvalValue = value;
         const eyebrow = document.createElement("span");
         eyebrow.className = "fl-approval-state";
         const shield = document.createElement("i");
@@ -1908,8 +1910,8 @@ export class AssistantPanel {
                     ? "Replace this image mask?"
                     : "Edit this image mask?",
                 consequence: maskRegions.length
-                    ? `Ren will ${maskVerb} ${maskRegionCount}, save a new mask image, and update the selected image node.`
-                    : "Ren will save a new mask image and update the selected image node.",
+                    ? `Ren will ${maskVerb} ${maskRegionCount} and stage a new mask for review. The image node will not change until you approve it.`
+                    : "Ren will stage a new mask for review. The image node will not change until you approve it.",
             },
             confirm_mask_review: {
                 title: "Use this mask?",
@@ -1960,6 +1962,16 @@ export class AssistantPanel {
         const resolution = value.resolution || (value.approved ? "approved" : "denied");
         card.classList.add(resolution);
         const isMaskReview = card.dataset.toolName === "confirm_mask_review";
+        if (isMaskReview && !value.approved) {
+            const approval = card.approvalValue || {};
+            const request = approval.arguments?.request || approval.arguments || {};
+            Promise.resolve(this.discardMaskReview?.(
+                request.node_id,
+                request.review_token,
+            )).catch((error) => {
+                this.showError(`Mask preview could not be discarded: ${error.message}`);
+            });
+        }
         const labels = {
             approved: isMaskReview ? "Mask approved" : "Approved",
             always_allowed: "Always allowed",

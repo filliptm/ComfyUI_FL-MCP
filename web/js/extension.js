@@ -382,6 +382,9 @@ app.registerExtension({
                             ),
                             getCanvasContext,
                             subscribeCanvasContext,
+                            discardMaskReview: (nodeId, reviewToken) => (
+                                toolExecutor.flApi.discardMaskReview(nodeId, reviewToken)
+                            ),
                         },
                     );
                     window.FL_MCP.assistantPanel = assistantPanel;

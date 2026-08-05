@@ -14,9 +14,10 @@ import {
     findNonOverlappingPosition,
     getGraphInsertionOrigin,
 } from "./node_placement.js";
-import { nodeMatchesQuery } from "./node_identity.js";
+import { nodeIdsEqual, nodeMatchesQuery } from "./node_identity.js";
 import { captureAuthenticatedQueue } from "./queue_capture.js";
 import {
+    imageRefsEqual,
     normalizeMaskRegion,
     parseImageWidgetRef,
     summarizeMaskPixels,
@@ -617,7 +618,10 @@ export class FL_API {
             throw new Error(`Node ${nodeId} has no image widget to receive the edited mask`);
         }
 
-        const source = this.getNodeImageRef(nodeId).image;
+        const existingReview = this._findPendingMaskReview(node.id)?.[1];
+        const currentImage = this.getNodeImageRef(nodeId).image;
+        const source = existingReview?.image || currentImage;
+        const baseImage = existingReview?.baseImage || currentImage;
         const [rgbImage, alphaImage] = await Promise.all([
             this._loadComfyImage(source, "rgb"),
             this._loadComfyImage(source, "a"),
@@ -714,8 +718,7 @@ export class FL_API {
         formData.append("image", blob, filename);
         formData.append("type", "input");
         formData.append("subfolder", "fl_mcp_masks");
-        formData.append("original_ref", JSON.stringify(source));
-        const response = await api.fetchApi("/upload/mask", {
+        const response = await api.fetchApi("/upload/image", {
             method: "POST",
             body: formData,
         });
@@ -736,18 +739,6 @@ export class FL_API {
         };
         const widgetPath = [image.subfolder, image.filename].filter(Boolean).join("/");
         const widgetValue = `${widgetPath} [${image.type}]`;
-        this._setWidgetValue(node, imageWidget, widgetValue);
-        node.images = [image];
-        node.imgs = undefined;
-        if (node.properties) {
-            node.properties.image = widgetValue;
-        }
-        if (node.widgets_values && node.widgets) {
-            const widgetIndex = node.widgets.indexOf(imageWidget);
-            if (widgetIndex >= 0) {
-                node.widgets_values[widgetIndex] = widgetValue;
-            }
-        }
         const reviewToken = crypto.randomUUID();
         if (this.pendingMaskReviews.size === 0) {
             this.maskReviewAutoQueueState = this._pauseAutoQueueForMaskReview();
@@ -756,11 +747,13 @@ export class FL_API {
             token: reviewToken,
             nodeId: node.id,
             image,
+            baseImage,
+            widgetValue,
         });
         node.imgs = [reviewImage];
         app.canvas?.selectNodes?.([node]);
         app.canvas?.centerOnNode?.(node);
-        this._markGraphChanged();
+        this._markCanvasDirty();
 
         return {
             success: true,
@@ -779,9 +772,7 @@ export class FL_API {
     }
 
     confirmMaskReview(nodeId, reviewToken) {
-        const pendingEntry = [...this.pendingMaskReviews.entries()].find(
-            ([, value]) => nodeIdsEqual(value.nodeId, nodeId)
-        );
+        const pendingEntry = this._findPendingMaskReview(nodeId);
         const pending = pendingEntry?.[1];
         if (!pending) {
             throw new Error(`There is no edited mask on node ${nodeId} waiting for review`);
@@ -789,25 +780,35 @@ export class FL_API {
         if (pending.token !== reviewToken) {
             throw new Error("This mask review is stale; inspect the latest mask before approving it");
         }
+        const node = this._findNode(pending.nodeId);
+        if (!node) {
+            this.discardMaskReview(pending.nodeId, pending.token);
+            throw new Error("The edited image node was removed before the mask was approved");
+        }
         const currentImage = this.getNodeImageRef(pending.nodeId).image;
-        if (
-            currentImage.filename !== pending.image.filename
-            || currentImage.subfolder !== pending.image.subfolder
-            || currentImage.type !== pending.image.type
-        ) {
+        if (!imageRefsEqual(currentImage, pending.baseImage)) {
+            this.discardMaskReview(pending.nodeId, pending.token);
             throw new Error("The node image changed after this mask was created; review the current mask before approving it");
         }
-        this.pendingMaskReviews.delete(pendingEntry[0]);
-        if (this.pendingMaskReviews.size === 0) {
-            this._restoreAutoQueueAfterMaskReview(this.maskReviewAutoQueueState);
-            this.maskReviewAutoQueueState = null;
+        const imageWidget = node.widgets?.find(widget => widget.name === "image");
+        if (!imageWidget) {
+            this.discardMaskReview(pending.nodeId, pending.token);
+            throw new Error(`Node ${pending.nodeId} no longer has an image widget`);
         }
-        const node = this._findNode(pending.nodeId);
-        if (node) {
-            node.imgs = undefined;
-            node.images = [pending.image];
+        this._setWidgetValue(node, imageWidget, pending.widgetValue);
+        node.images = [pending.image];
+        node.imgs = undefined;
+        if (node.properties) {
+            node.properties.image = pending.widgetValue;
         }
-        this._markCanvasDirty();
+        if (node.widgets_values && node.widgets) {
+            const widgetIndex = node.widgets.indexOf(imageWidget);
+            if (widgetIndex >= 0) {
+                node.widgets_values[widgetIndex] = pending.widgetValue;
+            }
+        }
+        this._finishMaskReview(pendingEntry[0]);
+        this._markGraphChanged();
         return {
             success: true,
             node_id: pending.nodeId,
@@ -815,6 +816,29 @@ export class FL_API {
             review_token: pending.token,
             approved: true,
             message: "The user approved this mask for workflow execution.",
+        };
+    }
+
+    discardMaskReview(nodeId, reviewToken) {
+        const pendingEntry = this._findPendingMaskReview(nodeId);
+        const pending = pendingEntry?.[1];
+        if (!pending) {
+            return { success: true, discarded: false };
+        }
+        if (reviewToken && pending.token !== reviewToken) {
+            throw new Error("This mask review is stale; only the latest mask can be discarded");
+        }
+        const node = this._findNode(pending.nodeId);
+        if (node) {
+            node.imgs = undefined;
+        }
+        this._finishMaskReview(pendingEntry[0]);
+        this._markCanvasDirty();
+        return {
+            success: true,
+            discarded: true,
+            node_id: pending.nodeId,
+            review_token: pending.token,
         };
     }
 
@@ -1829,6 +1853,11 @@ export class FL_API {
      */
     async queueWorkflow(batchCount = null) {
         try {
+            for (const pending of [...this.pendingMaskReviews.values()]) {
+                if (!this._findNode(pending.nodeId)) {
+                    this.discardMaskReview(pending.nodeId, pending.token);
+                }
+            }
             if (this.pendingMaskReviews.size > 0) {
                 const pending = this.pendingMaskReviews.values().next().value;
                 throw new Error(
@@ -2143,6 +2172,20 @@ export class FL_API {
             return image;
         } finally {
             URL.revokeObjectURL(url);
+        }
+    }
+
+    _findPendingMaskReview(nodeId) {
+        return [...this.pendingMaskReviews.entries()].find(
+            ([, value]) => nodeIdsEqual(value.nodeId, nodeId)
+        );
+    }
+
+    _finishMaskReview(key) {
+        this.pendingMaskReviews.delete(key);
+        if (this.pendingMaskReviews.size === 0) {
+            this._restoreAutoQueueAfterMaskReview(this.maskReviewAutoQueueState);
+            this.maskReviewAutoQueueState = null;
         }
     }
 
