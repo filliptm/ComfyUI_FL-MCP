@@ -15,6 +15,7 @@ import {
     getGraphInsertionOrigin,
 } from "./node_placement.js";
 import { nodeMatchesQuery } from "./node_identity.js";
+import { captureAuthenticatedQueue } from "./queue_capture.js";
 
 /**
  * FL_API class - Wrapper for workflow manipulation functions
@@ -1607,37 +1608,13 @@ export class FL_API {
                 if (app.processingQueue) {
                     throw new Error("ComfyUI is still preparing another queue request. Try again shortly.");
                 }
-                const originalQueuePrompt = api.queuePrompt;
-                const capturedResults = [];
-                let capturedError = null;
-                let captureQueueResult = true;
-                const captureAuthenticatedQueueResult = async (...args) => {
-                    try {
-                        const result = await originalQueuePrompt.apply(api, args);
-                        if (captureQueueResult) {
-                            capturedResults.push(result);
-                        }
-                        return result;
-                    } catch (error) {
-                        if (captureQueueResult) {
-                            capturedError = error;
-                        }
-                        throw error;
-                    }
-                };
-                api.queuePrompt = captureAuthenticatedQueueResult;
-                try {
-                    const accepted = await app.queuePrompt(0, effectiveBatchCount);
-                    if (capturedError) throw capturedError;
-                    queueResult = capturedResults.at(-1) || null;
-                    if (!accepted || !queueResult) {
-                        throw new Error("ComfyUI did not accept the workflow for queueing.");
-                    }
-                } finally {
-                    captureQueueResult = false;
-                    if (api.queuePrompt === captureAuthenticatedQueueResult) {
-                        api.queuePrompt = originalQueuePrompt;
-                    }
+                const capture = await captureAuthenticatedQueue(
+                    api,
+                    () => app.queuePrompt(0, effectiveBatchCount),
+                );
+                queueResult = capture.result;
+                if (!capture.accepted || !queueResult) {
+                    throw new Error("ComfyUI did not accept the workflow for queueing.");
                 }
             } else {
                 const prompt = await app.graphToPrompt();

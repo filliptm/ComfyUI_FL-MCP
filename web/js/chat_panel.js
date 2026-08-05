@@ -893,13 +893,7 @@ export class AssistantPanel {
         if (Array.isArray(model?.reasoningEfforts) && model.reasoningEfforts.length) {
             return model.reasoningEfforts;
         }
-        if (preset?.type === "codex_cli") {
-            return ["low", "medium", "high", "xhigh", "max", "ultra"];
-        }
-        if (preset?.type === "claude_cli" || preset?.type === "anthropic") {
-            return ["low", "medium", "high", "xhigh", "max"];
-        }
-        return ["low", "medium", "high"];
+        return preset?.reasoning_efforts || [];
     }
 
     populateReasoningSelect(select, value, efforts) {

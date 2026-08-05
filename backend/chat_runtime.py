@@ -142,6 +142,19 @@ def tool_result_content(content: Any) -> str:
     return json.dumps(content, ensure_ascii=False, separators=(",", ":"))
 
 
+def model_settings_for_provider(settings: dict[str, Any]) -> dict[str, Any]:
+    model_settings: dict[str, Any] = {
+        "temperature": settings["temperature"],
+    }
+    reasoning_effort = settings.get("reasoning_effort", "default")
+    reasoning_setting = PROVIDER_PRESETS[settings["provider"]].get(
+        "reasoning_setting"
+    )
+    if reasoning_effort != "default" and reasoning_setting:
+        model_settings[reasoning_setting] = reasoning_effort
+    return model_settings
+
+
 def codex_tool_name(params: dict[str, Any]) -> str | None:
     """Extract the Ren tool name from a Codex MCP approval request."""
     metadata = params.get("_meta")
@@ -694,17 +707,11 @@ class ChatRuntime:
                 process_tool_call=process_tool_call,
                 read_timeout=300,
             )
-            model_settings: dict[str, Any] = {
-                "temperature": settings["temperature"],
-            }
-            reasoning_effort = settings.get("reasoning_effort", "default")
-            if reasoning_effort != "default":
-                model_settings["openai_reasoning_effort"] = reasoning_effort
             agent = Agent(
                 model,
                 instructions=prompt,
                 toolsets=[mcp_server],
-                model_settings=model_settings,
+                model_settings=model_settings_for_provider(settings),
                 prepare_tools=prepare_tools,
             )
             messages = [

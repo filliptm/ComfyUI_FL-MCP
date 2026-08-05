@@ -177,17 +177,19 @@ test("reasoning can be set as a default and overridden in the composer", async (
     assert.match(panel, /data-reasoning="composer"/);
     assert.match(panel, /reasoningEffort: this\.composerReasoningSelect\.value/);
     assert.match(panel, /ultra: "Ultra"/);
+    assert.match(panel, /preset\?\.reasoning_efforts \|\| \[\]/);
     assert.match(client, /reasoningEffort: reasoningEffort \|\| "default"/);
 });
 
 
 test("workflow queueing preserves ComfyUI frontend authentication", async () => {
     const api = await readFile(new URL("web/js/fl_api.js", root), "utf8");
+    const capture = await readFile(new URL("web/js/queue_capture.js", root), "utf8");
 
-    assert.match(api, /await app\.queuePrompt\(0, effectiveBatchCount\)/);
-    assert.match(api, /const originalQueuePrompt = api\.queuePrompt/);
-    assert.match(api, /api\.queuePrompt === captureAuthenticatedQueueResult/);
-    assert.match(api, /captureQueueResult = false/);
+    assert.match(api, /captureAuthenticatedQueue/);
+    assert.match(api, /\(\) => app\.queuePrompt\(0, effectiveBatchCount\)/);
+    assert.match(capture, /event\.detail\?\.requestId === requestId/);
+    assert.match(capture, /api\.queuePrompt === captureQueuePrompt/);
     assert.match(api, /partner\/API nodes report "Please login first"/);
 });
 

@@ -34,6 +34,15 @@ def test_reasoning_effort_persists_and_validates(tmp_path):
         store.update({"reasoning_effort": "unlimited"})
 
 
+def test_provider_reasoning_capabilities_are_explicit():
+    assert PROVIDER_PRESETS["anthropic"]["reasoning_efforts"] == []
+    assert PROVIDER_PRESETS["openai"]["reasoning_setting"] == (
+        "openai_reasoning_effort"
+    )
+    assert "ultra" in PROVIDER_PRESETS["codex_subscription"]["reasoning_efforts"]
+    assert "ultra" not in PROVIDER_PRESETS["claude_subscription"]["reasoning_efforts"]
+
+
 def test_approval_preferences_persist_and_validate(tmp_path):
     store = ChatSettingsStore(tmp_path / "settings.json")
     value = store.update({
