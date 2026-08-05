@@ -163,7 +163,7 @@ export class AssistantPanel {
                     </div>
 
                     <div class="fl-run-status" id="fl-run-drafting-hint" hidden>
-                        <span class="fl-run-status-copy"><i class="pi pi-spin pi-spinner" aria-hidden="true"></i><span>Ren is working…</span></span>
+                        <span class="fl-run-status-copy"><i class="pi pi-spin pi-spinner fl-run-status-icon" aria-hidden="true"></i><span>Ren is working…</span></span>
                         <button class="fl-inline-action danger" data-action="stop" type="button">Stop</button>
                     </div>
 
@@ -408,6 +408,7 @@ export class AssistantPanel {
         this.attachmentTray = this.container.querySelector(".fl-composer-attachments");
         this.sendButton = this.container.querySelector('[data-action="send"]');
         this.runStatus = this.container.querySelector(".fl-run-status");
+        this.runStatusIcon = this.runStatus.querySelector(".fl-run-status-icon");
         this.runStatusText = this.runStatus.querySelector("span span");
         this.stopButton = this.runStatus.querySelector('[data-action="stop"]');
         this.jumpLatestButton = this.container.querySelector(".fl-jump-latest");
@@ -2081,7 +2082,7 @@ export class AssistantPanel {
         toggle.dataset.action = "toggle-tool-history";
         toggle.setAttribute("aria-expanded", "false");
         const icon = document.createElement("i");
-        icon.className = "pi pi-cog fl-crumb-icon";
+        icon.className = "pi pi-cog fl-crumb-icon fl-toolchain-active-icon";
         icon.setAttribute("aria-hidden", "true");
         const current = document.createElement("strong");
         current.className = "fl-toolchain-current";
@@ -2154,9 +2155,9 @@ export class AssistantPanel {
         rail.hidden = summary.total === 0;
         const toggle = rail.querySelector(".fl-toolchain-summary");
         toggle.setAttribute("aria-expanded", String(history.expanded));
-        toggle.querySelector(".fl-crumb-icon").className = `${
+        toggle.querySelector(".fl-toolchain-active-icon").className = `${
             tool.iconClass || "pi pi-cog"
-        } fl-crumb-icon`;
+        } fl-crumb-icon fl-toolchain-active-icon`;
         const current = toggle.querySelector(".fl-toolchain-current");
         current.textContent = active
             ? tool.runningLabel
@@ -2213,6 +2214,7 @@ export class AssistantPanel {
         card.setAttribute("role", "listitem");
         const summary = document.createElement("summary");
         const icon = document.createElement("i");
+        icon.className = "pi pi-bolt fl-crumb-icon fl-tool-history-icon";
         icon.setAttribute("aria-hidden", "true");
         const copy = document.createElement("span");
         copy.className = "fl-crumb-copy";
@@ -2239,8 +2241,10 @@ export class AssistantPanel {
         const tool = getToolConfig(step.name);
         card.className = `fl-toolchain-crumb ${visualStatus}`;
         card.dataset.toolName = step.name || "";
-        const icon = card.querySelector("summary > i");
-        icon.className = `${tool.iconClass || "pi pi-cog"} fl-crumb-icon`;
+        const icon = card.querySelector(".fl-tool-history-icon");
+        icon.className = `${
+            tool.iconClass || "pi pi-cog"
+        } fl-crumb-icon fl-tool-history-icon`;
         card.querySelector(".fl-crumb-label").textContent = visualStatus === "loading"
             ? tool.runningLabel
             : summarizeToolStep(step, tool);
@@ -2463,7 +2467,7 @@ export class AssistantPanel {
             if (message.runId) message.article.dataset.runId = message.runId;
             if (context && context === this.currentRunContext && this.steering) {
                 this.steering = false;
-                this.runStatusText.textContent = "Ren is working…";
+                this.setRunStatus("Ren is working…");
                 this.updateComposerState();
             }
             this.announce("Ren started working.");
@@ -2496,7 +2500,8 @@ export class AssistantPanel {
                 arguments: "",
                 step,
             });
-            this.runStatusText.textContent = getToolConfig(event.toolCallName).runningLabel;
+            const toolConfig = getToolConfig(event.toolCallName);
+            this.setRunStatus(toolConfig.runningLabel, toolConfig.iconClass);
         } else if (event.type === "TOOL_CALL_ARGS") {
             const tool = (context?.assistant || this.currentAssistant)?.tools.get(
                 event.toolCallId,
@@ -2513,7 +2518,7 @@ export class AssistantPanel {
                 event.toolCallId,
             );
             if (tool) this.setToolStatus(tool, "done", event.content);
-            this.runStatusText.textContent = "Ren is working…";
+            this.setRunStatusForActiveTool(context?.assistant || this.currentAssistant);
         } else if (event.type === "CUSTOM" && event.name === "approval_required") {
             this.renderApproval(event.value, context);
         } else if (event.type === "CUSTOM" && event.name === "approval_resolved") {
@@ -2781,7 +2786,7 @@ export class AssistantPanel {
 
     async steer(message, attachments, searchMode) {
         this.steering = true;
-        this.runStatusText.textContent = "Steering Ren…";
+        this.setRunStatus("Steering Ren…", "pi pi-send");
         this.updateComposerState();
         try {
             const activeRunId = this.chat.runId || await this.chat.runReady;
@@ -2801,7 +2806,7 @@ export class AssistantPanel {
             this.showError(`Message could not steer the response: ${error.message}`);
         } finally {
             this.steering = false;
-            if (this.running) this.runStatusText.textContent = "Ren is working…";
+            if (this.running) this.setRunStatus("Ren is working…");
             this.updateComposerState();
         }
     }
@@ -2990,7 +2995,7 @@ export class AssistantPanel {
         if (!this.running || this.stopping || this.steering) return;
         const activeRun = this.activeRunPromise;
         this.stopping = true;
-        this.runStatusText.textContent = "Stopping Ren…";
+        this.setRunStatus("Stopping Ren…", "pi pi-stop-circle");
         this.updateComposerState();
         try {
             const cancelled = await this.chat.cancel();
@@ -3002,9 +3007,25 @@ export class AssistantPanel {
             this.showError(`Response could not be stopped: ${error.message}`);
         } finally {
             this.stopping = false;
-            if (this.running) this.runStatusText.textContent = "Ren is working…";
+            if (this.running) this.setRunStatus("Ren is working…");
             this.updateComposerState();
         }
+    }
+
+    setRunStatus(text, iconClass = "pi pi-spin pi-spinner") {
+        this.runStatusText.textContent = text;
+        this.runStatusIcon.className = `${iconClass} fl-run-status-icon`;
+    }
+
+    setRunStatusForActiveTool(message) {
+        const tools = [...(message?.tools?.values() || [])];
+        for (let index = tools.length - 1; index >= 0; index--) {
+            if (tools[index].status !== "running") continue;
+            const config = getToolConfig(tools[index].name);
+            this.setRunStatus(config.runningLabel, config.iconClass);
+            return;
+        }
+        this.setRunStatus("Ren is working…");
     }
 
     updateComposerState() {
@@ -3019,10 +3040,10 @@ export class AssistantPanel {
             ? "Steer Ren with this message (Enter)"
             : "Send message (Enter)";
         this.runStatus.hidden = !this.running;
-        if (!this.running) this.runStatusText.textContent = "Ren is working…";
         this.stopButton.disabled = this.stopping || this.steering;
         this.stopButton.textContent = this.stopping ? "Stopping…" : "Stop";
         this.textarea.disabled = false;
+        if (!this.running) this.setRunStatus("Ren is working…");
         if (this.running) {
             this.textarea.setAttribute("aria-describedby", "fl-run-drafting-hint");
         } else {

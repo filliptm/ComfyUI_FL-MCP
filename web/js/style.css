@@ -1054,6 +1054,12 @@
     text-align: center;
 }
 
+.fl-toolchain-active-icon,
+.fl-tool-history-icon {
+    display: inline-block;
+    flex: none;
+}
+
 .fl-crumb-copy {
     display: flex;
     min-width: 0;
@@ -1369,6 +1375,12 @@
 
 .fl-run-status-copy i {
     color: var(--ren-accent-hover);
+}
+
+.fl-run-status-icon {
+    width: 16px;
+    flex: none;
+    text-align: center;
 }
 
 .fl-chat-input-container {

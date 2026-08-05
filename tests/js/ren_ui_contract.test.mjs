@@ -157,6 +157,9 @@ test("tool calls use a compact summary with lazy vertical per-call cards", async
     assert.match(panel, /history\.cards\.get\(step\)/);
     assert.match(panel, /history\.steps\.slice\(firstVisible\)/);
     assert.match(panel, /card\.setAttribute\("role", "listitem"\)/);
+    assert.match(panel, /fl-tool-history-icon/);
+    assert.match(panel, /tool\.iconClass \|\| "pi pi-cog"/);
+    assert.match(panel, /fl-toolchain-active-icon/);
     assert.match(panel, /event\.content/);
     assert.match(runtime, /"contentOffset": len\(state\.assistant_text\)/);
     assert.match(runtime, /normalize_assistant_timeline/);
@@ -262,6 +265,9 @@ test("composer can steer an active response and exposes real stop progress", asy
     assert.match(panel, /context === this\.currentRunContext && this\.steering/);
     assert.match(panel, /Steer Ren with this message \(Enter\)/);
     assert.match(panel, /Stopping Ren…/);
+    assert.match(panel, /fl-run-status-icon/);
+    assert.match(panel, /this\.setRunStatus\(toolConfig\.runningLabel, toolConfig\.iconClass\)/);
+    assert.match(panel, /setRunStatusForActiveTool/);
     assert.match(panel, /this\.stopButton\.disabled = this\.stopping \|\| this\.steering/);
     assert.match(panel, /this\.textarea\.disabled = false/);
     assert.match(panel, /fl-run-status/);
