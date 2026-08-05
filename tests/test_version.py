@@ -1,6 +1,18 @@
+import tomllib
+from pathlib import Path
+
 import pytest
 import server
 from version import __version__
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_runtime_version_matches_package_version():
+    with (PROJECT_ROOT / "pyproject.toml").open("rb") as handle:
+        package = tomllib.load(handle)
+
+    assert package["project"]["version"] == __version__
 
 
 @pytest.mark.asyncio
