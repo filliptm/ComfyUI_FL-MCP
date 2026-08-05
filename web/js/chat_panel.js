@@ -1,13 +1,13 @@
 import { ChatClient } from "./chat_client.js";
 import {
-    canStackToolSteps,
+    groupToolSteps,
     isNearBottom,
     modelProviderSummary,
     starterPrompts,
     summarizeToolStep,
     technicalText,
     toolDisplayImages,
-    toolStackState,
+    toolHistorySummary,
 } from "./chat_ui_helpers.js";
 import { renderMarkdown } from "./safe_markdown.js";
 import { getToolConfig } from "./tool_activity.js";
@@ -30,6 +30,7 @@ const SEARCH_MODE_OPTIONS = [
 ];
 
 const MAX_TOOL_GALLERY_IMAGES = 12;
+const TOOL_HISTORY_INITIAL_GROUPS = 60;
 const MAX_CHAT_ATTACHMENTS = 8;
 const MAX_CHAT_ATTACHMENT_BYTES = 32 * 1024 * 1024;
 const CHAT_IMAGE_TYPES = new Set(["image/png", "image/jpeg", "image/webp", "image/gif"]);
@@ -60,6 +61,7 @@ export class AssistantPanel {
         this.activeRunPromise = null;
         this.initializing = false;
         this.currentAssistant = null;
+        this.currentRunContext = null;
         this.availableModels = [];
         this.diagnostics = null;
         this.backendRunning = null;
@@ -67,6 +69,7 @@ export class AssistantPanel {
         this.followOutput = true;
         this.jumpingToLatest = false;
         this.jumpScrollTimer = null;
+        this.followFrame = null;
         this.activeSheet = null;
         this.sheetReturnFocus = null;
         this.undoTimer = null;
@@ -80,6 +83,9 @@ export class AssistantPanel {
         this.lastArchivedConversation = null;
         this.pendingDeleteConversationId = null;
         this.contextUnsubscribe = null;
+        this.olderMessagesCursor = null;
+        this.hasOlderMessages = false;
+        this.loadingOlderMessages = false;
         this.render();
         this.bind();
         this.initialize();
@@ -526,6 +532,19 @@ export class AssistantPanel {
             if (action === "use-tool-image") {
                 this.useToolImage(actionElement.toolImage);
             }
+            if (action === "toggle-tool-history") {
+                this.toggleToolHistory(actionElement.closest(".fl-toolchain-breadcrumb"));
+            }
+            if (action === "select-tool-history") {
+                this.selectToolHistory(
+                    actionElement.closest(".fl-toolchain-breadcrumb"),
+                    Number(actionElement.dataset.groupIndex),
+                );
+            }
+            if (action === "load-tool-history") {
+                this.loadMoreToolHistory(actionElement.closest(".fl-toolchain-breadcrumb"));
+            }
+            if (action === "load-older-messages") this.loadOlderMessages();
             if (action === "stop") this.stop();
             if (action === "jump-latest") this.jumpToLatest();
             if (action === "status-action") this.handleStatusAction();
@@ -1417,6 +1436,8 @@ export class AssistantPanel {
         try {
             const result = await this.chat.loadConversation(conversationId);
             this.conversationId = conversationId;
+            this.olderMessagesCursor = result.nextBefore || null;
+            this.hasOlderMessages = Boolean(result.hasMore);
             this.updateConversationTitle();
             this.renderHistory();
             this.renderMessages(result.messages || []);
@@ -1680,23 +1701,98 @@ export class AssistantPanel {
     }
 
     renderMessages(messages) {
-        this.messagesElement.replaceChildren();
         this.currentAssistant = null;
+        const fragment = document.createDocumentFragment();
+        if (this.hasOlderMessages) fragment.appendChild(this.createOlderMessagesButton());
         for (const message of messages) {
             this.appendMessage(message.role, message.content, {
                 ...(message.metadata || {}),
                 messageId: message.id,
                 revision: message.revision,
                 createdAt: message.createdAt,
-            });
+            }, fragment, false);
         }
+        this.messagesElement.replaceChildren(fragment);
         const empty = messages.length === 0;
         this.welcomeElement.hidden = !empty;
         this.messagesElement.hidden = empty;
         if (!empty) this.scrollToBottom();
     }
 
-    appendMessage(role, content, metadata = {}) {
+    createOlderMessagesButton() {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "fl-load-older-messages";
+        button.dataset.action = "load-older-messages";
+        button.textContent = this.loadingOlderMessages
+            ? "Loading earlier messages…"
+            : "Load earlier messages";
+        button.disabled = this.loadingOlderMessages;
+        return button;
+    }
+
+    async loadOlderMessages() {
+        if (
+            this.loadingOlderMessages
+            || !this.hasOlderMessages
+            || !this.olderMessagesCursor
+            || !this.conversationId
+        ) return;
+        const conversationId = this.conversationId;
+        this.loadingOlderMessages = true;
+        const existingButton = this.messagesElement.querySelector(
+            ".fl-load-older-messages",
+        );
+        if (existingButton) {
+            existingButton.disabled = true;
+            existingButton.textContent = "Loading earlier messages…";
+        }
+        const previousHeight = this.scrollElement.scrollHeight;
+        const previousTop = this.scrollElement.scrollTop;
+        try {
+            const result = await this.chat.loadConversation(conversationId, {
+                before: this.olderMessagesCursor,
+            });
+            if (this.conversationId !== conversationId) return;
+            this.olderMessagesCursor = result.nextBefore || null;
+            this.hasOlderMessages = Boolean(result.hasMore);
+            const fragment = document.createDocumentFragment();
+            if (this.hasOlderMessages) {
+                fragment.appendChild(this.createOlderMessagesButton());
+            }
+            for (const message of result.messages || []) {
+                this.appendMessage(message.role, message.content, {
+                    ...(message.metadata || {}),
+                    messageId: message.id,
+                    revision: message.revision,
+                    createdAt: message.createdAt,
+                }, fragment, false);
+            }
+            existingButton?.remove();
+            this.messagesElement.prepend(fragment);
+            requestAnimationFrame(() => {
+                const addedHeight = this.scrollElement.scrollHeight - previousHeight;
+                this.scrollElement.scrollTop = previousTop + addedHeight;
+            });
+        } catch (error) {
+            this.showError(`Earlier messages could not load: ${error.message}`);
+        } finally {
+            this.loadingOlderMessages = false;
+            const button = this.messagesElement.querySelector(".fl-load-older-messages");
+            if (button) {
+                button.disabled = false;
+                button.textContent = "Load earlier messages";
+            }
+        }
+    }
+
+    appendMessage(
+        role,
+        content,
+        metadata = {},
+        target = this.messagesElement,
+        follow = true,
+    ) {
         this.welcomeElement.hidden = true;
         this.messagesElement.hidden = false;
         const article = document.createElement("article");
@@ -1717,15 +1813,17 @@ export class AssistantPanel {
         header.append(label, timestamp);
         let body = null;
         let timeline = null;
+        let toolHistory = null;
         if (role === "assistant") {
             timeline = document.createElement("div");
             timeline.className = "fl-message-timeline";
             article.append(header, timeline);
-            body = this.renderPersistedAssistantTimeline(
+            ({ body, toolHistory } = this.renderPersistedAssistantTimeline(
                 timeline,
                 content,
                 metadata?.toolSteps || [],
-            );
+            ));
+            if (metadata.interrupted) article.classList.add("interrupted");
         } else {
             body = this.createMessageContent(content, article.messageAttachments, {
                 messageId: metadata.messageId,
@@ -1735,9 +1833,9 @@ export class AssistantPanel {
                 article.appendChild(this.createUserMessageActions(metadata));
             }
         }
-        this.messagesElement.appendChild(article);
-        this.maybeFollowOutput();
-        return { article, body, timeline };
+        target.appendChild(article);
+        if (follow) this.maybeFollowOutput();
+        return { article, body, timeline, toolHistory };
     }
 
     createUserMessageActions(metadata = {}) {
@@ -1874,56 +1972,16 @@ export class AssistantPanel {
     }
 
     renderPersistedAssistantTimeline(timeline, content, toolSteps) {
-        const characters = Array.from(String(content || ""));
-        const orderedSteps = toolSteps
-            .map((step, index) => {
-                const requestedOffset = Number(step.contentOffset);
-                const offset = Number.isFinite(requestedOffset)
-                    ? Math.max(0, Math.min(Math.floor(requestedOffset), characters.length))
-                    : characters.length;
-                return { step, offset, index };
-            })
-            .sort((left, right) => left.offset - right.offset || left.index - right.index);
-        let cursor = 0;
-        let lastBody = null;
-        let stepIndex = 0;
-
-        while (stepIndex < orderedSteps.length) {
-            const offset = orderedSteps[stepIndex].offset;
-            const precedingText = characters.slice(cursor, offset).join("");
-            const hasVisibleText = Boolean(precedingText.trim());
-            if (hasVisibleText) {
-                lastBody = this.appendTimelineText(
-                    timeline,
-                    precedingText,
-                );
-            }
-            const previousBlock = timeline.lastElementChild;
-            const rail = (
-                !hasVisibleText
-                && previousBlock?.classList.contains("fl-toolchain-breadcrumb")
-            )
-                ? previousBlock
-                : this.createToolRail();
-            while (
-                stepIndex < orderedSteps.length
-                && orderedSteps[stepIndex].offset === offset
-            ) {
-                this.addToolStep(rail, orderedSteps[stepIndex].step);
-                stepIndex += 1;
-            }
-            if (rail.parentElement !== timeline) timeline.appendChild(rail);
-            cursor = offset;
+        const steps = Array.isArray(toolSteps) ? toolSteps : [];
+        let toolHistory = null;
+        if (steps.length) {
+            const rail = this.createToolRail(steps);
+            timeline.appendChild(rail);
+            toolHistory = rail.toolHistory;
+            this.renderToolHistory(toolHistory, { images: true });
         }
-
-        const remainingText = characters.slice(cursor).join("");
-        if (remainingText.trim()) {
-            lastBody = this.appendTimelineText(
-                timeline,
-                remainingText,
-            );
-        }
-        return lastBody;
+        const body = this.appendTimelineText(timeline, content);
+        return { body, toolHistory };
     }
 
     appendTimelineText(timeline, content) {
@@ -1943,39 +2001,52 @@ export class AssistantPanel {
         return timestamp.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
     }
 
-    ensureAssistantMessage() {
-        if (this.currentAssistant) return this.currentAssistant;
+    ensureAssistantMessage(context = null) {
+        if (context?.assistant) return context.assistant;
+        if (!context && this.currentAssistant) return this.currentAssistant;
         const message = this.appendMessage("assistant", "");
         message.article.classList.add("streaming");
         message.source = "";
         message.activeBody = message.body;
         message.activeSource = "";
         message.pendingText = "";
+        message.textRenderFrame = null;
         if (message.activeBody) message.activeBody.classList.add("streaming-active");
         message.tools = new Map();
-        this.currentAssistant = message;
+        if (context) context.assistant = message;
+        if (!context || context === this.currentRunContext) this.currentAssistant = message;
         return message;
     }
 
     appendAssistantDelta(message, delta) {
+        message.pendingText += delta;
+        if (message.textRenderFrame !== null) return;
+        message.textRenderFrame = requestAnimationFrame(() => {
+            message.textRenderFrame = null;
+            this.flushAssistantText(message);
+        });
+    }
+
+    flushAssistantText(message) {
+        if (!message?.pendingText && message?.activeBody) return;
         if (!message.activeBody) {
-            message.pendingText += delta;
             if (!message.pendingText.trim()) return;
-            message.activeBody = this.appendTimelineText(
-                message.timeline,
-                message.pendingText,
-            );
+            message.activeBody = this.createMessageContent();
+            message.timeline.appendChild(message.activeBody);
             message.activeBody.classList.add("streaming-active");
-            message.activeSource = message.pendingText;
-            message.pendingText = "";
-        } else {
-            message.activeSource += delta;
         }
+        message.activeSource += message.pendingText;
+        message.pendingText = "";
         message.activeBody.replaceChildren(this.renderChatMarkdown(message.activeSource));
         message.body = message.activeBody;
     }
 
     finishActiveTextSegment(message, discardEmpty = false) {
+        if (message?.textRenderFrame !== null && message?.textRenderFrame !== undefined) {
+            cancelAnimationFrame(message.textRenderFrame);
+            message.textRenderFrame = null;
+        }
+        this.flushAssistantText(message);
         if (discardEmpty && message.activeBody && !message.activeSource) {
             message.activeBody.remove();
         }
@@ -1986,106 +2057,204 @@ export class AssistantPanel {
     }
 
     toolRailAtCursor(message) {
-        this.finishActiveTextSegment(message, true);
-        const last = message.timeline.lastElementChild;
-        if (last?.classList.contains("fl-toolchain-breadcrumb")) return last;
+        if (message.toolHistory?.rail?.isConnected) return message.toolHistory.rail;
         const rail = this.createToolRail();
-        message.timeline.appendChild(rail);
+        message.timeline.prepend(rail);
+        message.toolHistory = rail.toolHistory;
         return rail;
     }
 
     finishAssistantMessage(message) {
         if (!message) return;
         this.finishActiveTextSegment(message, true);
+        const history = message.toolHistory;
+        if (history?.renderFrame !== null) {
+            cancelAnimationFrame(history.renderFrame);
+            history.renderFrame = null;
+            const renderImages = history.renderImages;
+            history.renderDetails = false;
+            history.renderImages = false;
+            this.renderToolHistory(history, { images: renderImages });
+        }
         message.article.classList.remove("streaming");
     }
 
-    createToolRail() {
-        const rail = document.createElement("div");
+    createToolRail(steps = []) {
+        const rail = document.createElement("section");
         rail.className = "fl-toolchain-breadcrumb";
+        const toggle = document.createElement("button");
+        toggle.type = "button";
+        toggle.className = "fl-toolchain-summary";
+        toggle.dataset.action = "toggle-tool-history";
+        toggle.setAttribute("aria-expanded", "false");
+        const icon = document.createElement("i");
+        icon.className = "pi pi-cog fl-crumb-icon";
+        icon.setAttribute("aria-hidden", "true");
+        const current = document.createElement("strong");
+        current.className = "fl-toolchain-current";
+        const meta = document.createElement("span");
+        meta.className = "fl-toolchain-meta";
+        const disclosure = document.createElement("span");
+        disclosure.className = "fl-toolchain-disclosure";
+        disclosure.textContent = "Show history";
+        const chevron = document.createElement("i");
+        chevron.className = "pi pi-chevron-down";
+        chevron.setAttribute("aria-hidden", "true");
+        toggle.append(icon, current, meta, disclosure, chevron);
+
+        const panel = document.createElement("div");
+        panel.className = "fl-tool-history-panel";
+        panel.hidden = true;
+        const chips = document.createElement("div");
+        chips.className = "fl-tool-history-chips";
+        chips.setAttribute("role", "list");
+        chips.setAttribute("aria-label", "Tool use history");
+        const technical = document.createElement("div");
+        technical.className = "fl-tool-technical";
+        technical.hidden = true;
+        const detailLabel = document.createElement("span");
+        detailLabel.textContent = "Technical details";
+        const pre = document.createElement("pre");
+        technical.append(detailLabel, pre);
+        panel.append(chips, technical);
+        rail.append(toggle, panel);
+        rail.toolHistory = {
+            rail,
+            steps: [...steps],
+            expanded: false,
+            selectedGroupIndex: null,
+            visibleGroupCount: TOOL_HISTORY_INITIAL_GROUPS,
+            renderFrame: null,
+            renderDetails: false,
+            renderImages: false,
+        };
         return rail;
     }
 
     addToolStep(rail, step) {
-        const lastElement = rail.lastElementChild;
-        const previousItem = lastElement?.classList.contains("fl-tool-image-grid")
-            ? lastElement.previousElementSibling
-            : lastElement;
-        const previousSteps = previousItem?.toolSteps || [];
-        if (canStackToolSteps(previousSteps.at(-1), step)) {
-            previousSteps.push(step);
-            this.renderToolStep(previousItem);
-            return previousItem;
-        }
-
-        const item = document.createElement("details");
-        const summary = document.createElement("summary");
-        const icon = document.createElement("i");
-        icon.setAttribute("aria-hidden", "true");
-        const name = document.createElement("span");
-        name.className = "fl-crumb-copy";
-        const label = document.createElement("strong");
-        label.className = "fl-crumb-label";
-        const description = document.createElement("span");
-        description.className = "fl-crumb-description";
-        name.append(label, description);
-        const count = document.createElement("span");
-        count.className = "fl-crumb-count";
-        count.hidden = true;
-        const status = document.createElement("em");
-        status.className = "fl-crumb-status";
-        summary.append(icon, name, count, status);
-        const detail = document.createElement("div");
-        detail.className = "fl-tool-technical";
-        const detailLabel = document.createElement("span");
-        detailLabel.textContent = "Technical details";
-        const pre = document.createElement("pre");
-        detail.append(detailLabel, pre);
-        item.append(summary, detail);
-        item.toolSteps = [step];
-        rail.appendChild(item);
-        this.renderToolStep(item);
-        return item;
+        const history = rail.toolHistory;
+        history.steps.push(step);
+        this.scheduleToolHistoryRender(history);
+        return history;
     }
 
-    renderToolStep(item, step = null) {
-        const steps = item.toolSteps?.length ? item.toolSteps : [step].filter(Boolean);
-        const stack = toolStackState(steps);
-        const representative = stack.step;
-        const visualStatus = this.toolVisualStatus(stack.status);
-        const tool = getToolConfig(representative.name);
-        item.className = `fl-toolchain-crumb ${visualStatus}`;
-        item.dataset.toolName = representative.name || "";
-        item.dataset.toolCount = String(stack.count);
-        const icon = item.querySelector("summary > i");
-        icon.className = `${tool.iconClass} fl-crumb-icon`;
-        const label = item.querySelector(".fl-crumb-label");
-        label.textContent = visualStatus === "loading"
-            ? tool.runningLabel
-            : summarizeToolStep(representative, tool);
-        const description = item.querySelector(".fl-crumb-description");
-        description.textContent = visualStatus === "loading"
-            ? (tool.description || tool.label || representative.name || "MCP tool")
-            : (tool.label || representative.name || "MCP tool");
-        const count = item.querySelector(".fl-crumb-count");
-        count.hidden = stack.count < 2;
-        count.textContent = `×${stack.count}`;
-        count.setAttribute(
-            "aria-label",
-            `${stack.count} consecutive ${tool.label || representative.name || "tool"} calls`,
-        );
-        const status = item.querySelector(".fl-crumb-status");
-        const statusLabels = {
-            loading: "Working",
-            completed: "Done",
-            retried: "Retried",
-            failed: "Failed",
-            cancelled: "Stopped",
-        };
-        status.textContent = statusLabels[visualStatus];
+    scheduleToolHistoryRender(history, { details = false, images = false } = {}) {
+        if (!history) return;
+        history.renderDetails ||= details;
+        history.renderImages ||= images;
+        if (history.renderFrame !== null) return;
+        history.renderFrame = requestAnimationFrame(() => {
+            history.renderFrame = null;
+            const nextDetails = history.renderDetails;
+            const nextImages = history.renderImages;
+            history.renderDetails = false;
+            history.renderImages = false;
+            this.renderToolHistory(history, {
+                details: nextDetails,
+                images: nextImages,
+            });
+        });
+    }
 
+    renderToolHistory(history, { details = false, images = false } = {}) {
+        if (!history) return;
+        const { rail } = history;
+        const summary = toolHistorySummary(history.steps);
+        const groups = groupToolSteps(history.steps);
+        const active = summary.active;
+        const representative = active || history.steps.at(-1) || {};
+        const tool = getToolConfig(representative.name);
+        const visualStatus = active
+            ? "loading"
+            : summary.failed
+                ? "failed"
+                : summary.interrupted
+                    ? "cancelled"
+                    : "completed";
+        rail.className = `fl-toolchain-breadcrumb ${visualStatus}`;
+        rail.dataset.toolCount = String(summary.total);
+        rail.hidden = summary.total === 0;
+        const toggle = rail.querySelector(".fl-toolchain-summary");
+        toggle.setAttribute("aria-expanded", String(history.expanded));
+        toggle.querySelector(".fl-crumb-icon").className = `${
+            tool.iconClass || "pi pi-cog"
+        } fl-crumb-icon`;
+        const current = toggle.querySelector(".fl-toolchain-current");
+        current.textContent = active
+            ? tool.runningLabel
+            : `${summary.total} ${summary.total === 1 ? "action" : "actions"}`;
+        const metaParts = [];
+        if (!active && summary.done) metaParts.push(`${summary.done} done`);
+        if (summary.retried) metaParts.push(`${summary.retried} retried`);
+        if (summary.failed) metaParts.push(`${summary.failed} failed`);
+        if (summary.interrupted) metaParts.push(`${summary.interrupted} interrupted`);
+        if (active) metaParts.push(`${summary.total} ${summary.total === 1 ? "call" : "calls"}`);
+        toggle.querySelector(".fl-toolchain-meta").textContent = metaParts.join(" · ");
+        toggle.querySelector(".fl-toolchain-disclosure").textContent = history.expanded
+            ? "Hide history"
+            : "Show history";
+        toggle.querySelector(".pi-chevron-down, .pi-chevron-up").className = history.expanded
+            ? "pi pi-chevron-up"
+            : "pi pi-chevron-down";
+        const panel = rail.querySelector(".fl-tool-history-panel");
+        panel.hidden = !history.expanded;
+        if (history.expanded) this.renderToolHistoryChips(history, groups);
+        if (history.expanded && (details || history.selectedGroupIndex !== null)) {
+            this.renderToolHistoryDetail(history, groups);
+        }
+        if (images) this.renderToolImages(rail, history.steps);
+    }
+
+    renderToolHistoryChips(history, groups = groupToolSteps(history.steps)) {
+        const chips = history.rail.querySelector(".fl-tool-history-chips");
+        const fragment = document.createDocumentFragment();
+        const visible = groups.slice(0, history.visibleGroupCount);
+        for (const group of visible) {
+            const representative = group.step;
+            const tool = getToolConfig(representative.name);
+            const visualStatus = this.toolVisualStatus(group.status);
+            const button = document.createElement("button");
+            button.type = "button";
+            button.className = `fl-tool-history-chip ${visualStatus}`;
+            button.dataset.action = "select-tool-history";
+            button.dataset.groupIndex = String(group.index);
+            button.setAttribute("role", "listitem");
+            button.title = summarizeToolStep(representative, tool);
+            button.setAttribute(
+                "aria-pressed",
+                String(history.selectedGroupIndex === group.index),
+            );
+            const icon = document.createElement("i");
+            icon.className = tool.iconClass || "pi pi-cog";
+            icon.setAttribute("aria-hidden", "true");
+            const label = document.createElement("span");
+            label.textContent = tool.label || representative.name || "Tool";
+            const count = document.createElement("em");
+            count.textContent = group.count > 1 ? `×${group.count}` : "";
+            button.append(icon, label, count);
+            fragment.appendChild(button);
+        }
+        if (groups.length > visible.length) {
+            const more = document.createElement("button");
+            more.type = "button";
+            more.className = "fl-tool-history-more";
+            more.dataset.action = "load-tool-history";
+            more.textContent = `Show ${groups.length - visible.length} more`;
+            fragment.appendChild(more);
+        }
+        chips.replaceChildren(fragment);
+    }
+
+    renderToolHistoryDetail(history, groups = groupToolSteps(history.steps)) {
+        const technical = history.rail.querySelector(".fl-tool-technical");
+        const group = groups[history.selectedGroupIndex];
+        if (!group) {
+            technical.hidden = true;
+            technical.querySelector("pre").textContent = "";
+            return;
+        }
         const technicalSections = [];
-        for (const [index, currentStep] of steps.entries()) {
+        for (const [index, currentStep] of group.steps.entries()) {
             const callSections = [];
             if (currentStep.arguments !== undefined && currentStep.arguments !== "") {
                 callSections.push(`Arguments\n${technicalText(currentStep.arguments)}`);
@@ -2095,18 +2264,38 @@ export class AssistantPanel {
             }
             if (callSections.length) {
                 technicalSections.push(
-                    steps.length > 1
+                    group.steps.length > 1
                         ? `Call ${index + 1}\n${callSections.join("\n\n")}`
                         : callSections.join("\n\n"),
                 );
             }
         }
-        const technical = item.querySelector(".fl-tool-technical");
         technical.hidden = !technicalSections.length;
         technical.querySelector("pre").textContent = technicalText(
             technicalSections.join("\n\n"),
         );
-        this.renderToolImages(item, steps);
+    }
+
+    toggleToolHistory(rail) {
+        const history = rail?.toolHistory;
+        if (!history) return;
+        history.expanded = !history.expanded;
+        this.renderToolHistory(history, { details: true });
+    }
+
+    selectToolHistory(rail, groupIndex) {
+        const history = rail?.toolHistory;
+        if (!history || !Number.isInteger(groupIndex)) return;
+        history.selectedGroupIndex = groupIndex;
+        history.expanded = true;
+        this.renderToolHistory(history, { details: true });
+    }
+
+    loadMoreToolHistory(rail) {
+        const history = rail?.toolHistory;
+        if (!history) return;
+        history.visibleGroupCount += TOOL_HISTORY_INITIAL_GROUPS;
+        this.renderToolHistory(history, { details: true });
     }
 
     renderToolImages(item, steps) {
@@ -2125,10 +2314,18 @@ export class AssistantPanel {
         if (!discovered.length) {
             item.imageGrid?.remove();
             item.imageGrid = null;
+            item.imageSignature = "";
             return;
         }
 
         const images = discovered.slice(0, MAX_TOOL_GALLERY_IMAGES);
+        const signature = JSON.stringify(images.map(image => (
+            image.kind === "comfy"
+                ? [image.kind, image.type, image.subfolder, image.filename]
+                : [image.kind, image.url]
+        )));
+        if (item.imageSignature === signature && item.imageGrid?.isConnected) return;
+        item.imageSignature = signature;
         let grid = item.imageGrid;
         if (!grid?.isConnected) {
             grid = document.createElement("section");
@@ -2167,10 +2364,10 @@ export class AssistantPanel {
             const preview = document.createElement("img");
             preview.src = source;
             preview.alt = image.alt || image.title || `Image ${index + 1}`;
-            preview.loading = index < 2 ? "eager" : "lazy";
+            preview.loading = "lazy";
             preview.decoding = "async";
             preview.referrerPolicy = "no-referrer";
-            if (index === 0) preview.fetchPriority = "high";
+            preview.fetchPriority = "low";
 
             const fallback = document.createElement("span");
             fallback.className = "fl-tool-image-fallback fl-image-fallback";
@@ -2270,22 +2467,31 @@ export class AssistantPanel {
             retried: "retried",
             failed: "failed",
             cancelled: "cancelled",
+            interrupted: "cancelled",
         }[status] || "completed";
     }
 
-    handleEvent(event) {
+    handleEvent(event, context = this.currentRunContext) {
         if (event.type === "RUN_STARTED") {
-            this.ensureAssistantMessage();
+            if (context) context.runId = event.runId || context.runId;
+            const message = this.ensureAssistantMessage(context);
+            message.runId = event.runId || message.runId || null;
+            if (message.runId) message.article.dataset.runId = message.runId;
+            if (context && context === this.currentRunContext && this.steering) {
+                this.steering = false;
+                this.runStatusText.textContent = "Ren is working…";
+                this.updateComposerState();
+            }
             this.announce("Ren started working.");
         } else if (event.type === "TEXT_MESSAGE_START") {
-            this.ensureAssistantMessage();
+            this.ensureAssistantMessage(context);
         } else if (event.type === "TEXT_MESSAGE_CONTENT") {
-            const message = this.ensureAssistantMessage();
+            const message = this.ensureAssistantMessage(context);
             const delta = event.delta || "";
             message.source += delta;
             this.appendAssistantDelta(message, delta);
         } else if (event.type === "TOOL_CALL_START") {
-            const message = this.ensureAssistantMessage();
+            const message = this.ensureAssistantMessage(context);
             const id = event.toolCallId || crypto.randomUUID();
             for (const tool of message.tools.values()) {
                 if (tool.name === event.toolCallName && tool.status === "running") {
@@ -2293,17 +2499,14 @@ export class AssistantPanel {
                     break;
                 }
             }
-            const item = this.addToolStep(this.toolRailAtCursor(message), {
-                name: event.toolCallName,
-                status: "running",
-            });
             const step = {
                 name: event.toolCallName,
                 status: "running",
                 arguments: "",
             };
+            const history = this.addToolStep(this.toolRailAtCursor(message), step);
             message.tools.set(id, {
-                item,
+                history,
                 name: event.toolCallName,
                 status: "running",
                 arguments: "",
@@ -2311,36 +2514,52 @@ export class AssistantPanel {
             });
             this.runStatusText.textContent = getToolConfig(event.toolCallName).runningLabel;
         } else if (event.type === "TOOL_CALL_ARGS") {
-            const tool = this.currentAssistant?.tools.get(event.toolCallId);
+            const tool = (context?.assistant || this.currentAssistant)?.tools.get(
+                event.toolCallId,
+            );
             if (tool) {
                 tool.arguments += event.delta || "";
                 tool.step.arguments = tool.arguments;
-                this.renderToolStep(tool.item, tool.step);
+                if (tool.history.expanded) {
+                    this.scheduleToolHistoryRender(tool.history, { details: true });
+                }
             }
         } else if (event.type === "TOOL_CALL_RESULT") {
-            const tool = this.currentAssistant?.tools.get(event.toolCallId);
+            const tool = (context?.assistant || this.currentAssistant)?.tools.get(
+                event.toolCallId,
+            );
             if (tool) this.setToolStatus(tool, "done", event.content);
             this.runStatusText.textContent = "Ren is working…";
         } else if (event.type === "CUSTOM" && event.name === "approval_required") {
-            this.renderApproval(event.value);
+            this.renderApproval(event.value, context);
         } else if (event.type === "CUSTOM" && event.name === "approval_resolved") {
             this.resolveApprovalCard(event.value);
         } else if (event.type === "RUN_ERROR") {
-            this.settleOpenTools(event.code === "cancelled" ? "cancelled" : "failed");
-            this.finishAssistantMessage(this.currentAssistant);
-            if (event.code === "cancelled") {
+            const interrupted = event.code === "steered";
+            this.settleOpenTools(
+                interrupted ? "interrupted" : event.code === "cancelled" ? "cancelled" : "failed",
+                context?.assistant || this.currentAssistant,
+            );
+            const assistant = context?.assistant || this.currentAssistant;
+            this.finishAssistantMessage(assistant);
+            if (interrupted) assistant?.article?.classList.add("interrupted");
+            if (event.code === "cancelled" || interrupted) {
                 this.clearError();
-                this.announce("Response stopped.");
+                this.announce(interrupted ? "Previous response interrupted." : "Response stopped.");
             } else {
                 this.showRunError(event.message || "The assistant run failed.");
             }
-            this.running = false;
-            this.updateComposerState();
+            if (!context || context === this.currentRunContext) {
+                this.running = false;
+                this.updateComposerState();
+            }
         } else if (event.type === "RUN_FINISHED") {
-            this.settleOpenTools("finished");
-            this.finishAssistantMessage(this.currentAssistant);
-            this.running = false;
-            this.updateComposerState();
+            this.settleOpenTools("finished", context?.assistant || this.currentAssistant);
+            this.finishAssistantMessage(context?.assistant || this.currentAssistant);
+            if (!context || context === this.currentRunContext) {
+                this.running = false;
+                this.updateComposerState();
+            }
             this.announce("Ren finished.");
         }
         this.maybeFollowOutput();
@@ -2350,17 +2569,20 @@ export class AssistantPanel {
         tool.status = status;
         tool.step.status = status;
         if (result !== undefined) tool.step.result = result;
-        this.renderToolStep(tool.item, tool.step);
+        this.scheduleToolHistoryRender(tool.history, {
+            details: tool.history.expanded,
+            images: result !== undefined,
+        });
     }
 
-    settleOpenTools(status) {
-        for (const tool of this.currentAssistant?.tools?.values() || []) {
+    settleOpenTools(status, message = this.currentAssistant) {
+        for (const tool of message?.tools?.values() || []) {
             if (tool.status === "running") this.setToolStatus(tool, status);
         }
     }
 
-    renderApproval(value) {
-        const message = this.ensureAssistantMessage();
+    renderApproval(value, context = this.currentRunContext) {
+        const message = this.ensureAssistantMessage(context);
         const copy = this.approvalCopy(value.toolName, value.arguments);
         const isMaskReview = value.toolName === "confirm_mask_review";
         const card = document.createElement("section");
@@ -2574,19 +2796,23 @@ export class AssistantPanel {
     }
 
     async steer(message, attachments, searchMode) {
-        const previousRun = this.activeRunPromise;
         this.steering = true;
         this.runStatusText.textContent = "Steering Ren…";
         this.updateComposerState();
         try {
-            const cancelled = await this.chat.cancel();
-            if (!cancelled) {
+            const activeRunId = this.chat.runId || await this.chat.runReady;
+            if (!activeRunId) {
                 throw new Error("The current response has not started yet.");
             }
-            if (previousRun) await previousRun;
             this.clearComposerDraft();
             this.announce("Steering Ren with your new message.");
-            await this.startRunMessage(message, null, searchMode, attachments);
+            await this.startRunMessage(
+                message,
+                null,
+                searchMode,
+                attachments,
+                activeRunId,
+            );
         } catch (error) {
             this.showError(`Message could not steer the response: ${error.message}`);
         } finally {
@@ -2601,8 +2827,9 @@ export class AssistantPanel {
         editMessageId = null,
         searchMode = this.composerSearchSelect.value,
         attachments = [],
+        steerRunId = null,
     ) {
-        if ((!message && !attachments.length) || this.running) return;
+        if ((!message && !attachments.length) || (this.running && !steerRunId)) return;
         if (!this.status?.configured) {
             this.openSheet("settings");
             this.showError("Choose and test a model before sending a message.");
@@ -2614,6 +2841,8 @@ export class AssistantPanel {
         this.lastFailedSearchMode = searchMode;
         this.lastFailedAttachments = attachments.map(item => ({ ...item }));
         this.running = true;
+        const runContext = { runId: null, assistant: null };
+        this.currentRunContext = runContext;
         this.currentAssistant = null;
         this.followOutput = true;
         if (editMessageId) {
@@ -2631,18 +2860,22 @@ export class AssistantPanel {
                 searchMode,
                 editMessageId,
                 attachments,
-                onReady: ({ conversationId }) => {
+                steerRunId,
+                onReady: ({ runId, conversationId }) => {
+                    runContext.runId = runId;
                     this.conversationId = conversationId;
                 },
-                onEvent: (event) => this.handleEvent(event),
+                onEvent: (event) => this.handleEvent(event, runContext),
             });
         } catch (error) {
             if (error.name !== "AbortError") {
                 this.showRunError(error.message);
             }
         } finally {
-            this.running = false;
-            this.updateComposerState();
+            if (this.currentRunContext === runContext) {
+                this.running = false;
+                this.updateComposerState();
+            }
             await this.refreshConversations(this.conversationId);
         }
     }
@@ -3176,7 +3409,9 @@ export class AssistantPanel {
             return;
         }
         this.jumpLatestButton.hidden = true;
-        requestAnimationFrame(() => {
+        if (this.followFrame !== null) return;
+        this.followFrame = requestAnimationFrame(() => {
+            this.followFrame = null;
             this.scrollElement.scrollTop = this.scrollElement.scrollHeight;
         });
     }
@@ -3227,6 +3462,13 @@ export class AssistantPanel {
         this.contextUnsubscribe = null;
         clearTimeout(this.undoTimer);
         clearTimeout(this.jumpScrollTimer);
+        if (this.followFrame !== null) cancelAnimationFrame(this.followFrame);
+        this.followFrame = null;
+        for (const history of this.container.querySelectorAll(".fl-toolchain-breadcrumb")) {
+            if (history.toolHistory?.renderFrame !== null) {
+                cancelAnimationFrame(history.toolHistory.renderFrame);
+            }
+        }
         document.removeEventListener("pointerdown", this.documentPointerHandler);
         this.container.replaceChildren();
         this.container.classList.remove("fl-chat-panel-host");

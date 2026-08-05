@@ -216,13 +216,25 @@ async def create_conversation(request: Request) -> JSONResponse:
 
 
 @router.get("/conversations/{conversation_id}")
-async def get_conversation(conversation_id: str) -> dict[str, Any]:
+async def get_conversation(
+    conversation_id: str,
+    limit: int = Query(default=50, ge=1, le=100),
+    before: str | None = Query(default=None),
+) -> dict[str, Any]:
     conversation = chat_store.get_conversation(conversation_id)
     if not conversation:
         raise HTTPException(status_code=404, detail="Conversation not found.")
+    try:
+        page = chat_store.list_messages_page(
+            conversation_id,
+            limit=limit,
+            before_message_id=before,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     return {
         "conversation": conversation,
-        "messages": chat_store.list_messages(conversation_id),
+        **page,
     }
 
 
@@ -282,38 +294,30 @@ async def delete_conversation(conversation_id: str) -> dict[str, bool]:
     return {"deleted": True}
 
 
-@router.post("/runs")
-async def start_run(request: Request) -> StreamingResponse:
-    data = await request.json()
+def _run_request_values(data: dict[str, Any]) -> dict[str, Any]:
     session_id = str(data.get("sessionId") or "").strip()
     if not session_id:
         raise HTTPException(status_code=400, detail="sessionId is required.")
-    try:
-        reasoning_effort = str(
-            data.get("reasoningEffort") or "default"
-        ).strip().lower()
-        if reasoning_effort not in REASONING_EFFORTS:
-            raise ValueError(f"Unsupported reasoning effort: {reasoning_effort}")
-        search_mode = str(
-            data.get("searchMode") or chat_settings.load().get("search_mode") or "free"
-        ).strip().lower()
-        if search_mode not in SEARCH_MODES:
-            raise ValueError(f"Unsupported web search mode: {search_mode}")
-        state = await chat_runtime.start(
-            session_id=session_id,
-            conversation_id=(
-                str(data["conversationId"]) if data.get("conversationId") else None
-            ),
-            message=str(data.get("message") or ""),
-            reasoning_effort=reasoning_effort,
-            search_mode=search_mode,
-            edit_message_id=(
-                str(data["editMessageId"]) if data.get("editMessageId") else None
-            ),
-            attachments=data.get("attachments"),
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    reasoning_effort = str(
+        data.get("reasoningEffort") or "default"
+    ).strip().lower()
+    if reasoning_effort not in REASONING_EFFORTS:
+        raise ValueError(f"Unsupported reasoning effort: {reasoning_effort}")
+    search_mode = str(
+        data.get("searchMode") or chat_settings.load().get("search_mode") or "free"
+    ).strip().lower()
+    if search_mode not in SEARCH_MODES:
+        raise ValueError(f"Unsupported web search mode: {search_mode}")
+    return {
+        "session_id": session_id,
+        "message": str(data.get("message") or ""),
+        "reasoning_effort": reasoning_effort,
+        "search_mode": search_mode,
+        "attachments": data.get("attachments"),
+    }
+
+
+def _run_stream(state: Any) -> StreamingResponse:
     return StreamingResponse(
         chat_runtime.subscribe(state.run_id),
         media_type="text/event-stream",
@@ -324,6 +328,37 @@ async def start_run(request: Request) -> StreamingResponse:
             "X-FL-MCP-Conversation-Id": state.conversation_id,
         },
     )
+
+
+@router.post("/runs")
+async def start_run(request: Request) -> StreamingResponse:
+    data = await request.json()
+    try:
+        values = _run_request_values(data)
+        state = await chat_runtime.start(
+            **values,
+            conversation_id=(
+                str(data["conversationId"]) if data.get("conversationId") else None
+            ),
+            edit_message_id=(
+                str(data["editMessageId"]) if data.get("editMessageId") else None
+            ),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return _run_stream(state)
+
+
+@router.post("/runs/{run_id}/steer")
+async def steer_run(run_id: str, request: Request) -> StreamingResponse:
+    try:
+        state = await chat_runtime.steer(
+            run_id,
+            **_run_request_values(await request.json()),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return _run_stream(state)
 
 
 @router.get("/runs/{run_id}/stream")

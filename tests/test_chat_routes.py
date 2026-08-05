@@ -205,6 +205,38 @@ def test_approval_route_accepts_always_allow_decision(monkeypatch):
     assert decisions == [("approval-1", "always_allow")]
 
 
+def test_steer_route_atomically_replaces_the_active_run(monkeypatch):
+    calls = []
+
+    class State:
+        run_id = "run-new"
+        conversation_id = "conversation-1"
+
+    class Runtime:
+        async def steer(self, run_id, **values):
+            calls.append((run_id, values))
+            return State()
+
+        async def subscribe(self, run_id):
+            yield f'data: {{"type":"RUN_STARTED","runId":"{run_id}"}}\n\n'
+
+    monkeypatch.setattr(chat_routes, "chat_runtime", Runtime())
+
+    with TestClient(server.app) as client:
+        response = client.post("/api/chat/runs/run-old/steer", json={
+            "sessionId": "session-1",
+            "message": "new direction",
+            "reasoningEffort": "high",
+            "searchMode": "off",
+            "attachments": [],
+        })
+
+    assert response.status_code == 200
+    assert response.headers["x-fl-mcp-run-id"] == "run-new"
+    assert calls[0][0] == "run-old"
+    assert calls[0][1]["message"] == "new direction"
+
+
 def test_claude_subscription_status_and_models_use_cli_auth(tmp_path, monkeypatch):
     settings = ChatSettingsStore(tmp_path / "settings.json")
     settings.update({"provider": "claude_subscription", "model": "sonnet"})

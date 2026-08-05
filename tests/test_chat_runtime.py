@@ -6,6 +6,7 @@ import chat_runtime as chat_runtime_module
 import pytest
 from chat_config import ChatSettingsStore
 from chat_runtime import (
+    CONTEXT_MAX_CHARS,
     ActiveRun,
     ChatRuntime,
     PendingApproval,
@@ -13,10 +14,13 @@ from chat_runtime import (
     bridge_settings,
     claude_tool_name,
     codex_tool_name,
+    compact_messages_for_model,
+    conversation_needs_compaction,
     install_codex_approval_handler,
+    message_content_for_model,
+    native_prompt_with_compaction,
     normalize_approval_decision,
     normalize_assistant_timeline,
-    message_content_for_model,
     normalize_chat_attachments,
     should_request_approval,
     tool_result_content,
@@ -61,6 +65,72 @@ def test_chat_attachments_are_validated_and_added_to_model_context():
             "subfolder": "../output",
             "type": "input",
         }])
+
+
+def test_large_image_and_tool_history_compacts_to_a_bounded_checkpoint():
+    messages = []
+    for index in range(90):
+        messages.extend([
+            {
+                "id": f"user-{index}",
+                "role": "user",
+                "content": f"Request {index} " + ("detail " * 180),
+                "status": "complete",
+                "metadata": {},
+            },
+            {
+                "id": f"assistant-{index}",
+                "role": "assistant",
+                "content": f"Response {index} " + ("result " * 180),
+                "status": "interrupted" if index == 55 else "complete",
+                "metadata": {
+                    "toolSteps": [{
+                        "name": "workflow_overview",
+                        "status": "interrupted" if index == 55 else "done",
+                        "result": "data:image/png;base64," + ("A" * 8_000),
+                    }],
+                },
+            },
+        ])
+
+    compacted, did_compact = compact_messages_for_model(messages)
+
+    assert did_compact is True
+    assert compacted[0]["id"] == "context-checkpoint"
+    assert "interrupted" in compacted[0]["content"]
+    assert compacted[-1]["content"].startswith("Response 89")
+    assert "base64" not in "".join(item["content"] for item in compacted)
+    assert sum(len(item["content"]) + 64 for item in compacted) <= CONTEXT_MAX_CHARS
+
+
+def test_provider_usage_rolls_native_thread_into_bounded_prompt():
+    messages = [
+        {
+            "id": "assistant-old",
+            "role": "assistant",
+            "content": "Previous result",
+            "status": "complete",
+            "metadata": {"usage": {"total": {"totalTokens": 70_000}}},
+        },
+        {
+            "id": "user-new",
+            "role": "user",
+            "content": "Continue with the selected nodes",
+            "status": "complete",
+            "metadata": {},
+        },
+    ]
+
+    prompt, did_compact = native_prompt_with_compaction(
+        messages,
+        "Continue with the selected nodes",
+    )
+
+    assert conversation_needs_compaction(messages) is True
+    assert did_compact is True
+    assert "provider thread was rolled over" in prompt
+    assert prompt.endswith("Continue with the selected nodes")
+    assert len(prompt) <= CONTEXT_MAX_CHARS
 
 
 @pytest.mark.asyncio
@@ -579,6 +649,44 @@ async def test_cancel_expires_pending_approval_before_provider_interrupt(tmp_pat
     assert "approval-1" not in runtime.approvals
     with pytest.raises(asyncio.CancelledError):
         await state.task
+
+
+def test_interrupted_assistant_persists_partial_text_tools_and_provider_thread(tmp_path):
+    store = ChatStore(tmp_path / "chat.db", tmp_path / "missing.db")
+    conversation = store.create_conversation(provider="codex_subscription", model="model")
+    user = store.append_message(conversation["id"], "user", "initial request")
+    store.create_run("run-1", conversation["id"])
+    runtime = ChatRuntime(store)
+    state = ActiveRun(
+        "run-1",
+        conversation["id"],
+        "session-1",
+        settings={"provider": "codex_subscription", "model": "model"},
+        user_message_id=user["id"],
+        assistant_text="Partial answer",
+        tool_steps=[{
+            "id": "tool-1",
+            "name": "workflow_overview",
+            "status": "running",
+            "arguments": "{}",
+            "contentOffset": 0,
+        }],
+        interruption_reason="steered",
+        provider_metadata={"codexThreadId": "thread-1"},
+    )
+
+    runtime._persist_interrupted_assistant(state)
+    runtime._persist_interrupted_assistant(state)
+
+    messages = store.list_messages(conversation["id"])
+    assert len(messages) == 2
+    assistant = messages[-1]
+    assert assistant["status"] == "interrupted"
+    assert assistant["content"] == "Partial answer"
+    assert assistant["metadata"]["interrupted"] is True
+    assert assistant["metadata"]["interruptionReason"] == "steered"
+    assert assistant["metadata"]["codexThreadId"] == "thread-1"
+    assert assistant["metadata"]["toolSteps"][0]["status"] == "interrupted"
 
 
 @pytest.mark.asyncio

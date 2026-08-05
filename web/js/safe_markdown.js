@@ -172,8 +172,9 @@ function createImageGallery(candidates, resolveImageUrl) {
             const preview = document.createElement("img");
             preview.src = previewUrl;
             preview.alt = candidate.alt || `Image ${index + 1}`;
-            preview.loading = index < 2 ? "eager" : "lazy";
+            preview.loading = "lazy";
             preview.decoding = "async";
+            preview.fetchPriority = "low";
             preview.referrerPolicy = "no-referrer";
             if (index === 0) preview.fetchPriority = "high";
             preview.addEventListener("error", () => {

@@ -417,6 +417,23 @@
     gap: 14px;
 }
 
+.fl-load-older-messages {
+    align-self: center;
+    min-height: 28px;
+    padding: 4px 10px;
+    border: 1px solid var(--ren-border);
+    border-radius: 999px;
+    background: rgba(255, 255, 255, 0.025);
+    color: var(--ren-text-muted);
+    font-size: 10px;
+    cursor: pointer;
+}
+
+.fl-load-older-messages:hover:not(:disabled) {
+    border-color: rgba(153, 102, 217, 0.42);
+    color: var(--ren-text-secondary);
+}
+
 .fl-message {
     display: flex;
     flex-direction: column;
@@ -424,6 +441,11 @@
     max-width: 94%;
     gap: 3px;
     animation: fl-ren-slide-in 0.18s ease-out;
+}
+
+.fl-message:not(.streaming) {
+    content-visibility: auto;
+    contain-intrinsic-size: auto 160px;
 }
 
 .fl-message.user {
@@ -684,11 +706,13 @@
 /* Action Trail */
 
 .fl-toolchain-breadcrumb {
-    display: flex;
-    flex-direction: column;
-    gap: 3px;
-    padding: 2px 0 2px 8px;
-    border-left: 1px solid rgba(153, 102, 217, 0.24);
+    display: block;
+    min-width: 0;
+    overflow: hidden;
+    border: 1px solid transparent;
+    border-radius: 7px;
+    background: rgba(255, 255, 255, 0.025);
+    contain: layout paint style;
 }
 
 .fl-image-grid {
@@ -917,6 +941,110 @@
     text-align: center;
 }
 
+.fl-toolchain-summary {
+    display: grid;
+    width: 100%;
+    min-width: 0;
+    min-height: 30px;
+    grid-template-columns: 18px minmax(0, 1fr) minmax(0, auto) auto 14px;
+    align-items: center;
+    gap: 6px;
+    padding: 3px 7px;
+    border: 0;
+    background: transparent;
+    color: var(--ren-text-secondary);
+    text-align: left;
+    cursor: pointer;
+}
+
+.fl-toolchain-summary:hover {
+    background: rgba(255, 255, 255, 0.035);
+}
+
+.fl-toolchain-current,
+.fl-toolchain-meta,
+.fl-toolchain-disclosure {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.fl-toolchain-current {
+    color: var(--ren-text-secondary);
+    font-size: 11px;
+    font-weight: 650;
+}
+
+.fl-toolchain-meta,
+.fl-toolchain-disclosure {
+    color: #777781;
+    font-size: 10px;
+}
+
+.fl-toolchain-disclosure {
+    color: #aa8fca;
+}
+
+.fl-tool-history-panel {
+    min-width: 0;
+    border-top: 1px solid var(--ren-border);
+    background: rgba(0, 0, 0, 0.12);
+}
+
+.fl-tool-history-chips {
+    display: flex;
+    min-width: 0;
+    gap: 5px;
+    overflow-x: auto;
+    overflow-y: hidden;
+    padding: 6px 7px;
+    overscroll-behavior-inline: contain;
+    scrollbar-width: thin;
+}
+
+.fl-tool-history-chip,
+.fl-tool-history-more {
+    display: inline-flex;
+    min-height: 25px;
+    flex: 0 0 auto;
+    align-items: center;
+    gap: 5px;
+    padding: 3px 7px;
+    border: 1px solid var(--ren-border);
+    border-radius: 999px;
+    background: rgba(255, 255, 255, 0.025);
+    color: var(--ren-text-secondary);
+    font-size: 10px;
+    cursor: pointer;
+}
+
+.fl-tool-history-chip em {
+    color: #aa8fca;
+    font-size: 9px;
+    font-style: normal;
+    font-weight: 700;
+}
+
+.fl-tool-history-chip[aria-pressed="true"] {
+    border-color: rgba(153, 102, 217, 0.54);
+    background: rgba(153, 102, 217, 0.14);
+    color: #fff;
+}
+
+.fl-tool-history-chip.failed {
+    border-color: rgba(239, 130, 120, 0.34);
+    color: var(--ren-danger);
+}
+
+.fl-tool-history-chip.loading {
+    border-color: rgba(153, 102, 217, 0.42);
+    color: #c7a7ec;
+}
+
+.fl-tool-history-more {
+    color: #aa8fca;
+}
+
 .fl-toolchain-crumb {
     width: 100%;
     min-width: 0;
@@ -1001,6 +1129,29 @@
     border-color: rgba(153, 102, 217, 0.38);
     background: var(--ren-accent-muted);
     animation: fl-breadcrumb-pulse 1.5s ease-in-out infinite;
+}
+
+.fl-toolchain-breadcrumb.loading {
+    border-color: rgba(153, 102, 217, 0.38);
+    background: var(--ren-accent-muted);
+}
+
+.fl-toolchain-breadcrumb.completed {
+    background: rgba(255, 255, 255, 0.018);
+}
+
+.fl-toolchain-breadcrumb.failed {
+    border-color: rgba(239, 130, 120, 0.3);
+    background: rgba(239, 130, 120, 0.08);
+}
+
+.fl-toolchain-breadcrumb.failed .fl-crumb-icon {
+    color: var(--ren-danger);
+}
+
+.fl-toolchain-breadcrumb.cancelled {
+    border-color: var(--ren-border);
+    background: rgba(255, 255, 255, 0.025);
 }
 
 .fl-toolchain-crumb.loading .fl-crumb-icon,

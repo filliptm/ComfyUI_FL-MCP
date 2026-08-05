@@ -95,8 +95,12 @@ export class ChatClient {
         );
     }
 
-    loadConversation(conversationId) {
-        return this.request(`/api/chat/conversations/${encodeURIComponent(conversationId)}`);
+    loadConversation(conversationId, { before = null, limit = 50 } = {}) {
+        const params = new URLSearchParams({ limit: String(limit) });
+        if (before) params.set("before", before);
+        return this.request(
+            `/api/chat/conversations/${encodeURIComponent(conversationId)}?${params}`,
+        );
     }
 
     createConversation() {
@@ -142,6 +146,7 @@ export class ChatClient {
         searchMode,
         editMessageId,
         attachments = [],
+        steerRunId = null,
         onEvent,
         onReady,
     }) {
@@ -165,7 +170,10 @@ export class ChatClient {
         };
         let response;
         try {
-            response = await fetch(`${this.baseUrl}/api/chat/runs`, {
+            const runPath = steerRunId
+                ? `/api/chat/runs/${encodeURIComponent(steerRunId)}/steer`
+                : "/api/chat/runs";
+            response = await fetch(`${this.baseUrl}${runPath}`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({

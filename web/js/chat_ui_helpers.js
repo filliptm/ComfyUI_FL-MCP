@@ -182,6 +182,45 @@ export function canStackToolSteps(previous, next) {
     return Boolean(previousName && previousName === String(next?.name || ""));
 }
 
+export function groupToolSteps(steps = []) {
+    const groups = [];
+    for (const step of steps.filter(Boolean)) {
+        const current = groups.at(-1);
+        if (current && canStackToolSteps(current.steps.at(-1), step)) {
+            current.steps.push(step);
+        } else {
+            groups.push({ steps: [step] });
+        }
+    }
+    return groups.map((group, index) => ({
+        index,
+        steps: group.steps,
+        ...toolStackState(group.steps),
+    }));
+}
+
+export function toolHistorySummary(steps = []) {
+    const entries = steps.filter(Boolean);
+    const counts = {
+        total: entries.length,
+        running: 0,
+        done: 0,
+        retried: 0,
+        failed: 0,
+        interrupted: 0,
+    };
+    for (const step of entries) {
+        const status = String(step?.status || "").toLowerCase();
+        if (status === "running") counts.running += 1;
+        else if (["failed", "error"].includes(status)) counts.failed += 1;
+        else if (status === "retried") counts.retried += 1;
+        else if (["cancelled", "interrupted"].includes(status)) counts.interrupted += 1;
+        else counts.done += 1;
+    }
+    counts.active = entries.findLast(step => step?.status === "running") || null;
+    return counts;
+}
+
 export function toolStackState(steps = []) {
     const entries = steps.filter(Boolean);
     const categories = [

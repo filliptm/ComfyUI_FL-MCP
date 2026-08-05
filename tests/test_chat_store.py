@@ -53,6 +53,40 @@ def test_conversation_list_rejects_unknown_view(tmp_path):
         raise AssertionError("Unknown conversation view should be rejected")
 
 
+def test_message_pages_return_newest_branch_items_with_stable_cursor(tmp_path):
+    store = ChatStore(tmp_path / "chat.db", tmp_path / "missing.db")
+    conversation = store.create_conversation()
+    for index in range(7):
+        store.append_message(
+            conversation["id"],
+            "user" if index % 2 == 0 else "assistant",
+            f"message-{index}",
+        )
+
+    newest = store.list_messages_page(conversation["id"], limit=3)
+    assert [item["content"] for item in newest["messages"]] == [
+        "message-4", "message-5", "message-6",
+    ]
+    assert newest["hasMore"] is True
+    older = store.list_messages_page(
+        conversation["id"],
+        limit=3,
+        before_message_id=newest["nextBefore"],
+    )
+    assert [item["content"] for item in older["messages"]] == [
+        "message-1", "message-2", "message-3",
+    ]
+    assert older["hasMore"] is True
+    oldest = store.list_messages_page(
+        conversation["id"],
+        limit=3,
+        before_message_id=older["nextBefore"],
+    )
+    assert [item["content"] for item in oldest["messages"]] == ["message-0"]
+    assert oldest["hasMore"] is False
+    assert oldest["nextBefore"] is None
+
+
 def test_message_edits_create_navigable_request_response_versions(tmp_path):
     store = ChatStore(tmp_path / "chat.db", tmp_path / "missing.db")
     conversation = store.create_conversation()

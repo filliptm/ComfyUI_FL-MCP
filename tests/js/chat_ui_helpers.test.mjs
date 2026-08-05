@@ -3,12 +3,14 @@ import test from "node:test";
 
 import {
     canStackToolSteps,
+    groupToolSteps,
     isNearBottom,
     modelProviderSummary,
     starterPrompts,
     summarizeToolStep,
     technicalText,
     toolDisplayImages,
+    toolHistorySummary,
     toolStackState,
 } from "../../web/js/chat_ui_helpers.js";
 
@@ -289,6 +291,31 @@ test("consecutive identical tool calls stack and retain the strongest state", ()
         { name: "modify_layout", status: "running" },
     ]);
     assert.equal(mixed.status, "running");
+});
+
+
+test("large tool histories group horizontally and summarize without DOM state", () => {
+    const steps = [
+        { name: "find_node", status: "done" },
+        { name: "find_node", status: "retried" },
+        { name: "connect_nodes_batch", status: "running" },
+        { name: "queue_workflow", status: "failed" },
+        { name: "wait", status: "interrupted" },
+    ];
+
+    const groups = groupToolSteps(steps);
+    assert.equal(groups.length, 4);
+    assert.equal(groups[0].count, 2);
+    assert.equal(groups[0].status, "retried");
+    assert.deepEqual(toolHistorySummary(steps), {
+        total: 5,
+        running: 1,
+        done: 1,
+        retried: 1,
+        failed: 1,
+        interrupted: 1,
+        active: steps[2],
+    });
 });
 
 

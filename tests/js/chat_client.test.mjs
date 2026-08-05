@@ -188,6 +188,41 @@ test("cancel gets the run id from SSE when CORS hides response headers", async (
 });
 
 
+test("steering uses the atomic replacement endpoint", async () => {
+    const originalFetch = globalThis.fetch;
+    let request;
+    globalThis.fetch = async (url, options = {}) => {
+        request = { url: String(url), options };
+        return new Response(
+            'data: {"type":"RUN_STARTED","runId":"run-new",'
+            + '"threadId":"conversation-1"}\n\n',
+            {
+                status: 200,
+                headers: {
+                    "X-FL-MCP-Run-Id": "run-new",
+                    "X-FL-MCP-Conversation-Id": "conversation-1",
+                },
+            },
+        );
+    };
+    try {
+        await new ChatClient("http://127.0.0.1:18000").startRun({
+            sessionId: "session-1",
+            message: "New direction",
+            steerRunId: "run old",
+        });
+    } finally {
+        globalThis.fetch = originalFetch;
+    }
+
+    assert.equal(
+        request.url,
+        "http://127.0.0.1:18000/api/chat/runs/run%20old/steer",
+    );
+    assert.equal(request.options.method, "POST");
+});
+
+
 test("web image previews stay on the local Ren backend", () => {
     const client = new ChatClient("http://127.0.0.1:18000");
 
@@ -273,6 +308,33 @@ test("conversation requests preserve active/archive views and additive updates",
         title: "Saved workflow",
     });
     assert.match(requests[1].url, /conversation%201$/);
+});
+
+
+test("conversation history loads in bounded cursor pages", async () => {
+    const originalFetch = globalThis.fetch;
+    let requestedUrl;
+    globalThis.fetch = async url => {
+        requestedUrl = String(url);
+        return new Response(JSON.stringify({ messages: [], hasMore: false }), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+        });
+    };
+    try {
+        await new ChatClient("http://127.0.0.1:18000").loadConversation(
+            "conversation 1",
+            { before: "message 40", limit: 25 },
+        );
+    } finally {
+        globalThis.fetch = originalFetch;
+    }
+
+    assert.equal(
+        requestedUrl,
+        "http://127.0.0.1:18000/api/chat/conversations/conversation%201"
+        + "?limit=25&before=message+40",
+    );
 });
 
 

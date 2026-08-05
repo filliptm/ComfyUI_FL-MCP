@@ -32,6 +32,16 @@ PROMPT_PATH = Path(__file__).with_name("chat_prompt.md")
 MANDATORY_REVIEW_TOOLS = {"confirm_mask_review"}
 MAX_CHAT_ATTACHMENTS = 8
 MAX_CHAT_ATTACHMENT_BYTES = 32 * 1024 * 1024
+CONTEXT_MAX_CHARS = 96_000
+CONTEXT_RECENT_CHARS = 64_000
+CONTEXT_CHECKPOINT_CHARS = 24_000
+CONTEXT_ROLLOVER_TOKENS = 64_000
+
+_DATA_IMAGE_URI = re.compile(
+    r"data:image/[^;,\s]+;base64,[A-Za-z0-9+/=]+",
+    re.IGNORECASE,
+)
+_LONG_BASE64_VALUE = re.compile(r"[A-Za-z0-9+/]{2048,}={0,2}")
 
 WEB_IMAGE_INTENT_PATTERNS = (
     re.compile(
@@ -179,6 +189,190 @@ def message_content_for_model(message: dict[str, Any]) -> str:
         + "\n".join(references)
     )
     return f"{content}\n\n{attachment_context}" if content else attachment_context
+
+
+def _bounded_context_text(value: Any, limit: int) -> str:
+    """Strip accidental binary payloads and bound one context fragment."""
+    text = str(value or "").replace("\x00", "")
+    text = _DATA_IMAGE_URI.sub("[image data omitted; use its ComfyUI reference]", text)
+    text = _LONG_BASE64_VALUE.sub("[binary data omitted]", text)
+    if len(text) <= limit:
+        return text
+    if limit <= 80:
+        return text[:limit]
+    suffix_size = min(limit // 4, 2_000)
+    prefix_size = limit - suffix_size - 32
+    return (
+        text[:prefix_size]
+        + "\n… [older content truncated] …\n"
+        + text[-suffix_size:]
+    )
+
+
+def _message_for_context(message: dict[str, Any]) -> dict[str, str]:
+    role = str(message.get("role") or "assistant")
+    raw_content = (
+        message_content_for_model(message)
+        if role == "user"
+        else str(message.get("content") or "")
+    )
+    return {
+        "id": str(message.get("id") or uuid.uuid4()),
+        "role": role,
+        "content": _bounded_context_text(raw_content, CONTEXT_RECENT_CHARS),
+    }
+
+
+def _tool_checkpoint(message: dict[str, Any]) -> str:
+    steps = (message.get("metadata") or {}).get("toolSteps") or []
+    summaries = []
+    for step in steps[-12:]:
+        if not isinstance(step, dict):
+            continue
+        name = str(step.get("name") or "tool")
+        status = str(step.get("status") or "unknown")
+        summaries.append(f"{name}={status}")
+    if len(steps) > len(summaries):
+        summaries.insert(0, f"{len(steps) - len(summaries)} earlier calls")
+    return ", ".join(summaries)
+
+
+def build_conversation_checkpoint(
+    messages: list[dict[str, Any]],
+    *,
+    max_chars: int = CONTEXT_CHECKPOINT_CHARS,
+) -> str:
+    """Create a deterministic, status-preserving checkpoint for older turns."""
+    if not messages:
+        return ""
+    lines = [
+        "Conversation checkpoint (older turns were compacted for performance).",
+        "Tool statuses are historical facts; interrupted/failed calls did not succeed.",
+    ]
+    remaining = max_chars - sum(len(line) + 1 for line in lines)
+    selected: list[str] = []
+    omitted = 0
+    for message in reversed(messages):
+        role = str(message.get("role") or "assistant")
+        status = str(message.get("status") or "complete")
+        content = _message_for_context(message)["content"]
+        excerpt = " ".join(content.split())
+        excerpt = _bounded_context_text(excerpt, 700 if role == "user" else 520)
+        tools = _tool_checkpoint(message)
+        line = f"- {role} [{status}]: {excerpt or '(no text)'}"
+        if tools:
+            line += f" | tools: {tools}"
+        if len(line) + 1 > remaining:
+            omitted += 1
+            continue
+        selected.append(line)
+        remaining -= len(line) + 1
+    if omitted:
+        lines.append(f"- {omitted} earliest turn(s) omitted from this checkpoint.")
+    lines.extend(reversed(selected))
+    return _bounded_context_text("\n".join(lines), max_chars)
+
+
+def _usage_token_high_watermark(value: Any) -> int:
+    """Return the largest reported token counter in nested provider metadata."""
+    if isinstance(value, dict):
+        values = [
+            _usage_token_high_watermark(item)
+            for key, item in value.items()
+            if "token" in str(key).lower() or isinstance(item, (dict, list))
+        ]
+        return max(values, default=0)
+    if isinstance(value, list):
+        return max((_usage_token_high_watermark(item) for item in value), default=0)
+    if isinstance(value, (int, float)) and value >= 0:
+        return int(value)
+    return 0
+
+
+def conversation_needs_compaction(messages: list[dict[str, Any]]) -> bool:
+    """Detect large local histories or native threads near a costly context size."""
+    context_size = sum(
+        len(_message_for_context(message)["content"]) + 64
+        for message in messages
+        if message.get("role") in {"user", "assistant"}
+    )
+    provider_tokens = max(
+        (
+            _usage_token_high_watermark((message.get("metadata") or {}).get("usage"))
+            for message in messages
+        ),
+        default=0,
+    )
+    return (
+        context_size > CONTEXT_MAX_CHARS
+        or provider_tokens >= CONTEXT_ROLLOVER_TOKENS
+    )
+
+
+def compact_messages_for_model(
+    messages: list[dict[str, Any]],
+    *,
+    force: bool = False,
+) -> tuple[list[dict[str, str]], bool]:
+    """Bound model history while retaining recent turns and an older checkpoint."""
+    eligible = [
+        message
+        for message in messages
+        if message.get("role") in {"user", "assistant"}
+    ]
+    normalized = [_message_for_context(message) for message in eligible]
+    if not force and not conversation_needs_compaction(eligible):
+        return normalized, False
+    if not normalized:
+        return [], force
+
+    recent_reversed: list[dict[str, str]] = []
+    recent_chars = 0
+    for item in reversed(normalized):
+        cost = len(item["content"]) + 64
+        if recent_reversed and recent_chars + cost > CONTEXT_RECENT_CHARS:
+            break
+        if cost > CONTEXT_RECENT_CHARS:
+            item = {
+                **item,
+                "content": _bounded_context_text(
+                    item["content"],
+                    CONTEXT_RECENT_CHARS - 64,
+                ),
+            }
+            cost = len(item["content"]) + 64
+        recent_reversed.append(item)
+        recent_chars += cost
+    recent = list(reversed(recent_reversed))
+    older_count = len(normalized) - len(recent)
+    compacted: list[dict[str, str]] = []
+    if older_count:
+        compacted.append({
+            "id": "context-checkpoint",
+            "role": "assistant",
+            "content": build_conversation_checkpoint(eligible[:older_count]),
+        })
+    compacted.extend(recent)
+    return compacted, True
+
+
+def native_prompt_with_compaction(
+    messages: list[dict[str, Any]],
+    latest_user_message: str,
+) -> tuple[str, bool]:
+    """Prepare a bounded prompt when rolling over a native Claude/Codex thread."""
+    if not conversation_needs_compaction(messages):
+        return latest_user_message, False
+    compacted, _ = compact_messages_for_model(messages, force=True)
+    prior = compacted[:-1] if compacted else []
+    sections = [
+        "The provider thread was rolled over to keep this long chat responsive.",
+        "Use this bounded conversation context, then handle the current request.",
+    ]
+    for item in prior:
+        sections.append(f"\n[{item['role']}]\n{item['content']}")
+    sections.append(f"\n[current user request]\n{latest_user_message}")
+    return _bounded_context_text("\n".join(sections), CONTEXT_MAX_CHARS), True
 
 INTENT_TOOL_GROUPS = {
     "debug": {
@@ -562,6 +756,9 @@ class ActiveRun:
     tool_steps: list[dict[str, Any]] = field(default_factory=list)
     error_emitted: bool = False
     started_emitted: bool = False
+    assistant_persisted: bool = False
+    interruption_reason: str = "stopped"
+    provider_metadata: dict[str, Any] = field(default_factory=dict)
     cancel_callback: Callable[[], Awaitable[Any]] | None = None
 
 
@@ -794,10 +991,11 @@ class ChatRuntime:
         for subscriber in list(state.subscribers):
             subscriber.put_nowait(raw)
 
-    async def cancel(self, run_id: str) -> bool:
+    async def cancel(self, run_id: str, *, reason: str = "stopped") -> bool:
         state = self.runs.get(run_id)
         if not state or state.done or not state.task:
             return False
+        state.interruption_reason = "steered" if reason == "steered" else "stopped"
         self._expire_approvals(state.run_id)
         interrupt_task = None
         if state.cancel_callback is not None:
@@ -819,6 +1017,63 @@ class ChatRuntime:
                 "The provider did not stop within 10 seconds. Please try Stop again."
             ) from exc
         return True
+
+    async def steer(
+        self,
+        run_id: str,
+        *,
+        session_id: str,
+        message: str,
+        reasoning_effort: str = "default",
+        search_mode: str | None = None,
+        attachments: Any = None,
+    ) -> ActiveRun:
+        previous = self.runs.get(run_id)
+        if not previous or previous.done:
+            raise ValueError("The response is no longer active.")
+        conversation_id = previous.conversation_id
+        if not await self.cancel(run_id, reason="steered"):
+            raise ValueError("The response could not be interrupted.")
+        return await self.start(
+            session_id=session_id,
+            conversation_id=conversation_id,
+            message=message,
+            reasoning_effort=reasoning_effort,
+            search_mode=search_mode,
+            attachments=attachments,
+        )
+
+    def _persist_interrupted_assistant(self, state: ActiveRun) -> None:
+        if state.assistant_persisted:
+            return
+        status = "interrupted" if state.interruption_reason == "steered" else "cancelled"
+        for step in state.tool_steps:
+            if step.get("status") == "running":
+                step["status"] = status
+        assistant_content, persisted_tool_steps = normalize_assistant_timeline(
+            state.assistant_text,
+            state.tool_steps,
+        )
+        if not assistant_content and not persisted_tool_steps:
+            return
+        self.store.append_message(
+            state.conversation_id,
+            "assistant",
+            assistant_content,
+            status="interrupted",
+            provider=(state.settings or {}).get("provider"),
+            model=(state.settings or {}).get("model"),
+            metadata={
+                "toolSteps": persisted_tool_steps,
+                "runId": state.run_id,
+                "interrupted": True,
+                "interruptionReason": state.interruption_reason,
+                **state.provider_metadata,
+            },
+            parent_message_id=state.user_message_id,
+            branch_from_active=False,
+        )
+        state.assistant_persisted = True
 
     async def resolve_approval(
         self,
@@ -1051,19 +1306,10 @@ class ChatRuntime:
                 model_settings=model_settings,
                 prepare_tools=prepare_tools,
             )
-            messages = [
-                {
-                    "id": item["id"],
-                    "role": item["role"],
-                    "content": (
-                        message_content_for_model(item)
-                        if item["role"] == "user"
-                        else item["content"]
-                    ),
-                }
-                for item in self.store.list_messages(state.conversation_id)
-                if item["role"] in {"user", "assistant"}
-            ]
+            stored_messages = self.store.list_messages(state.conversation_id)
+            messages, context_compacted = compact_messages_for_model(stored_messages)
+            if context_compacted:
+                state.provider_metadata["contextCompacted"] = True
             run_input = RunAgentInput.model_validate({
                 "threadId": state.conversation_id,
                 "runId": state.run_id,
@@ -1096,17 +1342,34 @@ class ChatRuntime:
                 provider=settings["provider"],
                 model=settings["model"],
                 serialized=serialized,
-                metadata={"toolSteps": persisted_tool_steps, "runId": state.run_id},
+                metadata={
+                    "toolSteps": persisted_tool_steps,
+                    "runId": state.run_id,
+                    **state.provider_metadata,
+                },
                 parent_message_id=user_message_id,
                 branch_from_active=False,
             )
+            state.assistant_persisted = True
             self.store.finish_run(state.run_id, "complete")
         except asyncio.CancelledError:
-            self.store.finish_run(state.run_id, "cancelled")
+            self._persist_interrupted_assistant(state)
+            self.store.finish_run(
+                state.run_id,
+                "interrupted" if state.interruption_reason == "steered" else "cancelled",
+            )
             await self.publish(state, {
                 "type": "RUN_ERROR",
-                "message": "Response stopped.",
-                "code": "cancelled",
+                "message": (
+                    "Response continued with the new message."
+                    if state.interruption_reason == "steered"
+                    else "Response stopped."
+                ),
+                "code": (
+                    "steered"
+                    if state.interruption_reason == "steered"
+                    else "cancelled"
+                ),
             })
         except Exception as exc:
             logger.error("Embedded chat run failed: %s", exc, exc_info=True)
@@ -1173,6 +1436,10 @@ class ChatRuntime:
             {},
         )
         latest_user_message = message_content_for_model(latest_user_item)
+        provider_user_message, context_compacted = native_prompt_with_compaction(
+            messages,
+            latest_user_message,
+        )
         allowed_tools = tools_for_message(
             latest_user_message,
             str(settings.get("search_mode") or "off"),
@@ -1186,6 +1453,12 @@ class ChatRuntime:
             ),
             None,
         )
+        if context_compacted:
+            claude_session_id = None
+            state.provider_metadata.update({
+                "contextCompacted": True,
+                "providerThreadRolledOver": True,
+            })
         environment = os.environ.copy()
         environment.update({
             "FL_MCP_MODE": "subprocess",
@@ -1274,7 +1547,7 @@ class ChatRuntime:
                 "type": "user",
                 "message": {
                     "role": "user",
-                    "content": latest_user_message,
+                    "content": provider_user_message,
                 },
             }
 
@@ -1316,6 +1589,8 @@ class ChatRuntime:
             option_values["effort"] = reasoning_effort
         if claude_session_id:
             option_values["resume"] = claude_session_id
+        elif context_compacted:
+            option_values["session_id"] = state.run_id
         else:
             try:
                 uuid.UUID(state.conversation_id)
@@ -1327,6 +1602,8 @@ class ChatRuntime:
         block_tools: dict[int, str] = {}
         seen_tool_ids: set[str] = set()
         captured_session_id = claude_session_id
+        if captured_session_id:
+            state.provider_metadata["claudeSessionId"] = captured_session_id
         result_message = None
         text_started = False
 
@@ -1349,7 +1626,10 @@ class ChatRuntime:
             if callable(interrupt):
                 state.cancel_callback = interrupt
             await wait_for_claude_mcp(client)
-            session_id = captured_session_id or state.conversation_id
+            session_id = (
+                captured_session_id
+                or (state.run_id if context_compacted else state.conversation_id)
+            )
             await client.query(prompt_stream(), session_id=session_id)
             message_stream = client.receive_response()
 
@@ -1358,6 +1638,7 @@ class ChatRuntime:
                 message_session_id = getattr(message, "session_id", None)
                 if message_session_id:
                     captured_session_id = str(message_session_id)
+                    state.provider_metadata["claudeSessionId"] = captured_session_id
 
                 if isinstance(message, StreamEvent):
                     event = message.event
@@ -1489,6 +1770,7 @@ class ChatRuntime:
             "runId": state.run_id,
             "claudeSessionId": captured_session_id,
             "usage": result_message.usage or {},
+            **state.provider_metadata,
         }
         self.store.append_message(
             state.conversation_id,
@@ -1500,6 +1782,7 @@ class ChatRuntime:
             parent_message_id=state.user_message_id,
             branch_from_active=False,
         )
+        state.assistant_persisted = True
         self.store.finish_run(state.run_id, "complete")
 
     async def _execute_codex_subscription(
@@ -1553,6 +1836,10 @@ class ChatRuntime:
             {},
         )
         latest_user_message = message_content_for_model(latest_user_item)
+        provider_user_message, context_compacted = native_prompt_with_compaction(
+            messages,
+            latest_user_message,
+        )
         allowed_tools = tools_for_message(
             latest_user_message,
             str(settings.get("search_mode") or "off"),
@@ -1566,6 +1853,12 @@ class ChatRuntime:
             ),
             None,
         )
+        if context_compacted:
+            codex_thread_id = None
+            state.provider_metadata.update({
+                "contextCompacted": True,
+                "providerThreadRolledOver": True,
+            })
         mcp_environment = {
             "FL_MCP_MODE": "subprocess",
             "FL_MCP_SESSION_ID": state.session_id,
@@ -1806,6 +2099,8 @@ class ChatRuntime:
                 ))
                 thread = AsyncThread(codex, started.thread.id)
                 codex_thread_id = thread.id
+            if codex_thread_id:
+                state.provider_metadata["codexThreadId"] = codex_thread_id
 
             status_params = ListMcpServerStatusParams(
                 thread_id=thread.id,
@@ -1834,7 +2129,7 @@ class ChatRuntime:
                 )
 
             turn = await thread.turn(
-                latest_user_message,
+                provider_user_message,
                 effort=(
                     None
                     if settings.get("reasoning_effort", "default") == "default"
@@ -1966,10 +2261,12 @@ class ChatRuntime:
                 "runId": state.run_id,
                 "codexThreadId": codex_thread_id,
                 "usage": usage,
+                **state.provider_metadata,
             },
             parent_message_id=state.user_message_id,
             branch_from_active=False,
         )
+        state.assistant_persisted = True
         self.store.finish_run(state.run_id, "complete")
 
     @staticmethod

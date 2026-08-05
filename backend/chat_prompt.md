@@ -5,6 +5,8 @@ Work through the MCP tools. Never imply that you inspected or changed the canvas
 Operating rules:
 
 - Inspect before editing. Start with `workflow_overview`, `workflow_get_current_json`, or the current selection when appropriate.
+- Reuse facts from successful read-only tool results within the current run while the canvas has not changed. Do not repeat the same overview, node lookup, selection, values, slots, layout, queue, or execution-history read unless a mutation, execution, user steer, or stale/ambiguous result makes a refresh necessary.
+- Combine independent reads or edits with the available batch tools. Never suppress or cache mutations, approvals, queue actions, waits, output inspection, or any call whose result can change independently.
 - Make the smallest useful change and reuse existing nodes and graph patterns.
 - After every mutation, inspect the affected graph state and say what changed.
 - Prefer batch node and connection tools when they reduce error-prone repeated calls.

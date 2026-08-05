@@ -138,7 +138,7 @@ test("fixed chat chrome casts inward depth shadows over the message viewport", a
 });
 
 
-test("tool calls keep chronological placement and one shared renderer", async () => {
+test("tool calls use one lazy horizontal history renderer", async () => {
     const panel = await readFile(new URL("web/js/chat_panel.js", root), "utf8");
     const runtime = await readFile(new URL("backend/chat_runtime.py", root), "utf8");
 
@@ -146,11 +146,14 @@ test("tool calls keep chronological placement and one shared renderer", async ()
     assert.match(panel, /renderPersistedAssistantTimeline/);
     assert.match(panel, /appendAssistantDelta/);
     assert.match(panel, /toolRailAtCursor/);
-    assert.match(panel, /renderToolStep/);
+    assert.match(panel, /renderToolHistory/);
+    assert.match(panel, /renderToolHistoryChips/);
+    assert.match(panel, /renderToolHistoryDetail/);
     assert.match(panel, /summarizeToolStep/);
-    assert.match(panel, /canStackToolSteps/);
-    assert.match(panel, /item\.toolSteps = \[step\]/);
-    assert.match(panel, /`×\$\{stack\.count\}`/);
+    assert.match(panel, /groupToolSteps/);
+    assert.match(panel, /TOOL_HISTORY_INITIAL_GROUPS = 60/);
+    assert.match(panel, /history\.steps\.push\(step\)/);
+    assert.match(panel, /`×\$\{group\.count\}`/);
     assert.match(panel, /`Call \$\{index \+ 1\}/);
     assert.match(panel, /event\.content/);
     assert.match(runtime, /"contentOffset": len\(state\.assistant_text\)/);
@@ -189,10 +192,11 @@ test("action trail stays compact, visible, and visually quiet when complete", as
     const tools = await readFile(new URL("web/js/tool_activity.js", root), "utf8");
 
     assert.match(styles, /\.fl-message-timeline\s*\{[^}]*gap:\s*5px/s);
-    assert.match(styles, /\.fl-toolchain-breadcrumb\s*\{[^}]*gap:\s*3px/s);
-    assert.match(styles, /\.fl-toolchain-crumb summary\s*\{[^}]*min-height:\s*30px/s);
-    assert.match(styles, /\.fl-crumb-count\s*\{[^}]*border-radius:\s*999px/s);
-    assert.match(styles, /\.fl-toolchain-crumb\.completed\s*\{[^}]*background:\s*rgba\(255, 255, 255, 0\.018\)/s);
+    assert.match(styles, /\.fl-toolchain-summary\s*\{[^}]*grid-template-columns:/s);
+    assert.match(styles, /\.fl-tool-history-chips\s*\{[^}]*overflow-x:\s*auto/s);
+    assert.match(styles, /\.fl-tool-history-chip[^}]*border-radius:\s*999px/s);
+    assert.match(styles, /\.fl-toolchain-breadcrumb\.completed\s*\{[^}]*background:\s*rgba\(255, 255, 255, 0\.018\)/s);
+    assert.match(styles, /content-visibility:\s*auto/);
     assert.match(tools, /TOOL_ICON_CLASSES/);
     assert.match(tools, /pi pi-plus-circle/);
     assert.match(tools, /view_node_mask/);
@@ -228,8 +232,9 @@ test("composer can steer an active response and exposes real stop progress", asy
 
     assert.match(panel, /if \(this\.running\) \{\s*await this\.steer\(/);
     assert.match(panel, /const cancelled = await this\.chat\.cancel\(\);/);
-    assert.match(panel, /if \(previousRun\) await previousRun;/);
-    assert.match(panel, /await this\.startRunMessage\(message, null, searchMode, attachments\);/);
+    assert.match(panel, /const activeRunId = this\.chat\.runId \|\| await this\.chat\.runReady;/);
+    assert.match(panel, /attachments,\s*activeRunId,/);
+    assert.match(panel, /context === this\.currentRunContext && this\.steering/);
     assert.match(panel, /Steer Ren with this message \(Enter\)/);
     assert.match(panel, /Stopping Ren…/);
     assert.match(panel, /this\.stopButton\.disabled = this\.stopping \|\| this\.steering/);
