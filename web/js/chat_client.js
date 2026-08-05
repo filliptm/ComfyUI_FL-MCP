@@ -118,7 +118,26 @@ export class ChatClient {
         });
     }
 
-    async startRun({ sessionId, conversationId, message, reasoningEffort, onEvent, onReady }) {
+    selectMessageVersion(conversationId, messageId, direction) {
+        return this.request(
+            `/api/chat/conversations/${encodeURIComponent(conversationId)}`
+            + `/messages/${encodeURIComponent(messageId)}/version`,
+            {
+                method: "POST",
+                body: JSON.stringify({ direction }),
+            },
+        );
+    }
+
+    async startRun({
+        sessionId,
+        conversationId,
+        message,
+        reasoningEffort,
+        editMessageId,
+        onEvent,
+        onReady,
+    }) {
         this.abortController = new AbortController();
         const response = await fetch(`${this.baseUrl}/api/chat/runs`, {
             method: "POST",
@@ -128,6 +147,7 @@ export class ChatClient {
                 conversationId: conversationId || null,
                 message,
                 reasoningEffort: reasoningEffort || "default",
+                editMessageId: editMessageId || null,
             }),
             signal: this.abortController.signal,
         });
@@ -143,9 +163,22 @@ export class ChatClient {
         }
         this.runId = response.headers.get("X-FL-MCP-Run-Id");
         this.conversationId = response.headers.get("X-FL-MCP-Conversation-Id");
+        const userMessageId = response.headers.get("X-FL-MCP-User-Message-Id");
         onReady?.({
             runId: this.runId,
             conversationId: this.conversationId,
+            userMessage: userMessageId ? {
+                id: userMessageId,
+                revision: {
+                    rootId: response.headers.get("X-FL-MCP-User-Revision-Root-Id"),
+                    index: Number(
+                        response.headers.get("X-FL-MCP-User-Revision-Index"),
+                    ) || 1,
+                    count: Number(
+                        response.headers.get("X-FL-MCP-User-Revision-Count"),
+                    ) || 1,
+                },
+            } : null,
         });
         await this.consumeSSE(response.body, onEvent);
     }

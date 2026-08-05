@@ -47,6 +47,42 @@ def test_model_settings_only_send_supported_reasoning_parameter():
 
 
 @pytest.mark.asyncio
+async def test_starting_an_edit_creates_a_sibling_user_revision(tmp_path, monkeypatch):
+    settings = ChatSettingsStore(tmp_path / "settings.json")
+    settings.update({"provider": "ollama", "model": "qwen3"})
+    monkeypatch.setattr(chat_runtime_module, "chat_settings", settings)
+
+    store = ChatStore(tmp_path / "chat.db", tmp_path / "missing.db")
+    conversation = store.create_conversation(provider="ollama", model="qwen3")
+    original = store.append_message(conversation["id"], "user", "original")
+    store.append_message(conversation["id"], "assistant", "original response")
+    runtime = ChatRuntime(store)
+
+    async def finish_without_provider_call(state, _user_message_id):
+        state.done = True
+
+    monkeypatch.setattr(runtime, "_execute", finish_without_provider_call)
+    state = await runtime.start(
+        session_id="session-1",
+        conversation_id=conversation["id"],
+        message="edited",
+        edit_message_id=original["id"],
+    )
+    await state.task
+
+    messages = store.list_messages(conversation["id"])
+    assert [item["content"] for item in messages] == ["edited"]
+    assert messages[0]["parentMessageId"] == original["parentMessageId"]
+    assert messages[0]["revision"] == {
+        "rootId": original["id"],
+        "index": 2,
+        "count": 2,
+    }
+    assert state.user_message_id == messages[0]["id"]
+    assert state.user_message_revision == messages[0]["revision"]
+
+
+@pytest.mark.asyncio
 async def test_run_events_track_text_tools_retries_and_replay(tmp_path):
     store = ChatStore(tmp_path / "chat.db", tmp_path / "missing.db")
     runtime = ChatRuntime(store)

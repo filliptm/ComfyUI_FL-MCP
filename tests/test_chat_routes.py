@@ -1,6 +1,7 @@
 import chat_routes
 import server
 from chat_config import ChatSettingsStore, CredentialStore
+from chat_runtime import ActiveRun
 from chat_store import ChatStore
 from fastapi.testclient import TestClient
 
@@ -35,6 +36,24 @@ def test_chat_settings_and_conversation_crud_use_http_api(tmp_path, monkeypatch)
         )
         assert renamed.status_code == 200
         assert renamed.json()["conversation"]["title"] == "Workflow review"
+
+        first = store.append_message(conversation_id, "user", "original")
+        revision = store.append_message(
+            conversation_id,
+            "user",
+            "edited",
+            parent_message_id=first["parentMessageId"],
+            revision_root_id=first["revision"]["rootId"],
+            revision_index=2,
+            branch_from_active=False,
+        )
+        selected = client.post(
+            f"/api/chat/conversations/{conversation_id}/messages/"
+            f"{revision['id']}/version",
+            json={"direction": -1},
+        )
+        assert selected.status_code == 200
+        assert selected.json()["messages"][0]["content"] == "original"
 
         active = client.get("/api/chat/conversations?view=active")
         assert [item["id"] for item in active.json()["conversations"]] == [
@@ -77,6 +96,45 @@ def test_chat_settings_reject_secret_fields(tmp_path, monkeypatch):
 
     assert response.status_code == 400
     assert "credential endpoint" in response.json()["detail"]
+
+
+def test_run_headers_identify_the_persisted_user_message(monkeypatch):
+    class Runtime:
+        async def start(self, **_kwargs):
+            return ActiveRun(
+                "run-1",
+                "conversation-1",
+                "session-1",
+                user_message_id="message-2",
+                user_message_revision={
+                    "rootId": "message-1",
+                    "index": 2,
+                    "count": 2,
+                },
+            )
+
+        def subscribe(self, _run_id):
+            async def stream():
+                if False:
+                    yield ""
+
+            return stream()
+
+    monkeypatch.setattr(chat_routes, "chat_runtime", Runtime())
+
+    with TestClient(server.app) as client:
+        response = client.post("/api/chat/runs", json={
+            "sessionId": "session-1",
+            "conversationId": "conversation-1",
+            "message": "Revised request",
+            "editMessageId": "message-1",
+        })
+
+    assert response.status_code == 200
+    assert response.headers["x-fl-mcp-user-message-id"] == "message-2"
+    assert response.headers["x-fl-mcp-user-revision-root-id"] == "message-1"
+    assert response.headers["x-fl-mcp-user-revision-index"] == "2"
+    assert response.headers["x-fl-mcp-user-revision-count"] == "2"
 
 
 def test_global_bypass_syncs_running_approvals(tmp_path, monkeypatch):
