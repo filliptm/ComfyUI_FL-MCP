@@ -59,22 +59,17 @@ pip install -r requirements.txt
 
 Restart ComfyUI. The sidebar should show a `Ren` tab with a chat-bubble icon. Inside that tab, the main panel is labeled **MCP**.
 
-### Recommended `.env`
+### Bridge settings
 
-```bash
-cd /path/to/ComfyUI/custom_nodes/ComfyUI_FL-MCP
-cp .env.example .env
-```
+The local defaults work for a standard ComfyUI install. To change the backend
+launch mode, bind address, ports, ComfyUI path, extra model paths file, logging,
+or server-side safety gates, open **Ren → Settings → Bridge & safety**.
 
-Default local settings:
-
-```dotenv
-AUTO_START_BACKEND=true
-BACKEND_LAUNCH_MODE=subprocess
-WS_HOST=127.0.0.1
-WS_PORT=8000
-COMFYUI_SERVER_URL=http://127.0.0.1:8188
-```
+Bridge settings are validated and stored locally in
+`.fl_mcp/bridge_settings.json`. Changes take effect after restarting ComfyUI.
+If an older install has a `.env` file, supported values are imported once when
+the JSON settings file does not yet exist. The legacy file is left untouched
+and is no longer read after that import.
 
 ## Quick Start
 
@@ -124,7 +119,7 @@ Routine canvas edits can run without an extra prompt. Queueing, workflow deletio
 - Select **History** to search, rename, archive, restore, or permanently delete conversations.
 - Tool calls stay at their chronological position in the conversation. Consecutive identical calls collapse into a single row with an `×N` count while retaining each call's details.
 - Approval cards support **Deny**, **Allow once**, and persistent per-tool **Always allow** decisions. Saved rules can be cleared from **Settings → Tool approvals**.
-- **Bypass all approval prompts** disables the chat approval layer globally. It does not override the environment-controlled workflow, file, Git, Manager, or process safety gates.
+- **Bypass all approval prompts** disables the chat approval layer globally. It does not override the server-side workflow, file, Git, Manager, or process safety gates.
 - The composer remains fixed below the scrollable conversation. **Jump to present** scrolls smoothly when new activity arrives out of view.
 - ComfyUI's native Fit View accounts for the visible canvas beside the open chat panel.
 - Automatic node insertion uses real node bounds and graph extents to avoid stacking new nodes on top of existing nodes.
@@ -149,10 +144,7 @@ Use the Python executable from the same environment where dependencies are insta
       "command": "python",
       "args": [
         "/path/to/ComfyUI/custom_nodes/ComfyUI_FL-MCP/backend/mcp_server.py"
-      ],
-      "env": {
-        "COMFYUI_SERVER_URL": "http://127.0.0.1:8188"
-      }
+      ]
     }
   }
 }
@@ -198,8 +190,8 @@ The bridge backend does **not** run inside ComfyUI's main event loop. It runs as
 
 ## Assistant Data and Security
 
-- Non-secret assistant settings are stored under `.fl_mcp/chat_settings.json`.
-- Approval mode and per-tool **Always allow** rules are non-secret settings stored in that same file.
+- Non-secret assistant settings, approval mode, and per-tool **Always allow** rules are stored under `.fl_mcp/chat_settings.json`.
+- Non-secret bridge, path, logging, and safety settings are stored under `.fl_mcp/bridge_settings.json`.
 - Conversations, messages, run state, approvals, and tool activity are stored locally in `.fl_mcp/chat.db`.
 - Existing conversations from `.ren/ren.db` are imported once when that database is present. Legacy provider secrets and session metadata are not copied.
 - API credentials use the OS keychain when available, then environment variables, with an in-memory fallback if the keychain cannot be used.
@@ -212,21 +204,16 @@ The bridge backend does **not** run inside ComfyUI's main event loop. It runs as
 
 Read-only tools are available by default. Anything that writes files, edits workflows, mutates Manager state, pushes git commits, or controls processes must be explicitly enabled.
 
-```dotenv
-FL_MCP_ENABLE_WORKFLOW_WRITES=false
-FL_MCP_ENABLE_CUSTOM_NODE_WRITES=false
-FL_MCP_ENABLE_GIT_WRITES=false
-FL_MCP_ENABLE_MANAGER_MUTATIONS=false
-FL_MCP_ENABLE_COMFY_PROCESS_CONTROL=false
-```
+Open **Ren → Settings → Bridge & safety → Server-side capabilities**, enable the
+narrowest required gate, save, and restart ComfyUI.
 
 | Gate | Enables |
 |---|---|
-| `FL_MCP_ENABLE_WORKFLOW_WRITES` | Canvas mutation, workflow load/save/delete, settings writes, history deletes |
-| `FL_MCP_ENABLE_CUSTOM_NODE_WRITES` | Writing files, applying patches, creating custom node packs |
-| `FL_MCP_ENABLE_GIT_WRITES` | Git commit and push tools under custom nodes |
-| `FL_MCP_ENABLE_MANAGER_MUTATIONS` | ComfyUI Manager install/update/uninstall queue actions |
-| `FL_MCP_ENABLE_COMFY_PROCESS_CONTROL` | Starting, stopping, and restarting managed ComfyUI processes |
+| **Workflow writes** | Canvas mutation, workflow load/save/delete, settings writes, history deletes |
+| **Custom node writes** | Writing files, applying patches, creating custom node packs |
+| **Git writes** | Git commit and push tools under custom nodes |
+| **Manager mutations** | ComfyUI Manager install/update/uninstall queue actions |
+| **Process control** | Starting, stopping, and restarting managed ComfyUI processes |
 
 ## Tool Inventory
 
@@ -489,7 +476,8 @@ Useful tools:
 - `custom_nodes_git_diff`
 - `custom_nodes_validate_pack`
 
-Enable `FL_MCP_ENABLE_CUSTOM_NODE_WRITES=true` only when you want the MCP client to write files or apply patches.
+Enable **Custom node writes** under **Ren → Settings → Bridge & safety** only when
+you want the MCP client to write files or apply patches.
 
 </details>
 
@@ -548,7 +536,9 @@ ComfyUI/custom_nodes/ComfyUI_FL-MCP/logs/fl_mcp_launcher.log
 <details>
 <summary><strong>A write tool is disabled</strong></summary>
 
-This is expected. Turn on the narrowest matching safety gate in `.env`, restart the backend, run the action, then turn it off again.
+This is expected. Turn on the narrowest matching gate under **Ren → Settings →
+Bridge & safety**, save, restart ComfyUI, run the action, then turn the gate off
+again when it is no longer needed.
 
 </details>
 

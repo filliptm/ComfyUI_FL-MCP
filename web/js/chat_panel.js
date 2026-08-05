@@ -34,7 +34,11 @@ export class AssistantPanel {
             selectedCount: 0,
         }));
         this.subscribeCanvasContext = options.subscribeCanvasContext;
+        this.loadBridgeSettings = options.loadBridgeSettings;
+        this.updateBridgeSettings = options.updateBridgeSettings;
         this.settings = null;
+        this.bridgeSettings = null;
+        this.bridgeSettingsError = null;
         this.status = null;
         this.conversations = [];
         this.archivedConversations = [];
@@ -280,6 +284,132 @@ export class AssistantPanel {
                             </div>
                         </section>
 
+                        <details class="fl-settings-card fl-settings-disclosure fl-settings-card-bridge" data-settings-section="bridge">
+                            <summary class="fl-settings-card-header">
+                                <div class="fl-settings-card-heading">
+                                    <span class="fl-settings-card-icon" aria-hidden="true"><i class="pi pi-server"></i></span>
+                                    <div>
+                                        <h3>Bridge &amp; safety</h3>
+                                        <p>Backend launch, local endpoints, paths, and server-side capabilities.</p>
+                                    </div>
+                                </div>
+                                <span class="fl-settings-summary-state">
+                                    <span class="fl-settings-state neutral" data-settings-state="bridge" role="status">Loading</span>
+                                    <i class="pi pi-chevron-down fl-settings-chevron" aria-hidden="true"></i>
+                                </span>
+                            </summary>
+                            <div class="fl-settings-card-body fl-bridge-settings-body">
+                                <fieldset class="fl-bridge-settings-group">
+                                    <legend>Backend</legend>
+                                    <div class="fl-bridge-settings-grid">
+                                        <label class="fl-field">
+                                            <span>Launch mode</span>
+                                            <select data-bridge-setting="backend_launch_mode">
+                                                <option value="subprocess">Subprocess</option>
+                                                <option value="terminal">Terminal</option>
+                                                <option value="auto">Auto</option>
+                                                <option value="manual">Manual</option>
+                                            </select>
+                                        </label>
+                                        <label class="fl-field">
+                                            <span>Log level</span>
+                                            <select data-bridge-setting="log_level">
+                                                <option value="DEBUG">Debug</option>
+                                                <option value="INFO">Info</option>
+                                                <option value="WARNING">Warning</option>
+                                                <option value="ERROR">Error</option>
+                                            </select>
+                                        </label>
+                                    </div>
+                                    <div class="fl-bridge-toggle-grid">
+                                        <label class="fl-bridge-toggle">
+                                            <input data-bridge-setting="auto_start_backend" type="checkbox">
+                                            <span>Start backend with ComfyUI</span>
+                                        </label>
+                                        <label class="fl-bridge-toggle">
+                                            <input data-bridge-setting="auto_restart_backend" type="checkbox">
+                                            <span>Restart backend after failure</span>
+                                        </label>
+                                        <label class="fl-bridge-toggle">
+                                            <input data-bridge-setting="log_backend_to_file" type="checkbox">
+                                            <span>Write backend log file</span>
+                                        </label>
+                                    </div>
+                                </fieldset>
+
+                                <fieldset class="fl-bridge-settings-group">
+                                    <legend>Local endpoints</legend>
+                                    <div class="fl-bridge-settings-grid">
+                                        <label class="fl-field">
+                                            <span>Bind host</span>
+                                            <input data-bridge-setting="ws_host" type="text" spellcheck="false">
+                                        </label>
+                                        <label class="fl-field">
+                                            <span>Bridge port</span>
+                                            <input data-bridge-setting="ws_port" type="number" min="1" max="65535" step="1">
+                                        </label>
+                                        <label class="fl-field fl-bridge-wide-field">
+                                            <span>Public bridge URL</span>
+                                            <input data-bridge-setting="public_url" type="url" spellcheck="false" placeholder="http://127.0.0.1:8000">
+                                        </label>
+                                        <label class="fl-field fl-bridge-wide-field">
+                                            <span>ComfyUI server URL</span>
+                                            <input data-bridge-setting="comfyui_server_url" type="url" spellcheck="false">
+                                        </label>
+                                        <label class="fl-field">
+                                            <span>API timeout (seconds)</span>
+                                            <input data-bridge-setting="comfyui_api_timeout" type="number" min="1" max="300" step="1">
+                                        </label>
+                                    </div>
+                                </fieldset>
+
+                                <fieldset class="fl-bridge-settings-group">
+                                    <legend>Paths</legend>
+                                    <div class="fl-bridge-settings-grid">
+                                        <label class="fl-field fl-bridge-wide-field">
+                                            <span>ComfyUI path <small>Optional</small></span>
+                                            <input data-bridge-setting="comfyui_path" type="text" spellcheck="false" placeholder="Auto-detect">
+                                        </label>
+                                        <label class="fl-field fl-bridge-wide-field">
+                                            <span>Extra model paths file <small>Optional</small></span>
+                                            <input data-bridge-setting="extra_model_paths_path" type="text" spellcheck="false" placeholder="Auto-detect extra_model_paths.yaml">
+                                        </label>
+                                    </div>
+                                </fieldset>
+
+                                <fieldset class="fl-bridge-settings-group">
+                                    <legend>Server-side capabilities</legend>
+                                    <p class="fl-bridge-settings-help">These gates remain authoritative even when chat approval prompts are bypassed.</p>
+                                    <div class="fl-bridge-capability-list">
+                                        <label class="fl-approval-toggle">
+                                            <input data-bridge-setting="enable_workflow_writes" type="checkbox">
+                                            <span><strong>Workflow writes</strong><span>Edit the canvas and manage workflows, history, and ComfyUI settings.</span></span>
+                                        </label>
+                                        <label class="fl-approval-toggle">
+                                            <input data-bridge-setting="enable_custom_node_writes" type="checkbox">
+                                            <span><strong>Custom node writes</strong><span>Write files, apply patches, and create custom node packs.</span></span>
+                                        </label>
+                                        <label class="fl-approval-toggle">
+                                            <input data-bridge-setting="enable_git_writes" type="checkbox">
+                                            <span><strong>Git writes</strong><span>Commit and push repositories under custom_nodes.</span></span>
+                                        </label>
+                                        <label class="fl-approval-toggle">
+                                            <input data-bridge-setting="enable_manager_mutations" type="checkbox">
+                                            <span><strong>Manager mutations</strong><span>Install, update, or remove packs through ComfyUI Manager.</span></span>
+                                        </label>
+                                        <label class="fl-approval-toggle">
+                                            <input data-bridge-setting="enable_comfy_process_control" type="checkbox">
+                                            <span><strong>Process control</strong><span>Start, stop, or restart FL-MCP-managed ComfyUI processes.</span></span>
+                                        </label>
+                                    </div>
+                                </fieldset>
+                            </div>
+                            <footer class="fl-settings-card-footer">
+                                <span class="fl-bridge-settings-message" role="status" aria-live="polite">Changes take effect after restarting ComfyUI.</span>
+                                <button class="fl-primary-button" data-action="save-bridge-settings" type="button">Save bridge settings</button>
+                            </footer>
+                        </details>
+
                         <details class="fl-settings-card fl-settings-disclosure fl-settings-card-diagnostics" data-settings-section="diagnostics">
                             <summary class="fl-settings-card-header">
                                 <div class="fl-settings-card-heading">
@@ -375,6 +505,18 @@ export class AssistantPanel {
         );
         this.approvalWarning = this.container.querySelector(".fl-approval-warning");
         this.approvalWarningCopy = this.approvalWarning.querySelector("span");
+        this.bridgeSettingsState = this.container.querySelector(
+            '[data-settings-state="bridge"]',
+        );
+        this.bridgeSettingsInputs = [
+            ...this.container.querySelectorAll("[data-bridge-setting]"),
+        ];
+        this.bridgeSettingsMessage = this.container.querySelector(
+            ".fl-bridge-settings-message",
+        );
+        this.bridgeSettingsSaveButton = this.container.querySelector(
+            '[data-action="save-bridge-settings"]',
+        );
         this.diagnosticsSettingsState = this.container.querySelector(
             '[data-settings-state="diagnostics"]',
         );
@@ -415,6 +557,7 @@ export class AssistantPanel {
             if (action === "status-action") this.handleStatusAction();
             if (action === "discover-models") this.discoverModels();
             if (action === "save-settings") this.saveSettings();
+            if (action === "save-bridge-settings") this.saveBridgeSettings();
             if (action === "claude-login") this.connectClaudeSubscription();
             if (action === "codex-login") this.connectCodexSubscription();
             if (action === "clear-always-allowed") this.clearAlwaysAllowedTools();
@@ -450,6 +593,13 @@ export class AssistantPanel {
             "change",
             () => this.setApprovalBypass(),
         );
+        this.bridgeSettingsInputs.forEach((input) => {
+            input.addEventListener("change", () => {
+                this.setSettingsState(this.bridgeSettingsState, "Unsaved", "warning");
+                this.bridgeSettingsMessage.textContent =
+                    "Save these changes, then restart ComfyUI to apply them.";
+            });
+        });
         this.textarea.addEventListener("keydown", (event) => {
             if (
                 event.key === "Enter"
@@ -618,11 +768,19 @@ export class AssistantPanel {
         this.initializing = true;
         try {
             const sessionId = this.sessionManager.getSessionId();
-            [this.settings, this.status] = await Promise.all([
+            const bridgeSettingsRequest = this.loadBridgeSettings
+                ? this.loadBridgeSettings().catch((error) => {
+                    this.bridgeSettingsError = error;
+                    return null;
+                })
+                : Promise.resolve(null);
+            [this.settings, this.status, this.bridgeSettings] = await Promise.all([
                 this.chat.settings(),
                 this.chat.status(sessionId),
+                bridgeSettingsRequest,
             ]);
             this.populateSettings();
+            this.populateBridgeSettings();
             await this.refreshConversations();
             this.updateStatus();
             this.updateComposerState();
@@ -695,6 +853,77 @@ export class AssistantPanel {
         this.updateCredentialField();
         this.updateProviderBadge();
         this.renderApprovalSettings();
+    }
+
+    populateBridgeSettings() {
+        if (!this.bridgeSettings) {
+            this.bridgeSettingsInputs.forEach((input) => {
+                input.disabled = true;
+            });
+            this.bridgeSettingsSaveButton.disabled = true;
+            this.setSettingsState(this.bridgeSettingsState, "Unavailable", "error");
+            this.bridgeSettingsMessage.textContent = this.bridgeSettingsError?.message
+                || "Bridge settings are unavailable.";
+            return;
+        }
+
+        const values = this.bridgeSettings.stored || this.bridgeSettings.defaults || {};
+        for (const input of this.bridgeSettingsInputs) {
+            const value = values[input.dataset.bridgeSetting];
+            input.disabled = false;
+            if (input.type === "checkbox") {
+                input.checked = Boolean(value);
+            } else {
+                input.value = value ?? "";
+            }
+        }
+        this.bridgeSettingsSaveButton.disabled = false;
+        this.updateBridgeSettingsState();
+    }
+
+    updateBridgeSettingsState() {
+        const pending = this.bridgeSettings?.pendingRestartFields || [];
+        if (pending.length) {
+            this.setSettingsState(this.bridgeSettingsState, "Restart needed", "warning");
+            this.bridgeSettingsMessage.textContent =
+                `${pending.length} saved ${pending.length === 1 ? "change is" : "changes are"} waiting for a ComfyUI restart.`;
+        } else {
+            this.setSettingsState(this.bridgeSettingsState, "Current", "ready");
+            this.bridgeSettingsMessage.textContent = this.bridgeSettings?.migratedFromEnv
+                ? "Legacy .env values were imported. Future changes are managed here."
+                : "Changes take effect after restarting ComfyUI.";
+        }
+    }
+
+    bridgeSettingsChanges() {
+        return Object.fromEntries(this.bridgeSettingsInputs.map((input) => {
+            const name = input.dataset.bridgeSetting;
+            if (input.type === "checkbox") return [name, input.checked];
+            if (input.type === "number") return [name, Number(input.value)];
+            if (["comfyui_path", "extra_model_paths_path"].includes(name)) {
+                return [name, input.value.trim() || null];
+            }
+            return [name, input.value.trim()];
+        }));
+    }
+
+    async saveBridgeSettings() {
+        if (!this.updateBridgeSettings || !this.bridgeSettings) return;
+        const button = this.bridgeSettingsSaveButton;
+        button.disabled = true;
+        button.textContent = "Saving…";
+        try {
+            this.bridgeSettings = await this.updateBridgeSettings(
+                this.bridgeSettingsChanges(),
+            );
+            this.populateBridgeSettings();
+        } catch (error) {
+            this.setSettingsState(this.bridgeSettingsState, "Save failed", "error");
+            this.bridgeSettingsMessage.textContent = error.message;
+        } finally {
+            button.disabled = false;
+            button.textContent = "Save bridge settings";
+        }
     }
 
     setSettingsState(element, label, tone = "neutral") {
