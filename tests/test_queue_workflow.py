@@ -1,5 +1,6 @@
 import mcp_server
 import pytest
+from config import MAX_GENERATION_COMPLETION_TIMEOUT_SECONDS
 
 
 def test_history_completion_results_are_distinct():
@@ -53,6 +54,15 @@ def test_history_completion_results_are_distinct():
     }]
     assert cancelled["status"] == "cancelled"
     assert cancelled["terminal"] is True
+
+
+def test_per_call_wait_accepts_the_full_supported_timeout():
+    request = mcp_server.QueueWorkflowRequest(
+        wait_for_completion=True,
+        completion_timeout=MAX_GENERATION_COMPLETION_TIMEOUT_SECONDS,
+    )
+
+    assert request.completion_timeout == 3600
 
 
 @pytest.mark.asyncio

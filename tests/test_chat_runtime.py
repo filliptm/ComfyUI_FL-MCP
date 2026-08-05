@@ -363,10 +363,10 @@ def test_completed_run_retention_is_bounded(tmp_path):
 def test_embedded_mcp_uses_loaded_bridge_port(monkeypatch):
     monkeypatch.setattr(bridge_settings, "ws_host", "0.0.0.0")
     monkeypatch.setattr(bridge_settings, "ws_port", 18000)
-    monkeypatch.setattr(bridge_settings, "generation_completion_timeout", 600)
+    monkeypatch.setattr(bridge_settings, "generation_completion_timeout", 60)
 
     assert ChatRuntime._ws_url() == "ws://127.0.0.1:18000/ws"
-    assert chat_runtime_module.mcp_tool_timeout_seconds() == 630
+    assert chat_runtime_module.mcp_tool_timeout_seconds() == 3630
 
 
 def test_empty_request_retry_uses_same_approval_fingerprint():

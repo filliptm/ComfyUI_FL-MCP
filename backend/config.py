@@ -17,6 +17,8 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = Path(os.getenv("FL_MCP_DATA_DIR", PROJECT_ROOT / ".fl_mcp"))
 SETTINGS_PATH = DATA_DIR / "bridge_settings.json"
 LEGACY_ENV_PATH = PROJECT_ROOT / ".env"
+MAX_GENERATION_COMPLETION_TIMEOUT_SECONDS = 3600
+MCP_TOOL_TIMEOUT_BUFFER_SECONDS = 30
 
 LEGACY_ENV_KEYS = {
     "BACKEND_LAUNCH_MODE": "backend_launch_mode",
@@ -58,7 +60,11 @@ class Settings(BaseModel):
 
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
     wait_for_generation_completion: bool = False
-    generation_completion_timeout: int = Field(300, ge=1, le=3600)
+    generation_completion_timeout: int = Field(
+        300,
+        ge=1,
+        le=MAX_GENERATION_COMPLETION_TIMEOUT_SECONDS,
+    )
     comfyui_path: str | None = None
     extra_model_paths_path: str | None = None
 

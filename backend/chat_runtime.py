@@ -24,7 +24,11 @@ from chat_config import (
 )
 from chat_security import classify_tool, requires_approval
 from chat_store import ChatStore, chat_store
-from config import settings as bridge_settings
+from config import (
+    MAX_GENERATION_COMPLETION_TIMEOUT_SECONDS,
+    MCP_TOOL_TIMEOUT_BUFFER_SECONDS,
+    settings as bridge_settings,
+)
 
 logger = logging.getLogger(__name__)
 PROMPT_PATH = Path(__file__).with_name("chat_prompt.md")
@@ -32,7 +36,10 @@ MANDATORY_REVIEW_TOOLS = {"confirm_mask_review"}
 
 
 def mcp_tool_timeout_seconds() -> int:
-    return max(300, bridge_settings.generation_completion_timeout + 30)
+    return (
+        MAX_GENERATION_COMPLETION_TIMEOUT_SECONDS
+        + MCP_TOOL_TIMEOUT_BUFFER_SECONDS
+    )
 
 
 CORE_CHAT_TOOLS = {

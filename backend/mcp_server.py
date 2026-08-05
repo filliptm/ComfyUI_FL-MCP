@@ -60,7 +60,7 @@ from fastmcp.utilities.types import Image as MCPImage
 from PIL import Image as PILImage, ImageOps, UnidentifiedImageError
 from pydantic import BaseModel, Field, model_validator
 
-from config import settings
+from config import MAX_GENERATION_COMPLETION_TIMEOUT_SECONDS, settings
 from models import WorkflowQuery
 from comfy_models import (
     ComfyListFoldersRequest, ComfyListFoldersResponse,
@@ -996,7 +996,7 @@ class QueueWorkflowRequest(BaseModel):
     completion_timeout: Optional[int] = Field(
         None,
         ge=1,
-        le=3600,
+        le=MAX_GENERATION_COMPLETION_TIMEOUT_SECONDS,
         description="Maximum seconds to wait when completion waiting is enabled",
     )
 
