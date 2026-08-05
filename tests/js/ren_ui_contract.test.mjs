@@ -277,7 +277,7 @@ test("mask edits show a live preview and block queueing until review", async () 
     assert.match(api, /node\.imgs = \[reviewPreview\.image\]/);
     assert.match(api, /previewUrl: reviewPreview\.url/);
     assert.match(api, /this\._assignImageToNode\(node, pending\.image\)/);
-    assert.match(api, /image\.src = api\.apiURL\(`\/fl_mcp\/image\/thumbnail\?/);
+    assert.match(api, /preview\.src = api\.apiURL\(`\/fl_mcp\/image\/thumbnail\?/);
     assert.match(api, /_releaseMaskReviewPreview/);
     assert.match(api, /discardMaskReviews\(\)/);
     assert.doesNotMatch(editImplementation, /_assignImageToNode/);
@@ -349,7 +349,9 @@ test("chat accepts local images and can place them into a selected image node", 
     assert.match(api, /restoreNestedImageReferences/);
     assert.match(api, /optionValues\.push\(widgetValue\)/);
     assert.match(api, /\/fl_mcp\/image\/thumbnail\?/);
-    assert.doesNotMatch(api, /_createComfyImage[\s\S]{0,500}params\.set\("rand"/);
+    assert.match(api, /preview\.onload = \(\) => \{[\s\S]*node\.imgs = \[preview\]/);
+    assert.match(api, /preview\.onerror = \(\) =>/);
+    assert.match(api, /preview\.src = api\.apiURL\(`\/view\?/);
     assert.match(extension, /afterConfigureGraph/);
     assert.match(runtime, /message_content_for_model/);
     assert.match(runtime, /"attachments": normalized_attachments/);

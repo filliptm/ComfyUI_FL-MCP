@@ -954,8 +954,7 @@ export class FL_API {
                 const currentImage = parseImageWidgetRef(imageWidget?.value)
                     || pending.originalImage;
                 if (currentImage) {
-                    node.imgs = [this._createComfyImage(currentImage)];
-                    node.imageIndex = 0;
+                    this._loadNodeImagePreview(node, currentImage);
                 }
             }
             this._releaseMaskReviewPreview(pending);
@@ -2314,8 +2313,7 @@ export class FL_API {
         if (notify) this._setWidgetValue(node, imageWidget, widgetValue);
         else imageWidget.value = widgetValue;
         node.images = [image];
-        node.imgs = [this._createComfyImage(image)];
-        node.imageIndex = 0;
+        this._loadNodeImagePreview(node, image);
         node.properties = node.properties || {};
         node.properties.image = widgetValue;
         if (node.widgets_values && node.widgets) {
@@ -2324,18 +2322,36 @@ export class FL_API {
         }
     }
 
-    _createComfyImage(ref) {
+    _loadNodeImagePreview(node, ref) {
         const params = new URLSearchParams({
             filename: ref.filename,
             subfolder: ref.subfolder || "",
             type: ref.type || "input",
         });
-        const image = new Image();
-        image.onload = () => this._markCanvasDirty();
+        const preview = new Image();
+        let usingOriginalFallback = false;
+        preview.onload = () => {
+            // Never attach an incomplete or failed image to LiteGraph. Some
+            // ComfyUI renderers retain stale canvas frames when drawing one.
+            node.imgs = [preview];
+            node.imageIndex = 0;
+            this._markCanvasDirty();
+        };
+        preview.onerror = () => {
+            if (usingOriginalFallback) {
+                console.warn(`[FL_API] Image preview failed for node ${node.id}`);
+                return;
+            }
+            // During plugin upgrades the refreshed frontend can briefly run
+            // against an older Python process without the thumbnail route.
+            usingOriginalFallback = true;
+            const originalParams = new URLSearchParams(params);
+            originalParams.set("rand", String(Date.now()));
+            preview.src = api.apiURL(`/view?${originalParams.toString()}`);
+        };
         // Canvas rendering uses a bounded cached preview. The original path
         // remains in the widget value above and is what graphToPrompt executes.
-        image.src = api.apiURL(`/fl_mcp/image/thumbnail?${params.toString()}`);
-        return image;
+        preview.src = api.apiURL(`/fl_mcp/image/thumbnail?${params.toString()}`);
     }
 
     _releaseMaskReviewPreview(review) {
