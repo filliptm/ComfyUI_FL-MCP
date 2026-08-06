@@ -221,7 +221,7 @@ def test_queue_action_posts_manager_v4_task_and_starts_queue(fake_http):
         "extension": {"manager": {"supports_v4": True}}
     }
     routes[("POST", "http://comfy/v2/manager/queue/task")] = {"ok": True}
-    routes[("POST", "http://comfy/v2/manager/queue/start")] = {"started": True}
+    routes[("GET", "http://comfy/v2/manager/queue/start")] = {"started": True}
 
     async def run():
         client = ComfyManagerClient("http://comfy")
@@ -244,6 +244,87 @@ def test_queue_action_posts_manager_v4_task_and_starts_queue(fake_http):
     }
     assert result["queued"] is True
     assert result["requires_restart"] is True
+
+
+def test_queue_start_and_reset_use_current_manager_get_routes(fake_http):
+    routes, requests = fake_http
+    routes[("GET", "http://comfy/features")] = {
+        "extension": {"manager": {"supports_v4": True}}
+    }
+    routes[("GET", "http://comfy/v2/manager/queue/start")] = {"started": True}
+    routes[("GET", "http://comfy/v2/manager/queue/reset")] = {"reset": True}
+
+    async def run():
+        client = ComfyManagerClient("http://comfy")
+        return await client.queue_start(), await client.queue_reset()
+
+    started, reset = asyncio.run(run())
+
+    assert started == {"started": True}
+    assert reset == {"reset": True}
+    queue_requests = [
+        request for request in requests if "/v2/manager/queue/" in request["url"]
+    ]
+    assert [request["method"] for request in queue_requests] == ["GET", "GET"]
+    assert all(request["json"] is None for request in queue_requests)
+
+
+@pytest.mark.parametrize("status_code", [404, 405])
+def test_queue_start_falls_back_to_post_and_remembers_older_manager_method(
+    fake_http,
+    status_code,
+):
+    routes, requests = fake_http
+    routes[("GET", "http://comfy/features")] = {
+        "extension": {"manager": {"supports_v4": True}}
+    }
+    routes[("GET", "http://comfy/v2/manager/queue/start")] = httpx.Response(
+        status_code,
+        text="method unavailable",
+    )
+    routes[("POST", "http://comfy/v2/manager/queue/start")] = {"started": True}
+
+    async def run():
+        client = ComfyManagerClient("http://comfy")
+        first = await client.queue_start()
+        second = await client.queue_start()
+        return first, second
+
+    first, second = asyncio.run(run())
+
+    assert first == second == {"started": True}
+    queue_requests = [
+        request for request in requests if request["url"].endswith("/queue/start")
+    ]
+    assert [request["method"] for request in queue_requests] == ["GET", "POST", "POST"]
+    assert queue_requests[0]["json"] is None
+    assert queue_requests[1]["json"] == {}
+    assert queue_requests[2]["json"] == {}
+
+
+def test_queue_method_fallback_does_not_hide_server_errors(fake_http):
+    routes, requests = fake_http
+    routes[("GET", "http://comfy/features")] = {
+        "extension": {"manager": {"supports_v4": True}}
+    }
+    routes[("GET", "http://comfy/v2/manager/queue/reset")] = httpx.Response(
+        500,
+        text="boom",
+    )
+    routes[("POST", "http://comfy/v2/manager/queue/reset")] = {"unexpected": True}
+
+    async def run():
+        client = ComfyManagerClient("http://comfy")
+        await client.queue_reset()
+
+    with pytest.raises(ManagerAPIError) as exc:
+        asyncio.run(run())
+
+    assert exc.value.status_code == 500
+    reset_requests = [
+        request for request in requests if request["url"].endswith("/queue/reset")
+    ]
+    assert [request["method"] for request in reset_requests] == ["GET"]
 
 
 def test_queue_action_update_all_uses_query_params(fake_http):

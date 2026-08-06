@@ -87,6 +87,21 @@ test("tool summaries expose human outcomes for core canvas operations", () => {
         status: "done",
         result: '{"catalog":{"node_count":1701}}',
     }), "Cataloged 1,701 loaded nodes");
+    assert.equal(summarizeToolStep({
+        name: "registry_search_packages",
+        status: "done",
+        result: '{"count":3,"results":[{},{},{}]}',
+    }), "Found 3 Registry packages");
+    assert.equal(summarizeToolStep({
+        name: "registry_get_package",
+        status: "done",
+        arguments: '{"request":{"package_id":"example.pack"}}',
+        result: '{"ok":true,"package":{"name":"Example Pack","registry_url":"https://registry.comfy.org/example","github_url":"https://github.com/example/pack"}}',
+    }), "Inspected Example Pack on Registry");
+    assert.equal(summarizeToolStep({
+        name: "registry_search_packages",
+        status: "failed",
+    }), "Couldn’t search official Comfy Registry");
 });
 
 test("image review and mask summaries report the visible outcome", () => {

@@ -44,3 +44,8 @@ def test_consequential_tools_require_approval():
         "confirm_mask_review",
     ):
         assert classify_tool(name) == "approval_required"
+
+
+def test_official_registry_discovery_is_read_only():
+    assert classify_tool("registry_search_packages") == "read_only"
+    assert classify_tool("registry_get_package") == "read_only"

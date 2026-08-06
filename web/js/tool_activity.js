@@ -347,6 +347,16 @@ export const TOOL_CONFIG = {
         label: "Find Compatible",
         description: "Finding nodes compatible with slot types"
     },
+    "registry_search_packages": {
+        icon: "🌐",
+        label: "Registry Search",
+        description: "Searching the official Comfy Registry"
+    },
+    "registry_get_package": {
+        icon: "📦",
+        label: "Registry Package",
+        description: "Inspecting an official Registry package"
+    },
 
     // Manager Operations
     "manager_search_nodes": {
@@ -472,6 +482,8 @@ const TOOL_ICON_CLASSES = {
     node_library_search: "pi pi-search",
     node_library_status: "pi pi-book",
     node_library_get_details: "pi pi-info-circle",
+    registry_search_packages: "pi pi-globe",
+    registry_get_package: "pi pi-box",
     manager_check_updates: "pi pi-refresh",
     manager_queue_action: "pi pi-download",
     get_recent_errors: "pi pi-exclamation-triangle",
@@ -503,6 +515,8 @@ const TOOL_RUNNING_LABELS = {
     web_fetch_page: "Reading web page",
     node_library_search: "Searching node library",
     node_library_status: "Checking node catalog",
+    registry_search_packages: "Searching official Comfy Registry",
+    registry_get_package: "Inspecting Registry package",
     manager_check_updates: "Checking for updates",
 };
 

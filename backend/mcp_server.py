@@ -74,6 +74,7 @@ from node_library import (
     NodeLibraryConnectionError,
     NodeTypeNotFoundError
 )
+from comfy_registry import ComfyRegistryClient, normalize_github_repository_url
 
 from comfy_manager import (
     get_comfy_manager_client,
@@ -348,6 +349,7 @@ async def mcp_lifespan(server: FastMCP) -> AsyncIterator[Any]:
         or os.getenv("FL_MCP_WEB_IMAGES_ALLOWED", "").strip().lower()
         in {"1", "true", "yes", "on"}
     )
+    registry_client = ComfyRegistryClient()
 
     async def close_web_resources() -> None:
         await web_search.aclose()
@@ -382,6 +384,7 @@ async def mcp_lifespan(server: FastMCP) -> AsyncIterator[Any]:
                 "web_search": web_search,
                 "web_pages": web_pages,
                 "web_images_allowed": web_images_allowed,
+                "registry_client": registry_client,
             }
         finally:
             await close_web_resources()
@@ -399,6 +402,7 @@ async def mcp_lifespan(server: FastMCP) -> AsyncIterator[Any]:
             "web_search": web_search,
             "web_pages": web_pages,
             "web_images_allowed": web_images_allowed,
+            "registry_client": registry_client,
         }
     finally:
         await close_web_resources()
@@ -1446,6 +1450,75 @@ class NodeLibraryFindCompatibleRequest(BaseModel):
         ge=1,
         le=100,
         description="Maximum results per direction (1-100)"
+    )
+
+
+class RegistrySearchPackagesRequest(BaseModel):
+    """Search the official Comfy Registry for published custom-node packs."""
+    query: str = Field(
+        ...,
+        min_length=1,
+        max_length=200,
+        description=(
+            "Concise capability terms, for example 'background removal', not the "
+            "user's whole request. Use a short generic phrase such as 'new nodes' "
+            "when the user wants to browse Registry-ranked packages."
+        ),
+    )
+    comfy_node_search: Optional[str] = Field(
+        None,
+        min_length=1,
+        max_length=200,
+        description="Optional Comfy node class/name to match inside published packs",
+    )
+    supported_os: Optional[str] = Field(
+        None,
+        min_length=1,
+        max_length=40,
+        description="Optional Registry operating-system filter, for example macos, windows, or linux",
+    )
+    supported_accelerator: Optional[str] = Field(
+        None,
+        min_length=1,
+        max_length=40,
+        description="Optional Registry accelerator filter, for example metal, cuda, or cpu",
+    )
+    include_installed: bool = Field(
+        False,
+        description=(
+            "Include packages Manager identifies as already installed. Defaults to false "
+            "for new-node discovery."
+        ),
+    )
+    max_results: int = Field(
+        10,
+        ge=1,
+        le=20,
+        description="Maximum number of ranked packages to return (1-20)",
+    )
+    refresh: bool = Field(
+        False,
+        description="Bypass the lightweight Registry response cache",
+    )
+
+
+class RegistryGetPackageRequest(BaseModel):
+    """Read one official Comfy Registry package and its published nodes."""
+    package_id: str = Field(
+        ...,
+        min_length=1,
+        max_length=200,
+        description="Exact Registry package identifier returned by registry_search_packages",
+    )
+    refresh: bool = Field(
+        False,
+        description="Bypass the lightweight Registry response cache",
+    )
+    max_classes: int = Field(
+        200,
+        ge=1,
+        le=200,
+        description="Maximum published node classes to include (1-200)",
     )
 
 # ============================================================================
@@ -3509,6 +3582,161 @@ async def node_library_find_compatible(request: NodeLibraryFindCompatibleRequest
         logger.error(f"Unexpected error in node_library_find_compatible: {e}")
         raise RuntimeError(f"Tool execution failed: {e}")
 
+
+# ============================================================================
+# OFFICIAL COMFY REGISTRY DISCOVERY TOOLS
+# ============================================================================
+
+async def _registry_installed_pack_ids(
+    ctx: Context,
+) -> tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
+    """Best-effort Manager annotation; Registry discovery must work without it."""
+    manager_client = ctx.request_context.lifespan_context.get("manager_client")
+    if manager_client is None:
+        return None, {
+            "state": "unknown",
+            "source": "comfyui_manager",
+            "reason": "ComfyUI Manager client is unavailable",
+        }
+    try:
+        installed = await manager_client.list_installed_packs()
+    except Exception as exc:
+        return None, {
+            "state": "unknown",
+            "source": "comfyui_manager",
+            "reason": f"{type(exc).__name__}: {exc}",
+        }
+    if not isinstance(installed, dict):
+        return None, {
+            "state": "unknown",
+            "source": "comfyui_manager",
+            "reason": "Manager returned an unexpected installed-pack response",
+        }
+
+    package_ids: set[str] = set()
+    repository_urls: set[str] = set()
+    identity_complete = True
+    for fallback_id, metadata in installed.items():
+        fallback_package_id = str(fallback_id or "").strip()
+        if fallback_package_id:
+            package_ids.add(fallback_package_id)
+
+        registry_id = metadata.get("cnr_id") if isinstance(metadata, dict) else None
+        registry_id = str(registry_id or "").strip()
+        if registry_id:
+            package_ids.add(registry_id)
+
+        aux_id = metadata.get("aux_id") if isinstance(metadata, dict) else None
+        aux_id = str(aux_id or "").strip()
+        repository_url = normalize_github_repository_url(aux_id)
+        if repository_url is None and aux_id.count("/") == 1:
+            repository_url = normalize_github_repository_url(
+                f"https://github.com/{aux_id}"
+            )
+        if repository_url:
+            repository_urls.add(repository_url)
+
+        # A Manager folder key can resemble a Registry ID, but does not prove
+        # package identity without either CNR metadata or a verified repository.
+        if not registry_id and not repository_url:
+            identity_complete = False
+
+    envelope = {
+        "package_ids": sorted(package_ids, key=str.casefold),
+        "repository_urls": sorted(repository_urls, key=str.casefold),
+        "identity_complete": identity_complete,
+    }
+    diagnostics: Dict[str, Any] = {
+        "state": "known",
+        "source": "comfyui_manager",
+        "installed_pack_count": len(installed),
+        "package_identity_count": len(package_ids),
+        "repository_identity_count": len(repository_urls),
+        "identity_complete": identity_complete,
+    }
+    if not identity_complete:
+        diagnostics["reason"] = (
+            "Some Manager packs lack both a Registry ID and a verifiable GitHub aux_id"
+        )
+    return envelope, diagnostics
+
+
+@mcp.tool()
+async def registry_search_packages(
+    request: RegistrySearchPackagesRequest,
+    ctx: Context,
+) -> Dict[str, Any]:
+    """Search all published packages in the official Comfy Registry.
+
+    Use this for new or uninstalled node-pack discovery. It is intentionally
+    separate from node_library_search, which only searches node types already
+    loaded by the current ComfyUI /object_info endpoint, and from
+    manager_search_nodes, which searches Manager's local/cache view.
+
+    Every result contains both `registry_url` and `github_url` so the user can
+    inspect the official package record and source repository. Registry
+    metadata is discovery evidence, not proof that a package is installed,
+    compatible with this machine, or usable by the current workflow.
+
+    Search functional requests with concise capability terms such as
+    `background removal`, not the user's whole sentence. A generic request to
+    browse new Registry nodes returns a bounded Registry-ranked package page;
+    do not describe that result as recent unless its metadata proves recency.
+    By default Manager-known installed packages are excluded; set
+    include_installed=true only when the user wants Registry records for both
+    installed and uninstalled packs.
+    """
+    await _report_tool_activity(ctx, "registry_search_packages")
+    registry_client: ComfyRegistryClient = (
+        ctx.request_context.lifespan_context["registry_client"]
+    )
+    installed_pack_ids, install_state = await _registry_installed_pack_ids(ctx)
+    try:
+        result = await registry_client.search_packages(
+            request.query,
+            comfy_node_search=request.comfy_node_search,
+            supported_os=request.supported_os,
+            supported_accelerator=request.supported_accelerator,
+            include_installed=request.include_installed,
+            max_results=request.max_results,
+            refresh=request.refresh,
+            installed_pack_ids=installed_pack_ids,
+        )
+        return {**result, "local_install_state": install_state}
+    except Exception as exc:
+        logger.error("Official Registry package search failed: %s", exc)
+        raise RuntimeError(f"Official Registry search failed: {exc}") from exc
+
+
+@mcp.tool()
+async def registry_get_package(
+    request: RegistryGetPackageRequest,
+    ctx: Context,
+) -> Dict[str, Any]:
+    """Inspect one official Registry package before recommending installation.
+
+    The structured result always includes the Registry page and deterministic
+    GitHub repository hyperlinks supplied by the Registry client, plus bounded
+    published node-class metadata. This does not prove local compatibility or
+    availability; use node_library_search after installation and restart.
+    """
+    await _report_tool_activity(ctx, "registry_get_package")
+    registry_client: ComfyRegistryClient = (
+        ctx.request_context.lifespan_context["registry_client"]
+    )
+    installed_pack_ids, install_state = await _registry_installed_pack_ids(ctx)
+    try:
+        result = await registry_client.get_package(
+            request.package_id,
+            refresh=request.refresh,
+            installed_pack_ids=installed_pack_ids,
+            max_classes=request.max_classes,
+        )
+        return {**result, "local_install_state": install_state}
+    except Exception as exc:
+        logger.error("Official Registry package lookup failed: %s", exc)
+        raise RuntimeError(f"Official Registry package lookup failed: {exc}") from exc
+
 # ============================================================================
 # COMFYUI MANAGER TOOLS
 # ============================================================================
@@ -3518,10 +3746,16 @@ async def manager_search_nodes(
     request: ManagerSearchNodesRequest,
     ctx: Context
 ) -> Dict[str, Any]:
-    """Search for custom node packs available through ComfyUI Manager.
+    """Search ComfyUI Manager's installed-pack and local/cache data.
+
+    This is not an authoritative search of every package published in the
+    official Comfy Registry. Use registry_search_packages for new or
+    uninstalled package discovery and registry_get_package before recommending
+    a package.
     
-    Use this tool to discover node packs by name, category, functionality, or specific nodes.
-    Helps find and understand what node packs are available to install or already installed.
+    Use this tool to inspect Manager-known installed or cached packs by name,
+    category, functionality, or specific node class. Results depend on the
+    current Manager installation and selected local/remote/cache mode.
     
     WHEN TO USE:
     - "What node packs handle image upscaling?" → query="upscale"

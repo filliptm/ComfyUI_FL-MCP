@@ -117,6 +117,7 @@ class ComfyManagerClient:
         self.cache = ManagerCache(ttl_seconds=300)
         self._manager_version: Optional[ManagerVersion] = None
         self._compatible_routes: Dict[str, str] = {}
+        self._compatible_methods: Dict[str, str] = {}
 
     async def _request(
         self,
@@ -171,6 +172,39 @@ class ComfyManagerClient:
             result = await self._request(method, alternate, params=params)
             preferred = alternate
         self._compatible_routes[endpoint] = preferred
+        return result
+
+    async def _request_with_method_fallback(
+        self,
+        endpoint: str,
+        *,
+        preferred_method: str = "GET",
+        fallback_method: str = "POST",
+    ) -> Any:
+        """Use the current Manager method, falling back for older releases.
+
+        Manager v4.1 exposes queue start/reset as GET routes. Some earlier v4
+        releases accepted POST instead, so retry only when the preferred method
+        is explicitly unsupported and remember the working method afterwards.
+        """
+        method = self._compatible_methods.get(endpoint, preferred_method)
+        alternate = fallback_method if method == preferred_method else preferred_method
+        try:
+            result = await self._request(
+                method,
+                endpoint,
+                json_data={} if method == "POST" else None,
+            )
+        except ManagerAPIError as exc:
+            if exc.status_code not in {404, 405}:
+                raise
+            result = await self._request(
+                alternate,
+                endpoint,
+                json_data={} if alternate == "POST" else None,
+            )
+            method = alternate
+        self._compatible_methods[endpoint] = method
         return result
 
     async def check_installed(self) -> ManagerVersion:
@@ -244,11 +278,11 @@ class ComfyManagerClient:
 
     async def queue_start(self) -> Dict[str, Any]:
         await self._ensure_v4()
-        return await self._request("POST", "/v2/manager/queue/start", json_data={})
+        return await self._request_with_method_fallback("/v2/manager/queue/start")
 
     async def queue_reset(self) -> Dict[str, Any]:
         await self._ensure_v4()
-        return await self._request("POST", "/v2/manager/queue/reset", json_data={})
+        return await self._request_with_method_fallback("/v2/manager/queue/reset")
 
     async def queue_history_list(self) -> Dict[str, Any]:
         await self._ensure_v4()
