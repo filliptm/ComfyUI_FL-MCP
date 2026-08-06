@@ -1135,15 +1135,15 @@ class ManagerQueueActionRequest(BaseModel):
     payload: Dict[str, Any] = Field(default_factory=dict, description="Raw Manager payload for that action")
     confirmed: bool = Field(False, description="Must be true to perform install/update/uninstall/disable actions")
     start_queue: bool = Field(True, description="Start the Manager worker queue after enqueueing")
-    client_id: str = Field("fl-mcp", description="Manager v4 client identifier")
-    ui_id: Optional[str] = Field(None, description="Optional Manager v4 task UI ID")
+    client_id: str = Field("fl-mcp", description="Manager client identifier")
+    ui_id: Optional[str] = Field(None, description="Optional Manager task UI ID")
 
 class ManagerInstalledPacksRequest(BaseModel):
-    """List installed Manager v4 node packs."""
+    """List installed ComfyUI Manager node packs."""
     mode: Literal["default", "imported"] = Field("default", description="Installed pack source")
 
 class ManagerQueueStatusRequest(BaseModel):
-    """Read Manager v4 queue status."""
+    """Read ComfyUI Manager queue status."""
     client_id: Optional[str] = Field(None, description="Optional Manager client ID filter")
 
 class ManagerSnapshotsRequest(BaseModel):
@@ -2562,10 +2562,13 @@ async def comfy_settings_set(request: ComfySettingsSetRequest, ctx: Context) -> 
 
 @mcp.tool()
 async def manager_queue_action(request: ManagerQueueActionRequest, ctx: Context) -> Dict[str, Any]:
-    """Queue a ComfyUI Manager v4 action such as install/update/uninstall/disable.
+    """Queue a ComfyUI Manager action such as install/update/uninstall/disable.
 
     This is intentionally confirmation-gated because Manager actions mutate the
-    local ComfyUI installation and often require a restart.
+    local ComfyUI installation and often require a restart. For Registry node
+    installs, pass the canonical package ID and exact published version from
+    registry_get_package. Manager installs package requirements in the Python
+    environment running ComfyUI.
     """
     await _report_tool_activity(ctx, "manager_queue_action")
     if not settings.enable_manager_mutations:
@@ -2604,7 +2607,7 @@ async def manager_queue_action(request: ManagerQueueActionRequest, ctx: Context)
 
 @mcp.tool()
 async def manager_queue_status(request: ManagerQueueStatusRequest, ctx: Context) -> Dict[str, Any]:
-    """Get ComfyUI Manager v4 queue status."""
+    """Get ComfyUI Manager queue status."""
     await _report_tool_activity(ctx, "manager_queue_status")
     manager_client = ctx.request_context.lifespan_context.get('manager_client')
     if not manager_client:
@@ -2616,7 +2619,7 @@ async def manager_queue_status(request: ManagerQueueStatusRequest, ctx: Context)
 
 @mcp.tool()
 async def manager_queue_start(request: GetSystemInfoRequest, ctx: Context) -> Dict[str, Any]:
-    """Start the ComfyUI Manager v4 worker queue."""
+    """Start the ComfyUI Manager worker queue."""
     await _report_tool_activity(ctx, "manager_queue_start")
     if not settings.enable_manager_mutations:
         return _disabled_by_config("FL_MCP_ENABLE_MANAGER_MUTATIONS")
@@ -2630,7 +2633,7 @@ async def manager_queue_start(request: GetSystemInfoRequest, ctx: Context) -> Di
 
 @mcp.tool()
 async def manager_queue_reset(request: GetSystemInfoRequest, ctx: Context) -> Dict[str, Any]:
-    """Reset the ComfyUI Manager v4 queue."""
+    """Reset the ComfyUI Manager queue."""
     await _report_tool_activity(ctx, "manager_queue_reset")
     if not settings.enable_manager_mutations:
         return _disabled_by_config("FL_MCP_ENABLE_MANAGER_MUTATIONS")
@@ -2911,16 +2914,43 @@ async def mcp_capability_audit(request: GetSystemInfoRequest, ctx: Context) -> D
     if manager_client:
         try:
             manager_status = await manager_client.status()
-            available = bool(manager_status.get("supports_v4"))
-            audit["manager_v4"] = {
+            queue_status = manager_status.get("queue")
+            queue_available = not (
+                isinstance(queue_status, dict)
+                and queue_status.get("success") is False
+            )
+            available = bool(manager_status.get("installed")) and queue_available
+            audit["manager"] = {
                 "available": available,
                 "state": "available" if available else "blocked",
                 "status": manager_status,
-                "reason": None if available else "ComfyUI Manager v4 is not available",
+                "reason": None if available else "No supported ComfyUI Manager queue API is available",
+            }
+            audit["manager_v4"] = {
+                "available": bool(manager_status.get("supports_v4")),
+                "state": (
+                    "available"
+                    if manager_status.get("supports_v4")
+                    else "degraded" if available else "blocked"
+                ),
+                "status": manager_status,
+                "reason": (
+                    None
+                    if manager_status.get("supports_v4")
+                    else "Using Manager's supported unversioned API"
+                    if available
+                    else "ComfyUI Manager v4 is not available"
+                ),
             }
         except Exception as e:
+            audit["manager"] = {"available": False, "state": "blocked", "reason": str(e)}
             audit["manager_v4"] = {"available": False, "state": "blocked", "reason": str(e)}
     else:
+        audit["manager"] = {
+            "available": False,
+            "state": "blocked",
+            "reason": "Manager client not initialized",
+        }
         audit["manager_v4"] = {
             "available": False,
             "state": "blocked",
