@@ -14,7 +14,43 @@ jobs:
     steps:
       - name: Check out code
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - name: Check whether the package version changed
+        id: package-version
+        shell: bash
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          current_version="$(sed -nE 's/^version = "([^"]+)"$/\1/p' pyproject.toml)"
+          if [[ -z "$current_version" ]]; then
+            echo "Could not read project.version from pyproject.toml." >&2
+            exit 1
+          fi
+
+          previous_version=""
+          if [[ -n "$BEFORE_SHA" ]] \
+            && [[ "$BEFORE_SHA" != "0000000000000000000000000000000000000000" ]] \
+            && git cat-file -e "$BEFORE_SHA:pyproject.toml" 2>/dev/null; then
+            previous_version="$(
+              git show "$BEFORE_SHA:pyproject.toml" \
+                | sed -nE 's/^version = "([^"]+)"$/\1/p'
+            )"
+          fi
+
+          echo "current=$current_version" >> "$GITHUB_OUTPUT"
+          echo "previous=$previous_version" >> "$GITHUB_OUTPUT"
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]] \
+            || [[ "$current_version" != "$previous_version" ]]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "Publishing Comfy Registry version $current_version."
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "Skipping publish because version $current_version is unchanged."
+          fi
       - name: Publish Custom Node
+        if: steps.package-version.outputs.changed == 'true'
         uses: Comfy-Org/publish-node-action@main
         with:
           personal_access_token: ${{ secrets.REGISTRY_ACCESS_TOKEN }}
+          skip_checkout: "true"
