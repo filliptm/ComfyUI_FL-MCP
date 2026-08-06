@@ -32,6 +32,7 @@ from backend.chat_image_preview import (  # noqa: E402
     render_chat_image_preview,
     resolve_chat_image_path,
 )
+from backend.comfy_runtime_paths import export_comfy_runtime_paths  # noqa: E402
 from backend.process_utils import daemon_process_kwargs, pid_is_running  # noqa: E402
 
 bridge_settings_payload = None
@@ -200,6 +201,12 @@ try:
     PromptServer = comfy_server_module.PromptServer
     import folder_paths
     from aiohttp import web
+
+    # Desktop and CLI flags can move these folders away from <ComfyUI>/input,
+    # output, and temp. Child bridge/MCP processes must inherit the exact roots
+    # used by the running ComfyUI instance so attachment references resolve to
+    # the same pixels that the canvas executes.
+    export_comfy_runtime_paths(folder_paths)
 
     @PromptServer.instance.routes.get("/fl_mcp/launcher/status")
     async def fl_mcp_launcher_status(request):

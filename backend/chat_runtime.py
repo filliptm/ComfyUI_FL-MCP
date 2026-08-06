@@ -1448,6 +1448,10 @@ class ChatRuntime:
             "- Ren tools are MCP tools whose full names begin with `mcp__ren__`.\n"
             "- Invoke the actual MCP tools. Never print or simulate "
             "`<function_calls>`, `<invoke>`, or `<function_response>` markup.\n"
+            "- Attachment references are ComfyUI references, not Claude filesystem "
+            "paths. Call `mcp__ren__view_chat_image` to receive their pixels; never "
+            "try to open `input/ren-chat/...` directly. Use the matching Ren image "
+            "and mask tools for outputs and masks.\n"
             "- Do not claim a tool succeeded unless its MCP result confirms it."
         )
         messages = self.store.list_messages(state.conversation_id)

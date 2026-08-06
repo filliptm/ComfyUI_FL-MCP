@@ -15,6 +15,7 @@ from urllib.parse import quote
 
 from comfy_models import ComfyFolderType, ComfyFileInfo, ComfySearchResult
 from config import settings
+from comfy_runtime_paths import configured_runtime_paths
 from extra_model_paths_loader import ExtraModelPathsLoader
 from path_resolver import PathResolver
 
@@ -96,6 +97,14 @@ class ComfyUITools:
         
         resolver = PathResolver(self.comfyui_root)
         default_mappings = resolver.get_default_mappings()
+        runtime_paths = configured_runtime_paths()
+        runtime_folder_types = {
+            "input": ComfyFolderType.INPUT,
+            "output": ComfyFolderType.OUTPUT,
+            "temp": ComfyFolderType.TEMP,
+        }
+        for folder_name, runtime_path in runtime_paths.items():
+            default_mappings[runtime_folder_types[folder_name]] = [runtime_path]
         self.folder_mappings = resolver.merge_with_extra_paths(default_mappings, extra_configs)
         
         # Log summary

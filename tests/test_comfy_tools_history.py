@@ -1,5 +1,6 @@
 import comfy_tools
 import pytest
+from comfy_models import ComfyFolderType
 
 
 class FakeResponse:
@@ -43,3 +44,28 @@ async def test_fetch_history_uses_exact_prompt_endpoint(monkeypatch):
         ("http://comfy/history/prompt%2Folder", None, 10.0),
     ]
     assert result == {"status": {"status_str": "success"}}
+
+
+def test_runtime_image_directories_override_source_tree_defaults(tmp_path, monkeypatch):
+    comfy_root = tmp_path / "ComfyUI"
+    for directory in ("custom_nodes", "models", "output"):
+        (comfy_root / directory).mkdir(parents=True)
+    for filename in ("nodes.py", "folder_paths.py"):
+        (comfy_root / filename).write_text("", encoding="utf-8")
+
+    desktop_root = tmp_path / "DesktopData"
+    runtime_paths = {
+        ComfyFolderType.INPUT: desktop_root / "input",
+        ComfyFolderType.OUTPUT: desktop_root / "output",
+        ComfyFolderType.TEMP: desktop_root / "temp",
+    }
+    for path in runtime_paths.values():
+        path.mkdir(parents=True)
+    monkeypatch.setenv("FL_MCP_COMFYUI_INPUT_DIR", str(runtime_paths[ComfyFolderType.INPUT]))
+    monkeypatch.setenv("FL_MCP_COMFYUI_OUTPUT_DIR", str(runtime_paths[ComfyFolderType.OUTPUT]))
+    monkeypatch.setenv("FL_MCP_COMFYUI_TEMP_DIR", str(runtime_paths[ComfyFolderType.TEMP]))
+
+    tools = comfy_tools.ComfyUITools(comfyui_root=str(comfy_root))
+
+    for folder_type, expected in runtime_paths.items():
+        assert list(tools._iter_all_paths(folder_type)) == [expected.resolve()]

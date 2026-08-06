@@ -746,7 +746,14 @@ async def test_claude_subscription_streams_tools_approvals_and_persists_session(
     store.append_message(
         conversation["id"],
         "user",
-        "Queue this workflow after checking it.",
+        "Inspect the attached image, then queue this workflow.",
+        metadata={
+            "attachments": [{
+                "filename": "reference.png",
+                "subfolder": "ren-chat/canvas-session",
+                "type": "input",
+            }],
+        },
     )
     runtime = ChatRuntime(store)
     state = ActiveRun("run-1", conversation["id"], "canvas-session")
@@ -755,10 +762,31 @@ async def test_claude_subscription_streams_tools_approvals_and_persists_session(
 
     async def fake_query(*, prompt, options):
         prompt_items = [item async for item in prompt]
-        assert prompt_items[0]["message"]["content"].startswith("Queue this workflow")
+        prompt_content = prompt_items[0]["message"]["content"]
+        assert prompt_content.startswith("Inspect the attached image")
+        assert '"subfolder":"ren-chat/canvas-session"' in prompt_content
         assert options.cli_path == "/fake/claude"
         assert options.env["ANTHROPIC_API_KEY"] == ""
-        assert options.mcp_servers["ren"]["env"]["FL_MCP_ALLOWED_TOOLS"]
+        allowed_tool_names = set(
+            options.mcp_servers["ren"]["env"]["FL_MCP_ALLOWED_TOOLS"].split(",")
+        )
+        assert "view_chat_image" in allowed_tool_names
+        assert "view_node_mask" in allowed_tool_names
+
+        image_view = await options.can_use_tool(
+            "mcp__ren__view_chat_image",
+            {
+                "request": {
+                    "image": {
+                        "filename": "reference.png",
+                        "subfolder": "ren-chat/canvas-session",
+                        "type": "input",
+                    },
+                },
+            },
+            None,
+        )
+        assert isinstance(image_view, PermissionResultAllow)
 
         safe = await options.can_use_tool(
             "mcp__ren__workflow_overview",
