@@ -4,20 +4,26 @@ Handles automatic startup, monitoring, and cleanup of the FastAPI backend server
 Supports multiple launch modes: terminal window, subprocess, or manual.
 """
 
+import atexit
 import http.client
 import json
-import os
-import sys
-import subprocess
-import atexit
-import socket
-import time
-import threading
 import logging
-from typing import Optional, Literal
+import os
+import socket
+import subprocess
+import sys
+import threading
+import time
 from pathlib import Path
+from typing import Literal, Optional
 
 from process_utils import managed_process_kwargs
+from version import (
+    RUNTIME_PRODUCT,
+    __version__,
+    runtime_build_identity,
+    runtime_project_identity,
+)
 
 
 class ServerRunner:
@@ -57,6 +63,13 @@ class ServerRunner:
         self.launch_mode = launch_mode
         self.auto_restart = auto_restart
         self.log_to_file = log_to_file
+        project_root = self.backend_dir.parent
+        self.runtime_identity = {
+            "product": RUNTIME_PRODUCT,
+            "project_id": runtime_project_identity(project_root),
+            "build_id": runtime_build_identity(project_root),
+            "version": __version__,
+        }
         
         # Track which mode was actually used
         self.active_mode: Optional[str] = None
@@ -87,24 +100,120 @@ class ServerRunner:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             return s.connect_ex(('127.0.0.1', self.port)) == 0
 
-    def is_fl_mcp_backend(self) -> bool:
+    def _request_json(self, method: str, path: str) -> Optional[dict]:
         connection = None
         try:
             connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=1)
-            connection.request("GET", "/health")
+            if method == "POST":
+                connection.request(
+                    method,
+                    path,
+                    body=b"{}",
+                    headers={"Content-Type": "application/json"},
+                )
+            else:
+                connection.request(method, path)
             response = connection.getresponse()
             if response.status != 200:
-                return False
+                response.read()
+                return None
             payload = json.loads(response.read().decode("utf-8"))
-            return (
-                payload.get("status") == "healthy"
-                and "active_connections" in payload
-            )
-        except (OSError, ValueError, json.JSONDecodeError):
-            return False
+            return payload if isinstance(payload, dict) else None
+        except (OSError, ValueError, json.JSONDecodeError, http.client.HTTPException):
+            return None
         finally:
             if connection is not None:
                 connection.close()
+
+    def _local_daemon_pid(self) -> Optional[int]:
+        try:
+            return int(
+                self._daemon_pid_path().read_text(encoding="utf-8").strip()
+            )
+        except (OSError, ValueError):
+            return None
+
+    def _daemon_pid_path(self) -> Path:
+        return self.backend_dir.parent / ".fl_mcp" / "daemon.pid"
+
+    def _remove_daemon_pid_file(self) -> None:
+        try:
+            self._daemon_pid_path().unlink(missing_ok=True)
+        except OSError as exc:
+            print(f"[FL-MCP] Warning: could not remove stale daemon PID file: {exc}")
+
+    def _probe_backend(self) -> dict:
+        health = self._request_json("GET", "/health") or {}
+        status = self._request_json("GET", "/api/mcp/status") or {}
+        runtime = status.get("runtime") or health.get("runtime") or {}
+        if not isinstance(runtime, dict):
+            runtime = {}
+
+        health_matches = (
+            health.get("status") == "healthy"
+            and "active_connections" in health
+        )
+        status_matches = (
+            status.get("healthy") is True
+            and status.get("port") == self.port
+        )
+        product_matches = runtime.get("product") == RUNTIME_PRODUCT
+        mode = str(runtime.get("mode") or status.get("mode") or "").lower()
+        remote_pid = runtime.get("pid") or status.get("pid")
+        legacy_same_project = bool(
+            not runtime
+            and health_matches
+            and status_matches
+            and mode == "daemon"
+            and isinstance(remote_pid, int)
+            and remote_pid == self._local_daemon_pid()
+        )
+        same_project = bool(
+            product_matches
+            and runtime.get("project_id") == self.runtime_identity["project_id"]
+        ) or legacy_same_project
+        identity_matches = bool(
+            product_matches
+            and same_project
+            and runtime.get("build_id") == self.runtime_identity["build_id"]
+            and runtime.get("version") == self.runtime_identity["version"]
+        )
+
+        return {
+            "health": health,
+            "status": status,
+            "runtime": runtime,
+            "is_fl_mcp": product_matches or (health_matches and status_matches),
+            "same_project": same_project,
+            "identity_matches": identity_matches,
+            "reusable": bool((health_matches or status_matches) and identity_matches),
+            "mode": mode,
+        }
+
+    def is_fl_mcp_backend(self) -> bool:
+        """Return whether the listening backend is safe to reuse."""
+        return bool(self._probe_backend()["reusable"])
+
+    def _wait_for_port_to_close(self, timeout: float = 5.0) -> bool:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if not self.is_port_in_use():
+                return True
+            time.sleep(0.1)
+        return not self.is_port_in_use()
+
+    def _shutdown_stale_daemon(self) -> bool:
+        response = self._request_json("POST", "/api/mcp/shutdown")
+        if response is not None and response.get("success") is not True:
+            self.last_error = "The stale FL-MCP daemon refused the shutdown request."
+            return False
+        if self._wait_for_port_to_close():
+            self._remove_daemon_pid_file()
+            return True
+        self.last_error = (
+            f"The stale FL-MCP daemon did not release port {self.port} after shutdown."
+        )
+        return False
     
     def _setup_log_file(self) -> Optional[object]:
         """Setup log file for server output.
@@ -152,17 +261,40 @@ class ServerRunner:
         
         # Check port availability
         if self.is_port_in_use():
-            if self.is_fl_mcp_backend():
+            probe = self._probe_backend()
+            if probe["reusable"]:
                 print(f"[FL-MCP] Reusing existing backend on port {self.port}.")
                 self.active_mode = "external"
                 return True
-            print(f"[FL-MCP] Port {self.port} is occupied by another service.")
-            print("[FL-MCP] Set WS_PORT to an available port and restart ComfyUI.")
-            self.last_error = (
-                f"Port {self.port} is occupied by another service. "
-                "Choose another bridge port and restart ComfyUI."
-            )
-            return False
+            if (
+                probe["is_fl_mcp"]
+                and probe["same_project"]
+                and probe["mode"] == "daemon"
+                and self.launch_mode in {"auto", "subprocess"}
+            ):
+                print(f"[FL-MCP] Replacing stale daemon on port {self.port}.")
+                if not self._shutdown_stale_daemon():
+                    print(f"[FL-MCP] {self.last_error}")
+                    return False
+            else:
+                if probe["is_fl_mcp"] and probe["same_project"]:
+                    self.last_error = (
+                        f"A stale FL-MCP backend is using port {self.port}, but launch mode "
+                        f"'{self.launch_mode}' cannot replace it safely. Stop that backend or "
+                        "use auto/subprocess launch mode."
+                    )
+                elif probe["is_fl_mcp"]:
+                    self.last_error = (
+                        f"Port {self.port} is occupied by an FL-MCP backend from another "
+                        "checkout. It was left untouched; choose another bridge port."
+                    )
+                else:
+                    self.last_error = (
+                        f"Port {self.port} is occupied by another service. "
+                        "Choose another bridge port and restart ComfyUI."
+                    )
+                print(f"[FL-MCP] {self.last_error}")
+                return False
         
         # Determine launch method
         if self.launch_mode == "manual":

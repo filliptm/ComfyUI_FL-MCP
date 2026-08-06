@@ -5,6 +5,7 @@ through the /object_info API endpoint.
 """
 
 import asyncio
+import copy
 import hashlib
 import json
 import logging
@@ -16,6 +17,10 @@ from typing import Any, Literal
 import httpx
 
 logger = logging.getLogger(__name__)
+
+
+CATALOG_HASH_SCHEMA = "fl-mcp.comfy-node-catalog-contract.v1"
+NODE_SCHEMA_HASH_SCHEMA = "fl-mcp.comfy-node-schema-contract.v1"
 
 
 # ============================================================================
@@ -52,8 +57,85 @@ def canonical_schema_hash(value: Any) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def _json_value_type(value: Any) -> str:
+    """Return the JSON type represented by a decoded value."""
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, (int, float)):
+        return "number"
+    if isinstance(value, list):
+        return "array"
+    if isinstance(value, dict):
+        return "object"
+    return type(value).__name__
+
+
+def normalize_node_schema_contract(node_info: dict[str, Any]) -> dict[str, Any]:
+    """Normalize runtime widget defaults out of a node's schema identity.
+
+    ComfyUI calls ``INPUT_TYPES()`` while serving ``/object_info``. Some custom
+    nodes generate a fresh widget default on every call, even though the node's
+    input/output contract has not changed. A widget default value initializes a
+    newly-created node; it does not alter whether the input exists or what can
+    connect to it.
+
+    Only the value at the documented input-spec metadata location is replaced.
+    The presence and JSON type of the default remain part of the contract, as
+    do enum choices, constraints, input ordering, outputs, and provenance. The
+    returned copy is safe to hash without changing the raw catalog used by Ren.
+    """
+    normalized = copy.deepcopy(node_info)
+    inputs = normalized.get("input")
+    if not isinstance(inputs, dict):
+        return normalized
+
+    for input_group in inputs.values():
+        if not isinstance(input_group, dict):
+            continue
+        for input_spec in input_group.values():
+            if not (
+                isinstance(input_spec, list)
+                and len(input_spec) > 1
+                and isinstance(input_spec[1], dict)
+                and "default" in input_spec[1]
+            ):
+                continue
+            input_spec[1]["default"] = {
+                "$contract": "widget-default",
+                "json_type": _json_value_type(input_spec[1]["default"]),
+            }
+
+    return normalized
+
+
+def catalog_contract_hash(catalog: dict[str, Any]) -> str:
+    """Hash the loaded node catalog's stable workflow-building contract."""
+    normalized_catalog = {
+        node_type: normalize_node_schema_contract(node_info)
+        if isinstance(node_info, dict)
+        else node_info
+        for node_type, node_info in catalog.items()
+    }
+    return canonical_schema_hash(
+        {
+            "hash_schema": CATALOG_HASH_SCHEMA,
+            "catalog": normalized_catalog,
+        }
+    )
+
+
 def node_schema_hash(node_type: str, node_info: dict[str, Any]) -> str:
-    return canonical_schema_hash({"node_type": node_type, "schema": node_info})
+    return canonical_schema_hash(
+        {
+            "hash_schema": NODE_SCHEMA_HASH_SCHEMA,
+            "node_type": node_type,
+            "schema": normalize_node_schema_contract(node_info),
+        }
+    )
 
 
 def classify_node_origin(node_info: dict[str, Any]) -> str:
@@ -113,6 +195,8 @@ class NodeCatalogSnapshot:
     data: dict[str, Any]
     source: str
     catalog_hash: str
+    observed_catalog_hash: str
+    catalog_hash_schema: str
     fetched_at: float
     expires_at: float
 
@@ -152,7 +236,9 @@ class NodeLibraryCache:
             self._snapshot = NodeCatalogSnapshot(
                 data=data,
                 source=source,
-                catalog_hash=canonical_schema_hash(data),
+                catalog_hash=catalog_contract_hash(data),
+                observed_catalog_hash=canonical_schema_hash(data),
+                catalog_hash_schema=CATALOG_HASH_SCHEMA,
                 fetched_at=fetched_at,
                 expires_at=fetched_at + self._ttl,
             )
@@ -167,6 +253,8 @@ class NodeLibraryCache:
                     "source": source,
                     "node_count": 0,
                     "catalog_hash": None,
+                    "observed_catalog_hash": None,
+                    "catalog_hash_schema": CATALOG_HASH_SCHEMA,
                     "fetched_at": None,
                     "expires_at": None,
                 }
@@ -176,6 +264,8 @@ class NodeLibraryCache:
                 "source": self._snapshot.source,
                 "node_count": len(self._snapshot.data),
                 "catalog_hash": self._snapshot.catalog_hash,
+                "observed_catalog_hash": self._snapshot.observed_catalog_hash,
+                "catalog_hash_schema": self._snapshot.catalog_hash_schema,
                 "fetched_at": self._snapshot.fetched_at,
                 "expires_at": self._snapshot.expires_at,
             }
@@ -373,7 +463,10 @@ class NodeLibraryClient:
             {
                 "origin": classify_node_origin(node_info),
                 "schema_hash": node_schema_hash(node_type, node_library[node_type]),
+                "schema_hash_schema": NODE_SCHEMA_HASH_SCHEMA,
                 "catalog_hash": status.get("catalog_hash"),
+                "catalog_hash_schema": status.get("catalog_hash_schema"),
+                "observed_catalog_hash": status.get("observed_catalog_hash"),
                 "source": self.source,
             }
         )
