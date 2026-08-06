@@ -137,6 +137,9 @@ CORE_CHAT_TOOLS = {
     "view_chat_image",
     "place_chat_image_in_node",
     "get_queue_status",
+    "node_library_search",
+    "node_library_get_details",
+    "node_library_status",
     "mcp_capability_audit",
 }
 

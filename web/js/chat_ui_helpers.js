@@ -338,6 +338,14 @@ export function summarizeToolStep(step, config = {}) {
     if (name === "workflow_get_current_json") return "Read workflow JSON";
     if (name === "workflow_save_current") return "Saved workflow";
     if (name === "node_library_search") return "Searched node library";
+    if (name === "node_library_status") {
+        const count = result?.catalog?.node_count;
+        if (Number.isFinite(count)) {
+            const label = count === 1 ? "loaded node" : "loaded nodes";
+            return `Cataloged ${count.toLocaleString("en-US")} ${label}`;
+        }
+        return "Checked loaded-node catalog";
+    }
     if (name === "manager_check_updates") return "Checked for custom-node updates";
     if (name === "workflow_overview") {
         const count = result?.node_count ?? result?.nodeCount ?? result?.total_nodes;

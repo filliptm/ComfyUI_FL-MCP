@@ -28,8 +28,7 @@ from config import settings
 from manager import manager
 from models import Handshake, ScreenshotMessage, ToolResult
 from process_utils import pid_is_running
-from version import __version__
-
+from version import __version__, runtime_metadata
 
 LOG_LEVEL = getattr(logging, settings.log_level, logging.INFO)
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -155,6 +154,7 @@ async def root() -> Dict[str, str]:
 async def health() -> Dict[str, Any]:
     return {
         "status": "healthy",
+        "runtime": runtime_metadata(),
         "active_connections": manager.get_active_session_count(),
         "total_sessions": manager.get_total_session_count(),
         "sessions": [
@@ -175,6 +175,7 @@ async def mcp_status() -> Dict[str, Any]:
         "pid": os.getpid(),
         "port": settings.ws_port,
         "healthy": True,
+        "runtime": runtime_metadata(),
         "activeConnections": manager.get_active_session_count(),
         "totalSessions": manager.get_total_session_count(),
     }

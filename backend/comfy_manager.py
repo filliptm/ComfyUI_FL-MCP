@@ -31,6 +31,10 @@ class ManagerConnectionError(ManagerError):
 class ManagerAPIError(ManagerError):
     """Raised when Manager API returns an error."""
 
+    def __init__(self, message: str, *, status_code: Optional[int] = None):
+        super().__init__(message)
+        self.status_code = status_code
+
 
 @dataclass
 class NodePackInfo:
@@ -112,6 +116,7 @@ class ComfyManagerClient:
         self.timeout = timeout
         self.cache = ManagerCache(ttl_seconds=300)
         self._manager_version: Optional[ManagerVersion] = None
+        self._compatible_routes: Dict[str, str] = {}
 
     async def _request(
         self,
@@ -136,7 +141,10 @@ class ComfyManagerClient:
                 detail = response.json()
             except Exception:
                 detail = response.text
-            raise ManagerAPIError(f"{method} {endpoint} failed with {response.status_code}: {detail}")
+            raise ManagerAPIError(
+                f"{method} {endpoint} failed with {response.status_code}: {detail}",
+                status_code=response.status_code,
+            )
 
         if not response.content:
             return {"success": True, "status": response.status_code}
@@ -144,6 +152,26 @@ class ComfyManagerClient:
             return response.json()
         except Exception:
             return {"success": True, "status": response.status_code, "data": response.text}
+
+    async def _request_with_fallback(
+        self,
+        method: str,
+        endpoint: str,
+        fallback_endpoint: str,
+        *,
+        params: Optional[Dict[str, Any]] = None,
+    ) -> Any:
+        preferred = self._compatible_routes.get(endpoint, endpoint)
+        alternate = fallback_endpoint if preferred == endpoint else endpoint
+        try:
+            result = await self._request(method, preferred, params=params)
+        except ManagerAPIError as exc:
+            if exc.status_code != 404:
+                raise
+            result = await self._request(method, alternate, params=params)
+            preferred = alternate
+        self._compatible_routes[endpoint] = preferred
+        return result
 
     async def check_installed(self) -> ManagerVersion:
         """Check Manager availability using ComfyUI's current /features response."""
@@ -168,10 +196,17 @@ class ComfyManagerClient:
         )
         return self._manager_version
 
-    async def _ensure_installed(self) -> None:
+    async def _ensure_installed(self) -> ManagerVersion:
         version_info = await self.check_installed()
-        if not version_info.installed or not version_info.supports_v4:
+        if not version_info.installed:
+            raise ManagerNotInstalledError("ComfyUI Manager is not available on this ComfyUI server")
+        return version_info
+
+    async def _ensure_v4(self) -> ManagerVersion:
+        version_info = await self._ensure_installed()
+        if not version_info.supports_v4:
             raise ManagerNotInstalledError("ComfyUI Manager v4 is not available on this ComfyUI server")
+        return version_info
 
     async def status(self) -> Dict[str, Any]:
         version = await self.check_installed()
@@ -189,36 +224,56 @@ class ComfyManagerClient:
         }
 
     async def list_installed_packs(self, mode: Literal["default", "imported"] = "default") -> Dict[str, Any]:
-        await self._ensure_installed()
-        return await self._request("GET", "/v2/customnode/installed", params={"mode": mode})
+        version = await self._ensure_installed()
+        if not version.supports_v4:
+            self._compatible_routes.setdefault(
+                "/v2/customnode/installed",
+                "/customnode/installed",
+            )
+        return await self._request_with_fallback(
+            "GET",
+            "/v2/customnode/installed",
+            "/customnode/installed",
+            params={"mode": mode},
+        )
 
     async def queue_status(self, client_id: Optional[str] = None) -> Dict[str, Any]:
-        await self._ensure_installed()
+        await self._ensure_v4()
         params = {"client_id": client_id} if client_id else None
         return await self._request("GET", "/v2/manager/queue/status", params=params)
 
     async def queue_start(self) -> Dict[str, Any]:
-        await self._ensure_installed()
+        await self._ensure_v4()
         return await self._request("POST", "/v2/manager/queue/start", json_data={})
 
     async def queue_reset(self) -> Dict[str, Any]:
-        await self._ensure_installed()
+        await self._ensure_v4()
         return await self._request("POST", "/v2/manager/queue/reset", json_data={})
 
     async def queue_history_list(self) -> Dict[str, Any]:
-        await self._ensure_installed()
+        await self._ensure_v4()
         return await self._request("GET", "/v2/manager/queue/history_list")
 
     async def list_snapshots(self) -> Dict[str, Any]:
-        await self._ensure_installed()
+        await self._ensure_v4()
         return await self._request("GET", "/v2/snapshot/getlist")
 
     async def get_node_mappings(
         self,
         mode: Literal["local", "remote", "cache", "nickname"] = "local",
     ) -> Dict[str, NodeMapping]:
-        await self._ensure_installed()
-        data = await self._request("GET", "/v2/customnode/getmappings", params={"mode": mode})
+        version = await self._ensure_installed()
+        if not version.supports_v4:
+            self._compatible_routes.setdefault(
+                "/v2/customnode/getmappings",
+                "/customnode/getmappings",
+            )
+        data = await self._request_with_fallback(
+            "GET",
+            "/v2/customnode/getmappings",
+            "/customnode/getmappings",
+            params={"mode": mode},
+        )
 
         mappings: Dict[str, NodeMapping] = {}
         for pack_id, pack_data in (data or {}).items():
@@ -317,7 +372,7 @@ class ComfyManagerClient:
         max_results: int = 10,
         mode: Literal["cache", "remote"] = "cache",
     ) -> List[ExternalModelInfo]:
-        await self._ensure_installed()
+        await self._ensure_v4()
         try:
             data = await self._request("GET", "/v2/externalmodel/getlist", params={"mode": mode})
         except ManagerAPIError as exc:
@@ -395,7 +450,7 @@ class ComfyManagerClient:
             ) from exc
 
     async def check_updates(self, mode: Literal["local", "remote", "cache"] = "remote") -> Dict[str, Any]:
-        await self._ensure_installed()
+        await self._ensure_v4()
         installed = await self.list_installed_packs()
         return {
             "updates_available": False,
@@ -423,7 +478,7 @@ class ComfyManagerClient:
         ui_id: Optional[str] = None,
         start_queue: bool = True,
     ) -> Dict[str, Any]:
-        await self._ensure_installed()
+        await self._ensure_v4()
         ui_id = ui_id or f"fl_mcp_{kind.replace('-', '_')}_{uuid.uuid4().hex[:10]}"
 
         if kind == "update-all":

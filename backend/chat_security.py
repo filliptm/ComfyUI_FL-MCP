@@ -111,6 +111,7 @@ READ_ONLY_TOOLS = {
     "node_library_search",
     "node_library_get_details",
     "node_library_find_compatible",
+    "node_library_status",
     "manager_search_nodes",
     "manager_get_node_mappings",
     "manager_check_updates",
