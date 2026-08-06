@@ -3832,8 +3832,66 @@ def _resolve_comfy_image_path(comfy_tools: Any, image: Dict[str, Any]) -> Path:
     )
 
 
+MCP_VISION_PREVIEW_MAX_BYTES = 600_000
+MCP_VISION_PREVIEW_MIN_DIMENSION = 256
+
+
+def _has_visible_transparency(image: PILImage.Image) -> bool:
+    """Return true only when alpha changes visible pixels."""
+
+    if "A" in image.getbands():
+        return image.getchannel("A").getextrema()[0] < 255
+    if image.mode == "P" and "transparency" in image.info:
+        return image.convert("RGBA").getchannel("A").getextrema()[0] < 255
+    return False
+
+
+def _bounded_vision_preview(
+    image: PILImage.Image,
+    max_dimension: int,
+) -> tuple[bytes, str, tuple[int, int]]:
+    """Encode visual MCP content below Claude's JSON transport threshold."""
+
+    preserve_alpha = _has_visible_transparency(image)
+    target_dimension = max_dimension
+    while True:
+        preview = image.copy()
+        preview.thumbnail(
+            (target_dimension, target_dimension),
+            PILImage.Resampling.LANCZOS,
+        )
+        buffer = io.BytesIO()
+        if preserve_alpha:
+            preview.save(buffer, format="PNG", optimize=True)
+            preview_format = "png"
+        else:
+            preview.convert("RGB").save(
+                buffer,
+                format="JPEG",
+                quality=88,
+                optimize=True,
+            )
+            preview_format = "jpeg"
+        content = buffer.getvalue()
+        current_dimension = max(preview.size)
+        if (
+            len(content) <= MCP_VISION_PREVIEW_MAX_BYTES
+            or current_dimension <= MCP_VISION_PREVIEW_MIN_DIMENSION
+        ):
+            return content, preview_format, preview.size
+
+        scale = min(
+            0.9,
+            max(0.5, (MCP_VISION_PREVIEW_MAX_BYTES / len(content)) ** 0.5 * 0.92),
+        )
+        target_dimension = max(
+            MCP_VISION_PREVIEW_MIN_DIMENSION,
+            int(current_dimension * scale),
+        )
+
+
 def _output_image_preview(path: Path, max_dimension: int) -> tuple[bytes, str, tuple[int, int], tuple[int, int]]:
-    """Create a bounded visual-review image while preserving transparency."""
+    """Create transport-bounded visual content without changing the source image."""
     try:
         with PILImage.open(path) as source:
             source.seek(0)
@@ -3842,24 +3900,11 @@ def _output_image_preview(path: Path, max_dimension: int) -> tuple[bytes, str, t
         raise ComfyUIError(f"Output is not a readable image: {path.name}") from exc
 
     original_size = image.size
-    image.thumbnail((max_dimension, max_dimension), PILImage.Resampling.LANCZOS)
-    preview_size = image.size
-    has_alpha = "A" in image.getbands() or (
-        image.mode == "P" and "transparency" in image.info
+    preview, preview_format, preview_size = _bounded_vision_preview(
+        image,
+        max_dimension,
     )
-    buffer = io.BytesIO()
-    if has_alpha:
-        image.save(buffer, format="PNG", optimize=True)
-        preview_format = "png"
-    else:
-        image.convert("RGB").save(
-            buffer,
-            format="JPEG",
-            quality=90,
-            optimize=True,
-        )
-        preview_format = "jpeg"
-    return buffer.getvalue(), preview_format, original_size, preview_size
+    return preview, preview_format, original_size, preview_size
 
 
 def _mask_overlay_preview(
@@ -3893,11 +3938,11 @@ def _mask_overlay_preview(
     tint = PILImage.new("RGB", base.size, (255, 0, 180))
     highlighted = PILImage.blend(base, tint, 0.62)
     preview = PILImage.composite(highlighted, base, mask)
-    preview.thumbnail((max_dimension, max_dimension), PILImage.Resampling.LANCZOS)
-    preview_size = preview.size
-    buffer = io.BytesIO()
-    preview.save(buffer, format="JPEG", quality=90, optimize=True)
-    return buffer.getvalue(), "jpeg", original_size, preview_size, mask_info
+    content, preview_format, preview_size = _bounded_vision_preview(
+        preview,
+        max_dimension,
+    )
+    return content, preview_format, original_size, preview_size, mask_info
 
 
 @mcp.tool()

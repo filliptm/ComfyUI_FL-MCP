@@ -42,6 +42,7 @@ CONTEXT_CHECKPOINT_CHARS = 24_000
 CONTEXT_ROLLOVER_TOKENS = 64_000
 CLAUDE_STDERR_MAX_LINES = 40
 CLAUDE_STDERR_MAX_LINE_CHARS = 1_000
+CLAUDE_MAX_MESSAGE_BYTES = 8 * 1024 * 1024
 
 
 def mcp_tool_timeout_seconds() -> int:
@@ -1660,6 +1661,7 @@ class ChatRuntime:
             "setting_sources": [],
             "skills": [],
             "stderr": capture_claude_stderr,
+            "max_buffer_size": CLAUDE_MAX_MESSAGE_BYTES,
         }
         reasoning_effort = settings.get("reasoning_effort", "default")
         if reasoning_effort != "default":

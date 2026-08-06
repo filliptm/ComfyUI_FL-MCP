@@ -780,6 +780,7 @@ async def test_claude_subscription_streams_tools_approvals_and_persists_session(
         assert "view_chat_image" in allowed_tool_names
         assert "view_node_mask" in allowed_tool_names
         assert callable(options.stderr)
+        assert options.max_buffer_size == 8 * 1024 * 1024
 
         image_view = await options.can_use_tool(
             "mcp__ren__view_chat_image",
