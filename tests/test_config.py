@@ -20,7 +20,28 @@ def test_bridge_settings_use_defaults_without_creating_a_file(tmp_path):
     value = store.load()
 
     assert value == Settings()
+    assert value.enable_workflow_writes is True
     assert path.exists() is False
+
+
+def test_explicit_workflow_write_opt_out_is_preserved(tmp_path):
+    path = tmp_path / "bridge_settings.json"
+    store = BridgeSettingsStore(path, tmp_path / ".env", environ={})
+
+    store.update({"enable_workflow_writes": False})
+    reloaded = BridgeSettingsStore(path, tmp_path / ".env", environ={}).load()
+
+    assert reloaded.enable_workflow_writes is False
+
+
+def test_legacy_environment_can_disable_default_workflow_writes(tmp_path):
+    store = BridgeSettingsStore(
+        tmp_path / "bridge_settings.json",
+        tmp_path / ".env",
+        environ={"FL_MCP_ENABLE_WORKFLOW_WRITES": "false"},
+    )
+
+    assert store.load().enable_workflow_writes is False
 
 
 def test_legacy_environment_is_imported_once_and_left_in_place(tmp_path):
