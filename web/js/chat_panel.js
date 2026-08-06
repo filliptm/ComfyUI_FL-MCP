@@ -471,7 +471,7 @@ export class AssistantPanel {
                                     <div class="fl-bridge-capability-list">
                                         <label class="fl-approval-toggle">
                                             <input data-bridge-setting="enable_workflow_writes" type="checkbox">
-                                            <span><strong>Workflow writes</strong><span>Edit the canvas and manage workflows, history, and ComfyUI settings.</span></span>
+                                            <span><strong>Workflow writes</strong><span>Enabled by default. Edit the canvas and manage workflows, history, and ComfyUI settings.</span></span>
                                         </label>
                                         <label class="fl-approval-toggle">
                                             <input data-bridge-setting="enable_custom_node_writes" type="checkbox">

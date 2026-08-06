@@ -68,7 +68,7 @@ class Settings(BaseModel):
     comfyui_path: str | None = None
     extra_model_paths_path: str | None = None
 
-    enable_workflow_writes: bool = False
+    enable_workflow_writes: bool = True
     enable_custom_node_writes: bool = False
     enable_git_writes: bool = False
     enable_manager_mutations: bool = False

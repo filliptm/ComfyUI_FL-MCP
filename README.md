@@ -223,14 +223,17 @@ The bridge backend does **not** run inside ComfyUI's main event loop. It runs as
 
 ## Safety Gates
 
-Read-only tools are available by default. Anything that writes files, edits workflows, mutates Manager state, pushes git commits, or controls processes must be explicitly enabled.
+Read-only tools and workflow-editing tools are available by default so Ren can
+prepare and execute ordinary ComfyUI workflows. Workflow writes can still be
+disabled explicitly. Writing custom-node files, mutating Manager state, pushing
+git commits, and controlling processes must be explicitly enabled.
 
-Open **Ren → Settings → Bridge & safety → Server-side capabilities**, enable the
-narrowest required gate, save, and restart ComfyUI.
+Open **Ren → Settings → Bridge & safety → Server-side capabilities** to change
+these gates, save, and restart ComfyUI.
 
 | Gate | Enables |
 |---|---|
-| **Workflow writes** | Canvas mutation, workflow load/save/delete, settings writes, history deletes |
+| **Workflow writes** *(on by default)* | Canvas mutation, workflow load/save/delete, settings writes, history deletes |
 | **Custom node writes** | Writing files, applying patches, creating custom node packs |
 | **Git writes** | Git commit and push tools under custom nodes |
 | **Manager mutations** | ComfyUI Manager install/update/uninstall queue actions |
