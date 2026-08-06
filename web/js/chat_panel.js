@@ -68,8 +68,10 @@ export class AssistantPanel {
         this.currentAssistant = null;
         this.currentRunContext = null;
         this.availableModels = [];
+        this.pendingSubscriptionModel = null;
         this.diagnostics = null;
         this.backendRunning = null;
+        this.backendError = "";
         this.canvasContext = { connected: false, nodeCount: 0, selectedCount: 0 };
         this.followOutput = true;
         this.jumpingToLatest = false;
@@ -642,7 +644,7 @@ export class AssistantPanel {
             this.diagnostics = this.createDiagnostics(
                 this.container.querySelector(".fl-diagnostics-host"),
                 {
-                    onBackendStatus: (running) => this.refreshBackendStatus(running),
+                    onBackendStatus: (status) => this.refreshBackendStatus(status),
                 },
             );
         }
@@ -720,11 +722,10 @@ export class AssistantPanel {
             if (action === "next-message-version") this.changeMessageVersion(actionElement.dataset.messageId, 1);
         });
         this.providerSelect.addEventListener("change", () => this.applyProviderPreset());
-        this.subscriptionModelSelect.addEventListener("change", () => {
-            this.modelInput.value = this.subscriptionModelSelect.value;
-            this.renderReasoningControls();
-            this.updateModelSettingsState();
-        });
+        this.subscriptionModelSelect.addEventListener(
+            "change",
+            () => this.selectSubscriptionModel(),
+        );
         this.modelInput.addEventListener("input", () => {
             this.renderReasoningControls();
             this.updateModelSettingsState();
@@ -969,11 +970,15 @@ export class AssistantPanel {
         }
     }
 
-    async refreshBackendStatus(running) {
-        this.backendRunning = Boolean(running);
+    async refreshBackendStatus(status) {
+        const launcherStatus = status && typeof status === "object"
+            ? status
+            : { backendReachable: Boolean(status) };
+        this.backendRunning = Boolean(launcherStatus.backendReachable);
+        this.backendError = String(launcherStatus.error || "").trim();
         this.updateDiagnosticsSettingsState();
         if (this.initializing) return;
-        if (!running) {
+        if (!this.backendRunning) {
             this.updateStatus("error");
             return;
         }
@@ -1362,6 +1367,35 @@ export class AssistantPanel {
         }
     }
 
+    async selectSubscriptionModel() {
+        const selectedModel = this.subscriptionModelSelect.value;
+        if (!selectedModel) return;
+        const previousModel = this.settings?.model || this.modelInput.value || "";
+        this.pendingSubscriptionModel = selectedModel;
+        this.modelInput.value = selectedModel;
+        if (this.settings) this.settings = { ...this.settings, model: selectedModel };
+        if (this.status) this.status = { ...this.status, model: selectedModel };
+        this.renderReasoningControls();
+        this.updateModelSettingsState();
+        this.subscriptionModelSelect.disabled = true;
+        try {
+            this.settings = await this.chat.updateSettings({ model: selectedModel });
+            if (this.status) this.status = { ...this.status, model: selectedModel };
+            this.pendingSubscriptionModel = null;
+            this.updateStatus();
+            this.announce(`Model changed to ${selectedModel}.`);
+        } catch (error) {
+            this.pendingSubscriptionModel = null;
+            this.modelInput.value = previousModel;
+            if (this.settings) this.settings = { ...this.settings, model: previousModel };
+            if (this.status) this.status = { ...this.status, model: previousModel };
+            this.renderProviderControls();
+            this.showError(`Model could not be changed: ${error.message}`);
+        } finally {
+            this.subscriptionModelSelect.disabled = false;
+        }
+    }
+
     renderProviderControls() {
         const currentModel = this.modelInput.value || this.settings?.model || "";
         const models = [...this.availableModels];
@@ -1476,8 +1510,11 @@ export class AssistantPanel {
                 ? "Refresh status"
                 : (isClaudeSubscription ? "Sign in with Claude" : "Sign in with Codex");
             button.disabled = connection.installed === false;
-            this.credentialStatus.textContent = connection.message
+            const connectionMessage = connection.message
                 || (isClaudeSubscription ? "Checking Claude Code…" : "Checking Codex…");
+            this.credentialStatus.textContent = connection.executablePath
+                ? `${connectionMessage} · CLI: ${connection.executablePath}`
+                : connectionMessage;
             this.credentialStatus.classList.toggle("error", !configured);
             this.updateModelSettingsState();
             return;
@@ -2302,7 +2339,7 @@ export class AssistantPanel {
         if (!message) return;
         this.finishActiveTextSegment(message, true);
         const history = message.toolHistory;
-        if (history?.renderFrame !== null) {
+        if (history && history.renderFrame !== null) {
             cancelAnimationFrame(history.renderFrame);
             history.renderFrame = null;
             const renderImages = history.renderImages;
@@ -3341,7 +3378,10 @@ export class AssistantPanel {
         this.statusCopy.textContent = labels[state];
         const bannerCopy = {
             warning: "Ren is ready, but the canvas bridge is disconnected.",
-            setup: "Choose a model connection before chatting with Ren.",
+            setup: this.status?.model
+                ? (this.status?.credential?.message
+                    || "The selected model connection is not ready.")
+                : "Choose a model connection before chatting with Ren.",
             error: "Ren is unavailable. Check the backend and bridge connection.",
         };
         const bannerAction = {
@@ -3353,8 +3393,9 @@ export class AssistantPanel {
         this.statusBannerCopy.textContent = bannerCopy[state] || "";
         this.statusBanner.querySelector("button").textContent = bannerAction[state] || "";
         this.updateDiagnosticsSettingsState(force === "error" ? "error" : null);
-        if (this.status?.model) {
-            this.modelInput.value = this.status.model;
+        const activeModel = this.pendingSubscriptionModel || this.status?.model;
+        if (activeModel) {
+            this.modelInput.value = activeModel;
             this.renderProviderControls();
         }
         this.updateProviderBadge();

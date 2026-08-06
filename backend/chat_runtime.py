@@ -7,7 +7,6 @@ import json
 import logging
 import os
 import re
-import shutil
 import sys
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -25,6 +24,7 @@ from chat_config import (
 )
 from chat_security import classify_tool, requires_approval
 from chat_store import ChatStore, chat_store
+from claude_subscription import claude_subscription
 from config import (
     MAX_GENERATION_COMPLETION_TIMEOUT_SECONDS,
     MCP_TOOL_TIMEOUT_BUFFER_SECONDS,
@@ -40,6 +40,9 @@ CONTEXT_MAX_CHARS = 96_000
 CONTEXT_RECENT_CHARS = 64_000
 CONTEXT_CHECKPOINT_CHARS = 24_000
 CONTEXT_ROLLOVER_TOKENS = 64_000
+CLAUDE_STDERR_MAX_LINES = 40
+CLAUDE_STDERR_MAX_LINE_CHARS = 1_000
+CLAUDE_MAX_MESSAGE_BYTES = 8 * 1024 * 1024
 
 
 def mcp_tool_timeout_seconds() -> int:
@@ -53,6 +56,45 @@ _DATA_IMAGE_URI = re.compile(
     re.IGNORECASE,
 )
 _LONG_BASE64_VALUE = re.compile(r"[A-Za-z0-9+/]{2048,}={0,2}")
+_ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+_SECRET_ASSIGNMENT = re.compile(
+    r"(?i)\b(api[_-]?key|authorization|auth[_-]?token|token)\b"
+    r"(\s*[:=]\s*)([^\s,;]+)"
+)
+
+
+def safe_provider_diagnostic(value: str) -> str:
+    """Keep provider failures useful without leaking credential-like values."""
+
+    cleaned = _ANSI_ESCAPE.sub("", str(value)).strip()[:CLAUDE_STDERR_MAX_LINE_CHARS]
+    return _SECRET_ASSIGNMENT.sub(r"\1\2[redacted]", cleaned)
+
+
+def provider_failure_message(exc: Exception, stderr_lines: list[str]) -> str:
+    """Replace the Claude SDK's generic stderr placeholder with captured output."""
+
+    message = str(exc).strip() or type(exc).__name__
+    diagnostics = [safe_provider_diagnostic(line) for line in stderr_lines]
+    diagnostics = [line for line in diagnostics if line]
+    if not diagnostics:
+        return message
+    message = message.replace(
+        "\nError output: Check stderr output for details",
+        "",
+    )
+    detail = "\n".join(diagnostics[-8:])
+    return f"{message}\nClaude Code output:\n{detail}"
+
+
+def claude_result_error_message(result_message: Any) -> str:
+    """Prefer Claude's actionable result text over an unhelpful subtype."""
+
+    details = (
+        result_message.errors
+        or ([result_message.result] if result_message.result else [])
+        or [result_message.subtype]
+    )
+    return "; ".join(str(item) for item in details if item)
 
 WEB_IMAGE_INTENT_PATTERNS = (
     re.compile(
@@ -783,6 +825,7 @@ class ActiveRun:
     assistant_persisted: bool = False
     interruption_reason: str = "stopped"
     provider_metadata: dict[str, Any] = field(default_factory=dict)
+    provider_stderr: list[str] = field(default_factory=list)
     cancel_callback: Callable[[], Awaitable[Any]] | None = None
 
 
@@ -1396,12 +1439,13 @@ class ChatRuntime:
                 ),
             })
         except Exception as exc:
-            logger.error("Embedded chat run failed: %s", exc, exc_info=True)
-            self.store.finish_run(state.run_id, "error", str(exc))
+            error_message = provider_failure_message(exc, state.provider_stderr)
+            logger.error("Embedded chat run failed: %s", error_message, exc_info=True)
+            self.store.finish_run(state.run_id, "error", error_message)
             if not state.error_emitted:
                 await self.publish(state, {
                     "type": "RUN_ERROR",
-                    "message": str(exc),
+                    "message": error_message,
                     "code": "chat_run_failed",
                 })
         finally:
@@ -1430,7 +1474,7 @@ class ChatRuntime:
             UserMessage,
         )
 
-        cli_path = shutil.which("claude")
+        cli_path = claude_subscription.cli_path()
         if not cli_path:
             raise ValueError(
                 "Claude Code is not installed or is not on PATH. "
@@ -1487,7 +1531,7 @@ class ChatRuntime:
                 "contextCompacted": True,
                 "providerThreadRolledOver": True,
             })
-        environment = os.environ.copy()
+        environment = claude_subscription.cli_environment()
         environment.update({
             "FL_MCP_MODE": "subprocess",
             "FL_MCP_SESSION_ID": state.session_id,
@@ -1507,6 +1551,13 @@ class ChatRuntime:
             "CLAUDE_CODE_USE_VERTEX": "",
             "CLAUDE_CODE_USE_FOUNDRY": "",
         })
+
+        def capture_claude_stderr(line: str) -> None:
+            value = safe_provider_diagnostic(line)
+            if not value:
+                return
+            state.provider_stderr.append(value)
+            del state.provider_stderr[:-CLAUDE_STDERR_MAX_LINES]
 
         async def keep_permission_stream_open(input_data, tool_use_id, context):
             del input_data, tool_use_id, context
@@ -1609,6 +1660,8 @@ class ChatRuntime:
             "include_partial_messages": True,
             "setting_sources": [],
             "skills": [],
+            "stderr": capture_claude_stderr,
+            "max_buffer_size": CLAUDE_MAX_MESSAGE_BYTES,
         }
         reasoning_effort = settings.get("reasoning_effort", "default")
         if reasoning_effort != "default":
@@ -1764,8 +1817,7 @@ class ChatRuntime:
         if result_message is None:
             raise RuntimeError("Claude Code ended without returning a result.")
         if result_message.is_error:
-            details = result_message.errors or [result_message.subtype]
-            raise RuntimeError("; ".join(str(item) for item in details if item))
+            raise RuntimeError(claude_result_error_message(result_message))
         if not state.assistant_text and result_message.result:
             if not text_started:
                 await self.publish(state, {

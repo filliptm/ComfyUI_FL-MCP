@@ -176,15 +176,21 @@ class BridgeStatusPanel {
     async refresh() {
         this.launcherStatus = await fetchLauncherStatus();
         const running = Boolean(this.launcherStatus.backendReachable);
-        this.backendText.textContent = running ? "Running" : "Stopped";
-        this.backendPill.textContent = running ? "Online" : "Offline";
+        const launcherError = String(this.launcherStatus.error || "").trim();
+        this.backendText.textContent = running
+            ? "Running"
+            : (launcherError || "Stopped");
+        this.backendText.title = launcherError;
+        this.backendPill.textContent = running
+            ? "Online"
+            : (launcherError ? "Failed" : "Offline");
         this.backendPill.classList.toggle("online", running);
         this.toggleButton.textContent = running ? "Stop backend" : "Start backend";
         if (running && !this.wsClient.isConnectedOrConnecting()) {
             this.wsClient.connect();
         }
         this.updateConnection();
-        this.onBackendStatus?.(running);
+        this.onBackendStatus?.(this.launcherStatus);
     }
 
     updateConnection() {

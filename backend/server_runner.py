@@ -67,6 +67,7 @@ class ServerRunner:
         self._cleaned_up = False
         self._should_monitor = False
         self._monitor_thread: Optional[threading.Thread] = None
+        self.last_error: Optional[str] = None
         
         # Setup logging
         self.logger = logging.getLogger("FL-MCP.ServerRunner")
@@ -142,6 +143,8 @@ class ServerRunner:
         Returns:
             True if started successfully, False otherwise
         """
+        self.last_error = None
+
         # Check if already running (subprocess mode)
         if self.process is not None:
             print("[FL-MCP] Backend already running (subprocess)")
@@ -155,6 +158,10 @@ class ServerRunner:
                 return True
             print(f"[FL-MCP] Port {self.port} is occupied by another service.")
             print("[FL-MCP] Set WS_PORT to an available port and restart ComfyUI.")
+            self.last_error = (
+                f"Port {self.port} is occupied by another service. "
+                "Choose another bridge port and restart ComfyUI."
+            )
             return False
         
         # Determine launch method
@@ -176,6 +183,7 @@ class ServerRunner:
         
         else:
             print(f"[FL-MCP] Unknown launch mode: {self.launch_mode}")
+            self.last_error = f"Unknown backend launch mode: {self.launch_mode}."
             return False
     
     def _launch_in_terminal(self, fallback: bool = True) -> bool:
@@ -249,6 +257,7 @@ class ServerRunner:
             if not server_script.exists():
                 print(f"[FL-MCP] Error: server.py not found at {server_script}")
                 print(f"[FL-MCP] Backend directory: {self.backend_dir}")
+                self.last_error = f"Backend entry point was not found: {server_script}"
                 return False
             
             print(f"[FL-MCP] Starting backend server (subprocess mode) on port {self.port}...")
@@ -300,11 +309,17 @@ class ServerRunner:
             else:
                 print("[FL-MCP] Backend server failed to start (timeout)")
                 print("[FL-MCP] Check backend/logs/fl_mcp_server.log for errors")
+                if not self.last_error:
+                    self.last_error = (
+                        "Backend did not become ready before the startup timeout. "
+                        f"Check {self.backend_dir / 'logs' / 'fl_mcp_server.log'}."
+                    )
                 self.cleanup()
                 return False
         
         except Exception as e:
             print(f"[FL-MCP] Failed to start backend server: {e}")
+            self.last_error = f"Backend failed to start: {e}"
             self.cleanup()
             return False
     
@@ -416,7 +431,12 @@ class ServerRunner:
             # Check if process crashed during startup (subprocess mode only)
             if self.active_mode == "subprocess" and self.process and self.process.poll() is not None:
                 print(" Failed!")
-                print(f"[FL-MCP] Process terminated during startup (exit code: {self.process.poll()})")
+                return_code = self.process.poll()
+                print(f"[FL-MCP] Process terminated during startup (exit code: {return_code})")
+                self.last_error = (
+                    f"Backend exited during startup with code {return_code}. "
+                    f"Check {self.backend_dir / 'logs' / 'fl_mcp_server.log'}."
+                )
                 return False
             
             time.sleep(0.5)

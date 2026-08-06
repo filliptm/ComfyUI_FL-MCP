@@ -59,6 +59,25 @@ pip install -r requirements.txt
 
 Restart ComfyUI. The sidebar should show a `Ren` tab with a chat-bubble icon. Inside that tab, the main panel is labeled **MCP**.
 
+### ComfyUI Desktop
+
+Desktop installations can contain more than one Python environment. Install
+FL-MCP requirements with the interpreter used by the running ComfyUI app, not
+an unqualified `pip`. From the ComfyUI directory on macOS or Linux:
+
+```bash
+./.venv/bin/python -m pip install -r custom_nodes/ComfyUI_FL-MCP/requirements.txt
+```
+
+On Windows:
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r .\custom_nodes\ComfyUI_FL-MCP\requirements.txt
+```
+
+Restart ComfyUI after installation. If the backend cannot start, **Ren →
+Settings → Bridge diagnostics** displays the launcher failure and log path.
+
 ### Bridge settings
 
 The local defaults work for a standard ComfyUI install. To change the backend
@@ -574,7 +593,7 @@ You still need to configure the `comfyui-fl-mcp` MCP server separately as descri
 
 ```bash
 cd /path/to/ComfyUI/custom_nodes/ComfyUI_FL-MCP
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
 python -m pytest
 ```
 

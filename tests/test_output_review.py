@@ -34,6 +34,40 @@ def fake_context():
     )
 
 
+def test_vision_preview_stays_below_claude_transport_limit():
+    noise = Image.effect_noise((1600, 900), 100).convert("L")
+    opaque = Image.merge(
+        "RGBA",
+        (noise, noise, noise, Image.new("L", noise.size, 255)),
+    )
+
+    content, preview_format, preview_size = mcp_server._bounded_vision_preview(
+        opaque,
+        2048,
+    )
+
+    assert preview_format == "jpeg"
+    assert len(content) <= mcp_server.MCP_VISION_PREVIEW_MAX_BYTES
+    assert max(preview_size) < 1600
+    assert opaque.size == (1600, 900)
+
+
+def test_transparent_vision_preview_is_bounded_without_dropping_alpha():
+    noise = Image.effect_noise((1600, 900), 100).convert("L")
+    alpha = Image.new("L", noise.size, 255)
+    ImageDraw.Draw(alpha).rectangle((0, 0, 799, 899), fill=0)
+    transparent = Image.merge("RGBA", (noise, noise, noise, alpha))
+
+    content, preview_format, preview_size = mcp_server._bounded_vision_preview(
+        transparent,
+        2048,
+    )
+
+    assert preview_format == "png"
+    assert len(content) <= mcp_server.MCP_VISION_PREVIEW_MAX_BYTES
+    assert max(preview_size) < 1600
+
+
 def test_output_candidates_preserve_node_and_image_order():
     candidates = mcp_server._output_image_candidates({
         "preview": {"images": [{"filename": "preview.png", "type": "temp"}]},

@@ -7,10 +7,15 @@ import json
 import os
 import platform
 import shlex
-import shutil
 import subprocess
 import time
 from typing import Any
+
+from cli_discovery import (
+    clear_cli_discovery_cache,
+    cli_environment,
+    discover_cli,
+)
 
 AUTH_TIMEOUT_SECONDS = 8
 STATUS_CACHE_SECONDS = 5
@@ -25,9 +30,15 @@ class ClaudeSubscriptionService:
 
     @staticmethod
     def cli_path() -> str | None:
-        return shutil.which("claude")
+        return discover_cli("claude").executable
+
+    @staticmethod
+    def cli_environment() -> dict[str, str]:
+        return cli_environment("claude")
 
     async def status(self, *, refresh: bool = False) -> dict[str, Any]:
+        if refresh:
+            clear_cli_discovery_cache()
         now = time.monotonic()
         if (
             not refresh
@@ -46,6 +57,7 @@ class ClaudeSubscriptionService:
                 "authMethod": None,
                 "subscriptionType": None,
                 "version": None,
+                "executablePath": None,
                 "message": "Claude Code is not installed or is not on PATH.",
             }
             self._remember(value)
@@ -58,6 +70,7 @@ class ClaudeSubscriptionService:
                 cli,
                 "auth",
                 "status",
+                env=self.cli_environment(),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -110,6 +123,7 @@ class ClaudeSubscriptionService:
             "authMethod": auth_method,
             "subscriptionType": subscription_type,
             "version": version,
+            "executablePath": cli,
             "message": message,
         }
         self._remember(value)
@@ -120,6 +134,7 @@ class ClaudeSubscriptionService:
             process = await asyncio.create_subprocess_exec(
                 cli,
                 "--version",
+                env=self.cli_environment(),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -163,23 +178,24 @@ class ClaudeSubscriptionService:
                 creationflags=creation_flags,
             )
         elif system == "Linux":
-            terminal = next(
+            terminal_choice = next(
                 (
-                    candidate
+                    (candidate, discover_cli(candidate).executable)
                     for candidate in (
                         "gnome-terminal",
                         "konsole",
                         "xfce4-terminal",
                         "xterm",
                     )
-                    if shutil.which(candidate)
+                    if discover_cli(candidate).executable
                 ),
                 None,
             )
-            if not terminal or not os.getenv("DISPLAY"):
+            if not terminal_choice or not os.getenv("DISPLAY"):
                 raise RuntimeError(
                     "Open a terminal and run `claude auth login`, then refresh the status."
                 )
+            terminal_name, terminal = terminal_choice
             shell_command = f"{command}; exec {shlex.quote(os.getenv('SHELL', '/bin/sh'))}"
             commands = {
                 "gnome-terminal": [terminal, "--", "sh", "-lc", shell_command],
@@ -187,7 +203,7 @@ class ClaudeSubscriptionService:
                 "xfce4-terminal": [terminal, "-e", f"sh -lc {shlex.quote(shell_command)}"],
                 "xterm": [terminal, "-hold", "-e", "sh", "-lc", shell_command],
             }
-            subprocess.Popen(commands[terminal])
+            subprocess.Popen(commands[terminal_name])
         else:
             raise RuntimeError(
                 "Open a terminal and run `claude auth login`, then refresh the status."

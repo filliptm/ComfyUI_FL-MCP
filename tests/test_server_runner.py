@@ -52,3 +52,22 @@ def test_existing_fl_mcp_backend_is_reusable(monkeypatch):
     runner = server_runner.ServerRunner(".", auto_start=False)
 
     assert runner.is_fl_mcp_backend() is True
+
+
+def test_startup_failure_is_retained_for_frontend_diagnostics(tmp_path, monkeypatch):
+    runner = server_runner.ServerRunner(tmp_path, auto_start=False)
+    runner.active_mode = "subprocess"
+    monkeypatch.setattr(runner, "is_port_in_use", lambda: False)
+
+    class FailedProcess:
+        @staticmethod
+        def poll():
+            return 1
+
+    runner.process = FailedProcess()
+
+    assert runner.wait_for_server(timeout=0.1) is False
+    assert "exited during startup with code 1" in runner.last_error
+    assert "fl_mcp_server.log" in runner.last_error
+    runner.process = None
+    runner.cleanup()

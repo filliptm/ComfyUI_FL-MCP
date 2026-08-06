@@ -45,6 +45,7 @@ async def test_status_uses_only_non_identity_claude_auth_fields(monkeypatch):
     assert status["configured"] is True
     assert status["source"] == "claude_cli"
     assert status["subscriptionType"] == "max"
+    assert status["executablePath"] == "/usr/local/bin/claude"
     assert "email" not in status
     assert "orgId" not in status
 
