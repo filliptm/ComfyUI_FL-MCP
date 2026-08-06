@@ -503,6 +503,7 @@ test("Claude subscription setup stays separate from API key providers", async ()
     assert.match(panel, /Finish signing in through the Claude Code terminal window/);
     assert.match(client, /\/api\/chat\/claude\/login/);
     assert.match(client, /\/api\/chat\/claude\/refresh/);
+    assert.match(panel, /history && history\.renderFrame !== null/);
 });
 
 

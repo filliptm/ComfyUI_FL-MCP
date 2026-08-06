@@ -113,6 +113,8 @@ def _launcher_status():
     )
     backend_reachable = health_matches or status_matches
     mode = (mcp_status or {}).get("mode")
+    runner = globals().get("server_runner")
+    launcher_error = getattr(runner, "last_error", None)
     return {
         "backendUrl": backend_url,
         "wsUrl": f"ws://127.0.0.1:{PORT}/ws",
@@ -124,6 +126,7 @@ def _launcher_status():
         "canStart": not backend_reachable,
         "canStop": bool(backend_reachable and (mode == "daemon" or pid)),
         "port": PORT,
+        "error": None if backend_reachable else launcher_error,
     }
 
 

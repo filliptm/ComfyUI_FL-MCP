@@ -80,3 +80,95 @@ test("runMessage renders the user request before starting the backend run", asyn
     assert.equal(panel.currentRunContext.runId, "run-1");
     assert.equal(panel.running, false);
 });
+
+
+test("plain-text assistant replies finish without tool history", async () => {
+    const AssistantPanel = await loadAssistantPanel();
+    const panel = Object.create(AssistantPanel.prototype);
+    let textFinished = false;
+    let streamingRemoved = false;
+    panel.finishActiveTextSegment = () => {
+        textFinished = true;
+    };
+    const message = {
+        toolHistory: null,
+        article: {
+            classList: {
+                remove(name) {
+                    assert.equal(name, "streaming");
+                    streamingRemoved = true;
+                },
+            },
+        },
+    };
+
+    assert.doesNotThrow(() => panel.finishAssistantMessage(message));
+    assert.equal(textFinished, true);
+    assert.equal(streamingRemoved, true);
+});
+
+
+test("subscription model changes persist before status refresh can roll them back", async () => {
+    const AssistantPanel = await loadAssistantPanel();
+    const panel = Object.create(AssistantPanel.prototype);
+    const calls = [];
+    Object.assign(panel, {
+        settings: { model: "sonnet" },
+        status: { model: "sonnet" },
+        modelInput: { value: "sonnet" },
+        subscriptionModelSelect: { value: "opus", disabled: false },
+        renderReasoningControls: () => {},
+        updateModelSettingsState: () => {},
+        updateStatus: () => calls.push(["status", panel.status.model]),
+        updateProviderBadge: () => {},
+        announce: message => calls.push(["announce", message]),
+        showError: error => assert.fail(error),
+        chat: {
+            async updateSettings(update) {
+                calls.push(["update", update]);
+                assert.equal(panel.pendingSubscriptionModel, "opus");
+                return { model: update.model };
+            },
+        },
+    });
+
+    await panel.selectSubscriptionModel();
+
+    assert.deepEqual(JSON.parse(JSON.stringify(calls)), [
+        ["update", { model: "opus" }],
+        ["status", "opus"],
+        ["announce", "Model changed to opus."],
+    ]);
+    assert.equal(panel.modelInput.value, "opus");
+    assert.equal(panel.settings.model, "opus");
+    assert.equal(panel.pendingSubscriptionModel, null);
+    assert.equal(panel.subscriptionModelSelect.disabled, false);
+});
+
+
+test("status updates preserve a subscription model while it is being saved", async () => {
+    const AssistantPanel = await loadAssistantPanel();
+    const panel = Object.create(AssistantPanel.prototype);
+    let rendered = false;
+    Object.assign(panel, {
+        pendingSubscriptionModel: "opus",
+        status: { available: true, configured: true, bridgeConnected: true, model: "sonnet" },
+        modelInput: { value: "sonnet" },
+        statusDot: { className: "" },
+        statusCopy: { textContent: "" },
+        statusBanner: {
+            hidden: false,
+            querySelector: () => ({ textContent: "" }),
+        },
+        statusBannerCopy: { textContent: "" },
+        updateDiagnosticsSettingsState: () => {},
+        renderProviderControls: () => { rendered = true; },
+        updateProviderBadge: () => {},
+        refreshCanvasContext: () => {},
+    });
+
+    panel.updateStatus();
+
+    assert.equal(panel.modelInput.value, "opus");
+    assert.equal(rendered, true);
+});

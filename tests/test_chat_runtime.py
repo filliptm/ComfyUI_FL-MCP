@@ -758,7 +758,14 @@ async def test_claude_subscription_streams_tools_approvals_and_persists_session(
     runtime = ChatRuntime(store)
     state = ActiveRun("run-1", conversation["id"], "canvas-session")
     store.create_run(state.run_id, state.conversation_id)
-    monkeypatch.setattr("chat_runtime.shutil.which", lambda _name: "/fake/claude")
+    monkeypatch.setattr(
+        "chat_runtime.claude_subscription.cli_path",
+        lambda: "/fake/claude",
+    )
+    monkeypatch.setattr(
+        "chat_runtime.claude_subscription.cli_environment",
+        lambda: {"PATH": "/fake/bin"},
+    )
 
     async def fake_query(*, prompt, options):
         prompt_items = [item async for item in prompt]
@@ -772,6 +779,7 @@ async def test_claude_subscription_streams_tools_approvals_and_persists_session(
         )
         assert "view_chat_image" in allowed_tool_names
         assert "view_node_mask" in allowed_tool_names
+        assert callable(options.stderr)
 
         image_view = await options.can_use_tool(
             "mcp__ren__view_chat_image",
@@ -896,6 +904,39 @@ async def test_claude_subscription_streams_tools_approvals_and_persists_session(
     assert assistant["content"] == "Checked. Eight nodes."
     assert assistant["metadata"]["claudeSessionId"] == "claude-session"
     assert assistant["metadata"]["toolSteps"][0]["contentOffset"] == len("Checked. ")
+
+
+def test_provider_failure_message_surfaces_sanitized_claude_stderr():
+    from chat_runtime import provider_failure_message
+
+    error = RuntimeError(
+        "Command failed with exit code 1 (exit code: 1)\n"
+        "Error output: Check stderr output for details"
+    )
+
+    message = provider_failure_message(
+        error,
+        ["Authentication failed", "token=secret-value"],
+    )
+
+    assert "Check stderr output for details" not in message
+    assert "Authentication failed" in message
+    assert "token=[redacted]" in message
+    assert "secret-value" not in message
+
+
+def test_claude_result_error_prefers_actionable_result_text():
+    from types import SimpleNamespace
+
+    from chat_runtime import claude_result_error_message
+
+    message = claude_result_error_message(SimpleNamespace(
+        errors=[],
+        result="Not logged in · Please run /login",
+        subtype="success",
+    ))
+
+    assert message == "Not logged in · Please run /login"
 
 
 @pytest.mark.asyncio
