@@ -456,6 +456,10 @@ def test_intent_tool_filter_keeps_core_and_adds_narrow_groups():
     assert "edit_node_mask" in basic
     assert "confirm_mask_review" in basic
     assert "get_execution_history" in basic
+    assert "node_library_search" in basic
+    assert "node_library_get_details" in basic
+    assert "node_library_status" in basic
+    assert "node_library_find_compatible" not in basic
     assert "web_search" not in basic
     assert "web_fetch_page" not in basic
     assert "manager_queue_action" not in basic

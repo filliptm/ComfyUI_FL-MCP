@@ -332,6 +332,11 @@ export const TOOL_CONFIG = {
         label: "Search Nodes",
         description: "Searching available node types"
     },
+    "node_library_status": {
+        icon: "📚",
+        label: "Node Catalog",
+        description: "Checking the loaded-node catalog"
+    },
     "node_library_get_details": {
         icon: "📖",
         label: "Node Details",
@@ -465,6 +470,7 @@ const TOOL_ICON_CLASSES = {
     web_search: "pi pi-globe",
     web_fetch_page: "pi pi-file",
     node_library_search: "pi pi-search",
+    node_library_status: "pi pi-book",
     node_library_get_details: "pi pi-info-circle",
     manager_check_updates: "pi pi-refresh",
     manager_queue_action: "pi pi-download",
@@ -496,6 +502,7 @@ const TOOL_RUNNING_LABELS = {
     web_search: "Searching the web",
     web_fetch_page: "Reading web page",
     node_library_search: "Searching node library",
+    node_library_status: "Checking node catalog",
     manager_check_updates: "Checking for updates",
 };
 

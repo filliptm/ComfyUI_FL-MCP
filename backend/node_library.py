@@ -5,10 +5,13 @@ through the /object_info API endpoint.
 """
 
 import asyncio
+import hashlib
+import json
 import logging
 import time
-from typing import Any, Dict, List, Optional, Literal
+from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Any, Literal
 
 import httpx
 
@@ -19,86 +22,168 @@ logger = logging.getLogger(__name__)
 # Exceptions
 # ============================================================================
 
+
 class NodeLibraryError(Exception):
     """Base exception for node library errors."""
+
     pass
 
 
 class NodeLibraryConnectionError(NodeLibraryError):
     """Raised when ComfyUI server is unreachable."""
+
     pass
 
 
 class NodeTypeNotFoundError(NodeLibraryError):
     """Raised when a node type doesn't exist."""
+
     pass
+
+
+def canonical_schema_hash(value: Any) -> str:
+    """Return a stable identity for JSON-compatible runtime schema data."""
+    payload = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def node_schema_hash(node_type: str, node_info: dict[str, Any]) -> str:
+    return canonical_schema_hash({"node_type": node_type, "schema": node_info})
+
+
+def classify_node_origin(node_info: dict[str, Any]) -> str:
+    """Classify a loaded node from the provenance exposed by /object_info."""
+    python_module = str(node_info.get("python_module") or "")
+    category = str(node_info.get("category") or "").lower()
+    if (
+        bool(node_info.get("api_node"))
+        or python_module.startswith("comfy_api_nodes.")
+        or category == "partner"
+        or category.startswith("partner/")
+    ):
+        return "partner"
+    if python_module == "nodes" or python_module.startswith("comfy_extras."):
+        return "native"
+    if python_module.startswith("custom_nodes."):
+        return "custom"
+    return "unknown"
 
 
 # ============================================================================
 # Data Classes
 # ============================================================================
 
+
 @dataclass
 class NodeSearchResult:
     """Result from node library search."""
+
     node_type: str
     display_name: str
     category: str
     description: str
-    inputs: Dict[str, Any]
-    outputs: List[str]
+    inputs: dict[str, Any]
+    outputs: list[str]
     match_reason: str
+    origin: str
+    python_module: str
+    schema_hash: str
+    score: int
 
 
 @dataclass
 class CompatibleNode:
     """Compatible node type for connection."""
+
     node_type: str
     display_name: str
     category: str
-    connection: Dict[str, str]
+    direction: Literal["downstream", "upstream"]
+    connection: dict[str, str]
     description: str
+
+
+@dataclass(frozen=True)
+class NodeCatalogSnapshot:
+    data: dict[str, Any]
+    source: str
+    catalog_hash: str
+    fetched_at: float
+    expires_at: float
 
 
 # ============================================================================
 # Cache
 # ============================================================================
 
+
 class NodeLibraryCache:
     """Cache for ComfyUI node library data."""
-    
-    def __init__(self, ttl_seconds: int = 300):
-        self._cache: Optional[Dict[str, Any]] = None
-        self._cache_time: Optional[float] = None
+
+    def __init__(self, ttl_seconds: int = 300, clock: Callable[[], float] = time.time):
+        self._snapshot: NodeCatalogSnapshot | None = None
         self._ttl = ttl_seconds
+        self._clock = clock
         self._lock = asyncio.Lock()
-    
-    async def get(self) -> Optional[Dict[str, Any]]:
+
+    async def get(self) -> NodeCatalogSnapshot | None:
         """Get cached data if valid."""
         async with self._lock:
-            if self._cache is None:
+            if self._snapshot is None:
                 return None
-            
-            age = time.time() - self._cache_time
+
+            age = self._clock() - self._snapshot.fetched_at
             if age > self._ttl:
                 logger.debug(f"[NodeLibrary] Cache expired (age: {age:.1f}s)")
                 return None
-            
+
             logger.debug(f"[NodeLibrary] Cache hit (age: {age:.1f}s)")
-            return self._cache
-    
-    async def set(self, data: Dict[str, Any]):
+            return self._snapshot
+
+    async def set(self, data: dict[str, Any], source: str) -> NodeCatalogSnapshot:
         """Set cache data."""
         async with self._lock:
-            self._cache = data
-            self._cache_time = time.time()
+            fetched_at = self._clock()
+            self._snapshot = NodeCatalogSnapshot(
+                data=data,
+                source=source,
+                catalog_hash=canonical_schema_hash(data),
+                fetched_at=fetched_at,
+                expires_at=fetched_at + self._ttl,
+            )
             logger.debug(f"[NodeLibrary] Cache updated ({len(data)} nodes)")
-    
+            return self._snapshot
+
+    async def status(self, source: str) -> dict[str, Any]:
+        async with self._lock:
+            if self._snapshot is None:
+                return {
+                    "state": "empty",
+                    "source": source,
+                    "node_count": 0,
+                    "catalog_hash": None,
+                    "fetched_at": None,
+                    "expires_at": None,
+                }
+            state = "fresh" if self._clock() <= self._snapshot.expires_at else "stale"
+            return {
+                "state": state,
+                "source": self._snapshot.source,
+                "node_count": len(self._snapshot.data),
+                "catalog_hash": self._snapshot.catalog_hash,
+                "fetched_at": self._snapshot.fetched_at,
+                "expires_at": self._snapshot.expires_at,
+            }
+
     async def invalidate(self):
         """Clear cache."""
         async with self._lock:
-            self._cache = None
-            self._cache_time = None
+            self._snapshot = None
             logger.debug("[NodeLibrary] Cache invalidated")
 
 
@@ -106,392 +191,449 @@ class NodeLibraryCache:
 # Core Client
 # ============================================================================
 
+
 class NodeLibraryClient:
     """Client for ComfyUI node library discovery."""
-    
-    def __init__(self, server_url: str = "http://127.0.0.1:8188", timeout: int = 10):
-        self.server_url = server_url.rstrip('/')
+
+    def __init__(
+        self,
+        server_url: str = "http://127.0.0.1:8188",
+        timeout: int = 10,
+        *,
+        cache_ttl: int = 300,
+        clock: Callable[[], float] = time.time,
+    ):
+        self.server_url = server_url.rstrip("/")
         self.timeout = timeout
-        self.cache = NodeLibraryCache(ttl_seconds=300)
-    
-    async def fetch_node_library(self) -> Dict[str, Any]:
+        self.cache = NodeLibraryCache(ttl_seconds=cache_ttl, clock=clock)
+        self._fetch_lock = asyncio.Lock()
+
+    @property
+    def source(self) -> str:
+        return f"{self.server_url}/object_info"
+
+    async def fetch_node_library(self, *, force_refresh: bool = False) -> dict[str, Any]:
         """Fetch node library from ComfyUI /object_info endpoint.
-        
+
         Returns:
             Dictionary mapping node type names to node metadata
-            
+
         Raises:
             NodeLibraryConnectionError: If ComfyUI server is unreachable
         """
-        # Check cache first
-        cached = await self.cache.get()
-        if cached is not None:
-            return cached
-        
-        # Fetch from ComfyUI
-        url = f"{self.server_url}/object_info"
-        
-        try:
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
-                logger.info(f"[NodeLibrary] Fetching from {url}")
-                response = await client.get(url)
-                response.raise_for_status()
-                
-                data = response.json()
-                
-                # Validate response structure
-                if not isinstance(data, dict):
-                    raise NodeLibraryConnectionError(
-                        f"Invalid response from ComfyUI: expected dict, got {type(data)}"
-                    )
-                
-                logger.info(f"[NodeLibrary] Fetched {len(data)} node types")
-                
-                # Cache the result
-                await self.cache.set(data)
-                
-                return data
-                
-        except httpx.TimeoutException:
-            raise NodeLibraryConnectionError(
-                f"ComfyUI server timeout. Is ComfyUI running at {self.server_url}?"
-            )
-        except httpx.HTTPStatusError as e:
-            raise NodeLibraryConnectionError(
-                f"ComfyUI server error: {e.response.status_code}"
-            )
-        except httpx.RequestError as e:
-            raise NodeLibraryConnectionError(
-                f"Failed to connect to ComfyUI at {self.server_url}: {e}"
-            )
-        except Exception as e:
-            logger.error(f"[NodeLibrary] Unexpected error: {e}")
-            raise NodeLibraryConnectionError(f"Failed to fetch node library: {e}")
-    
+        if not force_refresh:
+            cached = await self.cache.get()
+            if cached is not None:
+                return cached.data
+
+        async with self._fetch_lock:
+            if not force_refresh:
+                cached = await self.cache.get()
+                if cached is not None:
+                    return cached.data
+
+            try:
+                async with httpx.AsyncClient(timeout=self.timeout) as client:
+                    logger.info(f"[NodeLibrary] Fetching from {self.source}")
+                    response = await client.get(self.source)
+                    response.raise_for_status()
+                    data = response.json()
+                    if not isinstance(data, dict):
+                        raise NodeLibraryConnectionError(
+                            f"Invalid response from ComfyUI: expected dict, got {type(data)}"
+                        )
+                    logger.info(f"[NodeLibrary] Fetched {len(data)} node types")
+                    await self.cache.set(data, self.source)
+                    return data
+            except NodeLibraryConnectionError:
+                raise
+            except httpx.TimeoutException as exc:
+                raise NodeLibraryConnectionError(
+                    f"ComfyUI server timeout. Is ComfyUI running at {self.server_url}?"
+                ) from exc
+            except httpx.HTTPStatusError as exc:
+                raise NodeLibraryConnectionError(
+                    f"ComfyUI server error: {exc.response.status_code}"
+                ) from exc
+            except httpx.RequestError as exc:
+                raise NodeLibraryConnectionError(
+                    f"Failed to connect to ComfyUI at {self.server_url}: {exc}"
+                ) from exc
+            except Exception as exc:
+                logger.error(f"[NodeLibrary] Unexpected error: {exc}")
+                raise NodeLibraryConnectionError(f"Failed to fetch node library: {exc}") from exc
+
+    async def catalog_status(self, *, refresh: bool = False) -> dict[str, Any]:
+        status = await self.cache.status(self.source)
+        if refresh or status["state"] == "empty":
+            await self.fetch_node_library(force_refresh=refresh)
+            status = await self.cache.status(self.source)
+        return status
+
     async def search_nodes(
         self,
-        query: Optional[str] = None,
-        category: Optional[str] = None,
-        input_type: Optional[str] = None,
-        output_type: Optional[str] = None,
-        max_results: int = 20
-    ) -> List[NodeSearchResult]:
+        query: str | None = None,
+        category: str | None = None,
+        input_type: str | None = None,
+        output_type: str | None = None,
+        max_results: int = 20,
+    ) -> list[NodeSearchResult]:
         """Search for node types by various criteria.
-        
+
         Args:
             query: Text search in node names/descriptions
             category: Filter by category
             input_type: Find nodes accepting this input type
             output_type: Find nodes producing this output type
             max_results: Maximum results to return
-            
+
         Returns:
             List of matching node search results
         """
         node_library = await self.fetch_node_library()
-        results = []
-        
+        ranked_results = []
+
         for node_type, node_info in node_library.items():
-            # Apply filters
             match_reasons = []
-            
-            # Text query
-            if query and not self._matches_text_query(node_type, node_info, query):
-                continue
+            score = 0
+
             if query:
-                match_reasons.append(f"matches query '{query}'")
-            
-            # Category filter
+                text_match = self._text_match_score(node_type, node_info, query)
+                if text_match is None:
+                    continue
+                score, reason = text_match
+                match_reasons.append(reason)
+
             if category and not self._matches_category(node_info, category):
                 continue
             if category:
                 match_reasons.append(f"category='{category}'")
-            
-            # Input type filter
+
             if input_type and not self._has_input_type(node_info, input_type):
                 continue
             if input_type:
                 match_reasons.append(f"accepts input type '{input_type}'")
-            
-            # Output type filter
+
             if output_type and not self._has_output_type(node_info, output_type):
                 continue
             if output_type:
                 match_reasons.append(f"outputs type '{output_type}'")
-            
-            # Build result
-            results.append(NodeSearchResult(
-                node_type=node_type,
-                display_name=node_info.get('display_name', node_type),
-                category=node_info.get('category', ''),
-                description=node_info.get('description', ''),
-                inputs=node_info.get('input', {}),
-                outputs=node_info.get('output', []),
-                match_reason=', '.join(match_reasons) if match_reasons else 'all nodes'
-            ))
-            
-            if len(results) >= max_results:
-                break
-        
+
+            ranked_results.append(
+                (
+                    score,
+                    NodeSearchResult(
+                        node_type=node_type,
+                        display_name=node_info.get("display_name", node_type),
+                        category=node_info.get("category", ""),
+                        description=node_info.get("description", ""),
+                        inputs=node_info.get("input", {}),
+                        outputs=node_info.get("output", []),
+                        match_reason=", ".join(match_reasons) if match_reasons else "all nodes",
+                        origin=classify_node_origin(node_info),
+                        python_module=str(node_info.get("python_module") or ""),
+                        schema_hash=node_schema_hash(node_type, node_info),
+                        score=score,
+                    ),
+                )
+            )
+
+        ranked_results.sort(
+            key=lambda item: (-item[0], item[1].node_type.casefold(), item[1].node_type)
+        )
+        results = [result for _, result in ranked_results[:max_results]]
         logger.info(f"[NodeLibrary] Search found {len(results)} results")
         return results
-    
-    async def get_node_details(self, node_type: str) -> Dict[str, Any]:
+
+    async def get_node_details(self, node_type: str) -> dict[str, Any]:
         """Get detailed information about a specific node type.
-        
+
         Args:
             node_type: Exact node type name
-            
+
         Returns:
             Complete node metadata
-            
+
         Raises:
             NodeTypeNotFoundError: If node type doesn't exist
         """
         node_library = await self.fetch_node_library()
-        
+
         if node_type not in node_library:
             # Find similar nodes for suggestion
             similar = self._find_similar_node_types(node_type, node_library, max_suggestions=5)
             raise NodeTypeNotFoundError(
-                f"Node type '{node_type}' not found.\n" +
-                (f"Did you mean: {', '.join(similar)}?" if similar else "")
+                f"Node type '{node_type}' not found.\n"
+                + (f"Did you mean: {', '.join(similar)}?" if similar else "")
             )
-        
-        return node_library[node_type]
-    
+
+        node_info = dict(node_library[node_type])
+        status = await self.catalog_status()
+        node_info.update(
+            {
+                "origin": classify_node_origin(node_info),
+                "schema_hash": node_schema_hash(node_type, node_library[node_type]),
+                "catalog_hash": status.get("catalog_hash"),
+                "source": self.source,
+            }
+        )
+        return node_info
+
     async def find_compatible_nodes(
         self,
         node_type: str,
         direction: Literal["downstream", "upstream", "both"] = "downstream",
-        output_slot: Optional[str] = None,
-        input_slot: Optional[str] = None,
-        max_results: int = 30
-    ) -> List[CompatibleNode]:
+        output_slot: str | None = None,
+        input_slot: str | None = None,
+        max_results: int = 30,
+    ) -> list[CompatibleNode]:
         """Find node types compatible with a given node type.
-        
+
         Args:
             node_type: Source node type name
             direction: Search direction (downstream/upstream/both)
             output_slot: Specific output slot to match (downstream only)
             input_slot: Specific input slot to match (upstream only)
             max_results: Maximum results per direction
-            
+
         Returns:
             List of compatible node types
-            
+
         Raises:
             NodeTypeNotFoundError: If source node type doesn't exist
         """
         node_library = await self.fetch_node_library()
-        
+
         # Validate source node exists
         if node_type not in node_library:
             similar = self._find_similar_node_types(node_type, node_library, max_suggestions=5)
             raise NodeTypeNotFoundError(
-                f"Node type '{node_type}' not found.\n" +
-                (f"Did you mean: {', '.join(similar)}?" if similar else "")
+                f"Node type '{node_type}' not found.\n"
+                + (f"Did you mean: {', '.join(similar)}?" if similar else "")
             )
-        
+
         source_node_info = node_library[node_type]
         compatible = []
-        
+
         # Find downstream compatible (what can connect after)
         if direction in ["downstream", "both"]:
             downstream = self._find_downstream_compatible(
                 source_node_info, node_library, output_slot, max_results
             )
             compatible.extend(downstream)
-        
+
         # Find upstream compatible (what can connect before)
         if direction in ["upstream", "both"]:
             upstream = self._find_upstream_compatible(
                 source_node_info, node_library, input_slot, max_results
             )
             compatible.extend(upstream)
-        
+
         logger.info(f"[NodeLibrary] Found {len(compatible)} compatible nodes")
         return compatible
-    
+
     # ========================================================================
     # Helper Methods
     # ========================================================================
-    
-    def _matches_text_query(self, node_type: str, node_info: Dict[str, Any], query: str) -> bool:
+
+    def _matches_text_query(self, node_type: str, node_info: dict[str, Any], query: str) -> bool:
         """Check if node matches text query."""
-        query_lower = query.lower()
-        
-        # Search in node type name
-        if node_type is not None:
-            if query_lower in node_type.lower():
-                return True
-        
-        if node_info is not None:
-            # Search in display name
-            dn = node_info.get('display_name', '')
-            if dn and query_lower in str(dn).lower():
-                return True
-            
-            # Search in description
-            dsc = node_info.get('description', '')
-            if dsc and query_lower in str(dsc).lower():
-                return True
-            
-            # Search in category
-            cat = node_info.get('category', '')
-            if query_lower in str(cat).lower():
-                return True
-        
-        return False
-    
-    def _has_input_type(self, node_info: Dict[str, Any], input_type: str) -> bool:
+        return self._text_match_score(node_type, node_info, query) is not None
+
+    def _text_match_score(
+        self,
+        node_type: str,
+        node_info: dict[str, Any],
+        query: str,
+    ) -> tuple[int, str] | None:
+        query_lower = query.strip().casefold()
+        if not query_lower:
+            return 0, "all nodes"
+
+        display_name = str(node_info.get("display_name") or node_type)
+        aliases = node_info.get("search_aliases") or []
+        if isinstance(aliases, str):
+            aliases = [aliases]
+        fields = [
+            (node_type, 100, 70, 50, "node type"),
+            (display_name, 90, 65, 45, "display name"),
+            *((str(alias), 80, 60, 40, "search alias") for alias in aliases),
+        ]
+        matches = []
+        for value, exact_score, prefix_score, contains_score, label in fields:
+            normalized = value.casefold()
+            if normalized == query_lower:
+                matches.append((exact_score, f"exact {label} match"))
+            elif normalized.startswith(query_lower):
+                matches.append((prefix_score, f"{label} prefix match"))
+            elif query_lower in normalized:
+                matches.append((contains_score, f"{label} contains query"))
+        if matches:
+            return max(matches, key=lambda item: item[0])
+
+        description = str(node_info.get("description") or "").casefold()
+        if query_lower in description:
+            return 20, "description contains query"
+        category = str(node_info.get("category") or "").casefold()
+        if query_lower in category:
+            return 10, "category contains query"
+        return None
+
+    def _has_input_type(self, node_info: dict[str, Any], input_type: str) -> bool:
         """Check if node has input of specified type."""
-        inputs = node_info.get('input', {})
-        required = inputs.get('required', {})
-        optional = inputs.get('optional', {})
-        
+        inputs = node_info.get("input", {})
+        required = inputs.get("required", {})
+        optional = inputs.get("optional", {})
+
         for param_spec in {**required, **optional}.values():
             if isinstance(param_spec, list) and len(param_spec) > 0:
                 if param_spec[0] == input_type:
                     return True
-        
+
         return False
-    
-    def _has_output_type(self, node_info: Dict[str, Any], output_type: str) -> bool:
+
+    def _has_output_type(self, node_info: dict[str, Any], output_type: str) -> bool:
         """Check if node has output of specified type."""
-        outputs = node_info.get('output', [])
+        outputs = node_info.get("output", [])
         return output_type in outputs
-    
-    def _matches_category(self, node_info: Dict[str, Any], category: str) -> bool:
+
+    def _matches_category(self, node_info: dict[str, Any], category: str) -> bool:
         """Check if node belongs to category."""
-        node_category = node_info.get('category', '').lower()
+        node_category = node_info.get("category", "").lower()
         category_lower = category.lower()
-        
+
         # Exact match or starts with (for subcategories like "image/upscaling")
-        return node_category == category_lower or node_category.startswith(category_lower + '/')
-    
+        return node_category == category_lower or node_category.startswith(category_lower + "/")
+
     def _find_similar_node_types(
-        self, 
-        query: str, 
-        node_library: Dict[str, Any], 
-        max_suggestions: int = 5
-    ) -> List[str]:
+        self, query: str, node_library: dict[str, Any], max_suggestions: int = 5
+    ) -> list[str]:
         """Find similar node type names for suggestions."""
         query_lower = query.lower()
         similar = []
-        
-        for node_type in node_library.keys():
+
+        for node_type in sorted(node_library, key=lambda value: (value.casefold(), value)):
             # Simple similarity: contains query or query contains node type
             if query_lower in node_type.lower() or node_type.lower() in query_lower:
                 similar.append(node_type)
                 if len(similar) >= max_suggestions:
                     break
-        
+
         return similar
-    
+
     def _find_downstream_compatible(
         self,
-        source_node_info: Dict[str, Any],
-        all_nodes: Dict[str, Any],
-        output_slot: Optional[str] = None,
-        max_results: int = 30
-    ) -> List[CompatibleNode]:
+        source_node_info: dict[str, Any],
+        all_nodes: dict[str, Any],
+        output_slot: str | None = None,
+        max_results: int = 30,
+    ) -> list[CompatibleNode]:
         """Find node types that can accept outputs from source node."""
-        source_outputs = source_node_info.get('output', [])
+        source_outputs = source_node_info.get("output", [])
         if not source_outputs:
             return []
-        
+
         # Filter to specific output slot if requested
         if output_slot is not None:
-            output_names = source_node_info.get('output_name', [])
-            if output_slot in output_names:
-                idx = output_names.index(output_slot)
-                if idx < len(source_outputs):
-                    source_outputs = [source_outputs[idx]]
-        
+            output_names = source_node_info.get("output_name", [])
+            if output_slot not in output_names:
+                return []
+            idx = output_names.index(output_slot)
+            if idx >= len(source_outputs):
+                return []
+            source_outputs = [source_outputs[idx]]
+
         compatible = []
-        
-        for node_type, node_info in all_nodes.items():
-            inputs = node_info.get('input', {}).get('required', {})
-            
+
+        for node_type in sorted(all_nodes, key=lambda value: (value.casefold(), value)):
+            node_info = all_nodes[node_type]
+            inputs = node_info.get("input", {}).get("required", {})
+
             for input_name, input_spec in inputs.items():
                 if isinstance(input_spec, list) and len(input_spec) > 0:
                     input_type = input_spec[0]
-                    
+
                     if input_type in source_outputs:
-                        compatible.append(CompatibleNode(
-                            node_type=node_type,
-                            display_name=node_info.get('display_name', node_type),
-                            category=node_info.get('category', ''),
-                            connection={
-                                'source_output': input_type,
-                                'target_input': input_name,
-                                'data_type': input_type
-                            },
-                            description=node_info.get('description', '')
-                        ))
+                        compatible.append(
+                            CompatibleNode(
+                                node_type=node_type,
+                                display_name=node_info.get("display_name", node_type),
+                                category=node_info.get("category", ""),
+                                direction="downstream",
+                                connection={
+                                    "source_output": input_type,
+                                    "target_input": input_name,
+                                    "data_type": input_type,
+                                },
+                                description=node_info.get("description", ""),
+                            )
+                        )
                         break
-            
+
             if len(compatible) >= max_results:
                 break
-        
+
         return compatible
-    
+
     def _find_upstream_compatible(
         self,
-        target_node_info: Dict[str, Any],
-        all_nodes: Dict[str, Any],
-        input_slot: Optional[str] = None,
-        max_results: int = 30
-    ) -> List[CompatibleNode]:
+        target_node_info: dict[str, Any],
+        all_nodes: dict[str, Any],
+        input_slot: str | None = None,
+        max_results: int = 30,
+    ) -> list[CompatibleNode]:
         """Find node types that can provide inputs to target node."""
-        target_inputs = target_node_info.get('input', {}).get('required', {})
+        target_inputs = target_node_info.get("input", {}).get("required", {})
         if not target_inputs:
             return []
-        
+
         # Filter to specific input slot if requested
         if input_slot is not None:
             if input_slot in target_inputs:
                 target_inputs = {input_slot: target_inputs[input_slot]}
             else:
                 return []
-        
+
         # Collect required input types
         required_types = set()
         for input_spec in target_inputs.values():
             if isinstance(input_spec, list) and len(input_spec) > 0:
                 required_types.add(input_spec[0])
-        
+
         if not required_types:
             return []
-        
+
         compatible = []
-        
-        for node_type, node_info in all_nodes.items():
-            outputs = node_info.get('output', [])
-            
+
+        for node_type in sorted(all_nodes, key=lambda value: (value.casefold(), value)):
+            node_info = all_nodes[node_type]
+            outputs = node_info.get("output", [])
+
             for output_type in outputs:
                 if output_type in required_types:
                     # Find which input this satisfies
                     for input_name, input_spec in target_inputs.items():
                         if isinstance(input_spec, list) and input_spec[0] == output_type:
-                            compatible.append(CompatibleNode(
-                                node_type=node_type,
-                                display_name=node_info.get('display_name', node_type),
-                                category=node_info.get('category', ''),
-                                connection={
-                                    'source_output': output_type,
-                                    'target_input': input_name,
-                                    'data_type': output_type
-                                },
-                                description=node_info.get('description', '')
-                            ))
+                            compatible.append(
+                                CompatibleNode(
+                                    node_type=node_type,
+                                    display_name=node_info.get("display_name", node_type),
+                                    category=node_info.get("category", ""),
+                                    direction="upstream",
+                                    connection={
+                                        "source_output": output_type,
+                                        "target_input": input_name,
+                                        "data_type": output_type,
+                                    },
+                                    description=node_info.get("description", ""),
+                                )
+                            )
                             break
                     break
-            
+
             if len(compatible) >= max_results:
                 break
-        
+
         return compatible
 
 
@@ -499,15 +641,15 @@ class NodeLibraryClient:
 # Global Instance
 # ============================================================================
 
-_node_library_client: Optional[NodeLibraryClient] = None
+_node_library_clients: dict[tuple[str, int], NodeLibraryClient] = {}
 
 
 def get_node_library_client(
-    server_url: str = "http://127.0.0.1:8188",
-    timeout: int = 10
+    server_url: str = "http://127.0.0.1:8188", timeout: int = 10
 ) -> NodeLibraryClient:
     """Get or create the global NodeLibraryClient instance."""
-    global _node_library_client
-    if _node_library_client is None:
-        _node_library_client = NodeLibraryClient(server_url, timeout)
-    return _node_library_client
+    normalized_url = server_url.rstrip("/")
+    key = (normalized_url, timeout)
+    if key not in _node_library_clients:
+        _node_library_clients[key] = NodeLibraryClient(normalized_url, timeout)
+    return _node_library_clients[key]

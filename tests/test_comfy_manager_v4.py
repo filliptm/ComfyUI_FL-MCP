@@ -6,7 +6,12 @@ from types import SimpleNamespace
 import httpx
 import pytest
 
-from backend.comfy_manager import ComfyManagerClient, ManagerAPIError, ManagerVersion
+from backend.comfy_manager import (
+    ComfyManagerClient,
+    ManagerAPIError,
+    ManagerNotInstalledError,
+    ManagerVersion,
+)
 
 
 class FakeAsyncClient:
@@ -87,6 +92,127 @@ def test_installed_packs_and_node_mappings_use_v2_routes(fake_http):
     assert mappings["KSampler"].node_pack_id == "comfy-core"
     assert mappings["KSampler"].node_pack_name == "Comfy Core"
     assert requests[-1]["params"] == {"mode": "local"}
+    assert not any(
+        request["url"].startswith("http://comfy/customnode/")
+        for request in requests
+    )
+
+
+def test_installed_packs_fall_back_to_legacy_route_and_remember_it(fake_http):
+    routes, requests = fake_http
+    routes[("GET", "http://comfy/features")] = {
+        "extension": {"manager": {"supports_v4": True}}
+    }
+    routes[("GET", "http://comfy/customnode/installed")] = {
+        "Example Pack": {
+            "ver": "abc123",
+            "cnr_id": "example-pack",
+            "aux_id": "example/pack",
+            "enabled": True,
+        }
+    }
+    routes[("GET", "http://comfy/v2/customnode/getmappings")] = {
+        "example-pack": [["ExampleNode"], {"title_aux": "Example Pack"}]
+    }
+
+    async def run():
+        client = ComfyManagerClient("http://comfy")
+        first = await client.list_installed_packs()
+        second = await client.list_installed_packs()
+        mappings = await client.get_node_mappings()
+        return first, second, mappings
+
+    first, second, mappings = asyncio.run(run())
+
+    assert first == second
+    assert "Example Pack" in first
+    assert mappings["ExampleNode"].node_pack_id == "example-pack"
+    urls = [request["url"] for request in requests]
+    assert urls.count("http://comfy/v2/customnode/installed") == 1
+    assert urls.count("http://comfy/customnode/installed") == 2
+    assert urls.count("http://comfy/v2/customnode/getmappings") == 1
+    assert "http://comfy/customnode/getmappings" not in urls
+
+
+def test_node_mappings_fall_back_to_legacy_route_and_remember_it(fake_http):
+    routes, requests = fake_http
+    routes[("GET", "http://comfy/features")] = {
+        "extension": {"manager": {"supports_v4": True}}
+    }
+    routes[("GET", "http://comfy/customnode/getmappings")] = {
+        "legacy-pack": [["LegacyNode"], {"title_aux": "Legacy Pack"}]
+    }
+
+    async def run():
+        client = ComfyManagerClient("http://comfy")
+        first = await client.get_node_mappings(mode="local")
+        second = await client.get_node_mappings(mode="local")
+        return first, second
+
+    first, second = asyncio.run(run())
+
+    assert first == second
+    assert first["LegacyNode"].node_pack_name == "Legacy Pack"
+    urls = [request["url"] for request in requests]
+    assert urls.count("http://comfy/v2/customnode/getmappings") == 1
+    assert urls.count("http://comfy/customnode/getmappings") == 2
+    mapping_requests = [
+        request for request in requests if request["url"].endswith("getmappings")
+    ]
+    assert all(request["params"] == {"mode": "local"} for request in mapping_requests)
+
+
+def test_customnode_read_does_not_fall_back_on_non_404(fake_http):
+    routes, requests = fake_http
+    routes[("GET", "http://comfy/features")] = {
+        "extension": {"manager": {"supports_v4": True}}
+    }
+    routes[("GET", "http://comfy/v2/customnode/installed")] = httpx.Response(
+        500,
+        text="boom",
+    )
+    routes[("GET", "http://comfy/customnode/installed")] = {"unexpected": {}}
+
+    async def run():
+        client = ComfyManagerClient("http://comfy")
+        await client.list_installed_packs()
+
+    with pytest.raises(ManagerAPIError) as exc:
+        asyncio.run(run())
+
+    assert exc.value.status_code == 500
+    assert "500" in str(exc.value)
+    assert not any(
+        request["url"] == "http://comfy/customnode/installed"
+        for request in requests
+    )
+
+
+def test_legacy_manager_allows_reads_but_keeps_v4_queue_blocked(fake_http):
+    routes, requests = fake_http
+    routes[("GET", "http://comfy/features")] = {
+        "extension": {"manager": {"version": "legacy"}}
+    }
+    routes[("GET", "http://comfy/customnode/installed")] = {
+        "Legacy Pack": {"aux_id": "legacy/pack", "enabled": True}
+    }
+    routes[("GET", "http://comfy/customnode/getmappings")] = {
+        "legacy-pack": [["LegacyNode"], {"title_aux": "Legacy Pack"}]
+    }
+
+    async def run():
+        client = ComfyManagerClient("http://comfy")
+        installed = await client.list_installed_packs()
+        mappings = await client.get_node_mappings()
+        with pytest.raises(ManagerNotInstalledError):
+            await client.queue_status()
+        return installed, mappings
+
+    installed, mappings = asyncio.run(run())
+
+    assert "Legacy Pack" in installed
+    assert mappings["LegacyNode"].node_pack_name == "Legacy Pack"
+    assert not any("/v2/" in request["url"] for request in requests)
 
 
 def test_queue_action_posts_manager_v4_task_and_starts_queue(fake_http):

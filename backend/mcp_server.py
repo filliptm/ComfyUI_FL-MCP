@@ -1381,6 +1381,14 @@ class ComfyLogsRequest(BaseModel):
 # NODE LIBRARY REQUEST MODELS
 # ============================================================================
 
+class NodeLibraryStatusRequest(BaseModel):
+    """Inspect or refresh the local /object_info catalog snapshot."""
+    refresh: bool = Field(
+        False,
+        description="Fetch a fresh /object_info snapshot before returning status"
+    )
+
+
 class NodeLibrarySearchRequest(BaseModel):
     """Search for ComfyUI node types by various criteria."""
     query: Optional[str] = Field(
@@ -3251,6 +3259,32 @@ async def extract_workflow_from_image(
 # ============================================================================
 
 @mcp.tool()
+async def node_library_status(request: NodeLibraryStatusRequest, ctx: Context) -> Dict[str, Any]:
+    """Report the identity and freshness of Ren's local loaded-node catalog.
+
+    The catalog comes only from this ComfyUI instance's /object_info endpoint.
+    Pass refresh=true after installing nodes or restarting ComfyUI so later
+    workflow plans use the latest loaded schemas.
+    """
+    await _report_tool_activity(ctx, "node_library_status")
+
+    try:
+        from config import settings
+        client = get_node_library_client(
+            server_url=settings.comfyui_server_url,
+            timeout=settings.comfyui_api_timeout
+        )
+        return {"catalog": await client.catalog_status(refresh=request.refresh)}
+    except NodeLibraryConnectionError as e:
+        raise RuntimeError(f"ComfyUI server connection failed: {e}")
+    except NodeLibraryError as e:
+        raise RuntimeError(f"Node library status failed: {e}")
+    except Exception as e:
+        logger.error(f"Unexpected error in node_library_status: {e}")
+        raise RuntimeError(f"Tool execution failed: {e}")
+
+
+@mcp.tool()
 async def node_library_search(request: NodeLibrarySearchRequest, ctx: Context) -> Dict[str, Any]:
     """Search for available ComfyUI node types (not workflow nodes).
     
@@ -3286,10 +3320,11 @@ async def node_library_search(request: NodeLibrarySearchRequest, ctx: Context) -
             category=request.category,
             input_type=request.input_type,
             output_type=request.output_type,
-            max_results=request.max_results
+            max_results=request.max_results + 1
         )
-        
-        # Format results
+        truncated = len(results) > request.max_results
+        results = results[:request.max_results]
+
         formatted_results = [
             {
                 "node_type": r.node_type,
@@ -3298,16 +3333,21 @@ async def node_library_search(request: NodeLibrarySearchRequest, ctx: Context) -
                 "description": r.description,
                 "inputs": r.inputs,
                 "outputs": r.outputs,
-                "match_reason": r.match_reason
+                "match_reason": r.match_reason,
+                "origin": r.origin,
+                "python_module": r.python_module,
+                "schema_hash": r.schema_hash,
+                "score": r.score,
             }
             for r in results
         ]
-        
+
         return {
             "query": request.model_dump(exclude_none=True),
             "results": formatted_results,
             "total_results": len(formatted_results),
-            "truncated": len(formatted_results) >= request.max_results
+            "truncated": truncated,
+            "catalog": await client.catalog_status(),
         }
         
     except NodeLibraryConnectionError as e:
@@ -3362,7 +3402,15 @@ async def node_library_get_details(request: NodeLibraryGetDetailsRequest, ctx: C
             "inputs": node_info.get('input', {}),
             "outputs": node_info.get('output', []),
             "output_names": node_info.get('output_name', []),
-            "input_order": node_info.get('input_order', [])
+            "input_order": node_info.get('input_order', []),
+            "origin": node_info.get('origin', 'unknown'),
+            "python_module": node_info.get('python_module', ''),
+            "schema_hash": node_info.get('schema_hash'),
+            "catalog_hash": node_info.get('catalog_hash'),
+            "source": node_info.get('source'),
+            "api_node": bool(node_info.get('api_node')),
+            "deprecated": bool(node_info.get('deprecated')),
+            "experimental": bool(node_info.get('experimental')),
         }
         
     except NodeTypeNotFoundError as e:
@@ -3379,9 +3427,12 @@ async def node_library_get_details(request: NodeLibraryGetDetailsRequest, ctx: C
 @mcp.tool()
 async def node_library_find_compatible(request: NodeLibraryFindCompatibleRequest, ctx: Context) -> Dict[str, Any]:
     """Find node types that can connect to/from a given node type.
-    
+
     This tool helps discover what node types are compatible based on input/output
     type matching. Use this when building workflows to find what comes next.
+
+    HEURISTIC ONLY: This currently uses exact runtime type labels. Confirm the
+    chosen nodes with node_library_get_details before creating connections.
     
     DISTINCTION FROM connect_nodes():
     - connect_nodes() connects EXISTING workflow nodes together
@@ -3413,19 +3464,30 @@ async def node_library_find_compatible(request: NodeLibraryFindCompatibleRequest
             direction=request.direction,
             output_slot=request.output_slot,
             input_slot=request.input_slot,
-            max_results=request.max_results
+            max_results=request.max_results + 1
         )
-        
-        # Format results
+        directions = (
+            ["downstream", "upstream"]
+            if request.direction == "both"
+            else [request.direction]
+        )
+        truncated = False
+        visible_compatible = []
+        for direction in directions:
+            directional = [item for item in compatible if item.direction == direction]
+            truncated = truncated or len(directional) > request.max_results
+            visible_compatible.extend(directional[:request.max_results])
+
         formatted_compatible = [
             {
                 "node_type": c.node_type,
                 "display_name": c.display_name,
                 "category": c.category,
+                "direction": c.direction,
                 "connection": c.connection,
                 "description": c.description
             }
-            for c in compatible
+            for c in visible_compatible
         ]
         
         return {
@@ -3433,7 +3495,8 @@ async def node_library_find_compatible(request: NodeLibraryFindCompatibleRequest
             "direction": request.direction,
             "compatible_nodes": formatted_compatible,
             "total_compatible": len(formatted_compatible),
-            "truncated": len(formatted_compatible) >= request.max_results
+            "truncated": truncated,
+            "catalog": await client.catalog_status(),
         }
         
     except NodeTypeNotFoundError as e:

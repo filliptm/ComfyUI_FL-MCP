@@ -82,6 +82,11 @@ test("tool summaries expose human outcomes for core canvas operations", () => {
         status: "done",
         result: '{"status":"timeout"}',
     }), "Workflow wait timed out");
+    assert.equal(summarizeToolStep({
+        name: "node_library_status",
+        status: "done",
+        result: '{"catalog":{"node_count":1701}}',
+    }), "Cataloged 1,701 loaded nodes");
 });
 
 test("image review and mask summaries report the visible outcome", () => {
