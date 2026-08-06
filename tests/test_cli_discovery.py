@@ -1,8 +1,11 @@
+import os
 from types import SimpleNamespace
 
 import cli_discovery
+import pytest
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Login-shell PATH recovery is POSIX-only.")
 def test_cli_discovery_uses_login_shell_path_for_gui_apps(tmp_path, monkeypatch):
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
