@@ -140,6 +140,7 @@ CORE_CHAT_TOOLS = {
     "node_library_search",
     "node_library_get_details",
     "node_library_status",
+    "node_knowledge_search",
     "compile_workflow_spec",
     "resolve_workflow_spec",
     "plan_workflow",
@@ -166,6 +167,7 @@ COMPILER_FIRST_REDUNDANT_TOOLS = {
     "node_library_search",
     "node_library_get_details",
     "node_library_status",
+    "node_knowledge_search",
     "resolve_workflow_spec",
     "plan_workflow",
     "mcp_capability_audit",
@@ -801,6 +803,11 @@ def registry_discovery_instructions() -> str:
         "`node_library_status` inspect only node types currently loaded by this "
         "ComfyUI instance through `/object_info`. Use them to prove a node can be "
         "created locally.\n"
+        "- `node_knowledge_search` queries Ren's lightweight persistent index of the "
+        "last valid local catalog and schema-scoped, canvas-verified connection lessons. "
+        "Use it for fast discovery or diagnostics, especially after node-pack changes. "
+        "Its results are never build authority: stale records must not enter a plan, and "
+        "the compiler always revalidates against live `/object_info`.\n"
         "- For a complete new workflow or subgraph described in user language, call "
         "`compile_workflow_spec` first. Include every requested role, value, connection, "
         "chat attachment binding, and a stable application ID in that one request. It "

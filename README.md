@@ -375,10 +375,18 @@ These generally require the browser bridge.
 <details>
 <summary><strong>Node Library and Compatibility Tools</strong></summary>
 
+Ren keeps a lightweight SQLite index of the last valid local `/object_info`
+catalog. It reconciles native, partner, and custom node schemas at bridge startup
+and after live catalog refreshes, marks removed classes inactive, and retains only
+schema-scoped connection lessons verified by atomic canvas application. The live
+catalog remains the sole authority for planning and applying workflows; persisted
+or stale records are discovery aids and can never authorize a build.
+
 | Tool | What it does |
 |---|---|
-| `node_library_status` | Reports or refreshes the local `/object_info` catalog identity and native/partner/custom/unknown class counts |
+| `node_library_status` | Reports or refreshes the local `/object_info` catalog identity, origin counts, and persistent-knowledge status |
 | `node_library_search` | Searches node types currently loaded by this ComfyUI instance |
+| `node_knowledge_search` | Searches the last-valid local index with exact origin/schema identity while labeling it discovery-only |
 | `node_library_get_details` | Reads detailed metadata for a node type |
 | `node_library_find_compatible` | Finds compatible node types for connections |
 | `compile_workflow_spec` | Resolves a complete semantic request, canonicalizes dynamic inputs, binds trusted chat images, fills stable defaults, and returns one ready-to-apply valid plan |

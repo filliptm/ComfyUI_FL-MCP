@@ -2,12 +2,19 @@ from types import SimpleNamespace
 
 import mcp_server
 import pytest
+from node_catalog_store import NodeCatalogStore
 from node_library import CompatibleNode, NodeCatalogSnapshot, NodeSearchResult
+from node_library import node_schema_hash
 
 
-def fake_context():
+def fake_context(node_catalog_store=None):
     return SimpleNamespace(
-        request_context=SimpleNamespace(lifespan_context={"client": None})
+        request_context=SimpleNamespace(
+            lifespan_context={
+                "client": None,
+                "node_catalog_store": node_catalog_store,
+            }
+        )
     )
 
 
@@ -78,6 +85,95 @@ async def test_mcp_search_preserves_provenance_and_exact_truncation(monkeypatch)
     assert result["results"][0]["origin"] == "custom"
     assert result["results"][0]["python_module"] == "custom_nodes.example"
     assert result["catalog"]["catalog_hash"] == "a" * 64
+
+
+@pytest.mark.asyncio
+async def test_mcp_node_knowledge_search_is_compact_and_discovery_only():
+    store = NodeCatalogStore(":memory:")
+    catalog = {
+        "CustomImageLoader": {
+            "display_name": "Custom Image Loader",
+            "category": "image/loaders",
+            "description": "Load an image from a custom source",
+            "python_module": "custom_nodes.example",
+            "input": {"required": {}},
+            "output": ["IMAGE"],
+            "output_name": ["IMAGE"],
+        }
+    }
+    try:
+        store.reconcile(catalog, source="http://127.0.0.1:8188/object_info")
+        result = await mcp_server.node_knowledge_search.fn(
+            mcp_server.NodeKnowledgeSearchRequest(query="image loader"),
+            fake_context(store),
+        )
+    finally:
+        store.close()
+
+    assert result["ok"] is True
+    assert result["discovery_only"] is True
+    assert result["build_authority"].startswith("live /object_info")
+    assert result["results"][0]["node_type"] == "CustomImageLoader"
+    assert result["results"][0]["origin"] == "custom"
+    assert "schema" not in result["results"][0]
+
+
+def test_verified_connection_lessons_are_scoped_to_exact_node_schemas():
+    store = NodeCatalogStore(":memory:")
+    catalog = {
+        "Source": {
+            "python_module": "nodes",
+            "input": {"required": {}},
+            "output": ["IMAGE"],
+            "output_name": ["IMAGE"],
+        },
+        "Target": {
+            "python_module": "custom_nodes.target",
+            "input": {"required": {"image": ["IMAGE", {}]}},
+            "output": ["IMAGE"],
+            "output_name": ["IMAGE"],
+        },
+    }
+    try:
+        store.reconcile(catalog, source="object_info")
+        plan = {
+            "nodes": [
+                {
+                    "alias": "source",
+                    "node_type": "Source",
+                    "schema_hash": node_schema_hash("Source", catalog["Source"]),
+                },
+                {
+                    "alias": "target",
+                    "node_type": "Target",
+                    "schema_hash": node_schema_hash("Target", catalog["Target"]),
+                },
+            ],
+            "connections": [
+                {
+                    "source_alias": "source",
+                    "source_output": "IMAGE",
+                    "source_output_index": 0,
+                    "target_alias": "target",
+                    "target_input": "image",
+                }
+            ],
+        }
+
+        mcp_server._record_verified_connection_lessons(
+            store,
+            plan=plan,
+            plan_hash="a" * 64,
+            application_id="verified-application-0001",
+        )
+
+        source_lessons = store.get_verified_lessons("Source")
+        target_lessons = store.get_verified_lessons("Target")
+        assert source_lessons[0]["payload"]["direction"] == "downstream"
+        assert target_lessons[0]["payload"]["direction"] == "upstream"
+        assert target_lessons[0]["payload"]["target_input"] == "image"
+    finally:
+        store.close()
 
 
 class FakeCompatibilityClient:

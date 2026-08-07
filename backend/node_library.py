@@ -9,14 +9,33 @@ import copy
 import hashlib
 import json
 import logging
+import threading
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
-from typing import Any, Literal
+from dataclasses import dataclass, field
+from typing import Any, Literal, Protocol
 
 import httpx
 
 logger = logging.getLogger(__name__)
+
+
+class NodeCatalogPersistence(Protocol):
+    """Narrow persistence boundary owned by the node-library client."""
+
+    def reconcile(
+        self,
+        catalog: dict[str, Any],
+        *,
+        source: str,
+        catalog_hash: str | None = None,
+        observed_catalog_hash: str | None = None,
+        node_schema_hashes: dict[str, str] | None = None,
+    ) -> Any: ...
+
+    def record_refresh_failure(self, error: str) -> None: ...
+
+    def status(self, *, max_age_seconds: float | None = None) -> dict[str, Any]: ...
 
 
 CATALOG_HASH_SCHEMA = "fl-mcp.comfy-node-catalog-contract.v1"
@@ -212,6 +231,7 @@ class NodeCatalogSnapshot:
     catalog_hash_schema: str
     fetched_at: float
     expires_at: float
+    node_schema_hashes: dict[str, str] = field(default_factory=dict)
 
 
 # ============================================================================
@@ -254,6 +274,11 @@ class NodeLibraryCache:
                 catalog_hash_schema=CATALOG_HASH_SCHEMA,
                 fetched_at=fetched_at,
                 expires_at=fetched_at + self._ttl,
+                node_schema_hashes={
+                    node_type: node_schema_hash(node_type, node_info)
+                    for node_type, node_info in data.items()
+                    if isinstance(node_info, dict)
+                },
             )
             logger.debug(f"[NodeLibrary] Cache updated ({len(data)} nodes)")
             return self._snapshot
@@ -317,10 +342,95 @@ class NodeLibraryClient:
         self.timeout = timeout
         self.cache = NodeLibraryCache(ttl_seconds=cache_ttl, clock=clock)
         self._fetch_lock = asyncio.Lock()
+        self._persistence_lock = threading.RLock()
+        self._persistence: NodeCatalogPersistence | None = None
 
     @property
     def source(self) -> str:
         return f"{self.server_url}/object_info"
+
+    def bind_persistence(self, persistence: NodeCatalogPersistence) -> None:
+        """Bind an optional persistent knowledge sidecar to this live client."""
+
+        required_methods = ("reconcile", "record_refresh_failure", "status")
+        if any(not callable(getattr(persistence, name, None)) for name in required_methods):
+            raise TypeError(
+                "persistence must provide reconcile, record_refresh_failure, and status"
+            )
+        with self._persistence_lock:
+            self._persistence = persistence
+
+    def unbind_persistence(
+        self,
+        persistence: NodeCatalogPersistence | None = None,
+    ) -> bool:
+        """Unbind persistence, optionally only when the supplied store is current."""
+
+        with self._persistence_lock:
+            if self._persistence is None:
+                return False
+            if persistence is not None and self._persistence is not persistence:
+                return False
+            self._persistence = None
+            return True
+
+    def _bound_persistence(self) -> NodeCatalogPersistence | None:
+        with self._persistence_lock:
+            return self._persistence
+
+    async def persisted_catalog_status(
+        self,
+        *,
+        max_age_seconds: float | None = None,
+    ) -> dict[str, Any] | None:
+        """Return sidecar status for diagnostics, never as live catalog data."""
+
+        persistence = self._bound_persistence()
+        if persistence is None:
+            return None
+        try:
+            return await asyncio.to_thread(
+                persistence.status,
+                max_age_seconds=max_age_seconds,
+            )
+        except Exception as exc:
+            logger.warning(f"[NodeLibrary] Failed to read persisted status: {exc}")
+            return {"state": "error", "error": str(exc)}
+
+    async def _record_persistence_failure(
+        self,
+        error: str,
+        *,
+        persistence: NodeCatalogPersistence | None = None,
+    ) -> None:
+        if persistence is None:
+            persistence = self._bound_persistence()
+        if persistence is None:
+            return
+        try:
+            await asyncio.to_thread(persistence.record_refresh_failure, error)
+        except Exception as exc:
+            logger.warning(f"[NodeLibrary] Failed to persist refresh error: {exc}")
+
+    async def _persist_snapshot(self, snapshot: NodeCatalogSnapshot) -> None:
+        persistence = self._bound_persistence()
+        if persistence is None:
+            return
+        try:
+            await asyncio.to_thread(
+                persistence.reconcile,
+                snapshot.data,
+                source=snapshot.source,
+                catalog_hash=snapshot.catalog_hash,
+                observed_catalog_hash=snapshot.observed_catalog_hash,
+                node_schema_hashes=snapshot.node_schema_hashes,
+            )
+        except Exception as exc:
+            logger.warning(f"[NodeLibrary] Failed to reconcile persistent catalog: {exc}")
+            await self._record_persistence_failure(
+                f"Persistent catalog reconciliation failed: {exc}",
+                persistence=persistence,
+            )
 
     async def fetch_node_library(self, *, force_refresh: bool = False) -> dict[str, Any]:
         """Fetch node library from ComfyUI /object_info endpoint.
@@ -353,25 +463,35 @@ class NodeLibraryClient:
                             f"Invalid response from ComfyUI: expected dict, got {type(data)}"
                         )
                     logger.info(f"[NodeLibrary] Fetched {len(data)} node types")
-                    await self.cache.set(data, self.source)
+                    snapshot = await self.cache.set(data, self.source)
+                    await self._persist_snapshot(snapshot)
                     return data
-            except NodeLibraryConnectionError:
+            except NodeLibraryConnectionError as exc:
+                await self._record_persistence_failure(str(exc))
                 raise
             except httpx.TimeoutException as exc:
-                raise NodeLibraryConnectionError(
+                error = NodeLibraryConnectionError(
                     f"ComfyUI server timeout. Is ComfyUI running at {self.server_url}?"
-                ) from exc
+                )
+                await self._record_persistence_failure(str(error))
+                raise error from exc
             except httpx.HTTPStatusError as exc:
-                raise NodeLibraryConnectionError(
+                error = NodeLibraryConnectionError(
                     f"ComfyUI server error: {exc.response.status_code}"
-                ) from exc
+                )
+                await self._record_persistence_failure(str(error))
+                raise error from exc
             except httpx.RequestError as exc:
-                raise NodeLibraryConnectionError(
+                error = NodeLibraryConnectionError(
                     f"Failed to connect to ComfyUI at {self.server_url}: {exc}"
-                ) from exc
+                )
+                await self._record_persistence_failure(str(error))
+                raise error from exc
             except Exception as exc:
                 logger.error(f"[NodeLibrary] Unexpected error: {exc}")
-                raise NodeLibraryConnectionError(f"Failed to fetch node library: {exc}") from exc
+                error = NodeLibraryConnectionError(f"Failed to fetch node library: {exc}")
+                await self._record_persistence_failure(str(error))
+                raise error from exc
 
     async def catalog_snapshot(
         self,
