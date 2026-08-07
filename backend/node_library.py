@@ -156,6 +156,19 @@ def classify_node_origin(node_info: dict[str, Any]) -> str:
     return "unknown"
 
 
+def catalog_origin_counts(catalog: dict[str, Any]) -> dict[str, int]:
+    """Count loaded node classes by deterministic /object_info provenance."""
+    counts = {"native": 0, "partner": 0, "custom": 0, "unknown": 0}
+    for node_info in catalog.values():
+        origin = (
+            classify_node_origin(node_info)
+            if isinstance(node_info, dict)
+            else "unknown"
+        )
+        counts[origin] += 1
+    return counts
+
+
 # ============================================================================
 # Data Classes
 # ============================================================================
@@ -252,6 +265,7 @@ class NodeLibraryCache:
                     "state": "empty",
                     "source": source,
                     "node_count": 0,
+                    "origin_counts": catalog_origin_counts({}),
                     "catalog_hash": None,
                     "observed_catalog_hash": None,
                     "catalog_hash_schema": CATALOG_HASH_SCHEMA,
@@ -263,6 +277,7 @@ class NodeLibraryCache:
                 "state": state,
                 "source": self._snapshot.source,
                 "node_count": len(self._snapshot.data),
+                "origin_counts": catalog_origin_counts(self._snapshot.data),
                 "catalog_hash": self._snapshot.catalog_hash,
                 "observed_catalog_hash": self._snapshot.observed_catalog_hash,
                 "catalog_hash_schema": self._snapshot.catalog_hash_schema,

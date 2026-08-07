@@ -376,7 +376,7 @@ These generally require the browser bridge.
 
 | Tool | What it does |
 |---|---|
-| `node_library_status` | Reports or refreshes the local `/object_info` catalog identity |
+| `node_library_status` | Reports or refreshes the local `/object_info` catalog identity and native/partner/custom/unknown class counts |
 | `node_library_search` | Searches node types currently loaded by this ComfyUI instance |
 | `node_library_get_details` | Reads detailed metadata for a node type |
 | `node_library_find_compatible` | Finds compatible node types for connections |

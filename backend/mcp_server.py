@@ -3368,11 +3368,13 @@ async def extract_workflow_from_image(
 
 @mcp.tool()
 async def node_library_status(request: NodeLibraryStatusRequest, ctx: Context) -> Dict[str, Any]:
-    """Report the identity and freshness of Ren's local loaded-node catalog.
+    """Report identity, freshness, and provenance counts for loaded node classes.
 
     The catalog comes only from this ComfyUI instance's /object_info endpoint.
     Pass refresh=true after installing nodes or restarting ComfyUI so later
-    workflow plans use the latest loaded schemas.
+    workflow plans use the latest loaded schemas. ``origin_counts`` classifies
+    every loaded class as native, partner, custom, or unknown from its runtime
+    module/category metadata; it does not infer installation state from disk.
     """
     await _report_tool_activity(ctx, "node_library_status")
 

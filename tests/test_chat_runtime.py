@@ -509,6 +509,11 @@ def test_exact_registry_request_gets_tools_and_source_guardrails():
     assert "not an authoritative whole-Registry search" in instructions
     assert "call `plan_workflow` with the current catalog hash" in instructions
     assert "returns `valid=true` and a plan hash" in instructions
+    assert "Treat the user's requested graph as the plan boundary" in instructions
+    assert "Existing local assets are never implicit defaults" in instructions
+    assert "If the user says exactly, only, or no extras" in instructions
+    assert "deduplicate node searches and schema reads" in instructions
+    assert "verify the created node IDs and intended connections once" in instructions
 
     combined = ren_instructions("off")
     assert instructions in combined
