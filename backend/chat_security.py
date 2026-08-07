@@ -112,6 +112,8 @@ READ_ONLY_TOOLS = {
     "node_library_get_details",
     "node_library_find_compatible",
     "node_library_status",
+    "registry_search_packages",
+    "registry_get_package",
     "manager_search_nodes",
     "manager_get_node_mappings",
     "manager_check_updates",

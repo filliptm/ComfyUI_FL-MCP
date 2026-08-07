@@ -376,9 +376,12 @@ These generally require the browser bridge.
 
 | Tool | What it does |
 |---|---|
-| `node_library_search` | Searches available ComfyUI node types |
+| `node_library_status` | Reports or refreshes the local `/object_info` catalog identity |
+| `node_library_search` | Searches node types currently loaded by this ComfyUI instance |
 | `node_library_get_details` | Reads detailed metadata for a node type |
 | `node_library_find_compatible` | Finds compatible node types for connections |
+| `registry_search_packages` | Searches all published packages in the official Comfy Registry and returns Registry + GitHub links |
+| `registry_get_package` | Inspects one official Registry package, its published nodes, and its Registry + GitHub links |
 
 </details>
 
@@ -387,14 +390,14 @@ These generally require the browser bridge.
 
 | Tool | What it does |
 |---|---|
-| `manager_v4_status` | Reports Manager v4 availability and queue status |
-| `manager_v4_queue_status` | Reads Manager v4 queue status |
-| `manager_v4_queue_action` | Queues a confirmation-gated Manager v4 action |
+| `manager_v4_status` | Compatibility alias that reports detected Manager protocol and queue status |
+| `manager_v4_queue_status` | Compatibility alias for Manager queue status |
+| `manager_v4_queue_action` | Compatibility alias for confirmation-gated Manager actions |
 | `manager_v4_installed_packs` | Lists installed custom node packs |
 | `manager_v4_snapshots` | Lists Manager snapshots |
 | `manager_v4_node_mappings` | Finds node-to-pack mappings |
 | `manager_v4_external_models` | Searches external model definitions |
-| `manager_queue_action` | Queues install/update/uninstall/disable actions |
+| `manager_queue_action` | Queues version-aware install/update/uninstall/disable actions; Manager installs dependencies in ComfyUI's Python environment |
 | `manager_queue_status` | Reads Manager queue status |
 | `manager_queue_start` | Starts the Manager worker queue |
 | `manager_queue_reset` | Resets the Manager queue |

@@ -219,6 +219,8 @@ export function summarizeToolStep(step, config = {}) {
             confirm_mask_review: "Mask needs changes",
             web_search: "Couldn’t search the web",
             web_fetch_page: "Couldn’t read the web page",
+            registry_search_packages: "Couldn’t search official Comfy Registry",
+            registry_get_package: "Couldn’t inspect Registry package",
         };
         return config.failureLabel
             || failureLabels[name]
@@ -345,6 +347,29 @@ export function summarizeToolStep(step, config = {}) {
             return `Cataloged ${count.toLocaleString("en-US")} ${label}`;
         }
         return "Checked loaded-node catalog";
+    }
+    if (name === "registry_search_packages") {
+        if (result?.ok === false) return "Registry search unavailable";
+        const count = Number.isFinite(result?.count)
+            ? result.count
+            : Array.isArray(result?.results)
+                ? result.results.length
+                : null;
+        return count === null
+            ? "Searched official Comfy Registry"
+            : `Found ${plural(count, "Registry package")}`;
+    }
+    if (name === "registry_get_package") {
+        if (result?.ok === false) return "Registry package unavailable";
+        const packageResult = result?.package || result;
+        const packageName = String(
+            packageResult?.name
+            || packageResult?.display_name
+            || packageResult?.id
+            || request?.package_id
+            || "Registry package"
+        ).trim();
+        return `Inspected ${packageName} on Registry`;
     }
     if (name === "manager_check_updates") return "Checked for custom-node updates";
     if (name === "workflow_overview") {

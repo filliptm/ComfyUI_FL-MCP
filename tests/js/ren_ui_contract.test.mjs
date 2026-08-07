@@ -411,6 +411,18 @@ test("web search can be selected per message and its composer action can be hidd
 });
 
 
+test("official Registry discovery has clear human tool activity", async () => {
+    const tools = await readFile(new URL("web/js/tool_activity.js", root), "utf8");
+
+    assert.match(tools, /"registry_search_packages"\s*:\s*\{/);
+    assert.match(tools, /label:\s*"Registry Search"/);
+    assert.match(tools, /registry_search_packages:\s*"Searching official Comfy Registry"/);
+    assert.match(tools, /"registry_get_package"\s*:\s*\{/);
+    assert.match(tools, /label:\s*"Registry Package"/);
+    assert.match(tools, /registry_get_package:\s*"Inspecting Registry package"/);
+});
+
+
 test("workflow queueing preserves ComfyUI frontend authentication", async () => {
     const api = await readFile(new URL("web/js/fl_api.js", root), "utf8");
 
