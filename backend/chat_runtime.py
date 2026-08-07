@@ -113,6 +113,17 @@ WEB_IMAGE_INTENT_PATTERNS = (
     re.compile(r"\bwhat\b.{0,100}\blooks?\s+like\b", re.IGNORECASE),
 )
 
+NODE_KNOWLEDGE_INTENT_PATTERNS = (
+    re.compile(
+        r"\b(?:local|persistent|remembered|learned)\s+(?:node\s+)?"
+        r"(?:knowledge|memory|catalog|index|lessons?)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\b(?:verified\s+)?connection[- ]lessons?\b", re.IGNORECASE),
+    re.compile(r"\b(?:first|last)[- ]seen\s+generation\b", re.IGNORECASE),
+    re.compile(r"\bnode_knowledge_search\b", re.IGNORECASE),
+)
+
 CORE_CHAT_TOOLS = {
     "workflow_overview",
     "workflow_get_current_json",
@@ -140,6 +151,7 @@ CORE_CHAT_TOOLS = {
     "node_library_search",
     "node_library_get_details",
     "node_library_status",
+    "node_knowledge_search",
     "compile_workflow_spec",
     "resolve_workflow_spec",
     "plan_workflow",
@@ -166,6 +178,7 @@ COMPILER_FIRST_REDUNDANT_TOOLS = {
     "node_library_search",
     "node_library_get_details",
     "node_library_status",
+    "node_knowledge_search",
     "resolve_workflow_spec",
     "plan_workflow",
     "mcp_capability_audit",
@@ -204,13 +217,28 @@ def explicit_web_research_requested(message: str) -> bool:
         1,
     )[0].casefold()
     return bool(
-        re.search(r"\b(?:search|browse|research|look[ -]?up|web search)\b", visible)
+        re.search(
+            r"\b(?:search|browse|research|look[ -]?up)\b.{0,40}"
+            r"\b(?:web|internet|online)\b",
+            visible,
+        )
+        or re.search(r"\bweb\s+search\b", visible)
         or re.search(
             r"\b(?:exact|current|latest)\b.{0,40}\b(?:pricing|price|cost|policy|"
             r"privacy|terms)\b",
             visible,
         )
     )
+
+
+def explicit_node_knowledge_requested(message: str) -> bool:
+    """Keep the persistent search tool when a combined build asks for its facts."""
+
+    visible = str(message or "").split(
+        "\n\nThe user attached ComfyUI input image(s)",
+        1,
+    )[0]
+    return any(pattern.search(visible) for pattern in NODE_KNOWLEDGE_INTENT_PATTERNS)
 
 
 def normalize_chat_attachments(value: Any) -> list[dict[str, Any]]:
@@ -744,6 +772,8 @@ def tools_for_message(message: str, search_mode: str = "off") -> set[str]:
         # already contains catalog, schema, attachment, plan, and partner-review
         # evidence, while atomic application verifies the created subgraph.
         selected.difference_update(COMPILER_FIRST_REDUNDANT_TOOLS)
+        if explicit_node_knowledge_requested(message):
+            selected.add("node_knowledge_search")
         if not explicit_web_research_requested(message):
             selected.difference_update({"web_search", "web_fetch_page"})
     return selected
@@ -801,6 +831,11 @@ def registry_discovery_instructions() -> str:
         "`node_library_status` inspect only node types currently loaded by this "
         "ComfyUI instance through `/object_info`. Use them to prove a node can be "
         "created locally.\n"
+        "- `node_knowledge_search` queries Ren's lightweight persistent index of the "
+        "last valid local catalog and schema-scoped, canvas-verified connection lessons. "
+        "Use it for fast discovery or diagnostics, especially after node-pack changes. "
+        "Its results are never build authority: stale records must not enter a plan, and "
+        "the compiler always revalidates against live `/object_info`.\n"
         "- For a complete new workflow or subgraph described in user language, call "
         "`compile_workflow_spec` first. Include every requested role, value, connection, "
         "chat attachment binding, and a stable application ID in that one request. It "

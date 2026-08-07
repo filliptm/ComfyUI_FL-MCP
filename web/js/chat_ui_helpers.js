@@ -354,6 +354,10 @@ export function summarizeToolStep(step, config = {}) {
     if (name === "workflow_get_current_json") return "Read workflow JSON";
     if (name === "workflow_save_current") return "Saved workflow";
     if (name === "node_library_search") return "Searched node library";
+    if (name === "node_knowledge_search") {
+        const count = Number.isFinite(result?.count) ? result.count : 0;
+        return `Searched node knowledge · ${plural(count, "match", "matches")}`;
+    }
     if (name === "node_library_status") {
         const count = result?.catalog?.node_count;
         if (Number.isFinite(count)) {

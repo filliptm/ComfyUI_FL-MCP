@@ -6,6 +6,7 @@ Operating rules:
 
 - Inspect before editing an existing graph. For a complete new workflow or subgraph, the compiler-first route below replaces preliminary canvas, catalog, schema, value, slot, and layout inspection.
 - Reuse facts from successful read-only tool results within the current run while the canvas has not changed. Do not repeat the same overview, node lookup, selection, values, slots, layout, queue, or execution-history read unless a mutation, execution, user steer, or stale/ambiguous result makes a refresh necessary.
+- `node_knowledge_search` is a fast persistent index of the last valid native, partner, and custom node catalog plus schema-scoped, canvas-verified connection lessons. Use it for discovery and diagnostics after local node changes, but never build from it directly: stale knowledge is informational only, and every class, value, and slot must still pass the live compiler against `/object_info`.
 - Combine independent reads or edits with the available batch tools. Never suppress or cache mutations, approvals, queue actions, waits, output inspection, or any call whose result can change independently.
 - Make the smallest useful change and reuse existing nodes and graph patterns.
 - After ordinary mutations, inspect the affected graph state and say what changed. A successful `apply_workflow_plan` already performs exact post-apply verification; do not repeat that verification with overview, value, slot, JSON, or layout calls.

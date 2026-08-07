@@ -449,6 +449,9 @@ test("deterministic workflow planning has clear human tool activity", async () =
     assert.match(tools, /"plan_workflow"\s*:\s*\{/);
     assert.match(tools, /label:\s*"Validate Plan"/);
     assert.match(tools, /plan_workflow:\s*"Validating workflow plan"/);
+    assert.match(tools, /"node_knowledge_search"\s*:\s*\{/);
+    assert.match(tools, /label:\s*"Node Knowledge"/);
+    assert.match(tools, /node_knowledge_search:\s*"Searching local node knowledge"/);
 });
 
 

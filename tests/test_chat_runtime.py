@@ -465,6 +465,7 @@ def test_intent_tool_filter_keeps_core_and_adds_narrow_groups():
     assert "node_library_search" in basic
     assert "node_library_get_details" in basic
     assert "node_library_status" in basic
+    assert "node_knowledge_search" in basic
     assert "compile_workflow_spec" in basic
     assert "resolve_workflow_spec" in basic
     assert "plan_workflow" in basic
@@ -507,6 +508,7 @@ def test_complete_new_workflow_uses_only_compiler_application_route():
     assert "web_fetch_page" not in selected
     assert "workflow_overview" not in selected
     assert "node_library_status" not in selected
+    assert "node_knowledge_search" not in selected
     assert "resolve_workflow_spec" not in selected
     assert "node_library_get_details" not in selected
     assert "plan_workflow" not in selected
@@ -524,6 +526,23 @@ def test_complete_new_workflow_uses_only_compiler_application_route():
     )
     assert explicit_web_research_requested(researched) is True
     assert "web_search" in tools_for_message(researched, "free")
+
+    build_then_inspect_knowledge = request.replace(
+        "and don't run it yet",
+        "and don't run it yet. Afterward, search your local node knowledge for "
+        "the verified connection-lesson counts",
+    )
+    selected_with_knowledge = tools_for_message(build_then_inspect_knowledge, "free")
+    assert compiler_first_workflow_requested(build_then_inspect_knowledge) is True
+    assert explicit_web_research_requested(build_then_inspect_knowledge) is False
+    assert {
+        "compile_workflow_spec",
+        "apply_workflow_plan",
+        "node_knowledge_search",
+    } <= selected_with_knowledge
+    assert "node_library_status" not in selected_with_knowledge
+    assert "web_search" not in selected_with_knowledge
+    assert "web_fetch_page" not in selected_with_knowledge
 
 
 def test_exact_registry_request_gets_tools_and_source_guardrails():

@@ -342,6 +342,11 @@ export const TOOL_CONFIG = {
         label: "Node Catalog",
         description: "Checking the loaded-node catalog"
     },
+    "node_knowledge_search": {
+        icon: "🧠",
+        label: "Node Knowledge",
+        description: "Searching learned local node knowledge"
+    },
     "node_library_get_details": {
         icon: "📖",
         label: "Node Details",
@@ -502,6 +507,7 @@ const TOOL_ICON_CLASSES = {
     web_fetch_page: "pi pi-file",
     node_library_search: "pi pi-search",
     node_library_status: "pi pi-book",
+    node_knowledge_search: "pi pi-database",
     node_library_get_details: "pi pi-info-circle",
     resolve_workflow_spec: "pi pi-compass",
     compile_workflow_spec: "pi pi-sitemap",
@@ -540,6 +546,7 @@ const TOOL_RUNNING_LABELS = {
     web_fetch_page: "Reading web page",
     node_library_search: "Searching node library",
     node_library_status: "Checking node catalog",
+    node_knowledge_search: "Searching local node knowledge",
     resolve_workflow_spec: "Resolving workflow capabilities",
     compile_workflow_spec: "Compiling complete workflow",
     plan_workflow: "Validating workflow plan",

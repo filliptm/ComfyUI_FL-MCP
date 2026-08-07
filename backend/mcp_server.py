@@ -60,7 +60,7 @@ from fastmcp.utilities.types import Image as MCPImage
 from PIL import Image as PILImage, ImageOps, UnidentifiedImageError
 from pydantic import BaseModel, Field, model_validator
 
-from config import MAX_GENERATION_COMPLETION_TIMEOUT_SECONDS, settings
+from config import DATA_DIR, MAX_GENERATION_COMPLETION_TIMEOUT_SECONDS, settings
 from models import WorkflowQuery
 from comfy_models import (
     ComfyListFoldersRequest, ComfyListFoldersResponse,
@@ -75,6 +75,7 @@ from node_library import (
     NodeLibraryConnectionError,
     NodeTypeNotFoundError
 )
+from node_catalog_store import NodeCatalogStore
 from workflow_planner import (
     ApplyWorkflowPlanRequest,
     PlanWorkflowRequest,
@@ -116,7 +117,6 @@ from coding_tools import (
     write_file as coding_write_file,
 )
 from comfy_supervisor import comfy_supervisor
-from chat_config import DATA_DIR
 from web_cache import WebCache
 from web_fetcher import AsyncWebFetcher
 from web_search import WebSearchService
@@ -348,6 +348,20 @@ async def mcp_lifespan(server: FastMCP) -> AsyncIterator[Any]:
     except Exception as e:
         logger.warning(f"[MCP] Could not check Manager status: {e}")
 
+    node_catalog_store: NodeCatalogStore | None = None
+    node_library_client = get_node_library_client(
+        server_url=settings.comfyui_server_url,
+        timeout=settings.comfyui_api_timeout,
+    )
+    try:
+        node_catalog_store = NodeCatalogStore(DATA_DIR / "node_catalog.sqlite3")
+        node_library_client.bind_persistence(node_catalog_store)
+    except Exception as exc:
+        logger.warning("[MCP] Persistent node knowledge is unavailable: %s", exc)
+        if node_catalog_store is not None:
+            node_catalog_store.close()
+        node_catalog_store = None
+
     web_cache = WebCache(DATA_DIR / "web_cache.sqlite3")
     web_fetcher = AsyncWebFetcher()
     web_pages = WebPageService(fetcher=web_fetcher, cache=web_cache)
@@ -370,12 +384,19 @@ async def mcp_lifespan(server: FastMCP) -> AsyncIterator[Any]:
         await web_fetcher.aclose()
         web_cache.close()
 
+    def close_node_knowledge() -> None:
+        if node_catalog_store is None:
+            return
+        node_library_client.unbind_persistence(node_catalog_store)
+        node_catalog_store.close()
+
     if os.getenv('FL_MCP_MODE') == 'subprocess':
         session_id = os.getenv('FL_MCP_SESSION_ID')
         ws_url = os.getenv('FL_MCP_WS_URL')
         if not session_id or not ws_url:
             logger.error("Missing FL_MCP_SESSION_ID or FL_MCP_WS_URL environment variables")
             await close_web_resources()
+            close_node_knowledge()
             raise RuntimeError("MCP subprocess not properly configured")
         
         logger.info(f"[MCP] Starting in subprocess mode for session: {session_id}")
@@ -388,6 +409,7 @@ async def mcp_lifespan(server: FastMCP) -> AsyncIterator[Any]:
         except Exception as e:
             logger.error(f"MCP Initialization Failed: {str(e)}")
             await close_web_resources()
+            close_node_knowledge()
             raise
 
         try:
@@ -399,9 +421,11 @@ async def mcp_lifespan(server: FastMCP) -> AsyncIterator[Any]:
                 "web_pages": web_pages,
                 "web_images_allowed": web_images_allowed,
                 "registry_client": registry_client,
+                "node_catalog_store": node_catalog_store,
             }
         finally:
             await close_web_resources()
+            close_node_knowledge()
 
         # NOTE: no disconnect/teardown here; keep WS open for the process lifetime.
         return
@@ -417,9 +441,11 @@ async def mcp_lifespan(server: FastMCP) -> AsyncIterator[Any]:
             "web_pages": web_pages,
             "web_images_allowed": web_images_allowed,
             "registry_client": registry_client,
+            "node_catalog_store": node_catalog_store,
         }
     finally:
         await close_web_resources()
+        close_node_knowledge()
 
 # Initialize FastMCP server with lifespan
 mcp = FastMCP("ComfyUI FL-MCP", lifespan=mcp_lifespan)
@@ -472,6 +498,17 @@ async def _report_tool_activity(ctx: Context, tool_name: str) -> None:
             }))
         except Exception as e:
             logger.debug(f"Could not report tool activity: {e}")
+
+
+def _node_knowledge_store(ctx: Context) -> NodeCatalogStore | None:
+    """Return the optional per-process catalog store without opening ad-hoc DB handles."""
+
+    request_context = getattr(ctx, "request_context", None)
+    lifespan_context = getattr(request_context, "lifespan_context", None)
+    if not isinstance(lifespan_context, dict):
+        return None
+    store = lifespan_context.get("node_catalog_store")
+    return store if isinstance(store, NodeCatalogStore) else None
 
 
 def _comfy_base_url() -> str:
@@ -1407,6 +1444,30 @@ class NodeLibrarySearchRequest(BaseModel):
         ge=1,
         le=50,
         description="Maximum number of results to return (1-50)"
+    )
+
+
+class NodeKnowledgeSearchRequest(BaseModel):
+    """Search the persistent last-valid locally loaded node knowledge index."""
+
+    query: str = Field(
+        ...,
+        min_length=1,
+        max_length=256,
+        description="Concise capability or exact node class to find",
+    )
+    max_results: int = Field(
+        20,
+        ge=1,
+        le=50,
+        description="Maximum number of active persisted matches to return",
+    )
+    refresh: bool = Field(
+        False,
+        description=(
+            "Refresh the authoritative live /object_info catalog before searching. "
+            "A failed refresh preserves but marks the last-valid knowledge stale."
+        ),
     )
 
 
@@ -2952,6 +3013,27 @@ async def mcp_capability_audit(request: GetSystemInfoRequest, ctx: Context) -> D
             "reason": "Manager client not initialized",
         }
 
+    node_knowledge = _node_knowledge_store(ctx)
+    if node_knowledge is None:
+        audit["node_knowledge"] = {
+            "available": False,
+            "state": "degraded",
+            "reason": "Persistent node knowledge is unavailable",
+        }
+    else:
+        knowledge_status = node_knowledge.status(max_age_seconds=300)
+        knowledge_state = knowledge_status.get("state", "empty")
+        audit["node_knowledge"] = {
+            "available": knowledge_state != "empty",
+            "state": "available" if knowledge_state == "fresh" else "degraded",
+            "status": knowledge_status,
+            "reason": (
+                None
+                if knowledge_state == "fresh"
+                else "No fresh last-valid node catalog has been reconciled yet"
+            ),
+        }
+
     audit["safety"] = {
         "available": True,
         "state": "available",
@@ -3374,7 +3456,14 @@ async def node_library_status(request: NodeLibraryStatusRequest, ctx: Context) -
             server_url=settings.comfyui_server_url,
             timeout=settings.comfyui_api_timeout
         )
-        return {"catalog": await client.catalog_status(refresh=request.refresh)}
+        catalog = await client.catalog_status(refresh=request.refresh)
+        persisted_status = getattr(client, "persisted_catalog_status", None)
+        knowledge = (
+            await persisted_status(max_age_seconds=300)
+            if callable(persisted_status)
+            else None
+        )
+        return {"catalog": catalog, "knowledge": knowledge}
     except NodeLibraryConnectionError as e:
         raise RuntimeError(f"ComfyUI server connection failed: {e}")
     except NodeLibraryError as e:
@@ -3382,6 +3471,75 @@ async def node_library_status(request: NodeLibraryStatusRequest, ctx: Context) -
     except Exception as e:
         logger.error(f"Unexpected error in node_library_status: {e}")
         raise RuntimeError(f"Tool execution failed: {e}")
+
+
+@mcp.tool()
+async def node_knowledge_search(
+    request: NodeKnowledgeSearchRequest,
+    ctx: Context,
+) -> Dict[str, Any]:
+    """Search Ren's lightweight last-valid index of locally loaded node schemas.
+
+    The index is rebuilt from this ComfyUI instance's authoritative ``/object_info``
+    catalog whenever that catalog is refreshed. It preserves exact schema hashes,
+    native/custom/partner origins, removal history, and schema-scoped verified lessons.
+    Results are discovery hints only: workflow compilation still revalidates every class,
+    slot, and value against the current live catalog before any canvas edit.
+    """
+
+    await _report_tool_activity(ctx, "node_knowledge_search")
+    store = _node_knowledge_store(ctx)
+    if store is None:
+        return {
+            "ok": False,
+            "query": request.query,
+            "results": [],
+            "knowledge": {"state": "unavailable"},
+            "error": "Persistent node knowledge is unavailable in this MCP process.",
+            "build_authority": "live /object_info via workflow compiler",
+        }
+
+    refresh: Dict[str, Any] = {"requested": request.refresh, "succeeded": None}
+    if request.refresh:
+        client = get_node_library_client(
+            server_url=settings.comfyui_server_url,
+            timeout=settings.comfyui_api_timeout,
+        )
+        try:
+            refresh["catalog"] = await client.catalog_status(refresh=True)
+            refresh["succeeded"] = True
+        except NodeLibraryError as exc:
+            refresh.update({"succeeded": False, "error": str(exc)})
+
+    knowledge = store.status(max_age_seconds=300)
+    results = []
+    for item in store.search(request.query, limit=request.max_results):
+        lessons = store.get_verified_lessons(item["node_type"])
+        results.append(
+            {
+                "node_type": item["node_type"],
+                "display_name": item["display_name"],
+                "category": item["category"],
+                "description": item["description"],
+                "origin": item["origin"],
+                "python_module": item["python_module"],
+                "schema_hash": item["schema_hash"],
+                "first_seen_generation": item["first_seen_generation"],
+                "last_seen_generation": item["last_seen_generation"],
+                "verified_lesson_count": len(lessons),
+                "search_backend": item["search_backend"],
+            }
+        )
+    return {
+        "ok": True,
+        "query": request.query,
+        "results": results,
+        "count": len(results),
+        "knowledge": knowledge,
+        "refresh": refresh,
+        "discovery_only": True,
+        "build_authority": "live /object_info via workflow compiler",
+    }
 
 
 def _validated_plan_attachment_values(
@@ -3399,6 +3557,63 @@ def _validated_plan_attachment_values(
         _resolve_comfy_image_path(comfy_tools, image)
         values[(binding.node_alias, binding.input_name)] = binding.image.widget_value()
     return values
+
+
+def _record_verified_connection_lessons(
+    store: NodeCatalogStore | None,
+    *,
+    plan: Dict[str, Any],
+    plan_hash: str,
+    application_id: str,
+) -> None:
+    """Remember only connections the atomic frontend application verified."""
+
+    if store is None:
+        return
+    nodes = {
+        str(node.get("alias")): node
+        for node in plan.get("nodes", [])
+        if isinstance(node, dict) and node.get("alias")
+    }
+    for connection in plan.get("connections", []):
+        if not isinstance(connection, dict):
+            continue
+        source = nodes.get(str(connection.get("source_alias")))
+        target = nodes.get(str(connection.get("target_alias")))
+        if source is None or target is None:
+            continue
+        identity = {
+            "source_node_type": source.get("node_type"),
+            "source_output": connection.get("source_output"),
+            "source_output_index": connection.get("source_output_index"),
+            "target_node_type": target.get("node_type"),
+            "target_input": connection.get("target_input"),
+        }
+        lesson_id = uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            json.dumps(identity, sort_keys=True, separators=(",", ":")),
+        ).hex
+        evidence = {
+            **identity,
+            "evidence": "atomic_canvas_application",
+            "plan_hash": plan_hash,
+            "application_id": application_id,
+        }
+        try:
+            store.record_verified_lesson(
+                str(source["node_type"]),
+                str(source["schema_hash"]),
+                f"downstream-connection:{lesson_id}",
+                {**evidence, "direction": "downstream"},
+            )
+            store.record_verified_lesson(
+                str(target["node_type"]),
+                str(target["schema_hash"]),
+                f"upstream-connection:{lesson_id}",
+                {**evidence, "direction": "upstream"},
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            logger.warning("Could not persist verified node connection lesson: %s", exc)
 
 
 @mcp.tool()
@@ -3639,6 +3854,15 @@ async def apply_workflow_plan(
         )
         if not isinstance(result, dict):
             raise RuntimeError("The frontend returned an invalid workflow application result.")
+        if result.get("success") is True and (
+            result.get("applied") is True or result.get("already_applied") is True
+        ):
+            _record_verified_connection_lessons(
+                _node_knowledge_store(ctx),
+                plan=compiled["plan"],
+                plan_hash=request.plan_hash,
+                application_id=request.application_id,
+            )
         return {**result, "validation": validation}
     except NodeLibraryConnectionError as e:
         raise RuntimeError(f"ComfyUI server connection failed: {e}")
@@ -3758,6 +3982,10 @@ async def node_library_get_details(request: NodeLibraryGetDetailsRequest, ctx: C
         )
         
         node_info = await client.get_node_details(request.node_type)
+        store = _node_knowledge_store(ctx)
+        verified_lessons = (
+            store.get_verified_lessons(request.node_type) if store is not None else []
+        )
         
         return {
             "node_type": request.node_type,
@@ -3776,6 +4004,7 @@ async def node_library_get_details(request: NodeLibraryGetDetailsRequest, ctx: C
             "api_node": bool(node_info.get('api_node')),
             "deprecated": bool(node_info.get('deprecated')),
             "experimental": bool(node_info.get('experimental')),
+            "verified_lessons": verified_lessons,
         }
         
     except NodeTypeNotFoundError as e:

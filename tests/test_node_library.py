@@ -74,6 +74,35 @@ def install_fake_http(monkeypatch, responses):
     return requests
 
 
+class FakeCatalogPersistence:
+    def __init__(self, *, reconcile_error=None):
+        self.reconcile_error = reconcile_error
+        self.reconciliations = []
+        self.failures = []
+        self.status_payload = {"state": "empty", "node_count": 0}
+
+    def reconcile(self, catalog, **metadata):
+        if self.reconcile_error is not None:
+            raise self.reconcile_error
+        self.reconciliations.append((catalog, metadata))
+        self.status_payload = {
+            "state": "fresh",
+            "node_count": len(catalog),
+            "catalog_hash": metadata["catalog_hash"],
+        }
+
+    def record_refresh_failure(self, error):
+        self.failures.append(error)
+        self.status_payload = {
+            **self.status_payload,
+            "state": "stale",
+            "last_error": error,
+        }
+
+    def status(self, *, max_age_seconds=None):
+        return {**self.status_payload, "max_age_seconds": max_age_seconds}
+
+
 def test_catalog_hash_ignores_object_info_key_order():
     first = {"NodeB": {"output": ["IMAGE"]}, "NodeA": {"input": {"required": {}}}}
     second = {"NodeA": {"input": {"required": {}}}, "NodeB": {"output": ["IMAGE"]}}
@@ -338,6 +367,96 @@ def test_cached_fetch_and_force_refresh_replace_catalog_generation(monkeypatch):
     assert refreshed == second
     assert requests == ["http://comfy/object_info", "http://comfy/object_info"]
     assert first_status["catalog_hash"] != second_status["catalog_hash"]
+
+
+def test_bound_persistence_reconciles_only_fresh_http_generations(monkeypatch):
+    first = {"KSampler": node_info(display_name="First")}
+    second = {"KSampler": node_info(display_name="Second")}
+    install_fake_http(monkeypatch, [(200, first), (200, second)])
+    persistence = FakeCatalogPersistence()
+
+    async def run():
+        client = NodeLibraryClient("http://comfy")
+        client.bind_persistence(persistence)
+        await client.fetch_node_library()
+        await client.fetch_node_library()
+        await client.fetch_node_library(force_refresh=True)
+        return await client.catalog_status(), await client.persisted_catalog_status()
+
+    live_status, persisted_status = asyncio.run(run())
+
+    assert len(persistence.reconciliations) == 2
+    for catalog, metadata in persistence.reconciliations:
+        assert metadata["source"] == "http://comfy/object_info"
+        assert metadata["catalog_hash"] == catalog_contract_hash(catalog)
+        assert metadata["observed_catalog_hash"] == canonical_schema_hash(catalog)
+        assert metadata["node_schema_hashes"] == {
+            node_type: node_schema_hash(node_type, info) for node_type, info in catalog.items()
+        }
+    assert "persistence" not in live_status
+    assert persisted_status["state"] == "fresh"
+    assert persisted_status["catalog_hash"] == catalog_contract_hash(second)
+
+
+def test_bind_and_conditional_unbind_are_explicit():
+    client = NodeLibraryClient("http://comfy")
+    first = FakeCatalogPersistence()
+    replacement = FakeCatalogPersistence()
+
+    client.bind_persistence(first)
+    assert client.unbind_persistence(replacement) is False
+    assert asyncio.run(client.persisted_catalog_status()) is not None
+    assert client.unbind_persistence(first) is True
+    assert asyncio.run(client.persisted_catalog_status()) is None
+    assert client.unbind_persistence() is False
+
+    with pytest.raises(TypeError, match="must provide"):
+        client.bind_persistence(object())
+
+
+def test_persistence_reconcile_failure_never_invalidates_fresh_live_catalog(monkeypatch):
+    catalog = {"KSampler": node_info()}
+    install_fake_http(monkeypatch, [(200, catalog)])
+    persistence = FakeCatalogPersistence(reconcile_error=RuntimeError("disk full"))
+
+    async def run():
+        client = NodeLibraryClient("http://comfy")
+        client.bind_persistence(persistence)
+        fetched = await client.fetch_node_library()
+        cached = await client.fetch_node_library()
+        snapshot = await client.catalog_snapshot()
+        return fetched, cached, snapshot
+
+    fetched, cached, snapshot = asyncio.run(run())
+
+    assert fetched == cached == snapshot.data == catalog
+    assert snapshot.catalog_hash == catalog_contract_hash(catalog)
+    assert persistence.failures == ["Persistent catalog reconciliation failed: disk full"]
+
+
+def test_failed_live_refresh_records_stale_sidecar_but_never_reads_it(monkeypatch):
+    install_fake_http(monkeypatch, [(500, "boom")])
+    persistence = FakeCatalogPersistence()
+    persistence.status_payload = {
+        "state": "fresh",
+        "node_count": 1,
+        "snapshot": {"PersistedOnly": node_info()},
+    }
+
+    async def run():
+        client = NodeLibraryClient("http://comfy")
+        client.bind_persistence(persistence)
+        with pytest.raises(NodeLibraryConnectionError):
+            await client.fetch_node_library()
+        return await client.cache.snapshot(), await client.persisted_catalog_status()
+
+    live_snapshot, persisted_status = asyncio.run(run())
+
+    assert live_snapshot is None
+    assert persistence.reconciliations == []
+    assert persistence.failures == ["ComfyUI server error: 500"]
+    assert persisted_status["state"] == "stale"
+    assert "PersistedOnly" in persisted_status["snapshot"]
 
 
 def test_catalog_snapshot_binds_data_source_and_hash_to_one_generation(monkeypatch):

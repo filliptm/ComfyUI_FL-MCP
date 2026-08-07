@@ -52,4 +52,5 @@ def test_official_registry_discovery_is_read_only():
     assert classify_tool("plan_workflow") == "read_only"
     assert classify_tool("compile_workflow_spec") == "read_only"
     assert classify_tool("resolve_workflow_spec") == "read_only"
+    assert classify_tool("node_knowledge_search") == "read_only"
     assert classify_tool("apply_workflow_plan") == "canvas_edit"

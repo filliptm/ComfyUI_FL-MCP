@@ -8,9 +8,10 @@ import json
 import logging
 import os
 import sys
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, AsyncIterator, Dict, Optional
+from typing import Any, Dict, Optional
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -24,9 +25,11 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 sys.path.insert(0, str(Path(__file__).parent))
 
 from comfy_supervisor import comfy_supervisor
-from config import settings
+from config import DATA_DIR, settings
 from manager import manager
 from models import Handshake, ScreenshotMessage, ToolResult
+from node_catalog_store import NodeCatalogStore
+from node_library import get_node_library_client
 from process_utils import pid_is_running
 from version import __version__, runtime_metadata
 
@@ -46,6 +49,11 @@ logging.basicConfig(
 )
 
 logger = logging.getLogger("fl_mcp_server")
+
+NODE_CATALOG_DB_NAME = "node_catalog.sqlite3"
+NODE_CATALOG_STARTUP_ATTEMPTS = 8
+NODE_CATALOG_INITIAL_RETRY_DELAY_SECONDS = 0.5
+NODE_CATALOG_MAX_RETRY_DELAY_SECONDS = 8.0
 
 
 async def cleanup_task() -> None:
@@ -72,6 +80,128 @@ async def parent_watchdog_task(parent_pid: int) -> None:
             os._exit(0)
 
 
+async def reconcile_node_catalog_on_startup(
+    client: Any,
+    *,
+    max_attempts: int = NODE_CATALOG_STARTUP_ATTEMPTS,
+    initial_retry_delay: float = NODE_CATALOG_INITIAL_RETRY_DELAY_SECONDS,
+    max_retry_delay: float = NODE_CATALOG_MAX_RETRY_DELAY_SECONDS,
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+) -> bool:
+    """Warm the durable node catalog without delaying bridge availability.
+
+    ComfyUI and the bridge start independently, so ``/object_info`` may be
+    unavailable for a short period. The bound ``NodeCatalogStore`` records each
+    failed refresh while retaining its last valid generation. Retries are
+    deliberately bounded; later normal node-library refreshes continue healing
+    the same persistent store.
+    """
+
+    if max_attempts < 1:
+        raise ValueError("max_attempts must be at least 1")
+    if initial_retry_delay < 0 or max_retry_delay < 0:
+        raise ValueError("catalog retry delays must not be negative")
+
+    retry_delay = min(initial_retry_delay, max_retry_delay)
+    for attempt in range(1, max_attempts + 1):
+        try:
+            await client.fetch_node_library(force_refresh=True)
+            status = await client.persisted_catalog_status()
+            if not status or status.get("state") != "fresh":
+                state = status.get("state") if status else "unavailable"
+                detail = None
+                if status:
+                    detail = status.get("last_error") or status.get("error")
+                raise RuntimeError(
+                    f"persistent node catalog remained {state}"
+                    + (f": {detail}" if detail else "")
+                )
+            logger.info(
+                "Persistent node catalog reconciled on startup "
+                "(attempt=%s, generation=%s, nodes=%s)",
+                attempt,
+                status.get("generation") if status else None,
+                status.get("node_count") if status else None,
+            )
+            return True
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            if attempt >= max_attempts:
+                logger.warning(
+                    "Persistent node catalog startup reconciliation exhausted "
+                    "%s attempts; retaining the last valid generation: %s",
+                    max_attempts,
+                    exc,
+                )
+                return False
+            logger.info(
+                "ComfyUI node catalog is not ready (attempt %s/%s): %s; "
+                "retrying in %.1fs",
+                attempt,
+                max_attempts,
+                exc,
+                retry_delay,
+            )
+            await sleep(retry_delay)
+            retry_delay = min(retry_delay * 2, max_retry_delay)
+
+    return False
+
+
+@asynccontextmanager
+async def node_catalog_persistence_lifespan(app: FastAPI) -> AsyncIterator[None]:
+    """Own the bridge process's durable node-catalog binding and warm-up task."""
+
+    catalog_store: NodeCatalogStore | None = None
+    catalog_client: Any | None = None
+    reconciliation_handle: asyncio.Task[bool] | None = None
+    persistence_bound = False
+
+    try:
+        catalog_store = NodeCatalogStore(DATA_DIR / NODE_CATALOG_DB_NAME)
+        catalog_client = get_node_library_client(
+            server_url=settings.comfyui_server_url,
+            timeout=settings.comfyui_api_timeout,
+        )
+        catalog_client.bind_persistence(catalog_store)
+        persistence_bound = True
+        reconciliation_handle = asyncio.create_task(
+            reconcile_node_catalog_on_startup(catalog_client),
+            name="fl-mcp-node-catalog-reconcile",
+        )
+        app.state.node_catalog_store = catalog_store
+        app.state.node_catalog_reconciliation_task = reconciliation_handle
+    except Exception as exc:
+        # Persistent discovery enriches Ren but must never prevent the bridge or
+        # canvas connection from becoming available.
+        logger.warning("Persistent node catalog is unavailable: %s", exc, exc_info=True)
+        app.state.node_catalog_store = None
+        app.state.node_catalog_reconciliation_task = None
+
+    try:
+        yield
+    finally:
+        if reconciliation_handle is not None:
+            reconciliation_handle.cancel()
+            try:
+                await reconciliation_handle
+            except asyncio.CancelledError:
+                pass
+        if persistence_bound and catalog_client is not None:
+            try:
+                catalog_client.unbind_persistence(catalog_store)
+            except Exception as exc:
+                logger.warning("Node catalog persistence unbind failed: %s", exc)
+        if catalog_store is not None:
+            try:
+                await asyncio.to_thread(catalog_store.close)
+            except Exception as exc:
+                logger.warning("Node catalog persistence close failed: %s", exc)
+        app.state.node_catalog_store = None
+        app.state.node_catalog_reconciliation_task = None
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     logger.info("Starting ComfyUI FL-MCP bridge server")
@@ -88,32 +218,33 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         except ValueError:
             logger.warning("Ignoring invalid FL_MCP_PARENT_PID=%r", parent_pid_raw)
 
-    try:
-        yield
-    finally:
-        logger.info("Shutting down ComfyUI FL-MCP bridge server")
+    async with node_catalog_persistence_lifespan(app):
         try:
-            from chat_runtime import chat_runtime
-
-            await chat_runtime.shutdown()
-        except Exception as exc:
-            logger.warning("Embedded chat shutdown cleanup failed: %s", exc)
-        try:
-            from chat_routes import web_image_previews
-
-            await web_image_previews.aclose()
-        except Exception as exc:
-            logger.warning("Web image preview cleanup failed: %s", exc)
-        cleanup_handle.cancel()
-        if watchdog_handle:
-            watchdog_handle.cancel()
-        for handle in (cleanup_handle, watchdog_handle):
-            if not handle:
-                continue
+            yield
+        finally:
+            logger.info("Shutting down ComfyUI FL-MCP bridge server")
             try:
-                await handle
-            except asyncio.CancelledError:
-                pass
+                from chat_runtime import chat_runtime
+
+                await chat_runtime.shutdown()
+            except Exception as exc:
+                logger.warning("Embedded chat shutdown cleanup failed: %s", exc)
+            try:
+                from chat_routes import web_image_previews
+
+                await web_image_previews.aclose()
+            except Exception as exc:
+                logger.warning("Web image preview cleanup failed: %s", exc)
+            cleanup_handle.cancel()
+            if watchdog_handle:
+                watchdog_handle.cancel()
+            for handle in (cleanup_handle, watchdog_handle):
+                if not handle:
+                    continue
+                try:
+                    await handle
+                except asyncio.CancelledError:
+                    pass
 
 
 app = FastAPI(
