@@ -14,6 +14,11 @@ import {
     WORKFLOW_APPLICATION_PROPERTY,
 } from "./workflow_plan_apply.js";
 
+const WORKFLOW_REVEAL_DELAYS_MS = Object.freeze({
+    node: 260,
+    connection: 160,
+});
+
 /**
  * ToolExecutor class - Executes tools and manages execution history
  */
@@ -419,8 +424,12 @@ export class ToolExecutor {
             listConnections: nodeIds => this.flApi.getConnectionsForNodeIds(nodeIds),
             removeNodes: nodeIds => this.flApi.remove(nodeIds),
             nodeExists: nodeId => this.flApi.nodeExists(nodeId),
-            // Yield briefly so the validated transaction is visible node-by-node.
-            afterMutationStep: () => new Promise(resolve => setTimeout(resolve, 24)),
+            // Keep the deterministic transaction visibly legible on the canvas:
+            // nodes arrive first, then their validated links are drawn in sequence.
+            afterMutationStep: step => new Promise(resolve => setTimeout(
+                resolve,
+                WORKFLOW_REVEAL_DELAYS_MS[step?.phase] ?? 160,
+            )),
         };
         try {
             return await applyWorkflowPlanAtomic(params, adapter);
