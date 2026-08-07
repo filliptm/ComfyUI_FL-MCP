@@ -297,6 +297,18 @@ export function summarizeToolStep(step, config = {}) {
             ?? (Array.isArray(args?.nodes) ? args.nodes.length : null);
         if (count !== null) return `Created ${plural(count, "node")}`;
     }
+    if (name === "apply_workflow_plan") {
+        const count = Number(result?.node_count ?? result?.plan?.nodes?.length ?? 0);
+        if (result?.success && result?.already_applied) {
+            return `Workflow already applied · ${plural(count, "node")}`;
+        }
+        if (result?.success) return `Applied workflow plan · ${plural(count, "node")}`;
+        if (result?.rollback?.attempted && result?.rollback?.complete) {
+            return `Workflow apply failed · rolled back ${plural(result.rollback.attempted_node_ids?.length || 0, "node")}`;
+        }
+        if (result?.rollback?.attempted) return "Workflow apply failed · rollback incomplete";
+        return "Workflow plan not applied";
+    }
     if (name === "connect_nodes_batch") {
         const count = countSuccessful(result)
             ?? (Array.isArray(args?.connections) ? args.connections.length : null);

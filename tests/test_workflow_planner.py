@@ -1,7 +1,11 @@
 import pytest
 from node_library import catalog_contract_hash
 from pydantic import ValidationError
-from workflow_planner import PlanWorkflowRequest, compile_workflow_plan
+from workflow_planner import (
+    ApplyWorkflowPlanRequest,
+    PlanWorkflowRequest,
+    compile_workflow_plan,
+)
 
 
 def _catalog():
@@ -435,3 +439,25 @@ def test_request_contract_rejects_unknown_fields_and_invalid_aliases():
                 "unexpected": True,
             }
         )
+
+
+def test_apply_request_requires_pinned_hashes_and_stable_application_id():
+    payload = _valid_payload() | {
+        "expected_catalog_hash": "c" * 64,
+        "plan_hash": "d" * 64,
+        "application_id": "workflow-application-0001",
+    }
+
+    request = ApplyWorkflowPlanRequest.model_validate(payload)
+    assert request.expected_catalog_hash == "c" * 64
+    assert request.plan_hash == "d" * 64
+    assert request.application_id == "workflow-application-0001"
+
+    for missing in ("expected_catalog_hash", "plan_hash", "application_id"):
+        invalid = dict(payload)
+        invalid.pop(missing)
+        with pytest.raises(ValidationError):
+            ApplyWorkflowPlanRequest.model_validate(invalid)
+
+    with pytest.raises(ValidationError):
+        ApplyWorkflowPlanRequest.model_validate(payload | {"application_id": "short"})

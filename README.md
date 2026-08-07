@@ -276,6 +276,7 @@ These generally require the browser bridge.
 | `workflow_duplicate_current` | Duplicates the active workflow tab |
 | `find_node` | Finds a node by ID, type, or title |
 | `create_nodes` | Creates one or more nodes |
+| `apply_workflow_plan` | Atomically creates and connects a validated catalog-pinned plan with idempotency, verification, and rollback |
 | `remove_nodes` | Removes nodes |
 | `bypass_nodes` | Bypasses nodes |
 | `unbypass_nodes` | Unbypasses nodes |
@@ -381,6 +382,7 @@ These generally require the browser bridge.
 | `node_library_get_details` | Reads detailed metadata for a node type |
 | `node_library_find_compatible` | Finds compatible node types for connections |
 | `plan_workflow` | Dry-runs a catalog-pinned workflow plan and validates exact node schemas, values, and connections |
+| `apply_workflow_plan` | Recompiles and atomically applies an exact valid plan without queueing |
 | `registry_search_packages` | Searches all published packages in the official Comfy Registry and returns Registry + GitHub links |
 | `registry_get_package` | Inspects one official Registry package, its published nodes, and its Registry + GitHub links |
 

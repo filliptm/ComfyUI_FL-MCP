@@ -46,6 +46,11 @@ export const TOOL_CONFIG = {
         label: "Create",
         description: "Adding new nodes to workflow"
     },
+    "apply_workflow_plan": {
+        icon: "✅",
+        label: "Apply Plan",
+        description: "Applying and verifying a validated workflow plan"
+    },
     "remove_nodes": {
         icon: "🗑️",
         label: "Remove",
@@ -457,6 +462,7 @@ const TOOL_ICON_CLASSES = {
     query_workflow: "pi pi-search",
     workflow_diagram: "pi pi-sitemap",
     create_nodes: "pi pi-plus-circle",
+    apply_workflow_plan: "pi pi-check-square",
     remove_nodes: "pi pi-trash",
     connect_nodes: "pi pi-link",
     connect_nodes_batch: "pi pi-link",
@@ -500,6 +506,7 @@ const TOOL_RUNNING_LABELS = {
     workflow_overview: "Inspecting workflow",
     query_workflow: "Searching workflow",
     create_nodes: "Creating nodes",
+    apply_workflow_plan: "Applying validated workflow plan",
     remove_nodes: "Removing nodes",
     connect_nodes: "Connecting nodes",
     connect_nodes_batch: "Connecting nodes",

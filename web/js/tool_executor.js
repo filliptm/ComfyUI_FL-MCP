@@ -9,6 +9,10 @@
 
 import { FL_API } from "./fl_api.js";
 import { QueryExecutor } from "./query_executor.js";
+import {
+    applyWorkflowPlanAtomic,
+    WORKFLOW_APPLICATION_PROPERTY,
+} from "./workflow_plan_apply.js";
 
 /**
  * ToolExecutor class - Executes tools and manages execution history
@@ -50,6 +54,7 @@ export class ToolExecutor {
             "find_node": this._handleFindNode.bind(this),
             "create_node": this._handleCreateNode.bind(this),
             "create_nodes_batch": this._handleCreateNodesBatch.bind(this),
+            "apply_workflow_plan": this._handleApplyWorkflowPlan.bind(this),
             "remove_nodes": this._handleRemoveNodes.bind(this),
             "bypass_nodes": this._handleBypassNodes.bind(this),
             "unbypass_nodes": this._handleUnbypassNodes.bind(this),
@@ -357,6 +362,54 @@ export class ToolExecutor {
         console.log(`[ToolExecutor] Batch created ${results.length} nodes in ${elapsed.toFixed(2)}ms`);
 
         return results;
+    }
+
+    async _handleApplyWorkflowPlan(params) {
+        const autoQueueState = this.flApi.pauseAutoQueue();
+        const adapter = {
+            findApplicationNodes: applicationId => this.flApi.findNodesByProperty(
+                WORKFLOW_APPLICATION_PROPERTY,
+                "application_id",
+                applicationId,
+            ),
+            createNode: plannedNode => {
+                const created = this.flApi.create(plannedNode.node_type, {}, null);
+                if (Object.keys(plannedNode.values || {}).length > 0) {
+                    this.flApi.setValues(created.id, plannedNode.values);
+                }
+                return created;
+            },
+            setNodeMetadata: (nodeId, metadata) => this.flApi.setNodeProperty(
+                nodeId,
+                WORKFLOW_APPLICATION_PROPERTY,
+                metadata,
+            ),
+            getNodeValues: nodeId => this.flApi.getValues(nodeId),
+            connectNodes: (sourceId, targetId, connection) => this.flApi.connect(
+                sourceId,
+                connection.source_output_index,
+                targetId,
+                connection.target_input,
+                { auto_match: false },
+            ),
+            connectionExists: (sourceId, targetId, connection) => {
+                const slots = this.flApi.getNodeSlots(targetId);
+                const input = slots.inputs.find(item => item.name === connection.target_input);
+                return Boolean(
+                    input?.connected
+                    && String(input.connected_from?.node_id) === String(sourceId)
+                    && input.connected_from?.slot_index === connection.source_output_index
+                );
+            },
+            listConnections: nodeIds => this.flApi.getConnectionsForNodeIds(nodeIds),
+            removeNodes: nodeIds => this.flApi.remove(nodeIds),
+            nodeExists: nodeId => this.flApi.nodeExists(nodeId),
+        };
+        try {
+            return applyWorkflowPlanAtomic(params, adapter);
+        } finally {
+            this.flApi.restoreAutoQueue(autoQueueState);
+        }
     }
 
     async _handleRemoveNodes(params) {

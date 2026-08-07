@@ -134,6 +134,56 @@ export class FL_API {
         }
     }
 
+    /** Return current-canvas nodes whose structured property field matches. */
+    findNodesByProperty(propertyName, fieldName, expectedValue) {
+        return (app.graph?._nodes || [])
+            .filter(node => node.properties?.[propertyName]?.[fieldName] === expectedValue)
+            .map(node => ({
+                id: node.id,
+                node_id: node.id,
+                node_type: node.comfyClass || node.type,
+                metadata: node.properties[propertyName],
+                position: { x: node.pos[0], y: node.pos[1] },
+                size: { width: node.size[0], height: node.size[1] },
+            }));
+    }
+
+    /** Persist structured workflow-application metadata on one canvas node. */
+    setNodeProperty(nodeId, propertyName, value) {
+        const node = this._findNode(nodeId);
+        if (!node) throw new Error(`Node not found: ${nodeId}`);
+        node.properties = node.properties || {};
+        node.properties[propertyName] = value;
+        this._markGraphChanged();
+        return value;
+    }
+
+    nodeExists(nodeId) {
+        return this._findNode(nodeId) !== null;
+    }
+
+    /** Return every graph connection touching one of the supplied node IDs. */
+    getConnectionsForNodeIds(nodeIds) {
+        const selected = new Set((nodeIds || []).map(id => String(id)));
+        return Object.values(app.graph?.links || {})
+            .filter(link => (
+                link
+                && (selected.has(String(link.origin_id)) || selected.has(String(link.target_id)))
+            ))
+            .map(link => {
+                const source = this._findNode(link.origin_id);
+                const target = this._findNode(link.target_id);
+                return {
+                    source_node_id: link.origin_id,
+                    source_output_index: link.origin_slot,
+                    source_output: source?.outputs?.[link.origin_slot]?.name ?? null,
+                    target_node_id: link.target_id,
+                    target_input_index: link.target_slot,
+                    target_input: target?.inputs?.[link.target_slot]?.name ?? null,
+                };
+            });
+    }
+
     /**
      * Remove nodes from workflow
      * @param {Array<number|string>} nodeIds - Array of node IDs or titles
@@ -2403,6 +2453,10 @@ export class FL_API {
         return null;
     }
 
+    pauseAutoQueue() {
+        return this._pauseAutoQueueForMaskReview();
+    }
+
     _restoreAutoQueueAfterMaskReview(state) {
         if (state?.kind === "queueSettings") {
             const queueSettings = this._getQueueSettings();
@@ -2410,6 +2464,10 @@ export class FL_API {
         } else if (state?.kind === "legacy" && app.ui) {
             app.ui.autoQueueEnabled = state.enabled;
         }
+    }
+
+    restoreAutoQueue(state) {
+        this._restoreAutoQueueAfterMaskReview(state);
     }
 
     _setWidgetValue(node, widget, value) {

@@ -20,7 +20,10 @@ This skill is workflow-first. It borrows the old Ren Agent's operating disciplin
    - Do not create replacement nodes when the user only asked to change a parameter.
    - Batch node creation or connection calls when the tool supports it.
    - Treat nodes as rectangles. Never plan spacing from x/y points alone or guess that different node types share one size.
+   - For a new or restructured subgraph, inspect exact loaded schemas and validate it with `plan_workflow` using the current catalog hash.
 3. Modify through explicit graph tools.
+   - Apply a valid new-subgraph plan with `apply_workflow_plan`; preserve its application ID for retries so duplicate nodes cannot be created.
+   - If atomic application fails, inspect its structured validation and rollback result before trying again.
    - Use `set_node_values` for widget values.
    - Use `connect_nodes` or `connect_nodes_batch` for links.
    - Omit x/y from `create_nodes` when exact placement is unimportant; collision-aware creation will place nodes beside the graph.
@@ -57,7 +60,8 @@ Common patterns:
 - Understand the open graph: `workflow_overview`, `workflow_diagram`, `workflow_get_current_json`.
 - Explain selected nodes: `get_current_node_selection`, then `get_node_values` or `get_node_slots`.
 - Change parameters: find the existing node, then call `set_node_values`, then verify.
-- Add or rewire nodes: inspect the surrounding layout, create nodes in a batch, use the returned rectangles, connect them, then `modify_layout` when semantic organization is needed and take a screenshot.
+- Add a new subgraph: inspect exact local schemas, call `plan_workflow`, then `apply_workflow_plan`; use its returned alias-to-node-ID mapping for any later layout work.
+- Rewire existing nodes: inspect the surrounding layout and slots, use explicit connection tools, then verify the affected branch.
 - Compact or clean layout: `get_layout`, `modify_layout`, optionally edit group bounds via workflow JSON, then `take_screenshot`.
 - Debug execution: `queue_workflow`, `wait`, `get_execution_history`, `get_execution_details`, and error-buffer tools.
 - Check assets/models: `comfy_models_list`, `comfy_list_folders`, `comfy_read_file`, `extract_workflow_from_image`.
