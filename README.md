@@ -241,7 +241,7 @@ these gates, save, and restart ComfyUI.
 
 ## Tool Inventory
 
-FL-MCP currently exposes **108 tools**.
+FL-MCP currently exposes **109 tools**.
 
 <details open>
 <summary><strong>Capability and Utility Tools</strong></summary>
@@ -381,6 +381,7 @@ These generally require the browser bridge.
 | `node_library_search` | Searches node types currently loaded by this ComfyUI instance |
 | `node_library_get_details` | Reads detailed metadata for a node type |
 | `node_library_find_compatible` | Finds compatible node types for connections |
+| `resolve_workflow_spec` | Deterministically resolves semantic roles to exact locally loaded classes with catalog pinning and origin guardrails |
 | `plan_workflow` | Dry-runs a catalog-pinned workflow plan and validates exact node schemas, values, and connections |
 | `apply_workflow_plan` | Recompiles and atomically applies an exact valid plan without queueing |
 | `registry_search_packages` | Searches all published packages in the official Comfy Registry and returns Registry + GitHub links |

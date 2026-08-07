@@ -79,6 +79,10 @@ from workflow_planner import (
     PlanWorkflowRequest,
     compile_workflow_plan,
 )
+from workflow_resolver import (
+    ResolveWorkflowSpecRequest,
+    resolve_workflow_spec as resolve_workflow_capabilities,
+)
 from comfy_registry import ComfyRegistryClient, normalize_github_repository_url
 
 from comfy_manager import (
@@ -3433,6 +3437,49 @@ async def plan_workflow(request: PlanWorkflowRequest, ctx: Context) -> Dict[str,
         raise RuntimeError(f"Workflow planning failed: {e}")
     except Exception as e:
         logger.error(f"Unexpected error in plan_workflow: {e}")
+        raise RuntimeError(f"Tool execution failed: {e}")
+
+
+@mcp.tool()
+async def resolve_workflow_spec(
+    request: ResolveWorkflowSpecRequest,
+    ctx: Context,
+) -> Dict[str, Any]:
+    """Resolve semantic workflow roles to exact locally loaded node classes.
+
+    Use this before ``plan_workflow`` when the user describes capabilities rather
+    than exact class names. Resolution is read-only and pinned to one /object_info
+    catalog generation. It applies hard input/output/origin constraints, honors an
+    explicitly requested exact class without silent substitution, prefers classes
+    already used by the workflow or a verified local pattern, and otherwise uses
+    stable semantic scoring, local-first origin policy, and lexical tie-breaking.
+
+    Only loaded native, custom, partner, or unknown classes are eligible. Public
+    Registry results never enter a workflow through this tool. Partner selections
+    carry authentication, cost, and privacy review warnings. Inspect every selected
+    class with ``node_library_get_details``, then submit exact nodes and edges to
+    ``plan_workflow``. This tool never changes the canvas, installs, or queues.
+    """
+    await _report_tool_activity(ctx, "resolve_workflow_spec")
+
+    try:
+        client = get_node_library_client(
+            server_url=settings.comfyui_server_url,
+            timeout=settings.comfyui_api_timeout,
+        )
+        snapshot = await client.catalog_snapshot()
+        return resolve_workflow_capabilities(
+            request,
+            snapshot.data,
+            catalog_hash=snapshot.catalog_hash,
+            source=snapshot.source,
+        )
+    except NodeLibraryConnectionError as e:
+        raise RuntimeError(f"ComfyUI server connection failed: {e}")
+    except NodeLibraryError as e:
+        raise RuntimeError(f"Workflow capability resolution failed: {e}")
+    except Exception as e:
+        logger.error(f"Unexpected error in resolve_workflow_spec: {e}")
         raise RuntimeError(f"Tool execution failed: {e}")
 
 

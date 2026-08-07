@@ -140,6 +140,7 @@ CORE_CHAT_TOOLS = {
     "node_library_search",
     "node_library_get_details",
     "node_library_status",
+    "resolve_workflow_spec",
     "plan_workflow",
     "apply_workflow_plan",
     "registry_search_packages",
@@ -727,7 +728,15 @@ def registry_discovery_instructions() -> str:
         "ComfyUI instance through `/object_info`. Use them to prove a node can be "
         "created locally.\n"
         "- Before building a new workflow or materially changing graph topology, "
-        "assign stable lowercase aliases, inspect every chosen node schema, and "
+        "translate each requested role into concise capabilities plus required input/output "
+        "types and call `resolve_workflow_spec` against the current catalog hash. If the "
+        "user explicitly named an exact loaded class, pass it as `requested_node_type`; "
+        "never silently substitute it. Pass classes already used by the graph or a verified "
+        "local pattern as `preferred_node_types`. The resolver is local-only and applies "
+        "stable scoring, origin policy, and lexical tie-breaking; Registry packages are "
+        "never eligible. Correct resolution errors and review partner/auth/cost/privacy or "
+        "unknown-origin warnings before proceeding. Inspect each selected exact schema, "
+        "assign stable lowercase aliases, and "
         "call `plan_workflow` with the current catalog hash. It is a read-only "
         "compiler check, not a canvas edit. Do not create or connect nodes unless "
         "it returns `valid=true` and a plan hash. Correct every issue and re-plan; "

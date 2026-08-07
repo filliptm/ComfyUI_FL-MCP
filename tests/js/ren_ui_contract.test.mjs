@@ -436,6 +436,9 @@ test("official Registry discovery has clear human tool activity", async () => {
 test("deterministic workflow planning has clear human tool activity", async () => {
     const tools = await readFile(new URL("web/js/tool_activity.js", root), "utf8");
 
+    assert.match(tools, /"resolve_workflow_spec"\s*:\s*\{/);
+    assert.match(tools, /label:\s*"Resolve Capabilities"/);
+    assert.match(tools, /resolve_workflow_spec:\s*"Resolving workflow capabilities"/);
     assert.match(tools, /"plan_workflow"\s*:\s*\{/);
     assert.match(tools, /label:\s*"Validate Plan"/);
     assert.match(tools, /plan_workflow:\s*"Validating workflow plan"/);
