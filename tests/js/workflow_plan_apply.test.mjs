@@ -86,7 +86,7 @@ class FakeCanvasAdapter {
 
     assignAttachment(id, binding) {
         if (this.failAttachment) throw new Error("attachment failed");
-        const value = `${binding.image.subfolder}/${binding.image.filename}`;
+        const value = `${binding.image.subfolder}/${binding.image.filename} [input]`;
         this.nodes.get(id).values[binding.input_name] = value;
         return { node_id: id, image: structuredClone(binding.image) };
     }
@@ -346,7 +346,7 @@ test("validated chat attachments are assigned inside the atomic transaction", as
 
     assert.equal(result.success, true);
     assert.equal(result.attachment_count, 1);
-    assert.equal(adapter.nodes.get(1).values.image, "ren-chat/session/main.png");
+    assert.equal(adapter.nodes.get(1).values.image, "ren-chat/session/main.png [input]");
     assert.equal(result.verification.valid, true);
 });
 

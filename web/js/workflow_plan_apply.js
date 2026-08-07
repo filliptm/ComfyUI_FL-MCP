@@ -1,5 +1,7 @@
 /** Deterministic, rollback-safe application of one validated workflow plan. */
 
+import { parseImageWidgetRef } from "./mask_utils.js";
+
 export const WORKFLOW_APPLICATION_PROPERTY = "fl_mcp_workflow_application";
 export const WORKFLOW_APPLICATION_SCHEMA = "fl-mcp.workflow-application.v1";
 
@@ -17,6 +19,13 @@ function canonicalValue(value) {
 
 function valuesEqual(left, right) {
     return JSON.stringify(canonicalValue(left)) === JSON.stringify(canonicalValue(right));
+}
+
+
+function imageValuesEqual(left, right) {
+    const leftRef = parseImageWidgetRef(left);
+    const rightRef = parseImageWidgetRef(right);
+    return Boolean(leftRef && rightRef && valuesEqual(leftRef, rightRef));
 }
 
 
@@ -114,6 +123,9 @@ function applicationConnectionOrder(connections) {
 
 function verifyApplication(plan, planHash, applicationId, adapter, applicationNodes) {
     const issues = [];
+    const attachmentInputs = new Set(
+        (plan.attachments || []).map(binding => `${binding.node_alias}\u0000${binding.input_name}`),
+    );
     const byAlias = new Map();
     for (const node of applicationNodes) {
         const metadata = node.metadata || {};
@@ -186,9 +198,12 @@ function verifyApplication(plan, planHash, applicationId, adapter, applicationNo
         }
         const observedValues = adapter.getNodeValues(id);
         for (const [name, value] of Object.entries(expected.values || {})) {
+            const attachmentBound = attachmentInputs.has(`${expected.alias}\u0000${name}`);
             if (
                 !Object.prototype.hasOwnProperty.call(observedValues, name)
-                || !valuesEqual(observedValues[name], value)
+                || !(attachmentBound
+                    ? imageValuesEqual(observedValues[name], value)
+                    : valuesEqual(observedValues[name], value))
             ) {
                 issues.push(issue(
                     "application_widget_mismatch",
