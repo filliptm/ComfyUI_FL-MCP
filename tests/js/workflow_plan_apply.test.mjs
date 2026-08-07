@@ -48,6 +48,7 @@ class FakeCanvasAdapter {
         this.failCreateAlias = null;
         this.failConnect = false;
         this.failAttachment = false;
+        this.mutationSteps = [];
     }
 
     findApplicationNodes(applicationId) {
@@ -135,6 +136,10 @@ class FakeCanvasAdapter {
     nodeExists(id) {
         return this.nodes.has(id);
     }
+
+    async afterMutationStep(step) {
+        this.mutationSteps.push(structuredClone(step));
+    }
 }
 
 
@@ -147,9 +152,9 @@ function request(applicationId = "atomic-test-0001") {
 }
 
 
-test("atomic apply creates values, exact connections, aliases, and metadata", () => {
+test("atomic apply creates values, exact connections, aliases, and metadata", async () => {
     const adapter = new FakeCanvasAdapter();
-    const result = applyWorkflowPlanAtomic(request(), adapter);
+    const result = await applyWorkflowPlanAtomic(request(), adapter);
 
     assert.equal(result.success, true);
     assert.equal(result.applied, true);
@@ -163,13 +168,17 @@ test("atomic apply creates values, exact connections, aliases, and metadata", ()
     assert.equal(adapter.nodes.get(2).values.filename_prefix, "atomic-e2e");
     assert.equal(adapter.nodes.get(1).metadata.schema, WORKFLOW_APPLICATION_SCHEMA);
     assert.equal(result.queued, false);
+    assert.deepEqual(
+        adapter.mutationSteps.map(step => step.phase),
+        ["node", "node", "connection"],
+    );
 });
 
 
-test("retrying the same application is idempotent", () => {
+test("retrying the same application is idempotent", async () => {
     const adapter = new FakeCanvasAdapter();
-    const first = applyWorkflowPlanAtomic(request(), adapter);
-    const second = applyWorkflowPlanAtomic(request(), adapter);
+    const first = await applyWorkflowPlanAtomic(request(), adapter);
+    const second = await applyWorkflowPlanAtomic(request(), adapter);
 
     assert.equal(first.applied, true);
     assert.equal(second.success, true);
@@ -182,12 +191,12 @@ test("retrying the same application is idempotent", () => {
 });
 
 
-test("an application ID conflict fails closed without mutation", () => {
+test("an application ID conflict fails closed without mutation", async () => {
     const adapter = new FakeCanvasAdapter();
-    applyWorkflowPlanAtomic(request(), adapter);
+    await applyWorkflowPlanAtomic(request(), adapter);
     adapter.nodes.get(2).values.filename_prefix = "manually-changed";
 
-    const result = applyWorkflowPlanAtomic(request(), adapter);
+    const result = await applyWorkflowPlanAtomic(request(), adapter);
 
     assert.equal(result.success, false);
     assert.equal(result.error.code, "idempotency_conflict");
@@ -197,9 +206,9 @@ test("an application ID conflict fails closed without mutation", () => {
 });
 
 
-test("an application ID conflict rejects unexpected internal or external edges", () => {
+test("an application ID conflict rejects unexpected internal or external edges", async () => {
     const adapter = new FakeCanvasAdapter();
-    applyWorkflowPlanAtomic(request(), adapter);
+    await applyWorkflowPlanAtomic(request(), adapter);
     adapter.connections.push({
         sourceId: 1,
         targetId: 99,
@@ -207,7 +216,7 @@ test("an application ID conflict rejects unexpected internal or external edges",
         targetInput: "images",
     });
 
-    const result = applyWorkflowPlanAtomic(request(), adapter);
+    const result = await applyWorkflowPlanAtomic(request(), adapter);
 
     assert.equal(result.success, false);
     assert.equal(result.error.code, "idempotency_conflict");
@@ -218,11 +227,11 @@ test("an application ID conflict rejects unexpected internal or external edges",
 });
 
 
-test("a node creation failure removes every node created by the transaction", () => {
+test("a node creation failure removes every node created by the transaction", async () => {
     const adapter = new FakeCanvasAdapter();
     adapter.failCreateAlias = "output";
 
-    const result = applyWorkflowPlanAtomic(request("atomic-test-create-failure"), adapter);
+    const result = await applyWorkflowPlanAtomic(request("atomic-test-create-failure"), adapter);
 
     assert.equal(result.success, false);
     assert.equal(result.error.code, "workflow_application_failed");
@@ -233,11 +242,11 @@ test("a node creation failure removes every node created by the transaction", ()
 });
 
 
-test("a connection failure rolls back the entire created subgraph", () => {
+test("a connection failure rolls back the entire created subgraph", async () => {
     const adapter = new FakeCanvasAdapter();
     adapter.failConnect = true;
 
-    const result = applyWorkflowPlanAtomic(request("atomic-test-connect-failure"), adapter);
+    const result = await applyWorkflowPlanAtomic(request("atomic-test-connect-failure"), adapter);
 
     assert.equal(result.success, false);
     assert.equal(result.rollback.attempted, true);
@@ -248,7 +257,79 @@ test("a connection failure rolls back the entire created subgraph", () => {
 });
 
 
-test("validated chat attachments are assigned inside the atomic transaction", () => {
+test("numbered dynamic inputs are connected in ascending socket order", async () => {
+    const adapter = new FakeCanvasAdapter();
+    const dynamicPlan = structuredClone(plan);
+    dynamicPlan.nodes = [
+        {
+            alias: "factory_reference",
+            node_type: "LoadImage",
+            schema_hash: "e".repeat(64),
+            values: {},
+        },
+        {
+            alias: "final_save",
+            node_type: "SaveImage",
+            schema_hash: "2".repeat(64),
+            values: {},
+        },
+        {
+            alias: "main_portrait",
+            node_type: "LoadImage",
+            schema_hash: "f".repeat(64),
+            values: {},
+        },
+        {
+            alias: "nano_banana",
+            node_type: "GeminiNanoBanana2V2",
+            schema_hash: "1".repeat(64),
+            values: {},
+        },
+    ];
+    dynamicPlan.connections = [
+        {
+            source_alias: "factory_reference",
+            source_output: "IMAGE",
+            source_output_index: 0,
+            target_alias: "nano_banana",
+            target_input: "model.images.image_2",
+        },
+        {
+            source_alias: "nano_banana",
+            source_output: "IMAGE",
+            source_output_index: 0,
+            target_alias: "final_save",
+            target_input: "images",
+        },
+        {
+            source_alias: "main_portrait",
+            source_output: "IMAGE",
+            source_output_index: 0,
+            target_alias: "nano_banana",
+            target_input: "model.images.image_1",
+        },
+    ];
+
+    const result = await applyWorkflowPlanAtomic({
+        ...request("atomic-test-dynamic-input-order"),
+        plan: dynamicPlan,
+    }, adapter);
+
+    assert.equal(result.success, true);
+    assert.deepEqual(
+        adapter.mutationSteps
+            .filter(step => step.phase === "node")
+            .map(step => step.alias),
+        ["factory_reference", "main_portrait", "nano_banana", "final_save"],
+    );
+    assert.deepEqual(
+        adapter.connections.map(connection => connection.targetInput),
+        ["model.images.image_1", "images", "model.images.image_2"],
+    );
+});
+
+
+test("validated chat attachments are assigned inside the atomic transaction", async () => {
     const adapter = new FakeCanvasAdapter();
     const attachmentPlan = structuredClone(plan);
     attachmentPlan.nodes[0].values.image = "ren-chat/session/main.png";
@@ -258,7 +339,7 @@ test("validated chat attachments are assigned inside the atomic transaction", ()
         image: { filename: "main.png", subfolder: "ren-chat/session", type: "input" },
     }];
 
-    const result = applyWorkflowPlanAtomic({
+    const result = await applyWorkflowPlanAtomic({
         ...request("atomic-test-attachment"),
         plan: attachmentPlan,
     }, adapter);
@@ -270,7 +351,7 @@ test("validated chat attachments are assigned inside the atomic transaction", ()
 });
 
 
-test("attachment assignment failure rolls back the complete subgraph", () => {
+test("attachment assignment failure rolls back the complete subgraph", async () => {
     const adapter = new FakeCanvasAdapter();
     adapter.failAttachment = true;
     const attachmentPlan = structuredClone(plan);
@@ -281,7 +362,7 @@ test("attachment assignment failure rolls back the complete subgraph", () => {
         image: { filename: "main.png", subfolder: "ren-chat/session", type: "input" },
     }];
 
-    const result = applyWorkflowPlanAtomic({
+    const result = await applyWorkflowPlanAtomic({
         ...request("atomic-test-attachment-failure"),
         plan: attachmentPlan,
     }, adapter);

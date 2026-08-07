@@ -40,6 +40,78 @@ function connectionKey(connection) {
 }
 
 
+function dynamicInputSequence(targetInput) {
+    const match = String(targetInput || "").match(/^(.*?)(?:_|\.)(\d+)$/);
+    if (!match) return null;
+    return { stem: match[1], index: Number(match[2]) };
+}
+
+
+function applicationNodeOrder(nodes, connections) {
+    const byAlias = new Map(nodes.map(node => [node.alias, node]));
+    const incoming = new Map(nodes.map(node => [node.alias, 0]));
+    const outgoing = new Map(nodes.map(node => [node.alias, new Set()]));
+    for (const connection of connections) {
+        if (
+            connection.source_alias === connection.target_alias
+            || !byAlias.has(connection.source_alias)
+            || !byAlias.has(connection.target_alias)
+            || outgoing.get(connection.source_alias).has(connection.target_alias)
+        ) {
+            continue;
+        }
+        outgoing.get(connection.source_alias).add(connection.target_alias);
+        incoming.set(connection.target_alias, incoming.get(connection.target_alias) + 1);
+    }
+    const ready = [...incoming.entries()]
+        .filter(([, count]) => count === 0)
+        .map(([alias]) => alias)
+        .sort();
+    const aliases = [];
+    while (ready.length > 0) {
+        const alias = ready.shift();
+        aliases.push(alias);
+        for (const target of [...outgoing.get(alias)].sort()) {
+            const remaining = incoming.get(target) - 1;
+            incoming.set(target, remaining);
+            if (remaining === 0) {
+                ready.push(target);
+                ready.sort();
+            }
+        }
+    }
+    if (aliases.length !== nodes.length) return nodes;
+    return aliases.map(alias => byAlias.get(alias));
+}
+
+
+/**
+ * Keep the canonical plan order except for numbered dynamic inputs on the same
+ * target. ComfyUI nodes such as Nano Banana expose image_2 only after image_1
+ * is connected, so those sockets must be populated in ascending sequence.
+ */
+function applicationConnectionOrder(connections) {
+    const ordered = [...connections];
+    const groups = new Map();
+    connections.forEach((connection, position) => {
+        const sequence = dynamicInputSequence(connection.target_input);
+        if (!sequence) return;
+        const key = `${connection.target_alias}\u0000${sequence.stem}`;
+        if (!groups.has(key)) groups.set(key, []);
+        groups.get(key).push({ connection, position, index: sequence.index });
+    });
+    for (const group of groups.values()) {
+        if (group.length < 2) continue;
+        const positions = group.map(item => item.position);
+        const sequenced = [...group].sort((left, right) => left.index - right.index);
+        positions.forEach((position, index) => {
+            ordered[position] = sequenced[index].connection;
+        });
+    }
+    return ordered;
+}
+
+
 function verifyApplication(plan, planHash, applicationId, adapter, applicationNodes) {
     const issues = [];
     const byAlias = new Map();
@@ -199,10 +271,10 @@ function rollbackCreatedNodes(createdIds, adapter) {
 
 
 /**
- * Apply one canonical planner result through a synchronous canvas adapter.
+ * Apply one canonical planner result through a canvas adapter.
  * The function never throws after mutation begins; failures include rollback state.
  */
-export function applyWorkflowPlanAtomic(request, adapter) {
+export async function applyWorkflowPlanAtomic(request, adapter) {
     const { plan, plan_hash: planHash, application_id: applicationId } = request || {};
     if (
         !plan
@@ -271,7 +343,7 @@ export function applyWorkflowPlanAtomic(request, adapter) {
     const connectionResults = [];
     const attachmentResults = [];
     try {
-        for (const plannedNode of plan.nodes) {
+        for (const plannedNode of applicationNodeOrder(plan.nodes, plan.connections)) {
             const created = adapter.createNode(plannedNode);
             const id = nodeId(created);
             if (id === undefined || id === null) {
@@ -293,6 +365,13 @@ export function applyWorkflowPlanAtomic(request, adapter) {
                 position: created.position || null,
                 size: created.size || null,
             });
+            if (typeof adapter.afterMutationStep === "function") {
+                await adapter.afterMutationStep({
+                    phase: "node",
+                    alias: plannedNode.alias,
+                    node_id: id,
+                });
+            }
         }
 
         for (const binding of plan.attachments || []) {
@@ -313,7 +392,7 @@ export function applyWorkflowPlanAtomic(request, adapter) {
             });
         }
 
-        for (const connection of plan.connections) {
+        for (const connection of applicationConnectionOrder(plan.connections)) {
             const sourceId = aliases[connection.source_alias];
             const targetId = aliases[connection.target_alias];
             const connected = adapter.connectNodes(sourceId, targetId, connection);
@@ -327,6 +406,14 @@ export function applyWorkflowPlanAtomic(request, adapter) {
                 target_input: connection.target_input,
                 connection: connected,
             });
+            if (typeof adapter.afterMutationStep === "function") {
+                await adapter.afterMutationStep({
+                    phase: "connection",
+                    source_alias: connection.source_alias,
+                    target_alias: connection.target_alias,
+                    target_input: connection.target_input,
+                });
+            }
         }
 
         const applicationNodes = adapter.findApplicationNodes(applicationId);

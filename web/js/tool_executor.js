@@ -419,9 +419,11 @@ export class ToolExecutor {
             listConnections: nodeIds => this.flApi.getConnectionsForNodeIds(nodeIds),
             removeNodes: nodeIds => this.flApi.remove(nodeIds),
             nodeExists: nodeId => this.flApi.nodeExists(nodeId),
+            // Yield briefly so the validated transaction is visible node-by-node.
+            afterMutationStep: () => new Promise(resolve => setTimeout(resolve, 24)),
         };
         try {
-            return applyWorkflowPlanAtomic(params, adapter);
+            return await applyWorkflowPlanAtomic(params, adapter);
         } finally {
             this.flApi.restoreAutoQueue(autoQueueState);
         }
