@@ -149,7 +149,39 @@ def _stable_default(spec: Any) -> tuple[bool, Any]:
         options = metadata.get("options")
         if isinstance(options, list) and options:
             return True, options[0]
+    if input_type == "COMFY_DYNAMICCOMBO_V3":
+        options = metadata.get("options")
+        if isinstance(options, list) and options:
+            first = options[0]
+            if isinstance(first, Mapping) and str(first.get("key") or "").strip():
+                return True, first["key"]
+            if isinstance(first, str) and first:
+                return True, first
     return False, None
+
+
+def _dynamic_selector_defaults(
+    node_info: Mapping[str, Any],
+    requested_values: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Choose stable first options so their dependent dotted inputs can expand."""
+
+    defaults: dict[str, Any] = {}
+    inputs = node_info.get("input")
+    if not isinstance(inputs, Mapping):
+        return defaults
+    for group in ("required", "optional"):
+        specs = inputs.get(group)
+        if not isinstance(specs, Mapping):
+            continue
+        for input_name, spec in specs.items():
+            input_type, _ = _input_parts(spec)
+            if input_type != "COMFY_DYNAMICCOMBO_V3" or input_name in requested_values:
+                continue
+            has_default, default = _stable_default(spec)
+            if has_default:
+                defaults[input_name] = default
+    return defaults
 
 
 def _expanded_inputs(
@@ -173,9 +205,11 @@ def _canonicalize_node_values(
 ) -> tuple[dict[str, Any], dict[str, Any], list[dict[str, str]]]:
     issues: list[dict[str, str]] = []
     seed_values = dict(node.values)
+    selector_defaults = _dynamic_selector_defaults(node_info, seed_values)
+    seed_values.update(selector_defaults)
     first_inputs, _ = _expanded_inputs(node_info, seed_values, connection_hints)
     available = sorted(first_inputs)
-    values: dict[str, Any] = {}
+    values: dict[str, Any] = dict(selector_defaults)
     for requested, value in node.values.items():
         resolved, name_issues = _resolve_runtime_name(
             requested,

@@ -217,6 +217,47 @@ def test_semantic_compiler_produces_one_exact_attachment_aware_partner_plan():
     ]
 
 
+def test_compiler_defaults_dynamic_model_before_resolving_short_dotted_inputs():
+    request_payload = _request().model_dump(mode="json")
+    generate = next(
+        node for node in request_payload["nodes"] if node["alias"] == "generate"
+    )
+    generate["values"].pop("model")
+    generate.pop("requested_node_type")
+
+    catalog = _catalog()
+    catalog["GeminiImage2Node"] = {
+        **catalog["GeminiNanoBanana2V2"],
+        "display_name": "Gemini Image 2",
+        "description": (
+            "Nano Banana 2 partner image editing with two reference images, "
+            "lighting, and atmosphere"
+        ),
+    }
+    request = CompileWorkflowSpecRequest.model_validate(request_payload)
+    result = compile_workflow_spec(
+        request,
+        catalog,
+        catalog_hash=catalog_contract_hash(catalog),
+        source="http://comfy/object_info",
+        validated_attachment_values={
+            (binding.node_alias, binding.input_name): binding.image.widget_value()
+            for binding in request.attachments
+        },
+    )
+
+    assert result["valid"] is True
+    assert result["selected_node_types"]["generate"] == "GeminiNanoBanana2V2"
+    generate_plan = next(
+        node for node in result["plan"]["nodes"] if node["alias"] == "generate"
+    )
+    assert generate_plan["values"]["model"] == (
+        "Nano Banana 2 (Gemini 3.1 Flash Image)"
+    )
+    assert generate_plan["values"]["model.aspect_ratio"] == "16:9"
+    assert generate_plan["values"]["model.thinking_level"] == "MINIMAL"
+
+
 def test_semantic_compiler_fails_closed_on_unknown_short_runtime_name():
     catalog = _catalog()
     request = _request()

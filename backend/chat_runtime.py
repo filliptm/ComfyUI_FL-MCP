@@ -196,6 +196,23 @@ def compiler_first_workflow_requested(message: str) -> bool:
     return bool(build_action and complete_graph_signal and not existing_edit_signal)
 
 
+def explicit_web_research_requested(message: str) -> bool:
+    """Keep web tools only when the visible request actually asks to browse."""
+
+    visible = str(message or "").split(
+        "\n\nThe user attached ComfyUI input image(s)",
+        1,
+    )[0].casefold()
+    return bool(
+        re.search(r"\b(?:search|browse|research|look[ -]?up|web search)\b", visible)
+        or re.search(
+            r"\b(?:exact|current|latest)\b.{0,40}\b(?:pricing|price|cost|policy|"
+            r"privacy|terms)\b",
+            visible,
+        )
+    )
+
+
 def normalize_chat_attachments(value: Any) -> list[dict[str, Any]]:
     """Validate browser-uploaded ComfyUI input references for chat persistence."""
     if value is None:
@@ -727,6 +744,8 @@ def tools_for_message(message: str, search_mode: str = "off") -> set[str]:
         # already contains catalog, schema, attachment, plan, and partner-review
         # evidence, while atomic application verifies the created subgraph.
         selected.difference_update(COMPILER_FIRST_REDUNDANT_TOOLS)
+        if not explicit_web_research_requested(message):
+            selected.difference_update({"web_search", "web_fetch_page"})
     return selected
 
 

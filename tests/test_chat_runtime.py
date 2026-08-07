@@ -14,6 +14,7 @@ from chat_runtime import (
     bridge_settings,
     claude_tool_name,
     compiler_first_workflow_requested,
+    explicit_web_research_requested,
     codex_tool_name,
     compact_messages_for_model,
     conversation_needs_compaction,
@@ -502,7 +503,8 @@ def test_complete_new_workflow_uses_only_compiler_application_route():
 
     selected = tools_for_message(request, "free")
     assert {"view_chat_image", "compile_workflow_spec", "apply_workflow_plan"} <= selected
-    assert "web_search" in selected
+    assert "web_search" not in selected
+    assert "web_fetch_page" not in selected
     assert "workflow_overview" not in selected
     assert "node_library_status" not in selected
     assert "resolve_workflow_spec" not in selected
@@ -515,6 +517,13 @@ def test_complete_new_workflow_uses_only_compiler_application_route():
     edit = "Change the seed on the selected KSampler node to 7."
     assert compiler_first_workflow_requested(edit) is False
     assert "get_node_values" in tools_for_message(edit)
+
+    researched = request.replace(
+        "and don't run it yet",
+        "and search the web for exact current pricing first",
+    )
+    assert explicit_web_research_requested(researched) is True
+    assert "web_search" in tools_for_message(researched, "free")
 
 
 def test_exact_registry_request_gets_tools_and_source_guardrails():
