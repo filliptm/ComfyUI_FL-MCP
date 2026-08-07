@@ -156,6 +156,8 @@ CORE_CHAT_TOOLS = {
     "resolve_workflow_spec",
     "plan_workflow",
     "apply_workflow_plan",
+    "plan_workflow_refinement",
+    "apply_workflow_refinement",
     "registry_search_packages",
     "registry_get_package",
     "mcp_capability_audit",
@@ -182,6 +184,20 @@ COMPILER_FIRST_REDUNDANT_TOOLS = {
     "resolve_workflow_spec",
     "plan_workflow",
     "mcp_capability_audit",
+    "plan_workflow_refinement",
+    "apply_workflow_refinement",
+}
+
+REFINEMENT_REDUNDANT_TOOLS = {
+    "create_nodes",
+    "remove_nodes",
+    "set_node_values",
+    "connect_nodes_batch",
+    "modify_layout",
+    "compile_workflow_spec",
+    "resolve_workflow_spec",
+    "plan_workflow",
+    "apply_workflow_plan",
 }
 
 
@@ -207,6 +223,60 @@ def compiler_first_workflow_requested(message: str) -> bool:
         visible,
     )
     return bool(build_action and complete_graph_signal and not existing_edit_signal)
+
+
+def workflow_refinement_requested(message: str) -> bool:
+    """Detect requests that splice nodes into or out of an existing graph path."""
+
+    raw_visible = str(message or "").split(
+        "\n\nThe user attached ComfyUI input image(s)",
+        1,
+    )[0]
+    visible = raw_visible.casefold()
+    replacement = re.search(
+        r"\b(?:replace|swap|remove|delete)\b.{0,100}\b(?:node|step|branch|chain)\b",
+        visible,
+    )
+    insertion = re.search(
+        r"\b(?:insert|add|put|place)\b.{0,120}\b(?:between|before|after)\b",
+        visible,
+    ) or re.search(
+        r"\b(?:insert|add|put|place)\b.{0,120}\b(?:to|into)\s+"
+        r"(?:(?:this|the|my)\s+)?(?:(?:existing|current|selected)\s+)?"
+        r"(?:workflow|graph|branch|chain)\b",
+        visible,
+    )
+    rewiring = re.search(
+        r"\b(?:splice|rewire|reconnect)\b.{0,100}\b(?:node|step|branch|chain|graph)\b",
+        visible,
+    )
+    direct_refinement = re.search(
+        r"\b(?:refine|expand|extend)\b.{0,120}"
+        r"\b(?:this|the|existing|current|selected)\s+"
+        r"(?:workflow|graph|branch|chain)\b",
+        visible,
+    )
+    exact_class_edit = False
+    class_edit = re.search(
+        r"\b(?:replace|swap|remove|delete)\s+"
+        r"([A-Za-z_][A-Za-z0-9_.-]{1,255})"
+        r"(?:\s+(?:with|for)\s+([A-Za-z_][A-Za-z0-9_.-]{1,255}))?\b",
+        raw_visible,
+        flags=re.IGNORECASE,
+    )
+    if class_edit:
+        identifiers = [value for value in class_edit.groups() if value]
+        exact_class_edit = all(
+            any(char.isupper() or char.isdigit() for char in value)
+            for value in identifiers
+        )
+    return bool(
+        replacement
+        or insertion
+        or rewiring
+        or direct_refinement
+        or exact_class_edit
+    )
 
 
 def explicit_web_research_requested(message: str) -> bool:
@@ -767,7 +837,11 @@ def tools_for_message(message: str, search_mode: str = "off") -> set[str]:
         selected.update(INTENT_TOOL_GROUPS["files"])
     if search_mode != "off":
         selected.update({"web_search", "web_fetch_page"})
-    if compiler_first_workflow_requested(message):
+    if workflow_refinement_requested(message):
+        selected.difference_update(REFINEMENT_REDUNDANT_TOOLS)
+        if not explicit_web_research_requested(message):
+            selected.difference_update({"web_search", "web_fetch_page"})
+    elif compiler_first_workflow_requested(message):
         # Keep one deterministic route for complete new graphs. The compiler result
         # already contains catalog, schema, attachment, plan, and partner-review
         # evidence, while atomic application verifies the created subgraph.
@@ -870,6 +944,23 @@ def registry_discovery_instructions() -> str:
         "only when retrying the same application. Do not replace this atomic call with "
         "separate create, value, and connection calls. It verifies the result, rolls "
         "back every created node on failure, and never queues.\n"
+        "- To refine an existing workflow, inspect the current "
+        "workflow or selection once only if its exact node IDs are unknown. If the "
+        "replacement class is unknown, use one local node-knowledge search, never web "
+        "search. Then call `plan_workflow_refinement`. For linear edits its first and "
+        "last path IDs are retained boundaries, so insertion uses [upstream, downstream] "
+        "and replacement or deletion uses [upstream, old_node..., downstream]. For a "
+        "terminal append, leave `path_node_ids` empty, identify the exact retained "
+        "`terminal_source`, order the created-node spine in `replacement_nodes`, and map "
+        "other retained branches through `side_input_mappings`; the last node may omit "
+        "`chain_output` when no downstream connection is requested. Pass a valid returned "
+        "`apply_request` unchanged to "
+        "`apply_workflow_refinement`; do not use separate create, remove, or connect calls. "
+        "The refinement route is pinned to both graph and catalog, validates every exact "
+        "live slot and source schema, preserves unrelated edges and existing fan-out, "
+        "rejects cycles or occupied targets, restores the full prior snapshot on failure, "
+        "and never queues. A validation error is a safety stop, not permission to bypass "
+        "the atomic route.\n"
         "- Treat the user's requested graph as the plan boundary. Never add local "
         "filenames, uploaded/chat images, prompts, models, utility nodes, output "
         "nodes, or extra connections merely to make a richer example. Use an exact "

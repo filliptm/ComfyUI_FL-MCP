@@ -372,6 +372,16 @@ export const TOOL_CONFIG = {
         label: "Validate Plan",
         description: "Checking workflow structure against loaded node schemas"
     },
+    "plan_workflow_refinement": {
+        icon: "🧭",
+        label: "Plan Refinement",
+        description: "Validating a safe change to the existing workflow"
+    },
+    "apply_workflow_refinement": {
+        icon: "🔀",
+        label: "Refine Workflow",
+        description: "Applying a verified workflow graph change"
+    },
     "registry_search_packages": {
         icon: "🌐",
         label: "Registry Search",
@@ -512,6 +522,8 @@ const TOOL_ICON_CLASSES = {
     resolve_workflow_spec: "pi pi-compass",
     compile_workflow_spec: "pi pi-sitemap",
     plan_workflow: "pi pi-check-circle",
+    plan_workflow_refinement: "pi pi-directions",
+    apply_workflow_refinement: "pi pi-arrows-h",
     registry_search_packages: "pi pi-globe",
     registry_get_package: "pi pi-box",
     manager_check_updates: "pi pi-refresh",
@@ -550,6 +562,8 @@ const TOOL_RUNNING_LABELS = {
     resolve_workflow_spec: "Resolving workflow capabilities",
     compile_workflow_spec: "Compiling complete workflow",
     plan_workflow: "Validating workflow plan",
+    plan_workflow_refinement: "Planning workflow refinement",
+    apply_workflow_refinement: "Refining workflow graph",
     registry_search_packages: "Searching official Comfy Registry",
     registry_get_package: "Inspecting Registry package",
     manager_check_updates: "Checking for updates",

@@ -34,6 +34,7 @@ from chat_runtime import (
     web_image_requested,
     web_search_environment,
     web_search_instructions,
+    workflow_refinement_requested,
 )
 from chat_store import ChatStore
 
@@ -543,6 +544,53 @@ def test_complete_new_workflow_uses_only_compiler_application_route():
     assert "node_library_status" not in selected_with_knowledge
     assert "web_search" not in selected_with_knowledge
     assert "web_fetch_page" not in selected_with_knowledge
+
+
+def test_existing_chain_edit_uses_only_atomic_refinement_route():
+    request = "Add an upscaler after the selected decode node in the existing workflow."
+    assert workflow_refinement_requested(request) is True
+
+    selected = tools_for_message(request, "free")
+    assert {"plan_workflow_refinement", "apply_workflow_refinement"} <= selected
+    assert "compile_workflow_spec" not in selected
+    assert "apply_workflow_plan" not in selected
+    assert "create_nodes" not in selected
+    assert "remove_nodes" not in selected
+    assert "connect_nodes_batch" not in selected
+    assert "web_search" not in selected
+    assert "web_fetch_page" not in selected
+
+    assert workflow_refinement_requested("Replace the selected node with ImageScale")
+    assert workflow_refinement_requested("Delete this node and reconnect the chain")
+    assert workflow_refinement_requested("Refine this workflow by adding another node")
+    assert workflow_refinement_requested("Expand the existing chain with a detail pass")
+    assert workflow_refinement_requested("Add a sharpen pass to this workflow")
+    assert workflow_refinement_requested("Replace KSampler with SamplerCustom")
+    assert workflow_refinement_requested("Delete INTConstant")
+    assert not workflow_refinement_requested("Replace blue with red in the image")
+    assert not workflow_refinement_requested("Replace input.png with output.png")
+    assert not workflow_refinement_requested("Delete workflow.json")
+    assert not workflow_refinement_requested("Build a new image workflow with four nodes")
+
+    multibranch = (
+        "Inspect my current workflow. Add a Wavelet Color Fix node: patch the image "
+        "from the final Nano Banana node into target_image and the industrial Load "
+        "Image branch into source_image, then add Save Image after it. Don't run it."
+    )
+    assert workflow_refinement_requested(multibranch) is True
+    assert compiler_first_workflow_requested(multibranch) is False
+    assert explicit_web_research_requested(multibranch) is False
+    multibranch_tools = tools_for_message(multibranch, "free")
+    assert {"plan_workflow_refinement", "apply_workflow_refinement"} <= multibranch_tools
+    assert "web_search" not in multibranch_tools
+    assert "web_fetch_page" not in multibranch_tools
+    assert "create_nodes" not in multibranch_tools
+    assert "connect_nodes_batch" not in multibranch_tools
+
+    instructions = registry_discovery_instructions()
+    assert "terminal_source" in instructions
+    assert "side_input_mappings" in instructions
+    assert "existing fan-out" in instructions
 
 
 def test_exact_registry_request_gets_tools_and_source_guardrails():

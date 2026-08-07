@@ -452,6 +452,12 @@ test("deterministic workflow planning has clear human tool activity", async () =
     assert.match(tools, /"node_knowledge_search"\s*:\s*\{/);
     assert.match(tools, /label:\s*"Node Knowledge"/);
     assert.match(tools, /node_knowledge_search:\s*"Searching local node knowledge"/);
+    assert.match(tools, /"plan_workflow_refinement"\s*:\s*\{/);
+    assert.match(tools, /label:\s*"Plan Refinement"/);
+    assert.match(tools, /plan_workflow_refinement:\s*"Planning workflow refinement"/);
+    assert.match(tools, /"apply_workflow_refinement"\s*:\s*\{/);
+    assert.match(tools, /label:\s*"Refine Workflow"/);
+    assert.match(tools, /apply_workflow_refinement:\s*"Refining workflow graph"/);
 });
 
 
