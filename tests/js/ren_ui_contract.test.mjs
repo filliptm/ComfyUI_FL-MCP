@@ -32,6 +32,16 @@ test("run identity remains available across CORS and provider startup", async ()
 });
 
 
+test("atomic workflow application is registered and suppresses auto-queue", async () => {
+    const executor = await readFile(new URL("web/js/tool_executor.js", root), "utf8");
+
+    assert.match(executor, /"apply_workflow_plan": this\._handleApplyWorkflowPlan/);
+    assert.match(executor, /const autoQueueState = this\.flApi\.pauseAutoQueue\(\)/);
+    assert.match(executor, /this\.flApi\.restoreAutoQueue\(autoQueueState\)/);
+    assert.match(executor, /applyWorkflowPlanAtomic\(params, adapter\)/);
+});
+
+
 test("chat shell has compact two-row chrome and full-panel sheets", async () => {
     const panel = await readFile(new URL("web/js/chat_panel.js", root), "utf8");
 

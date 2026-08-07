@@ -115,6 +115,35 @@ class PlanWorkflowRequest(BaseModel):
         return self
 
 
+class ApplyWorkflowPlanRequest(PlanWorkflowRequest):
+    """Re-submit a valid plan for one idempotent atomic canvas application."""
+
+    expected_catalog_hash: str = Field(
+        ...,
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-f]{64}$",
+        description="Exact catalog hash used to produce plan_hash.",
+    )
+    plan_hash: str = Field(
+        ...,
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-f]{64}$",
+        description="Exact plan hash returned by plan_workflow.",
+    )
+    application_id: str = Field(
+        ...,
+        min_length=8,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$",
+        description=(
+            "Stable ID for this intended application. Reuse it only when retrying "
+            "the same plan; use a new ID to intentionally create another copy."
+        ),
+    )
+
+
 def _canonical_hash(value: Any) -> str:
     payload = json.dumps(
         value,

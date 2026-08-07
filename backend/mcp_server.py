@@ -74,7 +74,11 @@ from node_library import (
     NodeLibraryConnectionError,
     NodeTypeNotFoundError
 )
-from workflow_planner import PlanWorkflowRequest, compile_workflow_plan
+from workflow_planner import (
+    ApplyWorkflowPlanRequest,
+    PlanWorkflowRequest,
+    compile_workflow_plan,
+)
 from comfy_registry import ComfyRegistryClient, normalize_github_repository_url
 
 from comfy_manager import (
@@ -3429,6 +3433,121 @@ async def plan_workflow(request: PlanWorkflowRequest, ctx: Context) -> Dict[str,
         raise RuntimeError(f"Workflow planning failed: {e}")
     except Exception as e:
         logger.error(f"Unexpected error in plan_workflow: {e}")
+        raise RuntimeError(f"Tool execution failed: {e}")
+
+
+@mcp.tool()
+async def apply_workflow_plan(
+    request: ApplyWorkflowPlanRequest,
+    ctx: Context,
+) -> Dict[str, Any]:
+    """Atomically apply one valid, catalog-pinned workflow plan to the canvas.
+
+    Re-submit the exact nodes, connections, catalog hash, and plan hash returned
+    by ``plan_workflow``. The server recompiles them against the current loaded
+    catalog before any browser mutation. The browser then creates widget values
+    and exact connections in one transaction, verifies the applied subgraph, and
+    removes every created node if creation, connection, or verification fails.
+
+    ``application_id`` is the idempotency boundary. Reusing it for the identical
+    plan returns the existing semantic alias-to-node-ID mapping without creating
+    duplicates. Reusing it for a different or manually changed graph fails closed.
+    This tool never queues the workflow.
+    """
+    await _report_tool_activity(ctx, "apply_workflow_plan")
+    if not settings.enable_workflow_writes:
+        return _disabled_by_config("FL_MCP_ENABLE_WORKFLOW_WRITES")
+
+    try:
+        client = get_node_library_client(
+            server_url=settings.comfyui_server_url,
+            timeout=settings.comfyui_api_timeout,
+        )
+        snapshot = await client.catalog_snapshot()
+        plan_request = PlanWorkflowRequest(
+            nodes=request.nodes,
+            connections=request.connections,
+            expected_catalog_hash=request.expected_catalog_hash,
+        )
+        compiled = compile_workflow_plan(
+            plan_request,
+            snapshot.data,
+            catalog_hash=snapshot.catalog_hash,
+            source=snapshot.source,
+        )
+        validation = {
+            "valid": compiled["valid"],
+            "plan_hash": compiled["plan_hash"],
+            "catalog": compiled["catalog"],
+            "issues": compiled["issues"],
+            "error_count": compiled["error_count"],
+            "warning_count": compiled["warning_count"],
+        }
+        if not compiled["valid"]:
+            return {
+                "success": False,
+                "applied": False,
+                "already_applied": False,
+                "application_id": request.application_id,
+                "plan_hash": request.plan_hash,
+                "error": {
+                    "code": "plan_invalid",
+                    "message": "The workflow plan is no longer valid; the canvas was not changed.",
+                },
+                "validation": validation,
+                "rollback": {
+                    "attempted": False,
+                    "complete": True,
+                    "attempted_node_ids": [],
+                    "remaining_node_ids": [],
+                    "errors": [],
+                },
+                "queued": False,
+            }
+        if compiled["plan_hash"] != request.plan_hash:
+            return {
+                "success": False,
+                "applied": False,
+                "already_applied": False,
+                "application_id": request.application_id,
+                "plan_hash": request.plan_hash,
+                "error": {
+                    "code": "plan_hash_mismatch",
+                    "message": (
+                        "The supplied plan hash does not match the canonical current plan; "
+                        "the canvas was not changed."
+                    ),
+                },
+                "validation": validation,
+                "rollback": {
+                    "attempted": False,
+                    "complete": True,
+                    "attempted_node_ids": [],
+                    "remaining_node_ids": [],
+                    "errors": [],
+                },
+                "queued": False,
+            }
+
+        result = await _execute_tool(
+            ctx,
+            "apply_workflow_plan",
+            {
+                "application_id": request.application_id,
+                "plan_hash": request.plan_hash,
+                "plan": compiled["plan"],
+            },
+            timeout_ms=60000,
+        )
+        if not isinstance(result, dict):
+            raise RuntimeError("The frontend returned an invalid workflow application result.")
+        return {**result, "validation": validation}
+    except NodeLibraryConnectionError as e:
+        raise RuntimeError(f"ComfyUI server connection failed: {e}")
+    except NodeLibraryError as e:
+        raise RuntimeError(f"Workflow application failed: {e}")
+    except Exception as e:
+        logger.error(f"Unexpected error in apply_workflow_plan: {e}")
         raise RuntimeError(f"Tool execution failed: {e}")
 
 

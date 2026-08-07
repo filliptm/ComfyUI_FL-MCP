@@ -7,6 +7,7 @@ from typing import Literal
 ToolRisk = Literal["read_only", "canvas_edit", "approval_required"]
 
 CANVAS_EDIT_TOOLS = {
+    "apply_workflow_plan",
     "create_nodes",
     "remove_nodes",
     "bypass_nodes",

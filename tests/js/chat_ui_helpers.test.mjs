@@ -98,6 +98,16 @@ test("tool summaries expose human outcomes for core canvas operations", () => {
         result: '{"valid":false,"plan":{"nodes":[{}]},"error_count":2}',
     }), "Plan needs fixes · 2 errors");
     assert.equal(summarizeToolStep({
+        name: "apply_workflow_plan",
+        status: "done",
+        result: '{"success":true,"applied":true,"node_count":2}',
+    }), "Applied workflow plan · 2 nodes");
+    assert.equal(summarizeToolStep({
+        name: "apply_workflow_plan",
+        status: "done",
+        result: '{"success":false,"rollback":{"attempted":true,"complete":true,"attempted_node_ids":[11,12]}}',
+    }), "Workflow apply failed · rolled back 2 nodes");
+    assert.equal(summarizeToolStep({
         name: "registry_search_packages",
         status: "done",
         result: '{"count":3,"results":[{},{},{}]}',

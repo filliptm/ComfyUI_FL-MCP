@@ -186,3 +186,107 @@ async def test_mcp_plan_workflow_is_a_read_only_catalog_pinned_dry_run(monkeypat
     assert result["valid"] is True
     assert result["catalog"]["catalog_hash"] == "c" * 64
     assert result["plan"]["nodes"][0]["schema_hash"]
+
+
+def _valid_apply_request(client, *, plan_hash=None, catalog_hash="c" * 64):
+    plan_request = mcp_server.PlanWorkflowRequest(
+        nodes=[{"alias": "source", "node_type": "Source"}],
+        expected_catalog_hash="c" * 64,
+    )
+    compiled = mcp_server.compile_workflow_plan(
+        plan_request,
+        client.catalog,
+        catalog_hash="c" * 64,
+        source=client.source,
+    )
+    return mcp_server.ApplyWorkflowPlanRequest(
+        nodes=plan_request.nodes,
+        connections=[],
+        expected_catalog_hash=catalog_hash,
+        plan_hash=plan_hash or compiled["plan_hash"],
+        application_id="atomic-application-0001",
+    )
+
+
+@pytest.mark.asyncio
+async def test_mcp_apply_recompiles_then_sends_one_canonical_frontend_transaction(
+    monkeypatch,
+):
+    client = FakePlannerClient()
+    captured = {}
+
+    async def execute_tool(ctx, name, payload, timeout_ms=30000):
+        captured.update(name=name, payload=payload, timeout_ms=timeout_ms)
+        return {
+            "success": True,
+            "applied": True,
+            "already_applied": False,
+            "aliases": {"source": 41},
+            "node_count": 1,
+            "connection_count": 0,
+            "queued": False,
+        }
+
+    monkeypatch.setattr(mcp_server, "get_node_library_client", lambda **kwargs: client)
+    monkeypatch.setattr(mcp_server, "_execute_tool", execute_tool)
+    monkeypatch.setattr(mcp_server.settings, "enable_workflow_writes", True)
+    request = _valid_apply_request(client)
+
+    result = await mcp_server.apply_workflow_plan.fn(request, fake_context())
+
+    assert result["success"] is True
+    assert result["validation"]["valid"] is True
+    assert captured["name"] == "apply_workflow_plan"
+    assert captured["timeout_ms"] == 60000
+    assert captured["payload"]["application_id"] == "atomic-application-0001"
+    assert captured["payload"]["plan_hash"] == request.plan_hash
+    assert captured["payload"]["plan"]["nodes"][0]["alias"] == "source"
+
+
+@pytest.mark.asyncio
+async def test_mcp_apply_rejects_plan_hash_mismatch_before_frontend_mutation(monkeypatch):
+    client = FakePlannerClient()
+
+    async def unexpected_execute(*args, **kwargs):
+        raise AssertionError("frontend must not be called")
+
+    monkeypatch.setattr(mcp_server, "get_node_library_client", lambda **kwargs: client)
+    monkeypatch.setattr(mcp_server, "_execute_tool", unexpected_execute)
+    monkeypatch.setattr(mcp_server.settings, "enable_workflow_writes", True)
+
+    result = await mcp_server.apply_workflow_plan.fn(
+        _valid_apply_request(client, plan_hash="f" * 64),
+        fake_context(),
+    )
+
+    assert result["success"] is False
+    assert result["applied"] is False
+    assert result["error"]["code"] == "plan_hash_mismatch"
+    assert result["validation"]["valid"] is True
+    assert result["rollback"]["attempted"] is False
+
+
+@pytest.mark.asyncio
+async def test_mcp_apply_rejects_changed_catalog_before_frontend_mutation(monkeypatch):
+    client = FakePlannerClient()
+
+    async def unexpected_execute(*args, **kwargs):
+        raise AssertionError("frontend must not be called")
+
+    monkeypatch.setattr(mcp_server, "get_node_library_client", lambda **kwargs: client)
+    monkeypatch.setattr(mcp_server, "_execute_tool", unexpected_execute)
+    monkeypatch.setattr(mcp_server.settings, "enable_workflow_writes", True)
+
+    result = await mcp_server.apply_workflow_plan.fn(
+        _valid_apply_request(client, catalog_hash="e" * 64),
+        fake_context(),
+    )
+
+    assert result["success"] is False
+    assert result["error"]["code"] == "plan_invalid"
+    assert result["validation"]["valid"] is False
+    assert result["rollback"]["attempted"] is False
+    assert any(
+        item["code"] == "catalog_changed"
+        for item in result["validation"]["issues"]
+    )

@@ -10,6 +10,7 @@ Operating rules:
 - Make the smallest useful change and reuse existing nodes and graph patterns.
 - After every mutation, inspect the affected graph state and say what changed.
 - Prefer batch node and connection tools when they reduce error-prone repeated calls.
+- For new or restructured subgraphs, discover exact loaded schemas, call `plan_workflow`, then use `apply_workflow_plan` with the returned catalog and plan hashes. Do not manually split a valid plan into create/value/connect calls. Reuse an application ID only to retry the identical intended graph.
 - Treat nodes as rectangles, not points. `create_nodes` returns each node's final `position` and measured `size`; use those bounds for later placement decisions.
 - You may omit x/y during creation for automatic collision-free placement. For intentional layouts, inspect with `get_layout`, connect the nodes, then use `modify_layout` and verify the result.
 - For layout work, verify the resulting positions or take a screenshot.

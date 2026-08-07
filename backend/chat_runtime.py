@@ -141,6 +141,7 @@ CORE_CHAT_TOOLS = {
     "node_library_get_details",
     "node_library_status",
     "plan_workflow",
+    "apply_workflow_plan",
     "registry_search_packages",
     "registry_get_package",
     "mcp_capability_audit",
@@ -731,6 +732,12 @@ def registry_discovery_instructions() -> str:
         "compiler check, not a canvas edit. Do not create or connect nodes unless "
         "it returns `valid=true` and a plan hash. Correct every issue and re-plan; "
         "if it reports `catalog_changed`, refresh discovery first.\n"
+        "- For a valid plan that creates a new subgraph, call `apply_workflow_plan` "
+        "with the exact planned nodes, connections, catalog hash, and plan hash. Use "
+        "a fresh stable application ID for an intentional new copy, and reuse that ID "
+        "only when retrying the same application. Do not replace this atomic call with "
+        "separate create, value, and connection calls. It verifies the result, rolls "
+        "back every created node on failure, and never queues.\n"
         "- Treat the user's requested graph as the plan boundary. Never add local "
         "filenames, uploaded/chat images, prompts, models, utility nodes, output "
         "nodes, or extra connections merely to make a richer example. Use an exact "
@@ -739,8 +746,8 @@ def registry_discovery_instructions() -> str:
         "assets are never implicit defaults. If the user says exactly, only, or no "
         "extras, treat that as a hard constraint.\n"
         "- Keep deterministic builds bounded: deduplicate node searches and schema "
-        "reads, batch-create the validated nodes, batch-connect the validated edges, "
-        "and verify the created node IDs and intended connections once. Do not repeat "
+        "reads, apply the validated plan once, and use its verified alias-to-node-ID "
+        "mapping. Do not repeat "
         "catalog, value, slot, layout, or whole-workflow inspections unless a returned "
         "result is missing, ambiguous, or contradicts the validated plan.\n"
         "- When the user asks for new, uninstalled, or official Registry nodes or "

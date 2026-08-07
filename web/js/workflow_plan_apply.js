@@ -1,0 +1,362 @@
+/** Deterministic, rollback-safe application of one validated workflow plan. */
+
+export const WORKFLOW_APPLICATION_PROPERTY = "fl_mcp_workflow_application";
+export const WORKFLOW_APPLICATION_SCHEMA = "fl-mcp.workflow-application.v1";
+
+
+function canonicalValue(value) {
+    if (Array.isArray(value)) return value.map(canonicalValue);
+    if (value && typeof value === "object") {
+        return Object.fromEntries(
+            Object.keys(value).sort().map(key => [key, canonicalValue(value[key])]),
+        );
+    }
+    return value;
+}
+
+
+function valuesEqual(left, right) {
+    return JSON.stringify(canonicalValue(left)) === JSON.stringify(canonicalValue(right));
+}
+
+
+function issue(code, path, message) {
+    return { code, path, message };
+}
+
+
+function nodeId(value) {
+    return value?.node_id ?? value?.id;
+}
+
+
+function connectionKey(connection) {
+    return [
+        String(connection.source_node_id),
+        String(connection.source_output_index),
+        String(connection.target_node_id),
+        String(connection.target_input),
+    ].join("|");
+}
+
+
+function verifyApplication(plan, planHash, applicationId, adapter, applicationNodes) {
+    const issues = [];
+    const byAlias = new Map();
+    for (const node of applicationNodes) {
+        const metadata = node.metadata || {};
+        const alias = metadata.alias;
+        if (!alias) {
+            issues.push(issue(
+                "application_alias_missing",
+                `nodes.${nodeId(node)}`,
+                "An application node is missing its semantic alias.",
+            ));
+            continue;
+        }
+        if (byAlias.has(alias)) {
+            issues.push(issue(
+                "application_alias_duplicate",
+                `nodes.${alias}`,
+                `Application alias ${alias} is present more than once on the canvas.`,
+            ));
+            continue;
+        }
+        byAlias.set(alias, node);
+    }
+
+    if (applicationNodes.length !== plan.nodes.length) {
+        issues.push(issue(
+            "application_node_count_mismatch",
+            "nodes",
+            `Expected ${plan.nodes.length} application nodes but found ${applicationNodes.length}.`,
+        ));
+    }
+
+    const aliases = {};
+    for (const expected of plan.nodes) {
+        const observed = byAlias.get(expected.alias);
+        if (!observed) {
+            issues.push(issue(
+                "application_node_missing",
+                `nodes.${expected.alias}`,
+                `Application node ${expected.alias} is missing from the canvas.`,
+            ));
+            continue;
+        }
+        const id = nodeId(observed);
+        aliases[expected.alias] = id;
+        const metadata = observed.metadata || {};
+        if (
+            metadata.schema !== WORKFLOW_APPLICATION_SCHEMA
+            || metadata.application_id !== applicationId
+            || metadata.plan_hash !== planHash
+        ) {
+            issues.push(issue(
+                "application_identity_mismatch",
+                `nodes.${expected.alias}.metadata`,
+                `Application metadata for ${expected.alias} does not match this request.`,
+            ));
+        }
+        if (observed.node_type !== expected.node_type) {
+            issues.push(issue(
+                "application_node_type_mismatch",
+                `nodes.${expected.alias}.node_type`,
+                `Expected ${expected.node_type} but found ${observed.node_type}.`,
+            ));
+        }
+        if (metadata.schema_hash !== expected.schema_hash) {
+            issues.push(issue(
+                "application_schema_hash_mismatch",
+                `nodes.${expected.alias}.schema_hash`,
+                `The applied schema identity for ${expected.alias} changed.`,
+            ));
+        }
+        const observedValues = adapter.getNodeValues(id);
+        for (const [name, value] of Object.entries(expected.values || {})) {
+            if (
+                !Object.prototype.hasOwnProperty.call(observedValues, name)
+                || !valuesEqual(observedValues[name], value)
+            ) {
+                issues.push(issue(
+                    "application_widget_mismatch",
+                    `nodes.${expected.alias}.values.${name}`,
+                    `Widget ${expected.alias}.${name} does not match the validated value.`,
+                ));
+            }
+        }
+    }
+
+    for (const connection of plan.connections) {
+        const sourceId = aliases[connection.source_alias];
+        const targetId = aliases[connection.target_alias];
+        if (sourceId === undefined || targetId === undefined) continue;
+        if (!adapter.connectionExists(sourceId, targetId, connection)) {
+            issues.push(issue(
+                "application_connection_missing",
+                `connections.${connection.source_alias}.${connection.target_alias}.${connection.target_input}`,
+                `Connection ${connection.source_alias}.${connection.source_output} → `
+                    + `${connection.target_alias}.${connection.target_input} is missing or different.`,
+            ));
+        }
+    }
+
+
+    const observedConnections = adapter.listConnections(Object.values(aliases));
+    const plannedKeys = new Set(
+        plan.connections
+            .filter(connection => (
+                aliases[connection.source_alias] !== undefined
+                && aliases[connection.target_alias] !== undefined
+            ))
+            .map(connection => connectionKey({
+                source_node_id: aliases[connection.source_alias],
+                source_output_index: connection.source_output_index,
+                target_node_id: aliases[connection.target_alias],
+                target_input: connection.target_input,
+            })),
+    );
+    for (const observed of observedConnections) {
+        const key = connectionKey(observed);
+        if (!plannedKeys.has(key)) {
+            issues.push(issue(
+                "application_connection_unexpected",
+                "connections",
+                `Unexpected connection ${observed.source_node_id}.${observed.source_output_index} → `
+                    + `${observed.target_node_id}.${observed.target_input || observed.target_input_index} `
+                    + "touches the applied subgraph.",
+            ));
+        }
+    }
+
+    return { valid: issues.length === 0, aliases, issues };
+}
+
+
+function rollbackCreatedNodes(createdIds, adapter) {
+    const errors = [];
+    try {
+        adapter.removeNodes([...createdIds].reverse());
+    } catch (error) {
+        errors.push(String(error?.message || error));
+    }
+    const remainingIds = createdIds.filter(id => {
+        try {
+            return adapter.nodeExists(id);
+        } catch (error) {
+            errors.push(String(error?.message || error));
+            return true;
+        }
+    });
+    return {
+        attempted: createdIds.length > 0,
+        complete: remainingIds.length === 0,
+        attempted_node_ids: [...createdIds],
+        remaining_node_ids: remainingIds,
+        errors,
+    };
+}
+
+
+/**
+ * Apply one canonical planner result through a synchronous canvas adapter.
+ * The function never throws after mutation begins; failures include rollback state.
+ */
+export function applyWorkflowPlanAtomic(request, adapter) {
+    const { plan, plan_hash: planHash, application_id: applicationId } = request || {};
+    if (
+        !plan
+        || !Array.isArray(plan.nodes)
+        || !Array.isArray(plan.connections)
+        || !/^[a-f0-9]{64}$/.test(String(planHash || ""))
+        || !/^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$/.test(String(applicationId || ""))
+    ) {
+        return {
+            success: false,
+            applied: false,
+            already_applied: false,
+            application_schema: WORKFLOW_APPLICATION_SCHEMA,
+            error: { code: "invalid_application_payload", message: "A canonical workflow plan is required." },
+            rollback: { attempted: false, complete: true, attempted_node_ids: [], remaining_node_ids: [], errors: [] },
+            queued: false,
+        };
+    }
+
+    const existing = adapter.findApplicationNodes(applicationId);
+    if (existing.length > 0) {
+        const verification = verifyApplication(
+            plan,
+            planHash,
+            applicationId,
+            adapter,
+            existing,
+        );
+        if (verification.valid) {
+            return {
+                success: true,
+                applied: false,
+                already_applied: true,
+                application_schema: WORKFLOW_APPLICATION_SCHEMA,
+                application_id: applicationId,
+                plan_hash: planHash,
+                aliases: verification.aliases,
+                node_count: plan.nodes.length,
+                connection_count: plan.connections.length,
+                verification,
+                rollback: { attempted: false, complete: true, attempted_node_ids: [], remaining_node_ids: [], errors: [] },
+                queued: false,
+            };
+        }
+        return {
+            success: false,
+            applied: false,
+            already_applied: false,
+            application_schema: WORKFLOW_APPLICATION_SCHEMA,
+            application_id: applicationId,
+            plan_hash: planHash,
+            error: {
+                code: "idempotency_conflict",
+                message: "This application ID already exists but does not match the validated plan.",
+            },
+            verification,
+            rollback: { attempted: false, complete: true, attempted_node_ids: [], remaining_node_ids: [], errors: [] },
+            queued: false,
+        };
+    }
+
+    const createdIds = [];
+    const createdNodes = [];
+    const aliases = {};
+    const connectionResults = [];
+    try {
+        for (const plannedNode of plan.nodes) {
+            const created = adapter.createNode(plannedNode);
+            const id = nodeId(created);
+            if (id === undefined || id === null) {
+                throw new Error(`Creating ${plannedNode.alias} did not return a node ID.`);
+            }
+            createdIds.push(id);
+            aliases[plannedNode.alias] = id;
+            adapter.setNodeMetadata(id, {
+                schema: WORKFLOW_APPLICATION_SCHEMA,
+                application_id: applicationId,
+                plan_hash: planHash,
+                alias: plannedNode.alias,
+                schema_hash: plannedNode.schema_hash,
+            });
+            createdNodes.push({
+                alias: plannedNode.alias,
+                node_id: id,
+                node_type: plannedNode.node_type,
+                position: created.position || null,
+                size: created.size || null,
+            });
+        }
+
+        for (const connection of plan.connections) {
+            const sourceId = aliases[connection.source_alias];
+            const targetId = aliases[connection.target_alias];
+            const connected = adapter.connectNodes(sourceId, targetId, connection);
+            connectionResults.push({
+                source_alias: connection.source_alias,
+                source_node_id: sourceId,
+                source_output: connection.source_output,
+                source_output_index: connection.source_output_index,
+                target_alias: connection.target_alias,
+                target_node_id: targetId,
+                target_input: connection.target_input,
+                connection: connected,
+            });
+        }
+
+        const applicationNodes = adapter.findApplicationNodes(applicationId);
+        const verification = verifyApplication(
+            plan,
+            planHash,
+            applicationId,
+            adapter,
+            applicationNodes,
+        );
+        if (!verification.valid) {
+            const error = new Error("Post-apply verification did not match the validated plan.");
+            error.code = "post_apply_verification_failed";
+            error.verification = verification;
+            throw error;
+        }
+
+        return {
+            success: true,
+            applied: true,
+            already_applied: false,
+            application_schema: WORKFLOW_APPLICATION_SCHEMA,
+            application_id: applicationId,
+            plan_hash: planHash,
+            aliases,
+            nodes: createdNodes,
+            connections: connectionResults,
+            node_count: createdNodes.length,
+            connection_count: connectionResults.length,
+            verification,
+            rollback: { attempted: false, complete: true, attempted_node_ids: [], remaining_node_ids: [], errors: [] },
+            queued: false,
+        };
+    } catch (error) {
+        const rollback = rollbackCreatedNodes(createdIds, adapter);
+        return {
+            success: false,
+            applied: false,
+            already_applied: false,
+            application_schema: WORKFLOW_APPLICATION_SCHEMA,
+            application_id: applicationId,
+            plan_hash: planHash,
+            aliases,
+            error: {
+                code: error?.code || "workflow_application_failed",
+                message: String(error?.message || error),
+            },
+            verification: error?.verification || { valid: false, aliases, issues: [] },
+            rollback,
+            queued: false,
+        };
+    }
+}

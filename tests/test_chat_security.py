@@ -50,3 +50,4 @@ def test_official_registry_discovery_is_read_only():
     assert classify_tool("registry_search_packages") == "read_only"
     assert classify_tool("registry_get_package") == "read_only"
     assert classify_tool("plan_workflow") == "read_only"
+    assert classify_tool("apply_workflow_plan") == "canvas_edit"
