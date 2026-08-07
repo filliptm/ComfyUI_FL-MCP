@@ -3389,6 +3389,9 @@ def _validated_plan_attachment_values(
 ) -> Dict[tuple[str, str], str]:
     """Validate every declared chat image and return its exact widget value."""
 
+    if not request.attachments:
+        return {}
+
     comfy_tools = get_comfy_tools()
     values: Dict[tuple[str, str], str] = {}
     for binding in request.attachments:
