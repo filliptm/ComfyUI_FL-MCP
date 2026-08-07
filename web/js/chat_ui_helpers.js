@@ -219,6 +219,7 @@ export function summarizeToolStep(step, config = {}) {
             confirm_mask_review: "Mask needs changes",
             web_search: "Couldn’t search the web",
             web_fetch_page: "Couldn’t read the web page",
+            plan_workflow: "Couldn’t validate workflow plan",
             registry_search_packages: "Couldn’t search official Comfy Registry",
             registry_get_package: "Couldn’t inspect Registry package",
         };
@@ -347,6 +348,16 @@ export function summarizeToolStep(step, config = {}) {
             return `Cataloged ${count.toLocaleString("en-US")} ${label}`;
         }
         return "Checked loaded-node catalog";
+    }
+    if (name === "plan_workflow") {
+        const nodeCount = Array.isArray(result?.plan?.nodes)
+            ? result.plan.nodes.length
+            : 0;
+        const errorCount = Number(result?.error_count || 0);
+        if (result?.valid === false) {
+            return `Plan needs fixes · ${plural(errorCount, "error")}`;
+        }
+        return `Validated workflow plan · ${plural(nodeCount, "node")}`;
     }
     if (name === "registry_search_packages") {
         if (result?.ok === false) return "Registry search unavailable";

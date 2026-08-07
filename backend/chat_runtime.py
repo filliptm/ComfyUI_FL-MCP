@@ -140,6 +140,7 @@ CORE_CHAT_TOOLS = {
     "node_library_search",
     "node_library_get_details",
     "node_library_status",
+    "plan_workflow",
     "registry_search_packages",
     "registry_get_package",
     "mcp_capability_audit",
@@ -724,6 +725,24 @@ def registry_discovery_instructions() -> str:
         "`node_library_status` inspect only node types currently loaded by this "
         "ComfyUI instance through `/object_info`. Use them to prove a node can be "
         "created locally.\n"
+        "- Before building a new workflow or materially changing graph topology, "
+        "assign stable lowercase aliases, inspect every chosen node schema, and "
+        "call `plan_workflow` with the current catalog hash. It is a read-only "
+        "compiler check, not a canvas edit. Do not create or connect nodes unless "
+        "it returns `valid=true` and a plan hash. Correct every issue and re-plan; "
+        "if it reports `catalog_changed`, refresh discovery first.\n"
+        "- Treat the user's requested graph as the plan boundary. Never add local "
+        "filenames, uploaded/chat images, prompts, models, utility nodes, output "
+        "nodes, or extra connections merely to make a richer example. Use an exact "
+        "schema default only for an unspecified required widget when that default is "
+        "stable, and report that choice; otherwise ask the user. Existing local "
+        "assets are never implicit defaults. If the user says exactly, only, or no "
+        "extras, treat that as a hard constraint.\n"
+        "- Keep deterministic builds bounded: deduplicate node searches and schema "
+        "reads, batch-create the validated nodes, batch-connect the validated edges, "
+        "and verify the created node IDs and intended connections once. Do not repeat "
+        "catalog, value, slot, layout, or whole-workflow inspections unless a returned "
+        "result is missing, ambiguous, or contradicts the validated plan.\n"
         "- When the user asks for new, uninstalled, or official Registry nodes or "
         "packs, call `registry_search_packages`. Inspect promising candidates with "
         "`registry_get_package` before recommending installation.\n"

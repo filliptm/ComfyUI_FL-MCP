@@ -2,7 +2,7 @@ from types import SimpleNamespace
 
 import mcp_server
 import pytest
-from node_library import CompatibleNode, NodeSearchResult
+from node_library import CompatibleNode, NodeCatalogSnapshot, NodeSearchResult
 
 
 def fake_context():
@@ -143,3 +143,46 @@ async def test_mcp_compatible_truncation_is_per_direction(
         "upstream",
         "upstream",
     ]
+
+
+class FakePlannerClient:
+    source = "http://127.0.0.1:8188/object_info"
+
+    def __init__(self):
+        self.catalog = {
+            "Source": {
+                "input": {"required": {}},
+                "output": ["IMAGE"],
+                "output_name": ["IMAGE"],
+                "python_module": "nodes",
+            }
+        }
+
+    async def catalog_snapshot(self):
+        return NodeCatalogSnapshot(
+            data=self.catalog,
+            source=self.source,
+            catalog_hash="c" * 64,
+            observed_catalog_hash="d" * 64,
+            catalog_hash_schema="test",
+            fetched_at=1.0,
+            expires_at=2.0,
+        )
+
+
+@pytest.mark.asyncio
+async def test_mcp_plan_workflow_is_a_read_only_catalog_pinned_dry_run(monkeypatch):
+    client = FakePlannerClient()
+    monkeypatch.setattr(mcp_server, "get_node_library_client", lambda **kwargs: client)
+
+    result = await mcp_server.plan_workflow.fn(
+        mcp_server.PlanWorkflowRequest(
+            nodes=[{"alias": "source", "node_type": "Source"}],
+            expected_catalog_hash="c" * 64,
+        ),
+        fake_context(),
+    )
+
+    assert result["valid"] is True
+    assert result["catalog"]["catalog_hash"] == "c" * 64
+    assert result["plan"]["nodes"][0]["schema_hash"]

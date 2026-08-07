@@ -156,6 +156,19 @@ def classify_node_origin(node_info: dict[str, Any]) -> str:
     return "unknown"
 
 
+def catalog_origin_counts(catalog: dict[str, Any]) -> dict[str, int]:
+    """Count loaded node classes by deterministic /object_info provenance."""
+    counts = {"native": 0, "partner": 0, "custom": 0, "unknown": 0}
+    for node_info in catalog.values():
+        origin = (
+            classify_node_origin(node_info)
+            if isinstance(node_info, dict)
+            else "unknown"
+        )
+        counts[origin] += 1
+    return counts
+
+
 # ============================================================================
 # Data Classes
 # ============================================================================
@@ -252,6 +265,7 @@ class NodeLibraryCache:
                     "state": "empty",
                     "source": source,
                     "node_count": 0,
+                    "origin_counts": catalog_origin_counts({}),
                     "catalog_hash": None,
                     "observed_catalog_hash": None,
                     "catalog_hash_schema": CATALOG_HASH_SCHEMA,
@@ -263,12 +277,18 @@ class NodeLibraryCache:
                 "state": state,
                 "source": self._snapshot.source,
                 "node_count": len(self._snapshot.data),
+                "origin_counts": catalog_origin_counts(self._snapshot.data),
                 "catalog_hash": self._snapshot.catalog_hash,
                 "observed_catalog_hash": self._snapshot.observed_catalog_hash,
                 "catalog_hash_schema": self._snapshot.catalog_hash_schema,
                 "fetched_at": self._snapshot.fetched_at,
                 "expires_at": self._snapshot.expires_at,
             }
+
+    async def snapshot(self) -> NodeCatalogSnapshot | None:
+        """Return the current data and identity as one atomic generation."""
+        async with self._lock:
+            return self._snapshot
 
     async def invalidate(self):
         """Clear cache."""
@@ -352,6 +372,18 @@ class NodeLibraryClient:
             except Exception as exc:
                 logger.error(f"[NodeLibrary] Unexpected error: {exc}")
                 raise NodeLibraryConnectionError(f"Failed to fetch node library: {exc}") from exc
+
+    async def catalog_snapshot(
+        self,
+        *,
+        force_refresh: bool = False,
+    ) -> NodeCatalogSnapshot:
+        """Return one internally consistent catalog data/hash generation."""
+        await self.fetch_node_library(force_refresh=force_refresh)
+        snapshot = await self.cache.snapshot()
+        if snapshot is None:
+            raise NodeLibraryError("Loaded-node catalog snapshot is unavailable")
+        return snapshot
 
     async def catalog_status(self, *, refresh: bool = False) -> dict[str, Any]:
         status = await self.cache.status(self.source)

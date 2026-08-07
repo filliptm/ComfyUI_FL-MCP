@@ -347,6 +347,11 @@ export const TOOL_CONFIG = {
         label: "Find Compatible",
         description: "Finding nodes compatible with slot types"
     },
+    "plan_workflow": {
+        icon: "✓",
+        label: "Validate Plan",
+        description: "Checking workflow structure against loaded node schemas"
+    },
     "registry_search_packages": {
         icon: "🌐",
         label: "Registry Search",
@@ -482,6 +487,7 @@ const TOOL_ICON_CLASSES = {
     node_library_search: "pi pi-search",
     node_library_status: "pi pi-book",
     node_library_get_details: "pi pi-info-circle",
+    plan_workflow: "pi pi-check-circle",
     registry_search_packages: "pi pi-globe",
     registry_get_package: "pi pi-box",
     manager_check_updates: "pi pi-refresh",
@@ -515,6 +521,7 @@ const TOOL_RUNNING_LABELS = {
     web_fetch_page: "Reading web page",
     node_library_search: "Searching node library",
     node_library_status: "Checking node catalog",
+    plan_workflow: "Validating workflow plan",
     registry_search_packages: "Searching official Comfy Registry",
     registry_get_package: "Inspecting Registry package",
     manager_check_updates: "Checking for updates",

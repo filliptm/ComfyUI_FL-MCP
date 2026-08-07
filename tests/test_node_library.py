@@ -11,6 +11,7 @@ from backend.node_library import (
     NodeLibraryConnectionError,
     canonical_schema_hash,
     catalog_contract_hash,
+    catalog_origin_counts,
     classify_node_origin,
     get_node_library_client,
     node_schema_hash,
@@ -188,6 +189,26 @@ def test_origin_classifies_loaded_node_provenance(info, expected):
     assert classify_node_origin(info) == expected
 
 
+def test_catalog_origin_counts_include_every_loaded_class():
+    catalog = {
+        "Native": node_info(python_module="nodes"),
+        "Partner": node_info(
+            python_module="comfy_api_nodes.nodes_gemini",
+            category="partner/image/Gemini",
+        ),
+        "Custom": node_info(python_module="custom_nodes.comfyui-kjnodes"),
+        "Unknown": node_info(python_module="vendor.nodes"),
+        "Malformed": None,
+    }
+
+    assert catalog_origin_counts(catalog) == {
+        "native": 1,
+        "partner": 1,
+        "custom": 1,
+        "unknown": 2,
+    }
+
+
 def test_exact_query_match_wins_regardless_of_catalog_order():
     async def run():
         client = NodeLibraryClient("http://comfy")
@@ -263,10 +284,17 @@ def test_cache_reports_empty_fresh_and_stale():
     empty, fresh, stale = asyncio.run(run())
 
     assert empty["state"] == "empty"
+    assert empty["origin_counts"] == catalog_origin_counts({})
     assert empty["catalog_hash_schema"] == CATALOG_HASH_SCHEMA
     assert empty["observed_catalog_hash"] is None
     assert fresh["state"] == "fresh"
     assert fresh["node_count"] == 1
+    assert fresh["origin_counts"] == {
+        "native": 1,
+        "partner": 0,
+        "custom": 0,
+        "unknown": 0,
+    }
     assert fresh["catalog_hash_schema"] == CATALOG_HASH_SCHEMA
     assert len(fresh["observed_catalog_hash"]) == 64
     assert stale["state"] == "stale"
@@ -310,6 +338,21 @@ def test_cached_fetch_and_force_refresh_replace_catalog_generation(monkeypatch):
     assert refreshed == second
     assert requests == ["http://comfy/object_info", "http://comfy/object_info"]
     assert first_status["catalog_hash"] != second_status["catalog_hash"]
+
+
+def test_catalog_snapshot_binds_data_source_and_hash_to_one_generation(monkeypatch):
+    catalog = {"KSampler": node_info(display_name="Pinned")}
+    install_fake_http(monkeypatch, [(200, catalog)])
+
+    async def run():
+        client = NodeLibraryClient("http://comfy")
+        return await client.catalog_snapshot()
+
+    snapshot = asyncio.run(run())
+
+    assert snapshot.data == catalog
+    assert snapshot.source == "http://comfy/object_info"
+    assert snapshot.catalog_hash == catalog_contract_hash(snapshot.data)
 
 
 def test_refresh_keeps_contract_hash_stable_for_runtime_widget_defaults(monkeypatch):

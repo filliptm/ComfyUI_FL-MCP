@@ -35,7 +35,7 @@ flowchart LR
 
 ## Highlights
 
-- **108 MCP tools** for workflow inspection, graph editing, queue control, Manager v4, model discovery, filesystem inspection, custom node development, and diagnostics.
+- **120 MCP tools** for workflow inspection, graph editing, queue control, Manager v4, model discovery, filesystem inspection, custom node development, and diagnostics.
 - **Built-in MCP chat**, powered by Ren, with streaming responses, persistent conversation history, chronological tool activity, and approval cards.
 - **Bring your own model** through LM Studio, Ollama, OpenAI, OpenRouter, Anthropic, Claude Code, Codex, or a custom OpenAI-compatible endpoint.
 - **Use existing subscriptions** from Claude Code or Codex without copying OAuth credentials into FL-MCP.
@@ -376,10 +376,11 @@ These generally require the browser bridge.
 
 | Tool | What it does |
 |---|---|
-| `node_library_status` | Reports or refreshes the local `/object_info` catalog identity |
+| `node_library_status` | Reports or refreshes the local `/object_info` catalog identity and native/partner/custom/unknown class counts |
 | `node_library_search` | Searches node types currently loaded by this ComfyUI instance |
 | `node_library_get_details` | Reads detailed metadata for a node type |
 | `node_library_find_compatible` | Finds compatible node types for connections |
+| `plan_workflow` | Dry-runs a catalog-pinned workflow plan and validates exact node schemas, values, and connections |
 | `registry_search_packages` | Searches all published packages in the official Comfy Registry and returns Registry + GitHub links |
 | `registry_get_package` | Inspects one official Registry package, its published nodes, and its Registry + GitHub links |
 
