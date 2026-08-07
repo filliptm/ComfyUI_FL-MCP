@@ -242,6 +242,7 @@ export function applyWorkflowPlanAtomic(request, adapter) {
                 aliases: verification.aliases,
                 node_count: plan.nodes.length,
                 connection_count: plan.connections.length,
+                attachment_count: (plan.attachments || []).length,
                 verification,
                 rollback: { attempted: false, complete: true, attempted_node_ids: [], remaining_node_ids: [], errors: [] },
                 queued: false,
@@ -268,6 +269,7 @@ export function applyWorkflowPlanAtomic(request, adapter) {
     const createdNodes = [];
     const aliases = {};
     const connectionResults = [];
+    const attachmentResults = [];
     try {
         for (const plannedNode of plan.nodes) {
             const created = adapter.createNode(plannedNode);
@@ -290,6 +292,24 @@ export function applyWorkflowPlanAtomic(request, adapter) {
                 node_type: plannedNode.node_type,
                 position: created.position || null,
                 size: created.size || null,
+            });
+        }
+
+        for (const binding of plan.attachments || []) {
+            const targetId = aliases[binding.node_alias];
+            if (targetId === undefined) {
+                throw new Error(`Attachment target ${binding.node_alias} was not created.`);
+            }
+            if (typeof adapter.assignAttachment !== "function") {
+                throw new Error("The canvas adapter cannot assign validated chat attachments.");
+            }
+            const assigned = adapter.assignAttachment(targetId, binding);
+            attachmentResults.push({
+                node_alias: binding.node_alias,
+                node_id: targetId,
+                input_name: binding.input_name,
+                image: binding.image,
+                assigned,
             });
         }
 
@@ -334,8 +354,10 @@ export function applyWorkflowPlanAtomic(request, adapter) {
             aliases,
             nodes: createdNodes,
             connections: connectionResults,
+            attachments: attachmentResults,
             node_count: createdNodes.length,
             connection_count: connectionResults.length,
+            attachment_count: attachmentResults.length,
             verification,
             rollback: { attempted: false, complete: true, attempted_node_ids: [], remaining_node_ids: [], errors: [] },
             queued: false,

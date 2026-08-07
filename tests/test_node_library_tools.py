@@ -214,6 +214,34 @@ async def test_mcp_resolves_semantic_roles_against_one_catalog_snapshot(monkeypa
     assert result["resolution_hash"]
 
 
+@pytest.mark.asyncio
+async def test_mcp_compiles_semantic_workflow_into_ready_apply_request(monkeypatch):
+    client = FakePlannerClient()
+    monkeypatch.setattr(mcp_server, "get_node_library_client", lambda **kwargs: client)
+
+    result = await mcp_server.compile_workflow_spec.fn(
+        mcp_server.CompileWorkflowSpecRequest(
+            application_id="semantic-application-0001",
+            nodes=[
+                {
+                    "alias": "source",
+                    "capability": "source image",
+                    "requested_node_type": "Source",
+                    "required_output_types": ["IMAGE"],
+                }
+            ],
+            expected_catalog_hash="c" * 64,
+        ),
+        fake_context(),
+    )
+
+    assert result["valid"] is True
+    assert result["selected_node_types"] == {"source": "Source"}
+    assert result["apply_request"]["plan_hash"] == result["plan_hash"]
+    assert result["apply_request"]["application_id"] == "semantic-application-0001"
+    assert result["partner_review"]["web_lookup_required"] is False
+
+
 def _valid_apply_request(client, *, plan_hash=None, catalog_hash="c" * 64):
     plan_request = mcp_server.PlanWorkflowRequest(
         nodes=[{"alias": "source", "node_type": "Source"}],

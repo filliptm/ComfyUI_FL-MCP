@@ -140,6 +140,7 @@ CORE_CHAT_TOOLS = {
     "node_library_search",
     "node_library_get_details",
     "node_library_status",
+    "compile_workflow_spec",
     "resolve_workflow_spec",
     "plan_workflow",
     "apply_workflow_plan",
@@ -727,9 +728,23 @@ def registry_discovery_instructions() -> str:
         "`node_library_status` inspect only node types currently loaded by this "
         "ComfyUI instance through `/object_info`. Use them to prove a node can be "
         "created locally.\n"
-        "- Before building a new workflow or materially changing graph topology, "
-        "translate each requested role into concise capabilities plus required input/output "
-        "types and call `resolve_workflow_spec` against the current catalog hash. If the "
+        "- For a complete new workflow or subgraph described in user language, call "
+        "`compile_workflow_spec` first. Include every requested role, value, connection, "
+        "chat attachment binding, and a stable application ID in that one request. It "
+        "resolves exact local classes, canonicalizes unique short names to dotted runtime "
+        "inputs, fills stable schema defaults, validates the complete graph, and returns a "
+        "ready `apply_request`. If valid, pass that request unchanged to "
+        "`apply_workflow_plan`; its verification is sufficient unless the result reports a "
+        "mismatch. Do not separately call catalog status, capability resolution, node "
+        "details, plan validation, attachment placement, value reads, slot reads, or whole-"
+        "workflow JSON for facts already returned by the compiler or atomic apply. Partner "
+        "review facts returned by the compiler are sufficient for a build-only request; do "
+        "not browse for authentication, cost, or privacy unless the user explicitly asks "
+        "for exact current pricing or policy text.\n"
+        "- Use the lower-level discovery path only when the compiler reports ambiguity or an "
+        "unsupported schema. Translate each requested role into concise capabilities plus "
+        "required input/output types and call `resolve_workflow_spec` against the current "
+        "catalog hash. If the "
         "user explicitly named an exact loaded class, pass it as `requested_node_type`; "
         "never silently substitute it. Pass classes already used by the graph or a verified "
         "local pattern as `preferred_node_types`. The resolver is local-only and applies "

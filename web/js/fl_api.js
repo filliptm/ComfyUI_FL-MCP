@@ -69,9 +69,10 @@ export class FL_API {
      * @param {string} nodeType - ComfyUI node class name
      * @param {object} parameters - Node parameter values {key: value}
      * @param {object|null} position - Optional position {x, y}
+     * @param {object} options - Optional creation behavior, including preferred_size
      * @returns {object} Created node object
      */
-    create(nodeType, parameters = {}, position = null) {
+    create(nodeType, parameters = {}, position = null, options = {}) {
         try {
             const node = LiteGraph.createNode(nodeType);
             if (!node) {
@@ -86,6 +87,19 @@ export class FL_API {
                         this._setWidgetValue(node, widget, value);
                     }
                 }
+            }
+
+            const preferredSize = options?.preferred_size;
+            if (
+                Number.isFinite(preferredSize?.width)
+                && Number.isFinite(preferredSize?.height)
+            ) {
+                const size = [
+                    Math.max(Number(node.size?.[0] || 0), preferredSize.width),
+                    Math.max(Number(node.size?.[1] || 0), preferredSize.height),
+                ];
+                if (typeof node.setSize === "function") node.setSize(size);
+                else node.size = size;
             }
 
             const occupiedRects = (app.graph?._nodes || []).map(existingNode => ({
@@ -733,7 +747,7 @@ export class FL_API {
         };
     }
 
-    placeChatImageInNode(image, nodeId = null) {
+    placeChatImageInNode(image, nodeId = null, { focus = true } = {}) {
         const hasExplicitNode = nodeId !== null && nodeId !== undefined;
         let node = hasExplicitNode ? this._findNode(nodeId) : null;
         if (hasExplicitNode && !node) {
@@ -778,8 +792,10 @@ export class FL_API {
             }
         }
         this._assignImageToNode(node, normalized);
-        app.canvas?.selectNodes?.([node]);
-        app.canvas?.centerOnNode?.(node);
+        if (focus) {
+            app.canvas?.selectNodes?.([node]);
+            app.canvas?.centerOnNode?.(node);
+        }
         this._markGraphChanged();
         return {
             success: true,

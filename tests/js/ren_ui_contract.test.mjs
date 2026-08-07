@@ -39,6 +39,7 @@ test("atomic workflow application is registered and suppresses auto-queue", asyn
     assert.match(executor, /const autoQueueState = this\.flApi\.pauseAutoQueue\(\)/);
     assert.match(executor, /this\.flApi\.restoreAutoQueue\(autoQueueState\)/);
     assert.match(executor, /applyWorkflowPlanAtomic\(params, adapter\)/);
+    assert.match(executor, /preferred_size:\s*\{ width: 420, height: 340 \}/);
 });
 
 
@@ -439,6 +440,9 @@ test("deterministic workflow planning has clear human tool activity", async () =
     assert.match(tools, /"resolve_workflow_spec"\s*:\s*\{/);
     assert.match(tools, /label:\s*"Resolve Capabilities"/);
     assert.match(tools, /resolve_workflow_spec:\s*"Resolving workflow capabilities"/);
+    assert.match(tools, /"compile_workflow_spec"\s*:\s*\{/);
+    assert.match(tools, /label:\s*"Compile Workflow"/);
+    assert.match(tools, /compile_workflow_spec:\s*"Compiling complete workflow"/);
     assert.match(tools, /"plan_workflow"\s*:\s*\{/);
     assert.match(tools, /label:\s*"Validate Plan"/);
     assert.match(tools, /plan_workflow:\s*"Validating workflow plan"/);

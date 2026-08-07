@@ -381,6 +381,7 @@ These generally require the browser bridge.
 | `node_library_search` | Searches node types currently loaded by this ComfyUI instance |
 | `node_library_get_details` | Reads detailed metadata for a node type |
 | `node_library_find_compatible` | Finds compatible node types for connections |
+| `compile_workflow_spec` | Resolves a complete semantic request, canonicalizes dynamic inputs, binds trusted chat images, fills stable defaults, and returns one ready-to-apply valid plan |
 | `resolve_workflow_spec` | Deterministically resolves semantic roles to exact locally loaded classes with catalog pinning and origin guardrails |
 | `plan_workflow` | Dry-runs a catalog-pinned workflow plan and validates exact node schemas, values, and connections |
 | `apply_workflow_plan` | Recompiles and atomically applies an exact valid plan without queueing |

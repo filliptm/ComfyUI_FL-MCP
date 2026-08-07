@@ -366,6 +366,9 @@ export class ToolExecutor {
 
     async _handleApplyWorkflowPlan(params) {
         const autoQueueState = this.flApi.pauseAutoQueue();
+        const attachmentAliases = new Set(
+            (params?.plan?.attachments || []).map(binding => binding.node_alias),
+        );
         const adapter = {
             findApplicationNodes: applicationId => this.flApi.findNodesByProperty(
                 WORKFLOW_APPLICATION_PROPERTY,
@@ -373,7 +376,14 @@ export class ToolExecutor {
                 applicationId,
             ),
             createNode: plannedNode => {
-                const created = this.flApi.create(plannedNode.node_type, {}, null);
+                const created = this.flApi.create(
+                    plannedNode.node_type,
+                    {},
+                    null,
+                    attachmentAliases.has(plannedNode.alias)
+                        ? { preferred_size: { width: 420, height: 340 } }
+                        : {},
+                );
                 if (Object.keys(plannedNode.values || {}).length > 0) {
                     this.flApi.setValues(created.id, plannedNode.values);
                 }
@@ -385,6 +395,11 @@ export class ToolExecutor {
                 metadata,
             ),
             getNodeValues: nodeId => this.flApi.getValues(nodeId),
+            assignAttachment: (nodeId, binding) => this.flApi.placeChatImageInNode(
+                binding.image,
+                nodeId,
+                { focus: false },
+            ),
             connectNodes: (sourceId, targetId, connection) => this.flApi.connect(
                 sourceId,
                 connection.source_output_index,

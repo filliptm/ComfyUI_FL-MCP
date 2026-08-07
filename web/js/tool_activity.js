@@ -357,6 +357,11 @@ export const TOOL_CONFIG = {
         label: "Resolve Capabilities",
         description: "Selecting exact locally loaded node classes"
     },
+    "compile_workflow_spec": {
+        icon: "🧩",
+        label: "Compile Workflow",
+        description: "Resolving and validating the complete workflow request"
+    },
     "plan_workflow": {
         icon: "✓",
         label: "Validate Plan",
@@ -499,6 +504,7 @@ const TOOL_ICON_CLASSES = {
     node_library_status: "pi pi-book",
     node_library_get_details: "pi pi-info-circle",
     resolve_workflow_spec: "pi pi-compass",
+    compile_workflow_spec: "pi pi-sitemap",
     plan_workflow: "pi pi-check-circle",
     registry_search_packages: "pi pi-globe",
     registry_get_package: "pi pi-box",
@@ -535,6 +541,7 @@ const TOOL_RUNNING_LABELS = {
     node_library_search: "Searching node library",
     node_library_status: "Checking node catalog",
     resolve_workflow_spec: "Resolving workflow capabilities",
+    compile_workflow_spec: "Compiling complete workflow",
     plan_workflow: "Validating workflow plan",
     registry_search_packages: "Searching official Comfy Registry",
     registry_get_package: "Inspecting Registry package",

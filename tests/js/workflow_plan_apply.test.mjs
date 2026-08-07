@@ -47,6 +47,7 @@ class FakeCanvasAdapter {
         this.connectCalls = 0;
         this.failCreateAlias = null;
         this.failConnect = false;
+        this.failAttachment = false;
     }
 
     findApplicationNodes(applicationId) {
@@ -80,6 +81,13 @@ class FakeCanvasAdapter {
 
     getNodeValues(id) {
         return structuredClone(this.nodes.get(id).values);
+    }
+
+    assignAttachment(id, binding) {
+        if (this.failAttachment) throw new Error("attachment failed");
+        const value = `${binding.image.subfolder}/${binding.image.filename}`;
+        this.nodes.get(id).values[binding.input_name] = value;
+        return { node_id: id, image: structuredClone(binding.image) };
     }
 
     connectNodes(sourceId, targetId, connection) {
@@ -237,4 +245,48 @@ test("a connection failure rolls back the entire created subgraph", () => {
     assert.deepEqual(result.rollback.attempted_node_ids, [1, 2]);
     assert.equal(adapter.nodes.size, 0);
     assert.equal(adapter.connections.length, 0);
+});
+
+
+test("validated chat attachments are assigned inside the atomic transaction", () => {
+    const adapter = new FakeCanvasAdapter();
+    const attachmentPlan = structuredClone(plan);
+    attachmentPlan.nodes[0].values.image = "ren-chat/session/main.png";
+    attachmentPlan.attachments = [{
+        node_alias: "blank",
+        input_name: "image",
+        image: { filename: "main.png", subfolder: "ren-chat/session", type: "input" },
+    }];
+
+    const result = applyWorkflowPlanAtomic({
+        ...request("atomic-test-attachment"),
+        plan: attachmentPlan,
+    }, adapter);
+
+    assert.equal(result.success, true);
+    assert.equal(result.attachment_count, 1);
+    assert.equal(adapter.nodes.get(1).values.image, "ren-chat/session/main.png");
+    assert.equal(result.verification.valid, true);
+});
+
+
+test("attachment assignment failure rolls back the complete subgraph", () => {
+    const adapter = new FakeCanvasAdapter();
+    adapter.failAttachment = true;
+    const attachmentPlan = structuredClone(plan);
+    attachmentPlan.nodes[0].values.image = "ren-chat/session/main.png";
+    attachmentPlan.attachments = [{
+        node_alias: "blank",
+        input_name: "image",
+        image: { filename: "main.png", subfolder: "ren-chat/session", type: "input" },
+    }];
+
+    const result = applyWorkflowPlanAtomic({
+        ...request("atomic-test-attachment-failure"),
+        plan: attachmentPlan,
+    }, adapter);
+
+    assert.equal(result.success, false);
+    assert.equal(result.rollback.complete, true);
+    assert.equal(adapter.nodes.size, 0);
 });
