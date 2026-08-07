@@ -149,6 +149,52 @@ CORE_CHAT_TOOLS = {
     "mcp_capability_audit",
 }
 
+COMPILER_FIRST_REDUNDANT_TOOLS = {
+    "workflow_overview",
+    "workflow_get_current_json",
+    "find_node",
+    "get_current_node_selection",
+    "get_node_values",
+    "get_node_slots",
+    "create_nodes",
+    "set_node_values",
+    "connect_nodes_batch",
+    "get_layout",
+    "modify_layout",
+    "take_screenshot",
+    "place_chat_image_in_node",
+    "node_library_search",
+    "node_library_get_details",
+    "node_library_status",
+    "resolve_workflow_spec",
+    "plan_workflow",
+    "mcp_capability_audit",
+}
+
+
+def compiler_first_workflow_requested(message: str) -> bool:
+    """Detect bounded new-workflow requests that the one-pass compiler owns."""
+
+    visible = str(message or "").split(
+        "\n\nThe user attached ComfyUI input image(s)",
+        1,
+    )[0].casefold()
+    build_action = re.search(
+        r"\b(?:build|create|make|assemble|construct|prepare|set[ -]?up)\b",
+        visible,
+    )
+    complete_graph_signal = re.search(
+        r"\b(?:workflow|pipeline|graph|nodes?|nano banana|save (?:it|the image) as|"
+        r"save prefix|filename prefix)\b",
+        visible,
+    )
+    existing_edit_signal = re.search(
+        r"\b(?:selected|existing|current|this node|these nodes|change|edit|update|"
+        r"fix|replace|rewire|disconnect|remove)\b",
+        visible,
+    )
+    return bool(build_action and complete_graph_signal and not existing_edit_signal)
+
 
 def normalize_chat_attachments(value: Any) -> list[dict[str, Any]]:
     """Validate browser-uploaded ComfyUI input references for chat persistence."""
@@ -246,8 +292,11 @@ def message_content_for_model(message: dict[str, Any]) -> str:
     attachment_context = (
         "The user attached ComfyUI input image(s) to this message. "
         "Call view_chat_image with a listed reference before making visual claims. "
-        "Use place_chat_image_in_node when the user asks to put one into a selected "
-        "Load Image node; assigning it does not queue the workflow.\n"
+        "For a complete new workflow or subgraph, bind every listed reference in the "
+        "attachments field of compile_workflow_spec; its apply_request assigns the "
+        "original full-resolution files atomically. Do not call "
+        "place_chat_image_in_node after atomic application. Use that lower-level tool "
+        "only when assigning an image to an already-existing selected Load Image node.\n"
         + "\n".join(references)
     )
     return f"{content}\n\n{attachment_context}" if content else attachment_context
@@ -673,6 +722,11 @@ def tools_for_message(message: str, search_mode: str = "off") -> set[str]:
         selected.update(INTENT_TOOL_GROUPS["files"])
     if search_mode != "off":
         selected.update({"web_search", "web_fetch_page"})
+    if compiler_first_workflow_requested(message):
+        # Keep one deterministic route for complete new graphs. The compiler result
+        # already contains catalog, schema, attachment, plan, and partner-review
+        # evidence, while atomic application verifies the created subgraph.
+        selected.difference_update(COMPILER_FIRST_REDUNDANT_TOOLS)
     return selected
 
 
