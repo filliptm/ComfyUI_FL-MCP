@@ -40,8 +40,8 @@ test("atomic workflow application is registered and suppresses auto-queue", asyn
     assert.match(executor, /this\.flApi\.restoreAutoQueue\(autoQueueState\)/);
     assert.match(executor, /await applyWorkflowPlanAtomic\(params, adapter\)/);
     assert.match(executor, /preferred_size:\s*\{ width: 420, height: 340 \}/);
-    assert.match(executor, /node:\s*700/);
-    assert.match(executor, /connection:\s*400/);
+    assert.match(executor, /node:\s*900/);
+    assert.match(executor, /connection:\s*600/);
     assert.match(executor, /WORKFLOW_REVEAL_DELAYS_MS\[step\?\.phase\]/);
 });
 
