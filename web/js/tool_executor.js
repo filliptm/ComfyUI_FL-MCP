@@ -15,8 +15,8 @@ import {
 } from "./workflow_plan_apply.js";
 
 const WORKFLOW_REVEAL_DELAYS_MS = Object.freeze({
-    node: 900,
-    connection: 600,
+    node: 700,
+    connection: 700,
 });
 
 /**
