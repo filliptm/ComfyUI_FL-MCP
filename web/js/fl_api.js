@@ -16,12 +16,41 @@ import {
 } from "./node_placement.js";
 import { nodeIdsEqual } from "./node_identity.js";
 import {
+    GRAPH_PRECONDITION_SCHEMA,
+    workflowGraphHash,
+} from "./graph_precondition.js";
+import {
     formatImageWidgetRef,
     nestedImageRefForNode,
     normalizeMaskRegion,
     parseImageWidgetRef,
     summarizeMaskPixels,
 } from "./mask_utils.js";
+
+const WORKFLOW_IDENTITY_SCHEMA = "fl-mcp.workflow-instance.v1";
+
+const WORKFLOW_IDENTITY_TOKENS = new WeakMap();
+const WORKFLOW_IDENTITY_SESSION = (() => {
+    if (typeof globalThis.crypto?.randomUUID === "function") {
+        return globalThis.crypto.randomUUID();
+    }
+    return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+})();
+let workflowIdentitySequence = 0;
+
+
+function workflowIdentityFor(workflow) {
+    if (!workflow || (typeof workflow !== "object" && typeof workflow !== "function")) {
+        throw new Error("A ComfyUI workflow object is required for exact identity.");
+    }
+    let identity = WORKFLOW_IDENTITY_TOKENS.get(workflow);
+    if (!identity) {
+        workflowIdentitySequence += 1;
+        identity = `fl-mcp-workflow:${WORKFLOW_IDENTITY_SESSION}:${workflowIdentitySequence}`;
+        WORKFLOW_IDENTITY_TOKENS.set(workflow, identity);
+    }
+    return identity;
+}
 
 /**
  * FL_API class - Wrapper for workflow manipulation functions
@@ -176,10 +205,26 @@ export class FL_API {
         return this._findNode(nodeId) !== null;
     }
 
+    /** Return link values across modern Map-backed and legacy object-backed LiteGraph builds. */
+    _workflowLinkValues() {
+        const links = app.graph?.links;
+        if (!links) return [];
+        if (typeof links.values === "function") return Array.from(links.values());
+        return Object.values(links);
+    }
+
+    /** Return link entries across modern Map-backed and legacy object-backed LiteGraph builds. */
+    _workflowLinkEntries() {
+        const links = app.graph?.links;
+        if (!links) return [];
+        if (typeof links.entries === "function") return Array.from(links.entries());
+        return Object.entries(links);
+    }
+
     /** Return every graph connection touching one of the supplied node IDs. */
     getConnectionsForNodeIds(nodeIds) {
         const selected = new Set((nodeIds || []).map(id => String(id)));
-        return Object.values(app.graph?.links || {})
+        return this._workflowLinkValues()
             .filter(link => (
                 link
                 && (selected.has(String(link.origin_id)) || selected.has(String(link.target_id)))
@@ -196,6 +241,288 @@ export class FL_API {
                     target_input: target?.inputs?.[link.target_slot]?.name ?? null,
                 };
             });
+    }
+
+    _getActiveWorkflow() {
+        const workflowStore = this._unwrap(app.extensionManager?.workflow);
+        return this._unwrap(workflowStore?.activeWorkflow) || null;
+    }
+
+    /** Return the opaque session identity of the exact active ComfyWorkflow object. */
+    getActiveWorkflowIdentity() {
+        const workflow = this._getActiveWorkflow();
+        if (!workflow) {
+            throw new Error("The active ComfyUI workflow identity is unavailable.");
+        }
+        return workflowIdentityFor(workflow);
+    }
+
+    /** Pin the exact ComfyWorkflow object only when its compiled identity still matches. */
+    pinActiveWorkflow(expectedIdentity) {
+        const workflow = this._getActiveWorkflow();
+        if (!workflow) {
+            throw new Error("The active ComfyUI workflow identity is unavailable.");
+        }
+        const actualIdentity = workflowIdentityFor(workflow);
+        if (
+            typeof expectedIdentity !== "string"
+            || !expectedIdentity
+            || expectedIdentity !== actualIdentity
+        ) {
+            const error = new Error(
+                "The active workflow instance no longer matches the compiled refinement.",
+            );
+            error.code = "workflow_identity_precondition_failed";
+            error.details = {
+                expected_workflow_identity: expectedIdentity ?? null,
+                actual_workflow_identity: actualIdentity,
+                workflow_identity_schema: WORKFLOW_IDENTITY_SCHEMA,
+            };
+            throw error;
+        }
+        return Object.freeze({
+            workflow,
+            identity: actualIdentity,
+            identitySchema: WORKFLOW_IDENTITY_SCHEMA,
+        });
+    }
+
+    /** Refuse to read or mutate a workflow other than the one pinned at transaction start. */
+    assertActiveWorkflow(pin) {
+        if (!pin?.workflow) throw new Error("A pinned ComfyUI workflow identity is required.");
+        const activeWorkflow = this._getActiveWorkflow();
+        if (activeWorkflow !== pin.workflow) {
+            const expected = pin.identity || "original workflow";
+            throw new Error(`The active workflow changed during refinement (expected ${expected}).`);
+        }
+        return activeWorkflow;
+    }
+
+    /** Run one synchronous adapter operation only while its original workflow remains active. */
+    withActiveWorkflow(pin, operation) {
+        this.assertActiveWorkflow(pin);
+        return operation();
+    }
+
+    /** Start one Comfy change-tracker transaction for the complete refinement. */
+    beginWorkflowChangeTransaction(pin) {
+        this.assertActiveWorkflow(pin);
+        const canvas = app.canvas;
+        if (
+            typeof canvas?.emitBeforeChange !== "function"
+            || typeof canvas?.emitAfterChange !== "function"
+        ) {
+            throw new Error("The current ComfyUI canvas cannot provide a balanced change transaction.");
+        }
+        const tracker = pin.workflow?.changeTracker || null;
+        const trackerChangeCountBefore = Number.isInteger(tracker?.changeCount)
+            ? tracker.changeCount
+            : null;
+        const canvasReadOnlyBefore = Boolean(canvas.read_only);
+        canvas.read_only = true;
+        try {
+            canvas.emitBeforeChange();
+        } catch (error) {
+            canvas.read_only = canvasReadOnlyBefore;
+            throw error;
+        }
+        return {
+            pin,
+            canvas,
+            tracker,
+            trackerChangeCountBefore,
+            canvasReadOnlyBefore,
+            ended: false,
+        };
+    }
+
+    /** Finish the exact change-tracker transaction, including guarded failure paths. */
+    endWorkflowChangeTransaction(transaction) {
+        if (!transaction || transaction.ended) return;
+        try {
+            if (this._getActiveWorkflow() === transaction.pin.workflow) {
+                transaction.canvas.emitAfterChange();
+                return { closed: true, workflow_identity_verified: true };
+            }
+
+            // Never call afterChange() on an inactive tracker: current ComfyUI
+            // treats its resulting canvas capture as an invariant violation. If
+            // rollback itself could not reactivate the pinned workflow, unwind
+            // only the counter opened above and preserve the structured failure.
+            if (
+                transaction.tracker
+                && transaction.trackerChangeCountBefore !== null
+                && Number.isInteger(transaction.tracker.changeCount)
+            ) {
+                transaction.tracker.changeCount = transaction.trackerChangeCountBefore;
+            }
+            console.warn(
+                "[FL-MCP] The pinned workflow was inactive while closing its change transaction; "
+                + "the transaction was cancelled without capturing another workflow.",
+            );
+            return { closed: false, workflow_identity_verified: false };
+        } finally {
+            transaction.canvas.read_only = transaction.canvasReadOnlyBefore;
+            transaction.ended = true;
+        }
+    }
+
+    /** Pin the graph content expected between staged refinement operations. */
+    async createWorkflowMutationGuard(pin) {
+        this.assertActiveWorkflow(pin);
+        const expectedGraphHash = await workflowGraphHash(app.graph.serialize());
+        this.assertActiveWorkflow(pin);
+        return { pin, expectedGraphHash };
+    }
+
+    /** Detect a same-tab user edit before it can be folded into an agent mutation. */
+    async assertWorkflowMutationGuard(guard) {
+        if (!guard?.pin || typeof guard.expectedGraphHash !== "string") {
+            throw new Error("A workflow mutation guard is required.");
+        }
+        this.assertActiveWorkflow(guard.pin);
+        const actualGraphHash = await workflowGraphHash(app.graph.serialize());
+        this.assertActiveWorkflow(guard.pin);
+        if (actualGraphHash !== guard.expectedGraphHash) {
+            const error = new Error(
+                "The canvas changed outside the guarded refinement transaction.",
+            );
+            error.code = "concurrent_workflow_edit";
+            error.details = {
+                expected_graph_hash: guard.expectedGraphHash,
+                actual_graph_hash: actualGraphHash,
+            };
+            throw error;
+        }
+        return actualGraphHash;
+    }
+
+    /** Accept exactly one completed agent mutation as the next guarded state. */
+    async acceptWorkflowMutationGuard(guard) {
+        if (!guard?.pin) throw new Error("A workflow mutation guard is required.");
+        this.assertActiveWorkflow(guard.pin);
+        const expectedGraphHash = await workflowGraphHash(app.graph.serialize());
+        this.assertActiveWorkflow(guard.pin);
+        guard.expectedGraphHash = expectedGraphHash;
+        return expectedGraphHash;
+    }
+
+    /** Return every current graph edge in one normalized, name-enriched shape. */
+    listWorkflowConnections(pin = null) {
+        if (pin) this.assertActiveWorkflow(pin);
+        return this._workflowLinkValues()
+            .filter(Boolean)
+            .map(link => {
+                const source = this._findNode(link.origin_id);
+                const target = this._findNode(link.target_id);
+                return {
+                    source_node_id: link.origin_id,
+                    source_output_index: link.origin_slot,
+                    source_output: source?.outputs?.[link.origin_slot]?.name ?? null,
+                    target_node_id: link.target_id,
+                    target_input_index: link.target_slot,
+                    target_input: target?.inputs?.[link.target_slot]?.name ?? null,
+                    type: link.type ?? null,
+                };
+            });
+    }
+
+    /** Return the exact live facts needed by atomic workflow refinement. */
+    getWorkflowNode(nodeId, pin = null) {
+        if (pin) this.assertActiveWorkflow(pin);
+        const node = this._findNode(nodeId);
+        if (!node) return null;
+        const serializedNode = typeof node.serialize === "function"
+            ? structuredClone(node.serialize())
+            : null;
+        return {
+            id: node.id,
+            node_id: node.id,
+            node_type: node.comfyClass || node.type,
+            type: node.comfyClass || node.type,
+            title: node.title,
+            values: this.getValues(node.id),
+            properties: structuredClone(node.properties || {}),
+            position: { x: node.pos[0], y: node.pos[1] },
+            size: { width: node.size[0], height: node.size[1] },
+            serialized_node: serializedNode,
+        };
+    }
+
+    /** Remove exactly one expected link; never delegate target replacement to LiteGraph. */
+    disconnectWorkflowConnection(expected, pin = null) {
+        if (pin) this.assertActiveWorkflow(pin);
+        const matches = this._workflowLinkEntries().filter(([, link]) => (
+            link
+            && nodeIdsEqual(link.origin_id, expected.source_node_id)
+            && link.origin_slot === expected.source_output_index
+            && nodeIdsEqual(link.target_id, expected.target_node_id)
+            && link.target_slot === expected.target_input_index
+        ));
+        if (matches.length !== 1) {
+            throw new Error(
+                `Expected exactly one workflow connection to disconnect; found ${matches.length}.`,
+            );
+        }
+        const [storedId, link] = matches[0];
+        const linkId = link.id ?? (/^-?\d+$/.test(storedId) ? Number(storedId) : storedId);
+        if (typeof app.graph?.removeLink === "function") {
+            app.graph.removeLink(linkId);
+        } else {
+            const target = this._findNode(link.target_id);
+            if (!target || typeof target.disconnectInput !== "function") {
+                throw new Error("The current ComfyUI graph cannot disconnect an exact link.");
+            }
+            target.disconnectInput(link.target_slot);
+        }
+        this._markGraphChanged();
+        return { disconnected: true, ...expected };
+    }
+
+    /** Capture a complete editable graph snapshot for transactional rollback. */
+    captureWorkflowSnapshot(pin = null) {
+        if (pin) this.assertActiveWorkflow(pin);
+        return structuredClone(app.graph.serialize());
+    }
+
+    /** Restore a complete graph snapshot into the same active canvas. */
+    async restoreWorkflowSnapshot(snapshot, pin) {
+        if (!snapshot || typeof snapshot !== "object") {
+            throw new Error("A serialized workflow snapshot is required for rollback.");
+        }
+        if (!pin?.workflow) throw new Error("The original ComfyUI workflow identity is required.");
+        await app.loadGraphData(
+            structuredClone(snapshot),
+            false,
+            false,
+            pin.workflow,
+            {
+                checkForRerouteMigration: false,
+                skipAssetScans: true,
+                silentAssetErrors: true,
+                deferWarnings: true,
+            },
+        );
+        this.assertActiveWorkflow(pin);
+        this.restoreNestedImageReferences();
+        this.assertActiveWorkflow(pin);
+        this._markGraphChanged();
+        return {
+            restored: true,
+            workflow_identity_verified: true,
+            graph_hash: await workflowGraphHash(app.graph.serialize()),
+            graph_hash_schema: GRAPH_PRECONDITION_SCHEMA,
+        };
+    }
+
+    /** Persist bounded refinement idempotency metadata in workflow-level extra state. */
+    setWorkflowExtra(key, value, pin = null) {
+        if (pin) this.assertActiveWorkflow(pin);
+        if (!key || typeof key !== "string") throw new Error("Workflow extra key is required.");
+        app.graph.extra = app.graph.extra || {};
+        app.graph.extra[key] = structuredClone(value);
+        this._markGraphChanged();
+        return value;
     }
 
     /**
@@ -1297,6 +1624,69 @@ export class FL_API {
     }
 
     /**
+     * Connect one refinement edge without auto-matching, target replacement, or
+     * accepting a LiteGraph hook that silently redirects the compiled slots.
+     */
+    connectWorkflowNodesExact(sourceId, targetId, connection, pin = null) {
+        if (pin) this.assertActiveWorkflow(pin);
+        const sourceNode = this._findNode(sourceId);
+        const targetNode = this._findNode(targetId);
+        if (!sourceNode || !targetNode) {
+            throw new Error("Source or target node not found for exact workflow connection.");
+        }
+
+        const sourceSlot = connection?.source_output_index;
+        const targetSlot = connection?.target_input_index;
+        if (!Number.isInteger(sourceSlot) || sourceSlot < 0) {
+            throw new Error(`Invalid exact source output index: ${sourceSlot}.`);
+        }
+        if (!Number.isInteger(targetSlot) || targetSlot < 0) {
+            throw new Error(`Invalid exact target input index: ${targetSlot}.`);
+        }
+        if (!Array.isArray(sourceNode.outputs) || sourceSlot >= sourceNode.outputs.length) {
+            throw new Error(`Exact source output ${sourceSlot} is out of bounds for node ${sourceNode.id}.`);
+        }
+        if (!Array.isArray(targetNode.inputs) || targetSlot >= targetNode.inputs.length) {
+            throw new Error(`Exact target input ${targetSlot} is out of bounds for node ${targetNode.id}.`);
+        }
+        if (targetNode.inputs[targetSlot]?.link != null) {
+            throw new Error(`Exact target input ${targetNode.id}[${targetSlot}] is already connected.`);
+        }
+
+        const link = sourceNode.connect(sourceSlot, targetNode, targetSlot);
+        if (!link || typeof link !== "object") {
+            throw new Error(
+                `LiteGraph rejected exact connection ${sourceNode.id}[${sourceSlot}] -> `
+                + `${targetNode.id}[${targetSlot}].`,
+            );
+        }
+        const endpointsMatch = (
+            nodeIdsEqual(link.origin_id, sourceNode.id)
+            && link.origin_slot === sourceSlot
+            && nodeIdsEqual(link.target_id, targetNode.id)
+            && link.target_slot === targetSlot
+        );
+        if (!endpointsMatch) {
+            throw new Error(
+                `LiteGraph redirected exact connection ${sourceNode.id}[${sourceSlot}] -> `
+                + `${targetNode.id}[${targetSlot}].`,
+            );
+        }
+
+        this._markGraphChanged();
+        return {
+            id: link.id ?? null,
+            source_node_id: link.origin_id,
+            source_output_index: link.origin_slot,
+            source_output: sourceNode.outputs[sourceSlot]?.name ?? null,
+            target_node_id: link.target_id,
+            target_input_index: link.target_slot,
+            target_input: targetNode.inputs[targetSlot]?.name ?? null,
+            type: link.type ?? null,
+        };
+    }
+
+    /**
      * Connect multiple node pairs in batch
      * @param {Array<object>} connections - Array of connection specs
      * @param {object} options - Options {auto_match, stop_on_error}
@@ -1928,18 +2318,46 @@ export class FL_API {
     }
 
     async getCurrentWorkflowJSON(apiFormat = false) {
+        const activeWorkflow = this._getActiveWorkflow();
+        if (!activeWorkflow) {
+            throw new Error("The active ComfyUI workflow identity is unavailable.");
+        }
+        const workflowIdentity = workflowIdentityFor(activeWorkflow);
+        const assertSameWorkflow = () => {
+            if (this._getActiveWorkflow() !== activeWorkflow) {
+                const error = new Error("The active workflow changed while it was being read.");
+                error.code = "workflow_identity_changed_during_read";
+                throw error;
+            }
+        };
         if (apiFormat) {
+            // Capture the guarded canvas identity before graphToPrompt can apply
+            // virtual-node transformations to the live graph.
+            const editableWorkflow = app.graph.serialize();
             const prompt = await app.graphToPrompt();
+            const graphHash = await workflowGraphHash(editableWorkflow);
+            assertSameWorkflow();
             return {
                 api_format: true,
                 output: prompt.output,
-                workflow: prompt.workflow
+                workflow: prompt.workflow,
+                workflow_identity: workflowIdentity,
+                workflow_identity_schema: WORKFLOW_IDENTITY_SCHEMA,
+                graph_hash: graphHash,
+                graph_hash_schema: GRAPH_PRECONDITION_SCHEMA,
             };
         }
 
+        const workflow = app.graph.serialize();
+        const graphHash = await workflowGraphHash(workflow);
+        assertSameWorkflow();
         return {
             api_format: false,
-            workflow: app.graph.serialize()
+            workflow,
+            workflow_identity: workflowIdentity,
+            workflow_identity_schema: WORKFLOW_IDENTITY_SCHEMA,
+            graph_hash: graphHash,
+            graph_hash_schema: GRAPH_PRECONDITION_SCHEMA,
         };
     }
 

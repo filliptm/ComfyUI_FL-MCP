@@ -277,6 +277,8 @@ These generally require the browser bridge.
 | `find_node` | Finds a node by ID, type, or title |
 | `create_nodes` | Creates one or more nodes |
 | `apply_workflow_plan` | Atomically creates and connects a validated catalog-pinned plan with idempotency, verification, and rollback |
+| `plan_workflow_refinement` | Validates an exact insert, replace, or delete splice against the current graph and live node schemas |
+| `apply_workflow_refinement` | Atomically refines one existing chain with graph preconditions, sibling preservation, and full-snapshot rollback |
 | `remove_nodes` | Removes nodes |
 | `bypass_nodes` | Bypasses nodes |
 | `unbypass_nodes` | Unbypasses nodes |
@@ -393,6 +395,8 @@ or stale records are discovery aids and can never authorize a build.
 | `resolve_workflow_spec` | Deterministically resolves semantic roles to exact locally loaded classes with catalog pinning and origin guardrails |
 | `plan_workflow` | Dry-runs a catalog-pinned workflow plan and validates exact node schemas, values, and connections |
 | `apply_workflow_plan` | Recompiles and atomically applies an exact valid plan without queueing |
+| `plan_workflow_refinement` | Plans a catalog- and graph-pinned insert, replacement, or deletion in an existing chain |
+| `apply_workflow_refinement` | Applies the exact refinement plan transactionally without queueing or touching unrelated branches |
 | `registry_search_packages` | Searches all published packages in the official Comfy Registry and returns Registry + GitHub links |
 | `registry_get_package` | Inspects one official Registry package, its published nodes, and its Registry + GitHub links |
 

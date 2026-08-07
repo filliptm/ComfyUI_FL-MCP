@@ -34,6 +34,7 @@ from chat_runtime import (
     web_image_requested,
     web_search_environment,
     web_search_instructions,
+    workflow_refinement_requested,
 )
 from chat_store import ChatStore
 
@@ -526,6 +527,33 @@ def test_complete_new_workflow_uses_only_compiler_application_route():
     )
     assert explicit_web_research_requested(researched) is True
     assert "web_search" in tools_for_message(researched, "free")
+
+
+def test_existing_chain_edit_uses_only_atomic_refinement_route():
+    request = "Add an upscaler after the selected decode node in the existing workflow."
+    assert workflow_refinement_requested(request) is True
+
+    selected = tools_for_message(request, "free")
+    assert {"plan_workflow_refinement", "apply_workflow_refinement"} <= selected
+    assert "compile_workflow_spec" not in selected
+    assert "apply_workflow_plan" not in selected
+    assert "create_nodes" not in selected
+    assert "remove_nodes" not in selected
+    assert "connect_nodes_batch" not in selected
+    assert "web_search" not in selected
+    assert "web_fetch_page" not in selected
+
+    assert workflow_refinement_requested("Replace the selected node with ImageScale")
+    assert workflow_refinement_requested("Delete this node and reconnect the chain")
+    assert workflow_refinement_requested("Refine this workflow by adding another node")
+    assert workflow_refinement_requested("Expand the existing chain with a detail pass")
+    assert workflow_refinement_requested("Add a sharpen pass to this workflow")
+    assert workflow_refinement_requested("Replace KSampler with SamplerCustom")
+    assert workflow_refinement_requested("Delete INTConstant")
+    assert not workflow_refinement_requested("Replace blue with red in the image")
+    assert not workflow_refinement_requested("Replace input.png with output.png")
+    assert not workflow_refinement_requested("Delete workflow.json")
+    assert not workflow_refinement_requested("Build a new image workflow with four nodes")
 
 
 def test_exact_registry_request_gets_tools_and_source_guardrails():

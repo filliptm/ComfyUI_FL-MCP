@@ -58,7 +58,7 @@ from fastmcp import FastMCP, Context
 from fastmcp.tools.tool import ToolResult
 from fastmcp.utilities.types import Image as MCPImage
 from PIL import Image as PILImage, ImageOps, UnidentifiedImageError
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, StrictInt, StrictStr, model_validator
 
 from config import DATA_DIR, MAX_GENERATION_COMPLETION_TIMEOUT_SECONDS, settings
 from models import WorkflowQuery
@@ -88,6 +88,15 @@ from workflow_resolver import (
 from workflow_compiler import (
     CompileWorkflowSpecRequest,
     compile_workflow_spec as compile_semantic_workflow,
+)
+from workflow_refinement import (
+    ApplyWorkflowRefinementRequest,
+    GRAPH_PRECONDITION_HASH_SCHEMA,
+    PlanWorkflowRefinementRequest,
+    WORKFLOW_IDENTITY_SCHEMA,
+    WorkflowRefinementNode,
+    compile_workflow_refinement,
+    normalize_workflow_graph,
 )
 from comfy_registry import ComfyRegistryClient, normalize_github_repository_url
 
@@ -148,6 +157,21 @@ logger.info(f"Logger initialized with level: {log_level_name}")
 # ============================================================================
 # WebSocket Client for MCP Subprocess (persist across tool calls)
 # ============================================================================
+
+class FrontendToolExecutionError(RuntimeError):
+    """Structured failure returned by the ComfyUI browser tool executor."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str = "tool_execution_failed",
+        details: Any = None,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.details = details
+
 
 class MCPWebSocketClient:
     """WebSocket client for MCP subprocess to communicate with backend."""
@@ -235,7 +259,11 @@ class MCPWebSocketClient:
                 if data.get('success'):
                     future.set_result(data.get('data'))
                 else:
-                    future.set_exception(RuntimeError(data.get('error', 'Tool execution failed')))
+                    future.set_exception(FrontendToolExecutionError(
+                        data.get('error', 'Tool execution failed'),
+                        code=data.get('error_code') or 'tool_execution_failed',
+                        details=data.get('error_details'),
+                    ))
                 self.pending_requests.pop(request_id, None)
         else:
             logger.warning(f"[MCP-WS] Unexpected message type: {msg_type}")
@@ -1122,6 +1150,68 @@ class FrontendExecuteCommandRequest(BaseModel):
 class WorkflowCurrentJsonRequest(BaseModel):
     """Get the current workflow JSON."""
     api_format: bool = Field(False, description="Return API prompt format instead of editable workflow JSON")
+
+
+class PlanCurrentWorkflowRefinementRequest(BaseModel):
+    """Describe one exact linear splice in the currently active workflow."""
+
+    model_config = {"extra": "forbid"}
+
+    application_id: str = Field(
+        ...,
+        min_length=8,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$",
+        description=(
+            "Stable idempotency ID for this intended refinement. Reuse it only "
+            "when retrying the identical change."
+        ),
+    )
+    path_node_ids: List[StrictInt | StrictStr] = Field(
+        ...,
+        min_length=2,
+        max_length=201,
+        description=(
+            "Ordered node IDs spanning two retained boundary nodes. For insertion "
+            "pass [upstream, downstream]. For replacement or deletion include every "
+            "internal node to remove: [upstream, old_node..., downstream]."
+        ),
+    )
+    replacement_nodes: List[WorkflowRefinementNode] = Field(
+        default_factory=list,
+        max_length=100,
+        description=(
+            "Ordered exact locally loaded nodes for the new linear chain. Leave empty "
+            "only when deleting the internal path nodes."
+        ),
+    )
+    expected_graph_hash: Optional[str] = Field(
+        None,
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-f]{64}$",
+        description=(
+            "Optional raw editable-graph hash from a prior inspection. If supplied, "
+            "planning fails when the active canvas changed."
+        ),
+    )
+    expected_catalog_hash: Optional[str] = Field(
+        None,
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-f]{64}$",
+        description=(
+            "Optional local node-catalog hash. If supplied, planning fails when loaded "
+            "native, partner, or custom-node schemas changed."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def validate_path_identity(self) -> "PlanCurrentWorkflowRefinementRequest":
+        typed_ids = {(type(value).__name__, value) for value in self.path_node_ids}
+        if len(typed_ids) != len(self.path_node_ids):
+            raise ValueError("path_node_ids must not repeat a node")
+        return self
 
 class WorkflowLoadJsonRequest(BaseModel):
     """Load workflow JSON into the active ComfyUI canvas."""
@@ -3614,6 +3704,503 @@ def _record_verified_connection_lessons(
             )
         except (KeyError, TypeError, ValueError) as exc:
             logger.warning("Could not persist verified node connection lesson: %s", exc)
+
+
+def _typed_workflow_node_id_equal(left: Any, right: Any) -> bool:
+    """Match the frontend graph-hash domain without conflating ``2`` and ``"2"``."""
+
+    return type(left) is type(right) and left == right
+
+
+async def _active_editable_workflow(ctx: Context) -> Dict[str, Any]:
+    """Read one raw editable graph and its frontend-computed precondition hash."""
+
+    result = await _execute_tool(
+        ctx,
+        "workflow_get_current_json",
+        {"api_format": False},
+        timeout_ms=30000,
+    )
+    if not isinstance(result, dict) or result.get("success") is False:
+        raise RuntimeError("The active editable workflow could not be read from the browser bridge.")
+    workflow = result.get("workflow")
+    workflow_identity = result.get("workflow_identity")
+    workflow_identity_schema = result.get("workflow_identity_schema")
+    graph_hash = result.get("graph_hash")
+    graph_hash_schema = result.get("graph_hash_schema")
+    if not isinstance(workflow, dict):
+        raise RuntimeError("The browser bridge returned no editable workflow JSON.")
+    if (
+        not isinstance(workflow_identity, str)
+        or len(workflow_identity) < 8
+        or workflow_identity_schema != WORKFLOW_IDENTITY_SCHEMA
+    ):
+        raise RuntimeError(
+            "The browser bridge does not expose an exact active-workflow identity. "
+            "Restart ComfyUI and hard-refresh the canvas before refining a workflow."
+        )
+    if (
+        not isinstance(graph_hash, str)
+        or len(graph_hash) != 64
+        or graph_hash_schema != GRAPH_PRECONDITION_HASH_SCHEMA
+    ):
+        raise RuntimeError(
+            "The browser bridge does not expose the current raw graph-precondition hash. "
+            "Restart ComfyUI and hard-refresh the canvas before refining a workflow."
+        )
+    return {
+        "workflow": workflow,
+        "workflow_identity": workflow_identity,
+        "workflow_identity_schema": workflow_identity_schema,
+        "graph_hash": graph_hash,
+        "graph_hash_schema": graph_hash_schema,
+    }
+
+
+def _derive_refinement_path_edges(
+    graph: Any,
+    path_node_ids: List[StrictInt | StrictStr],
+) -> tuple[List[Any], List[Dict[str, str]]]:
+    """Resolve exactly one edge for every consecutive pair in a requested path."""
+
+    edges: List[Any] = []
+    issues: List[Dict[str, str]] = []
+    for index, (source_id, target_id) in enumerate(
+        zip(path_node_ids, path_node_ids[1:])
+    ):
+        matches = [
+            edge
+            for edge in graph.edges
+            if _typed_workflow_node_id_equal(edge.source_node_id, source_id)
+            and _typed_workflow_node_id_equal(edge.target_node_id, target_id)
+        ]
+        if len(matches) == 1:
+            edges.append(matches[0])
+            continue
+        if not matches:
+            code = "path_edge_missing"
+            message = (
+                f"No connection exists from node {source_id!r} to node {target_id!r}."
+            )
+        else:
+            code = "path_edge_ambiguous"
+            message = (
+                f"Nodes {source_id!r} and {target_id!r} have {len(matches)} parallel "
+                "connections. Refine a path with an unambiguous node pair."
+            )
+        issues.append(
+            {
+                "severity": "error",
+                "code": code,
+                "path": f"path_node_ids[{index}:{index + 2}]",
+                "message": message,
+            }
+        )
+    return edges, issues
+
+
+def _refinement_validation_summary(compiled: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "valid": compiled.get("valid") is True,
+        "operation": compiled.get("operation"),
+        "refinement_hash": compiled.get("refinement_hash"),
+        "graph": compiled.get("graph"),
+        "catalog": compiled.get("catalog"),
+        "issues": compiled.get("issues", []),
+        "error_count": compiled.get("error_count", 0),
+    }
+
+
+def _refinement_apply_failure(
+    request: ApplyWorkflowRefinementRequest,
+    *,
+    code: str,
+    message: str,
+    validation: Dict[str, Any],
+) -> Dict[str, Any]:
+    return {
+        "success": False,
+        "applied": False,
+        "already_applied": False,
+        "application_id": request.application_id,
+        "refinement_hash": request.refinement_hash,
+        "operation": request.plan.operation,
+        "error": {"code": code, "message": message},
+        "validation": validation,
+        "rollback": {
+            "attempted": False,
+            "complete": True,
+            "snapshot_restored": False,
+            "hash_verified": False,
+            "errors": [],
+        },
+        "queued": False,
+    }
+
+
+def _planner_request_from_apply(
+    request: ApplyWorkflowRefinementRequest,
+    graph: Any,
+) -> PlanWorkflowRefinementRequest:
+    """Reconstruct the original strict planner input from a canonical apply plan."""
+
+    replacement_nodes: List[Dict[str, Any]] = []
+    replacement = request.plan.replacement
+    if replacement is not None:
+        last_index = len(replacement.nodes) - 1
+        for index, node in enumerate(replacement.nodes):
+            incoming = (
+                replacement.input
+                if index == 0
+                else replacement.connections[index - 1]
+            )
+            outgoing = (
+                replacement.output
+                if index == last_index
+                else replacement.connections[index]
+            )
+            replacement_nodes.append(
+                {
+                    "alias": node.alias,
+                    "node_type": node.node_type,
+                    "values": node.values,
+                    "chain_input": incoming.target_input,
+                    "chain_output": outgoing.source_output,
+                    "chain_output_index": outgoing.source_output_index,
+                }
+            )
+    return PlanWorkflowRefinementRequest.model_validate(
+        {
+            "application_id": request.application_id,
+            "expected_workflow_identity": request.plan.expected_workflow_identity,
+            "expected_graph_hash": request.plan.expected_graph_hash,
+            "graph": graph.model_dump(mode="json"),
+            "expected_path": {
+                "edges": [
+                    edge.model_dump(mode="json")
+                    for edge in request.plan.expected_path.connections
+                ]
+            },
+            "replacement_nodes": replacement_nodes,
+            "expected_catalog_hash": request.expected_catalog_hash,
+        }
+    )
+
+
+@mcp.tool()
+async def plan_workflow_refinement(
+    request: PlanCurrentWorkflowRefinementRequest,
+    ctx: Context,
+) -> Dict[str, Any]:
+    """Plan a safe insert, replacement, or deletion in the active workflow.
+
+    This tool reads the active editable graph internally, resolves one exact edge
+    between every consecutive pair in ``path_node_ids``, and validates replacement
+    nodes against one current local ``/object_info`` catalog. The first and last IDs
+    are retained boundaries; only IDs between them may be removed. It rejects
+    nonlinear targets with side branches and never changes or queues the canvas.
+
+    If ``valid=true``, pass the returned ``apply_request`` unchanged to
+    ``apply_workflow_refinement``. No separate JSON, schema, value, create, remove,
+    connect, layout, or web-search calls are needed for facts already returned here.
+    """
+
+    await _report_tool_activity(ctx, "plan_workflow_refinement")
+    try:
+        active = await _active_editable_workflow(ctx)
+        try:
+            graph = normalize_workflow_graph(active["workflow"])
+        except ValueError as exc:
+            return {
+                "valid": False,
+                "operation": None,
+                "refinement_hash": None,
+                "plan": None,
+                "apply_request": None,
+                "graph": {
+                    "state": "invalid",
+                    "graph_hash": active["graph_hash"],
+                    "graph_hash_schema": active["graph_hash_schema"],
+                },
+                "catalog": {"state": "not_read"},
+                "issues": [{
+                    "severity": "error",
+                    "code": "workflow_graph_incomplete",
+                    "path": "workflow",
+                    "message": str(exc),
+                }],
+                "error_count": 1,
+            }
+
+        path_edges, path_issues = _derive_refinement_path_edges(
+            graph,
+            request.path_node_ids,
+        )
+        if request.expected_graph_hash and (
+            request.expected_graph_hash != active["graph_hash"]
+        ):
+            path_issues.insert(0, {
+                "severity": "error",
+                "code": "graph_changed",
+                "path": "expected_graph_hash",
+                "message": "The active workflow changed after its earlier inspection.",
+            })
+        if path_issues:
+            return {
+                "valid": False,
+                "operation": None,
+                "refinement_hash": None,
+                "plan": None,
+                "apply_request": None,
+                "graph": {
+                    "state": "pinned",
+                    "graph_hash": active["graph_hash"],
+                    "graph_hash_schema": active["graph_hash_schema"],
+                    "node_count": len(graph.nodes),
+                    "edge_count": len(graph.edges),
+                },
+                "catalog": {"state": "not_read"},
+                "issues": path_issues,
+                "error_count": len(path_issues),
+            }
+
+        client = get_node_library_client(
+            server_url=settings.comfyui_server_url,
+            timeout=settings.comfyui_api_timeout,
+        )
+        snapshot = await client.catalog_snapshot(force_refresh=True)
+        planner_request = PlanWorkflowRefinementRequest(
+            application_id=request.application_id,
+            expected_workflow_identity=active["workflow_identity"],
+            expected_graph_hash=active["graph_hash"],
+            graph=graph,
+            expected_path={"edges": path_edges},
+            replacement_nodes=request.replacement_nodes,
+            expected_catalog_hash=request.expected_catalog_hash,
+        )
+        return compile_workflow_refinement(
+            planner_request,
+            snapshot.data,
+            catalog_hash=snapshot.catalog_hash,
+            source=snapshot.source,
+        )
+    except NodeLibraryConnectionError as exc:
+        raise RuntimeError(f"ComfyUI server connection failed: {exc}")
+    except NodeLibraryError as exc:
+        raise RuntimeError(f"Workflow refinement planning failed: {exc}")
+    except Exception as exc:
+        logger.error("Unexpected error in plan_workflow_refinement: %s", exc)
+        raise RuntimeError(f"Tool execution failed: {exc}")
+
+
+@mcp.tool()
+async def apply_workflow_refinement(
+    request: ApplyWorkflowRefinementRequest,
+    ctx: Context,
+) -> Dict[str, Any]:
+    """Atomically apply one unchanged, catalog- and graph-pinned refinement plan.
+
+    The backend rereads the active workflow, reconstructs and recompiles the exact
+    planner input against the current local catalog, and sends one canonical splice
+    transaction to the browser only when the catalog, graph, schemas, values, slots,
+    plan, and refinement hash still match. The browser preserves everything outside
+    the declared linear path, verifies the result, restores the complete original
+    workflow on any post-mutation failure, and never queues execution.
+    """
+
+    await _report_tool_activity(ctx, "apply_workflow_refinement")
+    if not settings.enable_workflow_writes:
+        return _disabled_by_config("FL_MCP_ENABLE_WORKFLOW_WRITES")
+
+    try:
+        active = await _active_editable_workflow(ctx)
+        if active["workflow_identity"] != request.plan.expected_workflow_identity:
+            return _refinement_apply_failure(
+                request,
+                code="workflow_identity_changed",
+                message=(
+                    "The active workflow tab changed after refinement planning; "
+                    "the canvas was not changed."
+                ),
+                validation={
+                    "valid": False,
+                    "operation": request.plan.operation,
+                    "refinement_hash": request.refinement_hash,
+                    "graph": {
+                        "state": "different_workflow",
+                        "graph_hash": active["graph_hash"],
+                        "graph_hash_schema": active["graph_hash_schema"],
+                    },
+                    "issues": [{
+                        "severity": "error",
+                        "code": "workflow_identity_changed",
+                        "path": "plan.expected_workflow_identity",
+                        "message": (
+                            "The active workflow tab is not the tab that was planned."
+                        ),
+                    }],
+                    "error_count": 1,
+                },
+            )
+        frontend_payload = {
+            "application_id": request.application_id,
+            "refinement_hash": request.refinement_hash,
+            "plan": request.plan.model_dump(mode="json"),
+        }
+        if active["graph_hash"] != request.plan.expected_graph_hash:
+            # The frontend ledger is authoritative for an identical retry after a
+            # successful application. Its engine checks the ledger before the old
+            # precondition and otherwise fails without beginning a mutation.
+            retry_result = await _execute_tool(
+                ctx,
+                "apply_workflow_refinement",
+                frontend_payload,
+                timeout_ms=30000,
+            )
+            if not isinstance(retry_result, dict):
+                raise RuntimeError(
+                    "The frontend returned an invalid workflow refinement result."
+                )
+            retry_valid = (
+                retry_result.get("success") is True
+                and retry_result.get("already_applied") is True
+            )
+            return {
+                **retry_result,
+                "validation": {
+                    "valid": retry_valid,
+                    "operation": request.plan.operation,
+                    "refinement_hash": request.refinement_hash,
+                    "graph": {
+                        "state": "already_applied" if retry_valid else "changed",
+                        "graph_hash": active["graph_hash"],
+                        "graph_hash_schema": active["graph_hash_schema"],
+                    },
+                    "issues": [] if retry_valid else [{
+                        "severity": "error",
+                        "code": "graph_changed",
+                        "path": "plan.expected_graph_hash",
+                        "message": (
+                            "The active workflow changed after refinement planning."
+                        ),
+                    }],
+                    "error_count": 0 if retry_valid else 1,
+                },
+            }
+        client = get_node_library_client(
+            server_url=settings.comfyui_server_url,
+            timeout=settings.comfyui_api_timeout,
+        )
+        snapshot = await client.catalog_snapshot(force_refresh=True)
+        graph = normalize_workflow_graph(active["workflow"])
+        planner_request = _planner_request_from_apply(request, graph)
+        compiled = compile_workflow_refinement(
+            planner_request,
+            snapshot.data,
+            catalog_hash=snapshot.catalog_hash,
+            source=snapshot.source,
+        )
+        validation = _refinement_validation_summary(compiled)
+        if not compiled["valid"]:
+            return _refinement_apply_failure(
+                request,
+                code="refinement_invalid",
+                message=(
+                    "The workflow refinement is no longer valid; the canvas was not changed."
+                ),
+                validation=validation,
+            )
+        supplied_plan = request.plan.model_dump(mode="json")
+        if (
+            active["graph_hash"] != request.plan.expected_graph_hash
+            or compiled["refinement_hash"] != request.refinement_hash
+            or compiled["plan"] != supplied_plan
+        ):
+            return _refinement_apply_failure(
+                request,
+                code="refinement_hash_mismatch",
+                message=(
+                    "The supplied refinement no longer matches the canonical current "
+                    "graph and catalog; the canvas was not changed."
+                ),
+                validation=validation,
+            )
+
+        result = await _execute_tool(
+            ctx,
+            "apply_workflow_refinement",
+            {
+                "application_id": request.application_id,
+                "refinement_hash": request.refinement_hash,
+                "plan": compiled["plan"],
+            },
+            # The largest accepted refinement can intentionally reveal roughly
+            # 133 seconds of sequential canvas mutations before verification.
+            # Keep the bridge deadline above that deterministic upper bound so a
+            # caller cannot time out while the guarded frontend transaction runs on.
+            timeout_ms=240000,
+        )
+        if not isinstance(result, dict):
+            raise RuntimeError("The frontend returned an invalid workflow refinement result.")
+        replacement = compiled["plan"].get("replacement")
+        if replacement and result.get("success") is True and (
+            result.get("applied") is True or result.get("already_applied") is True
+        ):
+            _record_verified_connection_lessons(
+                _node_knowledge_store(ctx),
+                plan=replacement,
+                plan_hash=request.refinement_hash,
+                application_id=request.application_id,
+            )
+        return {**result, "validation": validation}
+    except FrontendToolExecutionError as exc:
+        if exc.code == "canvas_mutation_busy":
+            return _refinement_apply_failure(
+                request,
+                code=exc.code,
+                message=str(exc),
+                validation={
+                    "valid": False,
+                    "operation": request.plan.operation,
+                    "refinement_hash": request.refinement_hash,
+                    "issues": [{
+                        "severity": "error",
+                        "code": exc.code,
+                        "path": "canvas",
+                        "message": str(exc),
+                    }],
+                    "error_count": 1,
+                    "retryable": bool(
+                        isinstance(exc.details, dict)
+                        and exc.details.get("retryable") is True
+                    ),
+                },
+            )
+        raise RuntimeError(f"Frontend refinement failed ({exc.code}): {exc}") from exc
+    except NodeLibraryConnectionError as exc:
+        raise RuntimeError(f"ComfyUI server connection failed: {exc}")
+    except NodeLibraryError as exc:
+        raise RuntimeError(f"Workflow refinement application failed: {exc}")
+    except ValueError as exc:
+        logger.error("Invalid active graph in apply_workflow_refinement: %s", exc)
+        return _refinement_apply_failure(
+            request,
+            code="workflow_graph_incomplete",
+            message=str(exc),
+            validation={
+                "valid": False,
+                "issues": [{
+                    "severity": "error",
+                    "code": "workflow_graph_incomplete",
+                    "path": "workflow",
+                    "message": str(exc),
+                }],
+                "error_count": 1,
+            },
+        )
+    except Exception as exc:
+        logger.error("Unexpected error in apply_workflow_refinement: %s", exc)
+        raise RuntimeError(f"Tool execution failed: {exc}")
 
 
 @mcp.tool()

@@ -376,6 +376,18 @@ export function summarizeToolStep(step, config = {}) {
         }
         return `Validated workflow plan · ${plural(nodeCount, "node")}`;
     }
+    if (name === "plan_workflow_refinement") {
+        if (result?.valid === false) {
+            return `Refinement needs fixes · ${plural(Number(result?.error_count || 0), "error")}`;
+        }
+        const operation = result?.plan?.operation || "change";
+        return `Planned workflow ${operation}`;
+    }
+    if (name === "apply_workflow_refinement") {
+        if (result?.success === false) return "Workflow refinement failed safely";
+        if (result?.already_applied) return "Workflow refinement already applied";
+        return `Refined workflow · ${result?.operation || "updated chain"}`;
+    }
     if (name === "compile_workflow_spec") {
         const nodeCount = Array.isArray(result?.plan?.nodes)
             ? result.plan.nodes.length

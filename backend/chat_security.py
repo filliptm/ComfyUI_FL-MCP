@@ -8,6 +8,7 @@ ToolRisk = Literal["read_only", "canvas_edit", "approval_required"]
 
 CANVAS_EDIT_TOOLS = {
     "apply_workflow_plan",
+    "apply_workflow_refinement",
     "create_nodes",
     "remove_nodes",
     "bypass_nodes",
@@ -117,6 +118,7 @@ READ_ONLY_TOOLS = {
     "compile_workflow_spec",
     "resolve_workflow_spec",
     "plan_workflow",
+    "plan_workflow_refinement",
     "registry_search_packages",
     "registry_get_package",
     "manager_search_nodes",
