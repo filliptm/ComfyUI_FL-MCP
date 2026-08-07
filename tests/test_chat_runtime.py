@@ -13,6 +13,8 @@ from chat_runtime import (
     approval_fingerprint,
     bridge_settings,
     claude_tool_name,
+    compiler_first_workflow_requested,
+    explicit_web_research_requested,
     codex_tool_name,
     compact_messages_for_model,
     conversation_needs_compaction,
@@ -60,6 +62,8 @@ def test_chat_attachments_are_validated_and_added_to_model_context():
     assert attachments[0]["type"] == "input"
     assert "Use this image" in model_content
     assert "view_chat_image" in model_content
+    assert "compile_workflow_spec" in model_content
+    assert "original full-resolution files" in model_content
     assert '"subfolder":"ren-chat/session-1"' in model_content
     with pytest.raises(ValueError, match="outside Ren's upload folder"):
         normalize_chat_attachments([{
@@ -461,6 +465,7 @@ def test_intent_tool_filter_keeps_core_and_adds_narrow_groups():
     assert "node_library_search" in basic
     assert "node_library_get_details" in basic
     assert "node_library_status" in basic
+    assert "compile_workflow_spec" in basic
     assert "resolve_workflow_spec" in basic
     assert "plan_workflow" in basic
     assert "apply_workflow_plan" in basic
@@ -488,6 +493,39 @@ def test_intent_tool_filter_keeps_core_and_adds_narrow_groups():
     assert "get_execution_details" in review
 
 
+def test_complete_new_workflow_uses_only_compiler_application_route():
+    request = (
+        "I've attached a portrait first and a factory image second. Please set up "
+        "Nano Banana 2, save it as ren-human-e2e, and don't run it yet.\n\n"
+        "The user attached ComfyUI input image(s) to this message."
+    )
+    assert compiler_first_workflow_requested(request) is True
+
+    selected = tools_for_message(request, "free")
+    assert {"view_chat_image", "compile_workflow_spec", "apply_workflow_plan"} <= selected
+    assert "web_search" not in selected
+    assert "web_fetch_page" not in selected
+    assert "workflow_overview" not in selected
+    assert "node_library_status" not in selected
+    assert "resolve_workflow_spec" not in selected
+    assert "node_library_get_details" not in selected
+    assert "plan_workflow" not in selected
+    assert "place_chat_image_in_node" not in selected
+    assert "get_layout" not in selected
+    assert "modify_layout" not in selected
+
+    edit = "Change the seed on the selected KSampler node to 7."
+    assert compiler_first_workflow_requested(edit) is False
+    assert "get_node_values" in tools_for_message(edit)
+
+    researched = request.replace(
+        "and don't run it yet",
+        "and search the web for exact current pricing first",
+    )
+    assert explicit_web_research_requested(researched) is True
+    assert "web_search" in tools_for_message(researched, "free")
+
+
 def test_exact_registry_request_gets_tools_and_source_guardrails():
     selected = tools_for_message("search for new nodes in the registry")
     assert {"registry_search_packages", "registry_get_package"} <= selected
@@ -509,6 +547,9 @@ def test_exact_registry_request_gets_tools_and_source_guardrails():
     assert "Never invent or reconstruct either URL" in instructions
     assert "does not prove that a package is installed" in instructions
     assert "not an authoritative whole-Registry search" in instructions
+    assert "call `compile_workflow_spec` first" in instructions
+    assert "do not browse for authentication, cost, or privacy" in instructions
+    assert "pass that request unchanged" in instructions
     assert "call `plan_workflow` with the current catalog hash" in instructions
     assert "call `resolve_workflow_spec` against the current catalog hash" in instructions
     assert "never silently substitute it" in instructions

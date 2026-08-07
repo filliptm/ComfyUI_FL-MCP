@@ -11,16 +11,17 @@ This skill is workflow-first. It borrows the old Ren Agent's operating disciplin
 
 ## Core Loop
 
-1. Inspect before changing anything.
+1. Inspect before changing an existing graph.
    - Use `workflow_overview` for graph health and node counts.
    - Use `workflow_get_current_json` or `query_workflow` for exact graph structure.
    - Use `get_current_node_selection` when the user says "this", "that node", or points at the canvas.
+   - For a complete new workflow or subgraph, skip those preliminary reads and use the compiler-first path below.
 2. Plan the smallest useful change.
    - Prefer existing nodes and existing graph patterns.
    - Do not create replacement nodes when the user only asked to change a parameter.
    - Batch node creation or connection calls when the tool supports it.
    - Treat nodes as rectangles. Never plan spacing from x/y points alone or guess that different node types share one size.
-   - For a new or restructured subgraph, inspect exact loaded schemas and validate it with `plan_workflow` using the current catalog hash.
+   - For a complete new or restructured subgraph, use `compile_workflow_spec` with every role, value, connection, and chat attachment. Pass a valid `apply_request` unchanged to `apply_workflow_plan`; do not separately place compiler-bound attachments or arrange the graph unless the user requested layout work. Use the lower-level schema and `plan_workflow` path only when compilation reports a genuine ambiguity or unsupported schema.
 3. Modify through explicit graph tools.
    - Apply a valid new-subgraph plan with `apply_workflow_plan`; preserve its application ID for retries so duplicate nodes cannot be created.
    - If atomic application fails, inspect its structured validation and rollback result before trying again.
@@ -29,6 +30,7 @@ This skill is workflow-first. It borrows the old Ren Agent's operating disciplin
    - Omit x/y from `create_nodes` when exact placement is unimportant; collision-aware creation will place nodes beside the graph.
    - Use `workflow_load_json` only when replacing or restructuring a larger graph.
 4. Verify immediately.
+   - A successful `apply_workflow_plan` includes exact post-apply verification. Do not repeat overview, values, slots, workflow JSON, or layout reads for the compiled subgraph.
    - Re-run `workflow_overview`.
    - For high-risk nodes, inspect slots or values directly.
    - Read the final `position` and measured `size` returned by `create_nodes`; use those bounds for subsequent manual placement.
@@ -60,7 +62,7 @@ Common patterns:
 - Understand the open graph: `workflow_overview`, `workflow_diagram`, `workflow_get_current_json`.
 - Explain selected nodes: `get_current_node_selection`, then `get_node_values` or `get_node_slots`.
 - Change parameters: find the existing node, then call `set_node_values`, then verify.
-- Add a new subgraph: inspect exact local schemas, call `plan_workflow`, then `apply_workflow_plan`; use its returned alias-to-node-ID mapping for any later layout work.
+- Add a new subgraph: call `compile_workflow_spec`, pass its valid `apply_request` unchanged to `apply_workflow_plan`, and use the returned alias-to-node-ID mapping for any later layout work.
 - Rewire existing nodes: inspect the surrounding layout and slots, use explicit connection tools, then verify the affected branch.
 - Compact or clean layout: `get_layout`, `modify_layout`, optionally edit group bounds via workflow JSON, then `take_screenshot`.
 - Debug execution: `queue_workflow`, `wait`, `get_execution_history`, `get_execution_details`, and error-buffer tools.

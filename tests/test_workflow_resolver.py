@@ -101,6 +101,42 @@ def test_preferred_existing_custom_class_outranks_native_default():
     assert "preferred class" in selected["match_reasons"][0]
 
 
+def test_explicit_display_name_in_capability_outranks_keyword_rich_description():
+    catalog = {
+        "GeminiImage2Node": node_info(
+            display_name="Gemini Image 2",
+            module="comfy_api_nodes.nodes_gemini",
+            category="partner/image",
+            description=(
+                "Nano Banana 2 partner image editing with two reference images, "
+                "lighting transfer, and atmosphere"
+            ),
+        ),
+        "GeminiNanoBanana2V2": node_info(
+            display_name="Nano Banana 2",
+            module="comfy_api_nodes.nodes_gemini",
+            category="partner/image",
+            description="Generate or edit an image",
+        ),
+    }
+
+    result = resolve(
+        [{
+            "alias": "editor",
+            "capability": "Nano Banana 2 partner image editing with two references",
+            "allowed_origins": ["partner"],
+            "required_input_types": ["IMAGE"],
+            "required_output_types": ["IMAGE"],
+        }],
+        catalog,
+    )
+
+    assert result["selected_node_types"] == {"editor": "GeminiNanoBanana2V2"}
+    assert "explicitly names display name" in (
+        result["resolutions"][0]["selected"]["match_reasons"][0]
+    )
+
+
 def test_explicit_partner_class_is_never_substituted_and_warns_before_execution():
     catalog = {
         "LocalGenerator": node_info(

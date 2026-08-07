@@ -256,6 +256,18 @@ def _capability_score(
         return 0, []
 
     fields = _search_fields(node_type, node_info)
+    identity_matches: list[tuple[int, str]] = []
+    for label, value, weight in fields:
+        if label not in {"node type", "display name", "search alias"}:
+            continue
+        # A user-facing node name embedded in a longer capability phrase is a
+        # stronger signal than a description that happens to share many terms.
+        # This keeps requests such as "Nano Banana 2 image editing" pinned to the
+        # locally loaded node whose display name is exactly "Nano Banana 2".
+        if len(value.split()) >= 2 and value in phrase:
+            identity_matches.append(
+                (weight + 2_500, f"capability explicitly names {label}")
+            )
     phrase_matches: list[tuple[int, str]] = []
     for label, value, weight in fields:
         if value == phrase:
@@ -265,6 +277,10 @@ def _capability_score(
 
     reasons: list[str] = []
     score = 0
+    if identity_matches:
+        identity_score, reason = max(identity_matches, key=lambda item: item[0])
+        score += identity_score
+        reasons.append(reason)
     if phrase_matches:
         phrase_score, reason = max(phrase_matches, key=lambda item: item[0])
         score += phrase_score

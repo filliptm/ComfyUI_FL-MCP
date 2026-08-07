@@ -14,6 +14,11 @@ import {
     WORKFLOW_APPLICATION_PROPERTY,
 } from "./workflow_plan_apply.js";
 
+const WORKFLOW_REVEAL_DELAYS_MS = Object.freeze({
+    node: 500,
+    connection: 500,
+});
+
 /**
  * ToolExecutor class - Executes tools and manages execution history
  */
@@ -366,6 +371,9 @@ export class ToolExecutor {
 
     async _handleApplyWorkflowPlan(params) {
         const autoQueueState = this.flApi.pauseAutoQueue();
+        const attachmentAliases = new Set(
+            (params?.plan?.attachments || []).map(binding => binding.node_alias),
+        );
         const adapter = {
             findApplicationNodes: applicationId => this.flApi.findNodesByProperty(
                 WORKFLOW_APPLICATION_PROPERTY,
@@ -373,7 +381,14 @@ export class ToolExecutor {
                 applicationId,
             ),
             createNode: plannedNode => {
-                const created = this.flApi.create(plannedNode.node_type, {}, null);
+                const created = this.flApi.create(
+                    plannedNode.node_type,
+                    {},
+                    null,
+                    attachmentAliases.has(plannedNode.alias)
+                        ? { preferred_size: { width: 420, height: 340 } }
+                        : {},
+                );
                 if (Object.keys(plannedNode.values || {}).length > 0) {
                     this.flApi.setValues(created.id, plannedNode.values);
                 }
@@ -385,6 +400,11 @@ export class ToolExecutor {
                 metadata,
             ),
             getNodeValues: nodeId => this.flApi.getValues(nodeId),
+            assignAttachment: (nodeId, binding) => this.flApi.placeChatImageInNode(
+                binding.image,
+                nodeId,
+                { focus: false },
+            ),
             connectNodes: (sourceId, targetId, connection) => this.flApi.connect(
                 sourceId,
                 connection.source_output_index,
@@ -404,9 +424,15 @@ export class ToolExecutor {
             listConnections: nodeIds => this.flApi.getConnectionsForNodeIds(nodeIds),
             removeNodes: nodeIds => this.flApi.remove(nodeIds),
             nodeExists: nodeId => this.flApi.nodeExists(nodeId),
+            // Keep the deterministic transaction visibly legible on the canvas:
+            // nodes arrive first, then their validated links are drawn in sequence.
+            afterMutationStep: step => new Promise(resolve => setTimeout(
+                resolve,
+                WORKFLOW_REVEAL_DELAYS_MS[step?.phase] ?? 160,
+            )),
         };
         try {
-            return applyWorkflowPlanAtomic(params, adapter);
+            return await applyWorkflowPlanAtomic(params, adapter);
         } finally {
             this.flApi.restoreAutoQueue(autoQueueState);
         }

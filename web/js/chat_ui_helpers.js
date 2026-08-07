@@ -219,6 +219,7 @@ export function summarizeToolStep(step, config = {}) {
             confirm_mask_review: "Mask needs changes",
             web_search: "Couldn’t search the web",
             web_fetch_page: "Couldn’t read the web page",
+            compile_workflow_spec: "Couldn’t compile workflow",
             plan_workflow: "Couldn’t validate workflow plan",
             registry_search_packages: "Couldn’t search official Comfy Registry",
             registry_get_package: "Couldn’t inspect Registry package",
@@ -370,6 +371,16 @@ export function summarizeToolStep(step, config = {}) {
             return `Plan needs fixes · ${plural(errorCount, "error")}`;
         }
         return `Validated workflow plan · ${plural(nodeCount, "node")}`;
+    }
+    if (name === "compile_workflow_spec") {
+        const nodeCount = Array.isArray(result?.plan?.nodes)
+            ? result.plan.nodes.length
+            : 0;
+        const errorCount = Number(result?.error_count || 0);
+        if (result?.valid === false) {
+            return `Workflow needs fixes · ${plural(errorCount, "error")}`;
+        }
+        return `Compiled workflow · ${plural(nodeCount, "node")}`;
     }
     if (name === "registry_search_packages") {
         if (result?.ok === false) return "Registry search unavailable";

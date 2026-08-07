@@ -107,6 +107,7 @@ def test_valid_plan_is_catalog_pinned_and_order_independent():
     assert len(first["plan_hash"]) == 64
     assert first["catalog"]["state"] == "pinned"
     assert first["requirements"]["output_node_aliases"] == ["save"]
+    assert "attachments" not in first["plan"]
     assert [node["alias"] for node in first["plan"]["nodes"]] == [
         "process",
         "save",
@@ -362,6 +363,93 @@ def test_partner_dynamic_combo_and_autogrow_inputs_are_resolved():
     )
     assert any(
         issue["code"] == "missing_dynamic_selection" for issue in missing_selection["issues"]
+    )
+
+
+def test_chat_attachment_binding_is_hashed_and_requires_backend_validation():
+    catalog = _catalog()
+    catalog["LoadImage"] = {
+        "display_name": "Load Image",
+        "category": "image",
+        "input": {"required": {"image": [["example.png"], {}]}},
+        "output": ["IMAGE"],
+        "output_name": ["IMAGE"],
+        "python_module": "nodes",
+    }
+    request = PlanWorkflowRequest.model_validate(
+        {
+            "nodes": [{"alias": "source", "node_type": "LoadImage"}],
+            "attachments": [
+                {
+                    "node_alias": "source",
+                    "image": {
+                        "filename": "main.png",
+                        "subfolder": "ren-chat/session",
+                        "type": "input",
+                    },
+                }
+            ],
+        }
+    )
+    catalog_hash = catalog_contract_hash(catalog)
+
+    untrusted = compile_workflow_plan(
+        request,
+        catalog,
+        catalog_hash=catalog_hash,
+        source="http://127.0.0.1:8188/object_info",
+    )
+    trusted = compile_workflow_plan(
+        request,
+        catalog,
+        catalog_hash=catalog_hash,
+        source="http://127.0.0.1:8188/object_info",
+        validated_attachment_values={
+            ("source", "image"): "ren-chat/session/main.png",
+        },
+    )
+
+    assert untrusted["valid"] is False
+    assert any(item["code"] == "attachment_not_validated" for item in untrusted["issues"])
+    assert trusted["valid"] is True
+    assert trusted["plan"]["nodes"][0]["values"]["image"] == "ren-chat/session/main.png"
+    assert trusted["plan"]["attachments"][0]["image"]["filename"] == "main.png"
+
+    wrong_widget_request = PlanWorkflowRequest.model_validate(
+        {
+            "nodes": [
+                {
+                    "alias": "save",
+                    "node_type": "SaveImage",
+                    "values": {"filename_prefix": "planned"},
+                }
+            ],
+            "attachments": [
+                {
+                    "node_alias": "save",
+                    "input_name": "filename_prefix",
+                    "image": {
+                        "filename": "main.png",
+                        "subfolder": "ren-chat/session",
+                        "type": "input",
+                    },
+                }
+            ],
+        }
+    )
+    wrong_widget = compile_workflow_plan(
+        wrong_widget_request,
+        catalog,
+        catalog_hash=catalog_hash,
+        source="http://127.0.0.1:8188/object_info",
+        validated_attachment_values={
+            ("save", "filename_prefix"): "ren-chat/session/main.png",
+        },
+    )
+    assert wrong_widget["valid"] is False
+    assert any(
+        item["code"] == "attachment_input_not_image_widget"
+        for item in wrong_widget["issues"]
     )
 
 

@@ -9,6 +9,7 @@ import re
 from collections.abc import Mapping
 from typing import Any, Literal
 
+from chat_images import ChatImageReference
 from node_library import (
     CATALOG_HASH_SCHEMA,
     NODE_SCHEMA_HASH_SCHEMA,
@@ -86,6 +87,30 @@ class WorkflowPlanConnection(BaseModel):
     )
 
 
+class WorkflowPlanAttachment(BaseModel):
+    """Bind one trusted Ren chat upload to a node widget in the atomic plan."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    node_alias: str = Field(..., min_length=1, max_length=64)
+    input_name: str = Field(
+        "image",
+        min_length=1,
+        max_length=256,
+        description="Exact image widget name on the target node.",
+    )
+    image: ChatImageReference
+
+    @model_validator(mode="after")
+    def validate_alias(self) -> WorkflowPlanAttachment:
+        if not _ALIAS_PATTERN.fullmatch(self.node_alias):
+            raise ValueError(
+                "node_alias must start with a lowercase letter and contain only "
+                "lowercase letters, digits, and underscores"
+            )
+        return self
+
+
 class PlanWorkflowRequest(BaseModel):
     """Compile and validate a workflow without changing the canvas."""
 
@@ -95,6 +120,14 @@ class PlanWorkflowRequest(BaseModel):
     connections: list[WorkflowPlanConnection] = Field(
         default_factory=list,
         max_length=500,
+    )
+    attachments: list[WorkflowPlanAttachment] = Field(
+        default_factory=list,
+        max_length=32,
+        description=(
+            "Trusted Ren chat uploads to include in validation and atomic application. "
+            "The backend verifies every referenced file before planning."
+        ),
     )
     expected_catalog_hash: str | None = Field(
         None,
@@ -531,6 +564,7 @@ def compile_workflow_plan(
     *,
     catalog_hash: str,
     source: str,
+    validated_attachment_values: Mapping[tuple[str, str], str] | None = None,
 ) -> dict[str, Any]:
     """Resolve and validate a plan against one immutable catalog snapshot."""
 
@@ -541,6 +575,30 @@ def compile_workflow_plan(
                 "catalog_changed",
                 "expected_catalog_hash",
                 "The loaded-node catalog changed after discovery; search and inspect nodes again.",
+            )
+        )
+
+    attachment_values = dict(validated_attachment_values or {})
+    declared_attachment_keys = {
+        (binding.node_alias, binding.input_name)
+        for binding in request.attachments
+    }
+    for index, binding in enumerate(request.attachments):
+        key = (binding.node_alias, binding.input_name)
+        if key not in attachment_values:
+            issues.append(
+                _issue(
+                    "attachment_not_validated",
+                    f"attachments[{index}]",
+                    "The chat attachment was not validated by the trusted backend.",
+                )
+            )
+    if len(declared_attachment_keys) != len(request.attachments):
+        issues.append(
+            _issue(
+                "duplicate_attachment_binding",
+                "attachments",
+                "A node widget may receive only one chat attachment binding.",
             )
         )
 
@@ -578,9 +636,23 @@ def compile_workflow_plan(
             )
             continue
 
+        node_values = dict(node.values)
+        for (binding_alias, input_name), widget_value in attachment_values.items():
+            if binding_alias != node.alias:
+                continue
+            if input_name in node_values and node_values[input_name] != widget_value:
+                issues.append(
+                    _issue(
+                        "attachment_value_conflict",
+                        f"{path}.values.{input_name}",
+                        f"{node.alias}.{input_name} conflicts with its chat attachment binding.",
+                    )
+                )
+            node_values[input_name] = widget_value
+
         input_groups, dynamic_issues = _expand_input_groups(
             raw_info.get("input") if isinstance(raw_info.get("input"), dict) else {},
-            node.values,
+            node_values,
             planned_target_inputs.get(node.alias, set()),
         )
         for issue in dynamic_issues:
@@ -588,7 +660,7 @@ def compile_workflow_plan(
             issues.append(issue)
         all_inputs = {**input_groups["required"], **input_groups["optional"]}
         accepted_values: dict[str, Any] = {}
-        for name, value in node.values.items():
+        for name, value in node_values.items():
             spec = all_inputs.get(name)
             if spec is None:
                 issues.append(
@@ -599,14 +671,18 @@ def compile_workflow_plan(
                     )
                 )
                 continue
-            value_issues = _validate_widget_value(name, spec, value)
+            value_issues = (
+                []
+                if (node.alias, name) in attachment_values and isinstance(value, str)
+                else _validate_widget_value(name, spec, value)
+            )
             for issue in value_issues:
                 issue["path"] = f"{path}.{issue['path']}"
                 issues.append(issue)
             if not value_issues:
                 accepted_values[name] = _canonical_widget_value(spec, value)
         for name, spec in all_inputs.items():
-            if name in node.values or _is_connectable(spec):
+            if name in node_values or _is_connectable(spec):
                 continue
             _, metadata = _input_parts(spec)
             if metadata.get("dynamic_type") == _DYNAMIC_COMBO:
@@ -784,6 +860,48 @@ def compile_workflow_plan(
                 )
             )
 
+    for index, binding in enumerate(request.attachments):
+        record = node_records.get(binding.node_alias)
+        if record is None:
+            issues.append(
+                _issue(
+                    "unknown_attachment_alias",
+                    f"attachments[{index}].node_alias",
+                    f"Attachment target alias {binding.node_alias!r} is unresolved.",
+                )
+            )
+            continue
+        inputs = {**record["inputs"]["required"], **record["inputs"]["optional"]}
+        spec = inputs.get(binding.input_name)
+        if spec is None:
+            issues.append(
+                _issue(
+                    "unknown_attachment_input",
+                    f"attachments[{index}].input_name",
+                    f"{record['node_type']} has no active input named {binding.input_name!r}.",
+                )
+            )
+        elif _is_connectable(spec):
+            issues.append(
+                _issue(
+                    "attachment_input_not_widget",
+                    f"attachments[{index}].input_name",
+                    f"{binding.node_alias}.{binding.input_name} is a connection slot, not an image widget.",
+                )
+            )
+        else:
+            input_type, _ = _input_parts(spec)
+            if not isinstance(input_type, list) or not all(
+                isinstance(option, str) for option in input_type
+            ):
+                issues.append(
+                    _issue(
+                        "attachment_input_not_image_widget",
+                        f"attachments[{index}].input_name",
+                        f"{binding.node_alias}.{binding.input_name} is not a Load Image-style choice widget.",
+                    )
+                )
+
     if partner_aliases:
         issues.append(
             _issue(
@@ -819,6 +937,14 @@ def compile_workflow_plan(
         "nodes": canonical_nodes,
         "connections": canonical_connections,
     }
+    if request.attachments:
+        canonical_plan["attachments"] = [
+            binding.model_dump(mode="json")
+            for binding in sorted(
+                request.attachments,
+                key=lambda item: (item.node_alias, item.input_name),
+            )
+        ]
     error_count = sum(issue["severity"] == "error" for issue in issues)
     warning_count = sum(issue["severity"] == "warning" for issue in issues)
     plan_hash = _canonical_hash(canonical_plan) if error_count == 0 else None

@@ -68,6 +68,7 @@ from comfy_models import (
     ComfySearchFilesRequest, ComfySearchFilesResponse, ComfyFolderType
 )
 from comfy_tools import get_comfy_tools, ComfyUIError, ComfyUINotFoundError
+from chat_images import ChatImageReference
 from node_library import (
     get_node_library_client,
     NodeLibraryError,
@@ -82,6 +83,10 @@ from workflow_planner import (
 from workflow_resolver import (
     ResolveWorkflowSpecRequest,
     resolve_workflow_spec as resolve_workflow_capabilities,
+)
+from workflow_compiler import (
+    CompileWorkflowSpecRequest,
+    compile_workflow_spec as compile_semantic_workflow,
 )
 from comfy_registry import ComfyRegistryClient, normalize_github_repository_url
 
@@ -1273,29 +1278,6 @@ class ViewOutputImageRequest(BaseModel):
         le=4096,
         description="Maximum preview width or height sent to the vision model.",
     )
-
-
-class ChatImageReference(BaseModel):
-    """A browser-uploaded image inside Ren's ComfyUI input subfolder."""
-    filename: str = Field(..., min_length=1, max_length=255)
-    subfolder: str = Field(..., min_length=1, max_length=512)
-    type: Literal["input"] = "input"
-
-    @model_validator(mode="after")
-    def validate_ren_upload_path(self) -> "ChatImageReference":
-        filename_path = Path(self.filename)
-        subfolder = self.subfolder.replace("\\", "/")
-        subfolder_path = Path(subfolder)
-        if filename_path.name != self.filename or self.filename in {".", ".."}:
-            raise ValueError("Chat image filename must be a basename.")
-        if (
-            subfolder_path.is_absolute()
-            or ".." in subfolder_path.parts
-            or not (subfolder == "ren-chat" or subfolder.startswith("ren-chat/"))
-        ):
-            raise ValueError("Chat images must be inside the ren-chat input folder.")
-        self.subfolder = subfolder
-        return self
 
 
 class ViewChatImageRequest(BaseModel):
@@ -3402,6 +3384,23 @@ async def node_library_status(request: NodeLibraryStatusRequest, ctx: Context) -
         raise RuntimeError(f"Tool execution failed: {e}")
 
 
+def _validated_plan_attachment_values(
+    request: PlanWorkflowRequest | CompileWorkflowSpecRequest,
+) -> Dict[tuple[str, str], str]:
+    """Validate every declared chat image and return its exact widget value."""
+
+    if not request.attachments:
+        return {}
+
+    comfy_tools = get_comfy_tools()
+    values: Dict[tuple[str, str], str] = {}
+    for binding in request.attachments:
+        image = binding.image.model_dump(mode="json")
+        _resolve_comfy_image_path(comfy_tools, image)
+        values[(binding.node_alias, binding.input_name)] = binding.image.widget_value()
+    return values
+
+
 @mcp.tool()
 async def plan_workflow(request: PlanWorkflowRequest, ctx: Context) -> Dict[str, Any]:
     """Validate a deterministic workflow plan without changing the canvas.
@@ -3425,11 +3424,13 @@ async def plan_workflow(request: PlanWorkflowRequest, ctx: Context) -> Dict[str,
             timeout=settings.comfyui_api_timeout,
         )
         snapshot = await client.catalog_snapshot()
+        attachment_values = _validated_plan_attachment_values(request)
         return compile_workflow_plan(
             request,
             snapshot.data,
             catalog_hash=snapshot.catalog_hash,
             source=snapshot.source,
+            validated_attachment_values=attachment_values,
         )
     except NodeLibraryConnectionError as e:
         raise RuntimeError(f"ComfyUI server connection failed: {e}")
@@ -3437,6 +3438,53 @@ async def plan_workflow(request: PlanWorkflowRequest, ctx: Context) -> Dict[str,
         raise RuntimeError(f"Workflow planning failed: {e}")
     except Exception as e:
         logger.error(f"Unexpected error in plan_workflow: {e}")
+        raise RuntimeError(f"Tool execution failed: {e}")
+
+
+@mcp.tool()
+async def compile_workflow_spec(
+    request: CompileWorkflowSpecRequest,
+    ctx: Context,
+) -> Dict[str, Any]:
+    """Compile a complete semantic workflow request into one ready-to-apply plan.
+
+    Prefer this tool for new workflows described in user language. In one bounded
+    dry run it resolves roles to exact locally loaded classes, canonicalizes unique
+    short widget and slot names to their exact runtime names (including dotted Comfy
+    v3 partner inputs), fills stable schema defaults, validates trusted Ren chat image
+    bindings, and produces the exact ``apply_workflow_plan`` request.
+
+    Partner/API selections include structured authentication, cost, and privacy facts.
+    Those facts are sufficient for a build-only request and do not require web search.
+    This tool never changes the canvas, transmits images to a partner, queues, installs,
+    or executes anything. If valid=true, pass ``apply_request`` unchanged to
+    ``apply_workflow_plan``. Use lower-level resolver, detail, and planner tools only
+    when this compiler reports a genuine ambiguity or unsupported schema.
+    """
+    await _report_tool_activity(ctx, "compile_workflow_spec")
+
+    try:
+        client = get_node_library_client(
+            server_url=settings.comfyui_server_url,
+            timeout=settings.comfyui_api_timeout,
+        )
+        snapshot = await client.catalog_snapshot()
+        attachment_values = _validated_plan_attachment_values(request)
+        return compile_semantic_workflow(
+            request,
+            snapshot.data,
+            catalog_hash=snapshot.catalog_hash,
+            source=snapshot.source,
+            validated_attachment_values=attachment_values,
+        )
+    except NodeLibraryConnectionError as e:
+        raise RuntimeError(f"ComfyUI server connection failed: {e}")
+    except NodeLibraryError as e:
+        raise RuntimeError(f"Workflow compilation failed: {e}")
+    except ComfyUIError as e:
+        raise RuntimeError(f"Workflow attachment validation failed: {e}")
+    except Exception as e:
+        logger.error(f"Unexpected error in compile_workflow_spec: {e}")
         raise RuntimeError(f"Tool execution failed: {e}")
 
 
@@ -3514,13 +3562,16 @@ async def apply_workflow_plan(
         plan_request = PlanWorkflowRequest(
             nodes=request.nodes,
             connections=request.connections,
+            attachments=request.attachments,
             expected_catalog_hash=request.expected_catalog_hash,
         )
+        attachment_values = _validated_plan_attachment_values(request)
         compiled = compile_workflow_plan(
             plan_request,
             snapshot.data,
             catalog_hash=snapshot.catalog_hash,
             source=snapshot.source,
+            validated_attachment_values=attachment_values,
         )
         validation = {
             "valid": compiled["valid"],

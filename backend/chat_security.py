@@ -113,6 +113,7 @@ READ_ONLY_TOOLS = {
     "node_library_get_details",
     "node_library_find_compatible",
     "node_library_status",
+    "compile_workflow_spec",
     "resolve_workflow_spec",
     "plan_workflow",
     "registry_search_packages",
