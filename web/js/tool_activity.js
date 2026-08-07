@@ -380,7 +380,7 @@ export const TOOL_CONFIG = {
     "apply_workflow_refinement": {
         icon: "🔀",
         label: "Refine Workflow",
-        description: "Applying a verified workflow-chain change"
+        description: "Applying a verified workflow graph change"
     },
     "registry_search_packages": {
         icon: "🌐",
@@ -563,7 +563,7 @@ const TOOL_RUNNING_LABELS = {
     compile_workflow_spec: "Compiling complete workflow",
     plan_workflow: "Validating workflow plan",
     plan_workflow_refinement: "Planning workflow refinement",
-    apply_workflow_refinement: "Refining workflow chain",
+    apply_workflow_refinement: "Refining workflow graph",
     registry_search_packages: "Searching official Comfy Registry",
     registry_get_package: "Inspecting Registry package",
     manager_check_updates: "Checking for updates",

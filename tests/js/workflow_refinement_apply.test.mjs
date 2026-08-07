@@ -41,6 +41,8 @@ function node(id, type, values = {}) {
         type,
         values: structuredClone(values),
         widgets_values: Object.values(structuredClone(values)),
+        inputs: [{ name: "image", type: "IMAGE", link: null }],
+        outputs: [{ name: "IMAGE", type: "IMAGE", links: [] }],
         properties: {},
         pos: [id * 100, 0],
         size: [220, 120],
@@ -95,6 +97,10 @@ class FakeRefinementAdapter {
         this.failConnectAfterMutation = false;
         this.sabotageSiblingOnRemove = false;
         this.sabotageSiblingFactsOnRemove = false;
+        this.sabotageWorkflowMetadataOnConnect = false;
+        this.sabotageWorkflowIdentityOnConnect = false;
+        this.sabotageV1StableStateOnConnect = false;
+        this.changeViewportOnConnect = false;
         this.corruptRestore = false;
     }
 
@@ -153,6 +159,7 @@ class FakeRefinementAdapter {
         this.createCalls += 1;
         const id = this.workflow.last_node_id + 1;
         this.workflow.last_node_id = id;
+        if (this.workflow.state) this.workflow.state.lastNodeId = id;
         this.workflow.nodes.push(node(id, plannedNode.node_type, plannedNode.values));
         return { id, node_id: id };
     }
@@ -172,6 +179,7 @@ class FakeRefinementAdapter {
         if (occupied) throw new Error("target input is occupied");
         const id = this.workflow.last_link_id + 1;
         this.workflow.last_link_id = id;
+        if (this.workflow.state) this.workflow.state.lastLinkId = id;
         this.workflow.links.push({
             id,
             source_node_id: sourceId,
@@ -182,6 +190,23 @@ class FakeRefinementAdapter {
             target_input: connection.target_input,
             type: connection.type,
         });
+        if (this.sabotageWorkflowMetadataOnConnect) {
+            this.workflow.groups.push({ title: "undeclared group" });
+        }
+        if (this.sabotageWorkflowIdentityOnConnect) {
+            this.workflow.id = "silently-replaced-workflow";
+            this.workflow.definitions = {
+                subgraphs: [{ id: "undeclared" }],
+                models: [],
+            };
+        }
+        if (this.sabotageV1StableStateOnConnect) {
+            this.workflow.state.lastGroupId += 1;
+            this.workflow.state.lastRerouteId += 1;
+        }
+        if (this.changeViewportOnConnect) {
+            this.workflow.extra.ds = { scale: 1.25, offset: [80, 40] };
+        }
         if (this.failConnectAfterMutation) throw new Error("connection failed after mutation");
         return { connected: true, id };
     }
@@ -294,6 +319,113 @@ async function replaceRequest(adapter, overrides = {}) {
 }
 
 
+function appendWorkflow() {
+    return {
+        id: "wavelet-refinement-workflow",
+        version: 0.4,
+        last_node_id: 61,
+        last_link_id: 109,
+        state: {
+            lastNodeId: 61,
+            lastLinkId: 109,
+            lastGroupId: 4,
+            lastRerouteId: 7,
+        },
+        definitions: { subgraphs: [], models: [] },
+        reroutes: [],
+        floatingLinks: [],
+        nodes: [
+            node(45, "Source"),
+            node(46, "BranchProcessor"),
+            node(47, "BranchProcessor"),
+            node(48, "LoadImage", { image: "industrial-background.png" }),
+            node(52, "GeminiNanoBanana2V2", { prompt: "preserve the subject" }),
+            node(60, "PreviewImage"),
+            node(61, "PreviewImage"),
+        ],
+        links: [
+            edge(100, 45, 0, 46, 0),
+            edge(101, 45, 0, 47, 0),
+            edge(102, 46, 0, 48, 0),
+            edge(103, 47, 0, 48, 1),
+            edge(104, 46, 0, 52, 0),
+            edge(105, 47, 0, 52, 1),
+            edge(106, 48, 0, 60, 0),
+            edge(107, 52, 0, 61, 0),
+            edge(108, 48, 0, 61, 1),
+            edge(109, 52, 0, 60, 1),
+        ],
+        groups: [],
+        config: {},
+        extra: { ds: { scale: 0.9, offset: [12, -8] }, theme: "dark" },
+    };
+}
+
+
+async function waveletAppendRequest(adapter, overrides = {}) {
+    return {
+        application_id: "refinement-append-wavelet-0001",
+        refinement_hash: "4".repeat(64),
+        plan: {
+            operation: "append",
+            expected_workflow_identity: EXPECTED_WORKFLOW_IDENTITY,
+            expected_graph_hash: await workflowGraphHash(adapter.captureWorkflow()),
+            expected_path: { nodes: [], connections: [] },
+            replacement: {
+                nodes: [
+                    {
+                        alias: "wavelet_fix",
+                        node_type: "WaveletColorFix",
+                        schema_hash: "d42f74e5ea682c89c4c4a964decd4025e830401d830fabfe10ed781aa7ef9b8e",
+                        values: { align_method: "wavelet" },
+                    },
+                    {
+                        alias: "save_image",
+                        node_type: "SaveImage",
+                        schema_hash: "919918acfefb2f1b0b628d52527ef9554c86b658c0ec4ee6ff96ef8785d8310f",
+                        values: { filename_prefix: "ren-wavelet-color-fix" },
+                    },
+                ],
+                connections: [{
+                    source_alias: "wavelet_fix",
+                    source_output_index: 0,
+                    source_output: "image",
+                    target_alias: "save_image",
+                    target_input_index: 0,
+                    target_input: "images",
+                    type: "IMAGE",
+                }],
+                input: null,
+                primary_input: {
+                    source_node_id: 52,
+                    source_node_type: "GeminiNanoBanana2V2",
+                    source_schema_hash: "6fa7d9dc1c847507a78f7937bfc98c0fb863b5f40b64754e2913ccb3373a04fc",
+                    source_output_index: 0,
+                    source_output: "IMAGE",
+                    target_alias: "wavelet_fix",
+                    target_input_index: 0,
+                    target_input: "target_image",
+                    type: "IMAGE",
+                },
+                side_inputs: [{
+                    source_node_id: 48,
+                    source_node_type: "LoadImage",
+                    source_schema_hash: "a".repeat(64),
+                    source_output_index: 0,
+                    source_output: "IMAGE",
+                    target_alias: "wavelet_fix",
+                    target_input_index: 1,
+                    target_input: "source_image",
+                    type: "IMAGE",
+                }],
+                output: null,
+            },
+            ...overrides,
+        },
+    };
+}
+
+
 test("replace splices a strict chain sequentially and preserves siblings", async () => {
     const adapter = new FakeRefinementAdapter();
     const siblingBefore = structuredClone(adapter.workflow.links[3]);
@@ -335,6 +467,344 @@ test("replace splices a strict chain sequentially and preserves siblings", async
 });
 
 
+test("append builds Wavelet fan-in plus terminal SaveImage and preserves source fan-out", async () => {
+    const adapter = new FakeRefinementAdapter(appendWorkflow());
+    const original = adapter.captureWorkflow();
+    const result = await applyWorkflowRefinementAtomic(
+        await waveletAppendRequest(adapter),
+        adapter,
+    );
+
+    assert.equal(result.success, true);
+    assert.equal(result.operation, "append");
+    assert.deepEqual(result.aliases, { wavelet_fix: 62, save_image: 63 });
+    assert.deepEqual(result.created_node_ids, [62, 63]);
+    assert.deepEqual(result.removed_node_ids, []);
+    assert.equal(adapter.disconnectCalls, 0);
+    assert.equal(adapter.removeCalls, 0);
+    assert.equal(original.nodes.length, 7);
+    assert.equal(original.links.length, 10);
+    assert.equal(adapter.workflow.nodes.length, 9);
+    assert.equal(adapter.workflow.links.length, 13);
+    assert.deepEqual(adapter.workflow.nodes.slice(0, 7), original.nodes);
+    assert.deepEqual(adapter.workflow.links.slice(0, 10), original.links);
+    assert.deepEqual(
+        adapter.workflow.links.slice(10).map(connection => ({
+            source_node_id: connection.source_node_id,
+            source_output_index: connection.source_output_index,
+            source_output: connection.source_output,
+            target_node_id: connection.target_node_id,
+            target_input_index: connection.target_input_index,
+            target_input: connection.target_input,
+            type: connection.type,
+        })),
+        [
+            {
+                source_node_id: 52,
+                source_output_index: 0,
+                source_output: "IMAGE",
+                target_node_id: 62,
+                target_input_index: 0,
+                target_input: "target_image",
+                type: "IMAGE",
+            },
+            {
+                source_node_id: 48,
+                source_output_index: 0,
+                source_output: "IMAGE",
+                target_node_id: 62,
+                target_input_index: 1,
+                target_input: "source_image",
+                type: "IMAGE",
+            },
+            {
+                source_node_id: 62,
+                source_output_index: 0,
+                source_output: "image",
+                target_node_id: 63,
+                target_input_index: 0,
+                target_input: "images",
+                type: "IMAGE",
+            },
+        ],
+    );
+    assert.deepEqual(adapter.getNode(62).values, { align_method: "wavelet" });
+    assert.deepEqual(
+        adapter.getNode(63).values,
+        { filename_prefix: "ren-wavelet-color-fix" },
+    );
+    assert.deepEqual(
+        adapter.events.map(event => event.phase),
+        ["node", "node", "connection", "connection", "connection"],
+    );
+    assert.equal(result.verification.valid, true);
+    assert.equal(result.verification.preserved_sibling_connection_count, 10);
+    assert.equal(result.queued, false);
+});
+
+
+test("append rejects a multiply-assigned target socket before canvas mutation", async () => {
+    const adapter = new FakeRefinementAdapter(appendWorkflow());
+    const request = await waveletAppendRequest(adapter);
+    request.plan.replacement.side_inputs[0].target_input_index = 0;
+    request.plan.replacement.side_inputs[0].target_input = "target_image";
+    const before = adapter.captureWorkflow();
+    const result = await applyWorkflowRefinementAtomic(request, adapter);
+
+    assert.equal(result.success, false);
+    assert.equal(result.error.code, "replacement_target_input_occupied");
+    assert.equal(result.rollback.attempted, false);
+    assert.equal(adapter.createCalls, 0);
+    assert.equal(adapter.connectCalls, 0);
+    assert.deepEqual(adapter.captureWorkflow(), before);
+});
+
+
+test("append rejects an unknown external source before canvas mutation", async () => {
+    const adapter = new FakeRefinementAdapter(appendWorkflow());
+    const request = await waveletAppendRequest(adapter);
+    request.plan.replacement.side_inputs[0].source_node_id = 999;
+    const before = adapter.captureWorkflow();
+    const result = await applyWorkflowRefinementAtomic(request, adapter);
+
+    assert.equal(result.success, false);
+    assert.equal(result.error.code, "external_input_mismatch");
+    assert.ok(result.verification.issues.some(issue => issue.code === "external_source_missing"));
+    assert.equal(result.rollback.attempted, false);
+    assert.equal(adapter.createCalls, 0);
+    assert.deepEqual(adapter.captureWorkflow(), before);
+});
+
+
+test("append rejects a stale external source slot before canvas mutation", async () => {
+    const workflow = appendWorkflow();
+    workflow.nodes.find(item => item.id === 48).outputs[0].name = "MASK";
+    const adapter = new FakeRefinementAdapter(workflow);
+    const request = await waveletAppendRequest(adapter);
+    const before = adapter.captureWorkflow();
+    const result = await applyWorkflowRefinementAtomic(request, adapter);
+
+    assert.equal(result.success, false);
+    assert.equal(result.error.code, "external_input_mismatch");
+    assert.ok(result.verification.issues.some(issue => (
+        issue.code === "external_source_output_mismatch"
+    )));
+    assert.equal(result.rollback.attempted, false);
+    assert.equal(adapter.createCalls, 0);
+    assert.deepEqual(adapter.captureWorkflow(), before);
+});
+
+
+test("ordinary splice rejects a side input that would create a feedback cycle", async () => {
+    const adapter = new FakeRefinementAdapter();
+    const request = await replaceRequest(adapter);
+    request.plan.replacement.side_inputs = [{
+        source_node_id: 4,
+        source_node_type: "Sink",
+        source_schema_hash: "9".repeat(64),
+        source_output_index: 0,
+        source_output: "IMAGE",
+        target_alias: "new_first",
+        target_input_index: 1,
+        target_input: "reference",
+        type: "IMAGE",
+    }];
+    const before = adapter.captureWorkflow();
+    const result = await applyWorkflowRefinementAtomic(request, adapter);
+
+    assert.equal(result.success, false);
+    assert.equal(result.error.code, "refinement_cycle");
+    assert.equal(result.rollback.attempted, false);
+    assert.equal(adapter.disconnectCalls, 0);
+    assert.deepEqual(adapter.captureWorkflow(), before);
+});
+
+
+test("ordinary splice accepts an exact non-cyclic side input and preserves its fan-out", async () => {
+    const adapter = new FakeRefinementAdapter();
+    const request = await replaceRequest(adapter);
+    request.plan.replacement.side_inputs = [{
+        source_node_id: 5,
+        source_node_type: "SiblingSource",
+        source_schema_hash: "8".repeat(64),
+        source_output_index: 0,
+        source_output: "IMAGE",
+        target_alias: "new_second",
+        target_input_index: 1,
+        target_input: "reference",
+        type: "IMAGE",
+    }];
+    const siblingBefore = structuredClone(adapter.workflow.links[3]);
+    const result = await applyWorkflowRefinementAtomic(request, adapter);
+
+    assert.equal(result.success, true);
+    assert.deepEqual(adapter.workflow.links.find(link => link.id === 13), siblingBefore);
+    assert.equal(adapter.workflow.links.some(link => (
+        sameId(link.source_node_id, 5)
+        && sameId(link.target_node_id, 8)
+        && link.target_input_index === 1
+        && link.target_input === "reference"
+    )), true);
+    assert.equal(result.verification.valid, true);
+});
+
+
+test("append connection failure rolls back the complete Wavelet graph", async () => {
+    const adapter = new FakeRefinementAdapter(appendWorkflow());
+    adapter.failConnectAfterMutation = true;
+    const before = adapter.captureWorkflow();
+    const beforeHash = await workflowGraphHash(before);
+    const result = await applyWorkflowRefinementAtomic(
+        await waveletAppendRequest(adapter),
+        adapter,
+    );
+
+    assert.equal(result.success, false);
+    assert.equal(result.rollback.attempted, true);
+    assert.equal(result.rollback.complete, true);
+    assert.equal(result.rollback.restored_graph_hash, beforeHash);
+    assert.deepEqual(adapter.captureWorkflow(), before);
+});
+
+
+test("append workflow metadata damage fails verification and restores the snapshot", async () => {
+    const adapter = new FakeRefinementAdapter(appendWorkflow());
+    adapter.sabotageWorkflowMetadataOnConnect = true;
+    const before = adapter.captureWorkflow();
+    const result = await applyWorkflowRefinementAtomic(
+        await waveletAppendRequest(adapter),
+        adapter,
+    );
+
+    assert.equal(result.success, false);
+    assert.equal(result.error.code, "post_refinement_verification_failed");
+    assert.ok(result.verification.issues.some(issue => (
+        issue.code === "workflow_metadata_changed"
+        && issue.fields.includes("groups")
+    )));
+    assert.equal(result.rollback.complete, true);
+    assert.deepEqual(adapter.captureWorkflow(), before);
+});
+
+
+test("append rejects workflow identity and definitions changes and rolls back", async () => {
+    const adapter = new FakeRefinementAdapter(appendWorkflow());
+    adapter.sabotageWorkflowIdentityOnConnect = true;
+    const before = adapter.captureWorkflow();
+    const result = await applyWorkflowRefinementAtomic(
+        await waveletAppendRequest(adapter),
+        adapter,
+    );
+
+    assert.equal(result.success, false);
+    assert.equal(result.error.code, "post_refinement_verification_failed");
+    const issue = result.verification.issues.find(candidate => (
+        candidate.code === "workflow_metadata_changed"
+    ));
+    assert.deepEqual(issue.fields, ["definitions", "id"]);
+    assert.equal(result.rollback.complete, true);
+    assert.deepEqual(adapter.captureWorkflow(), before);
+});
+
+
+test("v1 state permits node and link counters but protects group and reroute counters", async () => {
+    const accepted = new FakeRefinementAdapter(appendWorkflow());
+    const acceptedResult = await applyWorkflowRefinementAtomic(
+        await waveletAppendRequest(accepted),
+        accepted,
+    );
+
+    assert.equal(acceptedResult.success, true);
+    assert.deepEqual(accepted.workflow.state, {
+        lastNodeId: 63,
+        lastLinkId: 112,
+        lastGroupId: 4,
+        lastRerouteId: 7,
+    });
+
+    const rejected = new FakeRefinementAdapter(appendWorkflow());
+    rejected.sabotageV1StableStateOnConnect = true;
+    const before = rejected.captureWorkflow();
+    const rejectedResult = await applyWorkflowRefinementAtomic(
+        await waveletAppendRequest(rejected),
+        rejected,
+    );
+    assert.equal(rejectedResult.success, false);
+    assert.equal(rejectedResult.error.code, "post_refinement_verification_failed");
+    assert.ok(rejectedResult.verification.issues.some(issue => (
+        issue.code === "workflow_metadata_changed"
+        && issue.fields.includes("state")
+    )));
+    assert.equal(rejectedResult.rollback.complete, true);
+    assert.deepEqual(rejected.captureWorkflow(), before);
+});
+
+
+test("append tolerates viewport-only extra.ds changes during visible construction", async () => {
+    const adapter = new FakeRefinementAdapter(appendWorkflow());
+    adapter.changeViewportOnConnect = true;
+    const result = await applyWorkflowRefinementAtomic(
+        await waveletAppendRequest(adapter),
+        adapter,
+    );
+
+    assert.equal(result.success, true);
+    assert.equal(result.verification.valid, true);
+    assert.deepEqual(adapter.workflow.extra.ds, {
+        scale: 1.25,
+        offset: [80, 40],
+    });
+    assert.equal(
+        adapter.workflow.extra[REFINEMENT_LEDGER_KEY]
+            .entries["refinement-append-wavelet-0001"].result_graph_hash,
+        result.graph_hash,
+    );
+});
+
+
+test("append stale graph guard fails before creating Wavelet nodes", async () => {
+    const adapter = new FakeRefinementAdapter(appendWorkflow());
+    const request = await waveletAppendRequest(adapter, {
+        expected_graph_hash: "f".repeat(64),
+    });
+    const before = adapter.captureWorkflow();
+    const result = await applyWorkflowRefinementAtomic(request, adapter);
+
+    assert.equal(result.success, false);
+    assert.equal(result.error.code, "graph_precondition_failed");
+    assert.equal(result.rollback.attempted, false);
+    assert.equal(adapter.createCalls, 0);
+    assert.deepEqual(adapter.captureWorkflow(), before);
+});
+
+
+test("retrying an append is idempotent and does not duplicate nodes or edges", async () => {
+    const adapter = new FakeRefinementAdapter(appendWorkflow());
+    const request = await waveletAppendRequest(adapter);
+    const first = await applyWorkflowRefinementAtomic(request, adapter);
+    const mutationCounts = {
+        create: adapter.createCalls,
+        connect: adapter.connectCalls,
+        disconnect: adapter.disconnectCalls,
+        remove: adapter.removeCalls,
+    };
+    const second = await applyWorkflowRefinementAtomic(request, adapter);
+
+    assert.equal(first.success, true);
+    assert.equal(second.success, true);
+    assert.equal(second.applied, false);
+    assert.equal(second.already_applied, true);
+    assert.deepEqual(mutationCounts, {
+        create: adapter.createCalls,
+        connect: adapter.connectCalls,
+        disconnect: adapter.disconnectCalls,
+        remove: adapter.removeCalls,
+    });
+    assert.equal(adapter.workflow.nodes.length, 9);
+    assert.equal(adapter.workflow.links.length, 13);
+});
+
+
 test("retrying the same refinement uses the graph-hash ledger without mutation", async () => {
     const adapter = new FakeRefinementAdapter();
     const request = await replaceRequest(adapter);
@@ -373,6 +843,27 @@ test("a reused refinement ID with a different hash fails closed", async () => {
     assert.equal(result.success, false);
     assert.equal(result.error.code, "refinement_idempotency_conflict");
     assert.equal(result.rollback.attempted, false);
+});
+
+
+test("prototype-named refinement IDs remain ordinary idempotency keys", async () => {
+    const adapter = new FakeRefinementAdapter();
+    const request = {
+        ...await replaceRequest(adapter),
+        application_id: "constructor",
+    };
+
+    const first = await applyWorkflowRefinementAtomic(request, adapter);
+    const second = await applyWorkflowRefinementAtomic(request, adapter);
+
+    assert.equal(first.success, true);
+    assert.equal(first.applied, true);
+    assert.equal(second.success, true);
+    assert.equal(second.already_applied, true);
+    assert.equal(Object.prototype.hasOwnProperty.call(
+        adapter.workflow.extra[REFINEMENT_LEDGER_KEY].entries,
+        "constructor",
+    ), true);
 });
 
 

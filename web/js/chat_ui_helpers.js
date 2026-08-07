@@ -386,7 +386,7 @@ export function summarizeToolStep(step, config = {}) {
     if (name === "apply_workflow_refinement") {
         if (result?.success === false) return "Workflow refinement failed safely";
         if (result?.already_applied) return "Workflow refinement already applied";
-        return `Refined workflow · ${result?.operation || "updated chain"}`;
+        return `Refined workflow · ${result?.operation || "updated graph"}`;
     }
     if (name === "compile_workflow_spec") {
         const nodeCount = Array.isArray(result?.plan?.nodes)

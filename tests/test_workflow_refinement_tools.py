@@ -53,6 +53,44 @@ def catalog():
             "output": [],
             "output_name": [],
         },
+        "GeminiNanoBanana2V2": {
+            "python_module": "comfy_api_nodes.nodes_gemini",
+            "input": {"required": {}},
+            "output": ["IMAGE"],
+            "output_name": ["IMAGE"],
+        },
+        "LoadImage": {
+            "python_module": "nodes",
+            "input": {"required": {}},
+            "output": ["IMAGE"],
+            "output_name": ["IMAGE"],
+        },
+        "WaveletColorFix": {
+            "python_module": "custom_nodes.ComfyUI-FrameUtilitys",
+            "input": {
+                "required": {
+                    "target_image": ["IMAGE", {}],
+                    "source_image": ["IMAGE", {}],
+                    "align_method": [
+                        ["adain", "wavelet"],
+                        {"default": "wavelet"},
+                    ],
+                }
+            },
+            "output": ["IMAGE"],
+            "output_name": ["image"],
+        },
+        "SaveImage": {
+            "python_module": "nodes",
+            "input": {
+                "required": {
+                    "images": ["IMAGE", {}],
+                    "filename_prefix": ["STRING", {"default": "ComfyUI"}],
+                }
+            },
+            "output": ["IMAGE"],
+            "output_name": ["images"],
+        },
     }
 
 
@@ -93,6 +131,58 @@ def workflow(*, parallel=False):
         "config": {},
         "extra": {},
     }
+
+
+def wavelet_workflow():
+    return {
+        "version": 0.4,
+        "last_node_id": 52,
+        "last_link_id": 0,
+        "nodes": [
+            {
+                "id": 48,
+                "type": "LoadImage",
+                "pos": [0, 200],
+                "size": [200, 100],
+                "inputs": [],
+                "outputs": [{"name": "IMAGE", "type": "IMAGE", "links": []}],
+                "widgets_values": [],
+            },
+            {
+                "id": 52,
+                "type": "GeminiNanoBanana2V2",
+                "pos": [300, 0],
+                "size": [200, 100],
+                "inputs": [],
+                "outputs": [{"name": "IMAGE", "type": "IMAGE", "links": []}],
+                "widgets_values": [],
+            },
+        ],
+        "links": [],
+        "groups": [],
+        "config": {},
+        "extra": {},
+    }
+
+
+def wavelet_replacement_nodes():
+    return [
+        {
+            "alias": "wavelet_fix",
+            "node_type": "WaveletColorFix",
+            "values": {"align_method": "wavelet"},
+            "chain_input": "target_image",
+            "chain_output": "image",
+            "chain_output_index": 0,
+        },
+        {
+            "alias": "save_image",
+            "node_type": "SaveImage",
+            "values": {"filename_prefix": "ren-wavelet-color-fix"},
+            "chain_input": "images",
+            "chain_output": None,
+        },
+    ]
 
 
 def replacement_node():
@@ -222,6 +312,87 @@ async def test_plan_refinement_rejects_ambiguous_parallel_node_pair(monkeypatch)
     assert result["valid"] is False
     assert result["apply_request"] is None
     assert result["issues"][0]["code"] == "path_edge_ambiguous"
+
+
+@pytest.mark.asyncio
+async def test_wavelet_terminal_append_plans_and_recompiles_before_one_atomic_apply(
+    monkeypatch,
+):
+    calls = []
+
+    async def execute_tool(ctx, name, payload, timeout_ms=30000):
+        calls.append((name, payload, timeout_ms))
+        if name == "workflow_get_current_json":
+            return {
+                "workflow": wavelet_workflow(),
+                "workflow_identity": WORKFLOW_IDENTITY,
+                "workflow_identity_schema": WORKFLOW_IDENTITY_SCHEMA,
+                "graph_hash": GRAPH_HASH,
+                "graph_hash_schema": GRAPH_PRECONDITION_HASH_SCHEMA,
+            }
+        assert name == "apply_workflow_refinement"
+        assert payload["plan"]["operation"] == "append"
+        replacement = payload["plan"]["replacement"]
+        assert replacement["input"] is None
+        assert replacement["output"] is None
+        assert replacement["primary_input"]["source_node_id"] == 52
+        assert replacement["side_inputs"][0]["source_node_id"] == 48
+        assert replacement["connections"][0]["source_output"] == "image"
+        assert replacement["connections"][0]["target_input"] == "images"
+        return {
+            "success": True,
+            "applied": True,
+            "already_applied": False,
+            "operation": "append",
+            "created_node_ids": [70, 71],
+            "queued": False,
+        }
+
+    monkeypatch.setattr(mcp_server, "_execute_tool", execute_tool)
+    monkeypatch.setattr(
+        mcp_server,
+        "get_node_library_client",
+        lambda **kwargs: FakeCatalogClient(),
+    )
+    monkeypatch.setattr(mcp_server.settings, "enable_workflow_writes", True)
+
+    planned = await mcp_server.plan_workflow_refinement.fn(
+        mcp_server.PlanCurrentWorkflowRefinementRequest(
+            application_id="refinement-wavelet-tool",
+            terminal_source={
+                "node_id": 52,
+                "source_output": "IMAGE",
+                "source_output_index": 0,
+            },
+            side_input_mappings=[
+                {
+                    "source_node_id": 48,
+                    "source_output": "IMAGE",
+                    "source_output_index": 0,
+                    "target_alias": "wavelet_fix",
+                    "target_input": "source_image",
+                }
+            ],
+            replacement_nodes=wavelet_replacement_nodes(),
+        ),
+        fake_context(),
+    )
+    assert planned["valid"] is True
+    request = mcp_server.ApplyWorkflowRefinementRequest.model_validate(
+        planned["apply_request"]
+    )
+
+    applied = await mcp_server.apply_workflow_refinement.fn(request, fake_context())
+
+    assert applied["success"] is True
+    assert applied["validation"]["valid"] is True
+    assert applied["queued"] is False
+    assert [name for name, _, _ in calls] == [
+        "workflow_get_current_json",
+        "workflow_get_current_json",
+        "apply_workflow_refinement",
+    ]
+    assert calls[-1][2] == 240000
 
 
 @pytest.mark.asyncio

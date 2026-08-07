@@ -572,6 +572,26 @@ def test_existing_chain_edit_uses_only_atomic_refinement_route():
     assert not workflow_refinement_requested("Delete workflow.json")
     assert not workflow_refinement_requested("Build a new image workflow with four nodes")
 
+    multibranch = (
+        "Inspect my current workflow. Add a Wavelet Color Fix node: patch the image "
+        "from the final Nano Banana node into target_image and the industrial Load "
+        "Image branch into source_image, then add Save Image after it. Don't run it."
+    )
+    assert workflow_refinement_requested(multibranch) is True
+    assert compiler_first_workflow_requested(multibranch) is False
+    assert explicit_web_research_requested(multibranch) is False
+    multibranch_tools = tools_for_message(multibranch, "free")
+    assert {"plan_workflow_refinement", "apply_workflow_refinement"} <= multibranch_tools
+    assert "web_search" not in multibranch_tools
+    assert "web_fetch_page" not in multibranch_tools
+    assert "create_nodes" not in multibranch_tools
+    assert "connect_nodes_batch" not in multibranch_tools
+
+    instructions = registry_discovery_instructions()
+    assert "terminal_source" in instructions
+    assert "side_input_mappings" in instructions
+    assert "existing fan-out" in instructions
+
 
 def test_exact_registry_request_gets_tools_and_source_guardrails():
     selected = tools_for_message("search for new nodes in the registry")

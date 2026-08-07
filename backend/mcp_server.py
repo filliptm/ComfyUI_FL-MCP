@@ -91,10 +91,13 @@ from workflow_compiler import (
 )
 from workflow_refinement import (
     ApplyWorkflowRefinementRequest,
+    CanonicalAppendReplacement,
     GRAPH_PRECONDITION_HASH_SCHEMA,
     PlanWorkflowRefinementRequest,
     WORKFLOW_IDENTITY_SCHEMA,
+    WorkflowRefinementExistingOutput,
     WorkflowRefinementNode,
+    WorkflowRefinementSideInputMapping,
     compile_workflow_refinement,
     normalize_workflow_graph,
 )
@@ -1153,7 +1156,7 @@ class WorkflowCurrentJsonRequest(BaseModel):
 
 
 class PlanCurrentWorkflowRefinementRequest(BaseModel):
-    """Describe one exact linear splice in the currently active workflow."""
+    """Describe one exact splice or retained-source append in the active workflow."""
 
     model_config = {"extra": "forbid"}
 
@@ -1168,21 +1171,38 @@ class PlanCurrentWorkflowRefinementRequest(BaseModel):
         ),
     )
     path_node_ids: List[StrictInt | StrictStr] = Field(
-        ...,
-        min_length=2,
+        default_factory=list,
         max_length=201,
         description=(
             "Ordered node IDs spanning two retained boundary nodes. For insertion "
             "pass [upstream, downstream]. For replacement or deletion include every "
-            "internal node to remove: [upstream, old_node..., downstream]."
+            "internal node to remove: [upstream, old_node..., downstream]. Leave empty "
+            "only for a terminal_source append."
+        ),
+    )
+    terminal_source: Optional[WorkflowRefinementExistingOutput] = Field(
+        None,
+        description=(
+            "Existing retained node output that begins a terminal append. Supply its "
+            "node ID and output name and/or index; it feeds the first replacement "
+            "node's chain_input without disconnecting existing fan-out."
+        ),
+    )
+    side_input_mappings: List[WorkflowRefinementSideInputMapping] = Field(
+        default_factory=list,
+        max_length=100,
+        description=(
+            "Additional retained-node outputs mapped into exact inputs on replacement "
+            "aliases. Valid for terminal append and ordinary insert/replace splices."
         ),
     )
     replacement_nodes: List[WorkflowRefinementNode] = Field(
         default_factory=list,
         max_length=100,
         description=(
-            "Ordered exact locally loaded nodes for the new linear chain. Leave empty "
-            "only when deleting the internal path nodes."
+            "Ordered exact locally loaded nodes for the new sequential spine. The "
+            "last append node may omit chain_output when no downstream connection is "
+            "requested. Leave the list empty only when deleting internal path nodes."
         ),
     )
     expected_graph_hash: Optional[str] = Field(
@@ -1211,6 +1231,23 @@ class PlanCurrentWorkflowRefinementRequest(BaseModel):
         typed_ids = {(type(value).__name__, value) for value in self.path_node_ids}
         if len(typed_ids) != len(self.path_node_ids):
             raise ValueError("path_node_ids must not repeat a node")
+        if self.terminal_source is not None:
+            if self.path_node_ids:
+                raise ValueError(
+                    "terminal_source append refinements must leave path_node_ids empty"
+                )
+            if not self.replacement_nodes:
+                raise ValueError(
+                    "terminal_source append refinements require replacement_nodes"
+                )
+        elif len(self.path_node_ids) < 2:
+            raise ValueError(
+                "linear refinements require at least two path_node_ids"
+            )
+        if self.side_input_mappings and not self.replacement_nodes:
+            raise ValueError(
+                "side_input_mappings require replacement_nodes and cannot accompany deletion"
+            )
         return self
 
 class WorkflowLoadJsonRequest(BaseModel):
@@ -3845,15 +3882,20 @@ def _planner_request_from_apply(
     """Reconstruct the original strict planner input from a canonical apply plan."""
 
     replacement_nodes: List[Dict[str, Any]] = []
+    terminal_source: Optional[Dict[str, Any]] = None
+    side_input_mappings: List[Dict[str, Any]] = []
     replacement = request.plan.replacement
     if replacement is not None:
         last_index = len(replacement.nodes) - 1
         for index, node in enumerate(replacement.nodes):
-            incoming = (
-                replacement.input
-                if index == 0
-                else replacement.connections[index - 1]
-            )
+            if index == 0:
+                incoming = (
+                    replacement.primary_input
+                    if isinstance(replacement, CanonicalAppendReplacement)
+                    else replacement.input
+                )
+            else:
+                incoming = replacement.connections[index - 1]
             outgoing = (
                 replacement.output
                 if index == last_index
@@ -3865,8 +3907,28 @@ def _planner_request_from_apply(
                     "node_type": node.node_type,
                     "values": node.values,
                     "chain_input": incoming.target_input,
-                    "chain_output": outgoing.source_output,
-                    "chain_output_index": outgoing.source_output_index,
+                    "chain_output": (
+                        outgoing.source_output if outgoing is not None else None
+                    ),
+                    "chain_output_index": (
+                        outgoing.source_output_index if outgoing is not None else None
+                    ),
+                }
+            )
+        if isinstance(replacement, CanonicalAppendReplacement):
+            terminal_source = {
+                "node_id": replacement.primary_input.source_node_id,
+                "source_output": replacement.primary_input.source_output,
+                "source_output_index": replacement.primary_input.source_output_index,
+            }
+        for mapping in getattr(replacement, "side_inputs", []):
+            side_input_mappings.append(
+                {
+                    "source_node_id": mapping.source_node_id,
+                    "source_output": mapping.source_output,
+                    "source_output_index": mapping.source_output_index,
+                    "target_alias": mapping.target_alias,
+                    "target_input": mapping.target_input,
                 }
             )
     return PlanWorkflowRefinementRequest.model_validate(
@@ -3881,6 +3943,8 @@ def _planner_request_from_apply(
                     for edge in request.plan.expected_path.connections
                 ]
             },
+            "terminal_source": terminal_source,
+            "side_input_mappings": side_input_mappings,
             "replacement_nodes": replacement_nodes,
             "expected_catalog_hash": request.expected_catalog_hash,
         }
@@ -3892,13 +3956,14 @@ async def plan_workflow_refinement(
     request: PlanCurrentWorkflowRefinementRequest,
     ctx: Context,
 ) -> Dict[str, Any]:
-    """Plan a safe insert, replacement, or deletion in the active workflow.
+    """Plan a safe insert, replacement, deletion, or retained-source append.
 
-    This tool reads the active editable graph internally, resolves one exact edge
-    between every consecutive pair in ``path_node_ids``, and validates replacement
-    nodes against one current local ``/object_info`` catalog. The first and last IDs
-    are retained boundaries; only IDs between them may be removed. It rejects
-    nonlinear targets with side branches and never changes or queues the canvas.
+    For a linear splice, this tool resolves one exact edge between every consecutive
+    pair in ``path_node_ids``; the first and last IDs are retained boundaries. For a
+    terminal append, leave that path empty and supply ``terminal_source``. Additional
+    retained outputs may feed exact replacement inputs through
+    ``side_input_mappings``. Every existing and new slot is validated against one
+    current local ``/object_info`` catalog. It never changes or queues the canvas.
 
     If ``valid=true``, pass the returned ``apply_request`` unchanged to
     ``apply_workflow_refinement``. No separate JSON, schema, value, create, remove,
@@ -3932,9 +3997,10 @@ async def plan_workflow_refinement(
                 "error_count": 1,
             }
 
-        path_edges, path_issues = _derive_refinement_path_edges(
-            graph,
-            request.path_node_ids,
+        path_edges, path_issues = (
+            _derive_refinement_path_edges(graph, request.path_node_ids)
+            if request.path_node_ids
+            else ([], [])
         )
         if request.expected_graph_hash and (
             request.expected_graph_hash != active["graph_hash"]
@@ -3975,6 +4041,8 @@ async def plan_workflow_refinement(
             expected_graph_hash=active["graph_hash"],
             graph=graph,
             expected_path={"edges": path_edges},
+            terminal_source=request.terminal_source,
+            side_input_mappings=request.side_input_mappings,
             replacement_nodes=request.replacement_nodes,
             expected_catalog_hash=request.expected_catalog_hash,
         )
@@ -4003,9 +4071,10 @@ async def apply_workflow_refinement(
     The backend rereads the active workflow, reconstructs and recompiles the exact
     planner input against the current local catalog, and sends one canonical splice
     transaction to the browser only when the catalog, graph, schemas, values, slots,
-    plan, and refinement hash still match. The browser preserves everything outside
-    the declared linear path, verifies the result, restores the complete original
-    workflow on any post-mutation failure, and never queues execution.
+    retained source mappings, plan, and refinement hash still match. The browser
+    preserves everything outside the declared path or appended subgraph, verifies the
+    result, restores the complete original workflow on any post-mutation failure, and
+    never queues execution.
     """
 
     await _report_tool_activity(ctx, "apply_workflow_refinement")
@@ -4135,7 +4204,7 @@ async def apply_workflow_refinement(
                 "plan": compiled["plan"],
             },
             # The largest accepted refinement can intentionally reveal roughly
-            # 133 seconds of sequential canvas mutations before verification.
+            # 183 seconds of sequential canvas mutations before verification.
             # Keep the bridge deadline above that deterministic upper bound so a
             # caller cannot time out while the guarded frontend transaction runs on.
             timeout_ms=240000,

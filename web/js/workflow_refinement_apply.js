@@ -1,4 +1,4 @@
-/** Atomic, rollback-safe insertion, replacement, and deletion of one linear graph chain. */
+/** Atomic, rollback-safe workflow graph refinement with legacy linear-splice support. */
 
 import {
     canonicalWorkflowJSON,
@@ -11,7 +11,7 @@ export const WORKFLOW_REFINEMENT_SCHEMA = "fl-mcp.workflow-refinement.v1";
 
 const SHA256_PATTERN = /^[a-f0-9]{64}$/;
 const REFINEMENT_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$/;
-const REFINEMENT_OPERATIONS = new Set(["insert", "replace", "delete"]);
+const REFINEMENT_OPERATIONS = new Set(["append", "insert", "replace", "delete"]);
 const REFINEMENT_LEDGER_LIMIT = 64;
 
 
@@ -223,6 +223,19 @@ function normalizePathNode(value) {
 }
 
 
+function indexedSlot(node, field, index) {
+    const source = isRecord(node?.serialized_node) ? node.serialized_node : node;
+    const slots = source?.[field];
+    if (Array.isArray(slots)) return slots[index] ?? null;
+    if (!isRecord(slots)) return null;
+    if (Object.prototype.hasOwnProperty.call(slots, String(index))) {
+        return slots[String(index)];
+    }
+    const names = Object.keys(slots).sort();
+    return slots[names[index]] ?? null;
+}
+
+
 function normalizeReplacementConnection(value) {
     if (!isRecord(value)) return null;
     if (
@@ -247,6 +260,92 @@ function normalizeReplacementConnection(value) {
 }
 
 
+function normalizeExistingInput(value, label) {
+    if (
+        !isRecord(value)
+        || value.source_node_id === undefined
+        || value.source_node_id === null
+        || typeof value.source_node_type !== "string"
+        || !value.source_node_type
+        || !SHA256_PATTERN.test(String(value.source_schema_hash || ""))
+        || !isSlotIndex(value.source_output_index)
+        || typeof value.source_output !== "string"
+        || !value.source_output
+        || typeof value.target_alias !== "string"
+        || !value.target_alias
+        || !isSlotIndex(value.target_input_index)
+        || typeof value.target_input !== "string"
+        || !value.target_input
+        || typeof value.type !== "string"
+        || !value.type
+    ) {
+        throw refinementError(
+            "invalid_replacement_graph",
+            `${label} is not an exact existing-node input mapping.`,
+        );
+    }
+    return {
+        source_node_id: value.source_node_id,
+        source_node_type: value.source_node_type,
+        source_schema_hash: value.source_schema_hash,
+        source_output_index: value.source_output_index,
+        source_output: value.source_output,
+        target_alias: value.target_alias,
+        target_input_index: value.target_input_index,
+        target_input: value.target_input,
+        type: value.type,
+    };
+}
+
+
+function validateReplacementTargetInputs(replacement) {
+    const aliases = new Set(replacement.nodes.map(node => node.alias));
+    const targets = [];
+    for (const connection of replacement.connections) {
+        targets.push({
+            alias: connection.target_alias,
+            input_index: connection.target_input_index,
+            label: "replacement connection",
+        });
+    }
+    if (replacement.input) {
+        targets.push({
+            alias: replacement.input.target_alias,
+            input_index: replacement.input.target_input_index,
+            label: "replacement boundary input",
+        });
+    }
+    for (const [index, mapping] of [
+        ...(replacement.primary_input ? [["primary", replacement.primary_input]] : []),
+        ...replacement.side_inputs.map((mapping, index) => [`side input ${index}`, mapping]),
+    ]) {
+        targets.push({
+            alias: mapping.target_alias,
+            input_index: mapping.target_input_index,
+            label: index,
+        });
+    }
+
+    const occupied = new Set();
+    for (const target of targets) {
+        if (!aliases.has(target.alias)) {
+            throw refinementError(
+                "invalid_replacement_graph",
+                `${target.label} targets unknown alias ${target.alias}.`,
+            );
+        }
+        const key = `${target.alias}|${target.input_index}`;
+        if (occupied.has(key)) {
+            throw refinementError(
+                "replacement_target_input_occupied",
+                `Replacement input ${target.alias}[${target.input_index}] is assigned more than once.`,
+            );
+        }
+        occupied.add(key);
+    }
+}
+
+
 function normalizeReplacement(request) {
     const replacement = request.replacement;
     if (request.operation === "delete") {
@@ -261,7 +360,7 @@ function normalizeReplacement(request) {
     if (!isRecord(replacement) || !Array.isArray(replacement.nodes)) {
         throw refinementError(
             "invalid_refinement_payload",
-            "Insert and replace refinements require an ordered replacement chain.",
+            "Non-delete refinements require an ordered created-node spine.",
         );
     }
     if (replacement.nodes.length === 0) {
@@ -328,37 +427,113 @@ function normalizeReplacement(request) {
         }
     }
 
-    const input = replacement.input;
-    const output = replacement.output;
-    if (
-        !isRecord(input)
-        || input.target_alias !== nodes[0].alias
-        || !isSlotIndex(input.target_input_index)
-        || !isRecord(output)
-        || output.source_alias !== nodes[nodes.length - 1].alias
-        || !isSlotIndex(output.source_output_index)
-    ) {
+    const rawSideInputs = Object.prototype.hasOwnProperty.call(replacement, "side_inputs")
+        ? replacement.side_inputs
+        : [];
+    if (!Array.isArray(rawSideInputs)) {
         throw refinementError(
-            "invalid_replacement_chain",
-            "Replacement input and output must terminate on the first and last node.",
+            "invalid_replacement_graph",
+            "Replacement side inputs must be an array.",
         );
     }
-    return {
+    if (rawSideInputs.length > 100) {
+        throw refinementError(
+            "invalid_replacement_graph",
+            "Replacement side inputs cannot exceed 100 mappings.",
+        );
+    }
+    const sideInputs = rawSideInputs.map((value, index) => (
+        normalizeExistingInput(value, `Replacement side input ${index}`)
+    ));
+    const normalized = {
         nodes,
         connections,
-        input: {
+        input: null,
+        primary_input: null,
+        side_inputs: sideInputs,
+        output: null,
+    };
+
+    if (request.operation === "append") {
+        if (replacement.input !== null) {
+            throw refinementError(
+                "invalid_replacement_graph",
+                "Append refinements must not define a disconnected boundary input.",
+            );
+        }
+        normalized.primary_input = normalizeExistingInput(
+            replacement.primary_input,
+            "Replacement primary input",
+        );
+        if (normalized.primary_input.target_alias !== nodes[0].alias) {
+            throw refinementError(
+                "invalid_replacement_graph",
+                "The append primary input must target the first replacement node.",
+            );
+        }
+        if (replacement.output !== null && replacement.output !== undefined) {
+            const output = replacement.output;
+            if (
+                !isRecord(output)
+                || output.source_alias !== nodes[nodes.length - 1].alias
+                || !isSlotIndex(output.source_output_index)
+                || typeof output.source_output !== "string"
+                || !output.source_output
+                || typeof output.type !== "string"
+                || !output.type
+            ) {
+                throw refinementError(
+                    "invalid_replacement_graph",
+                    "An append output must describe an exact output on the final node.",
+                );
+            }
+            normalized.output = {
+                source_alias: output.source_alias,
+                source_output_index: output.source_output_index,
+                source_output: output.source_output,
+                type: output.type,
+            };
+        }
+    } else {
+        if (
+            replacement.primary_input !== null
+            && replacement.primary_input !== undefined
+        ) {
+            throw refinementError(
+                "invalid_replacement_chain",
+                "Legacy linear refinements cannot define an external primary input.",
+            );
+        }
+        const input = replacement.input;
+        const output = replacement.output;
+        if (
+            !isRecord(input)
+            || input.target_alias !== nodes[0].alias
+            || !isSlotIndex(input.target_input_index)
+            || !isRecord(output)
+            || output.source_alias !== nodes[nodes.length - 1].alias
+            || !isSlotIndex(output.source_output_index)
+        ) {
+            throw refinementError(
+                "invalid_replacement_chain",
+                "Replacement input and output must terminate on the first and last node.",
+            );
+        }
+        normalized.input = {
             target_alias: input.target_alias,
             target_input_index: input.target_input_index,
             target_input: input.target_input ?? null,
             type: input.type ?? null,
-        },
-        output: {
+        };
+        normalized.output = {
             source_alias: output.source_alias,
             source_output_index: output.source_output_index,
             source_output: output.source_output ?? null,
             type: output.type ?? null,
-        },
-    };
+        };
+    }
+    validateReplacementTargetInputs(normalized);
+    return normalized;
 }
 
 
@@ -407,10 +582,22 @@ function normalizeRequest(request) {
         }
         return connection;
     });
-    if (pathConnections.length !== pathNodes.length + 1) {
+    if (
+        plan.operation !== "append"
+        && pathConnections.length !== pathNodes.length + 1
+    ) {
         throw refinementError(
             "invalid_expected_path",
             "A linear path requires one more connection than internal nodes.",
+        );
+    }
+    if (
+        plan.operation === "append"
+        && (pathNodes.length !== 0 || pathConnections.length !== 0)
+    ) {
+        throw refinementError(
+            "invalid_expected_path",
+            "Append refinements require an empty expected path.",
         );
     }
     if (plan.operation === "insert" && pathNodes.length !== 0) {
@@ -419,40 +606,46 @@ function normalizeRequest(request) {
             "Insert refinements require one direct boundary edge and no internal nodes.",
         );
     }
-    if (plan.operation !== "insert" && pathNodes.length === 0) {
+    if (
+        plan.operation !== "insert"
+        && plan.operation !== "append"
+        && pathNodes.length === 0
+    ) {
         throw refinementError(
             "invalid_expected_path",
             "Replace and delete refinements require at least one internal node.",
         );
     }
 
-    const sequence = [
-        pathConnections[0].source_node_id,
-        ...pathNodes.map(node => node.node_id),
-        pathConnections[pathConnections.length - 1].target_node_id,
-    ];
-    if (
-        pathNodes.some(node => (
-            idsEqual(node.node_id, sequence[0])
-            || idsEqual(node.node_id, sequence[sequence.length - 1])
-        ))
-        || idsEqual(sequence[0], sequence[sequence.length - 1])
-    ) {
-        throw refinementError(
-            "invalid_expected_path",
-            "Path boundary nodes must be distinct from its internal nodes and each other.",
-        );
-    }
-    for (let index = 0; index < pathConnections.length; index += 1) {
-        const connection = pathConnections[index];
+    if (plan.operation !== "append") {
+        const sequence = [
+            pathConnections[0].source_node_id,
+            ...pathNodes.map(node => node.node_id),
+            pathConnections[pathConnections.length - 1].target_node_id,
+        ];
         if (
-            !idsEqual(connection.source_node_id, sequence[index])
-            || !idsEqual(connection.target_node_id, sequence[index + 1])
+            pathNodes.some(node => (
+                idsEqual(node.node_id, sequence[0])
+                || idsEqual(node.node_id, sequence[sequence.length - 1])
+            ))
+            || idsEqual(sequence[0], sequence[sequence.length - 1])
         ) {
             throw refinementError(
                 "invalid_expected_path",
-                "Expected path connections must follow the declared node order exactly.",
+                "Path boundary nodes must be distinct from its internal nodes and each other.",
             );
+        }
+        for (let index = 0; index < pathConnections.length; index += 1) {
+            const connection = pathConnections[index];
+            if (
+                !idsEqual(connection.source_node_id, sequence[index])
+                || !idsEqual(connection.target_node_id, sequence[index + 1])
+            ) {
+                throw refinementError(
+                    "invalid_expected_path",
+                    "Expected path connections must follow the declared node order exactly.",
+                );
+            }
         }
     }
 
@@ -488,7 +681,11 @@ function readLedger(snapshot) {
         || stored.schema !== WORKFLOW_REFINEMENT_SCHEMA
         || !Array.isArray(stored.order)
         || !isRecord(stored.entries)
-        || stored.order.some(id => typeof id !== "string" || !stored.entries[id])
+        || stored.order.some(id => (
+            typeof id !== "string"
+            || !Object.prototype.hasOwnProperty.call(stored.entries, id)
+            || !stored.entries[id]
+        ))
     ) {
         throw refinementError(
             "invalid_refinement_ledger",
@@ -577,6 +774,144 @@ async function observeExpectedPath(request, adapter, allConnections) {
 }
 
 
+async function observeExistingInputs(request, adapter) {
+    const mappings = [
+        ...(request.replacement?.primary_input ? [request.replacement.primary_input] : []),
+        ...(request.replacement?.side_inputs || []),
+    ];
+    const issues = [];
+    const observedById = new Map();
+    const removedIds = new Set(
+        request.expected_path.nodes.map(node => idKey(node.node_id)),
+    );
+    for (const mapping of mappings) {
+        const key = idKey(mapping.source_node_id);
+        if (removedIds.has(key)) {
+            issues.push({
+                code: "external_source_would_be_removed",
+                node_id: mapping.source_node_id,
+                message: `External source node ${mapping.source_node_id} is inside the path being removed.`,
+            });
+            continue;
+        }
+        let observed = observedById.get(key);
+        if (!observed) {
+            observed = await adapter.getNode(mapping.source_node_id);
+            observedById.set(key, observed);
+        }
+        if (!observed) {
+            issues.push({
+                code: "external_source_missing",
+                node_id: mapping.source_node_id,
+                message: `External source node ${mapping.source_node_id} is missing.`,
+            });
+        } else if (nodeType(observed) !== mapping.source_node_type) {
+            issues.push({
+                code: "external_source_type_mismatch",
+                node_id: mapping.source_node_id,
+                message: `Expected ${mapping.source_node_type} at external source node ${mapping.source_node_id}.`,
+            });
+        } else {
+            const output = indexedSlot(observed, "outputs", mapping.source_output_index);
+            if (
+                !isRecord(output)
+                || output.name !== mapping.source_output
+                || output.type !== mapping.type
+            ) {
+                issues.push({
+                    code: "external_source_output_mismatch",
+                    node_id: mapping.source_node_id,
+                    source_output_index: mapping.source_output_index,
+                    message: `External source ${mapping.source_node_id}.${mapping.source_output} no longer has the exact planned name and type.`,
+                });
+            }
+        }
+    }
+    return { valid: issues.length === 0, issues };
+}
+
+
+function graphVertex(kind, value) {
+    return `${kind}:${kind === "node" ? idKey(value) : value}`;
+}
+
+
+function plannedTopologyReferences(request, siblingConnections) {
+    const references = siblingConnections.map(connection => ({
+        source: graphVertex("node", connection.source_node_id),
+        target: graphVertex("node", connection.target_node_id),
+    }));
+    const aliasVertex = alias => graphVertex("alias", alias);
+    const nodeVertex = id => graphVertex("node", id);
+    const replacement = request.replacement;
+
+    if (request.operation === "delete") {
+        const first = request.expected_path.connections[0];
+        const last = request.expected_path.connections.at(-1);
+        references.push({ source: nodeVertex(first.source_node_id), target: nodeVertex(last.target_node_id) });
+        return references;
+    }
+    if (request.operation === "append") {
+        references.push({
+            source: nodeVertex(replacement.primary_input.source_node_id),
+            target: aliasVertex(replacement.primary_input.target_alias),
+        });
+    } else {
+        const first = request.expected_path.connections[0];
+        const last = request.expected_path.connections.at(-1);
+        references.push({
+            source: nodeVertex(first.source_node_id),
+            target: aliasVertex(replacement.input.target_alias),
+        });
+        references.push({
+            source: aliasVertex(replacement.output.source_alias),
+            target: nodeVertex(last.target_node_id),
+        });
+    }
+    for (const sideInput of replacement.side_inputs) {
+        references.push({
+            source: nodeVertex(sideInput.source_node_id),
+            target: aliasVertex(sideInput.target_alias),
+        });
+    }
+    for (const connection of replacement.connections) {
+        references.push({
+            source: aliasVertex(connection.source_alias),
+            target: aliasVertex(connection.target_alias),
+        });
+    }
+    return references;
+}
+
+
+function findTopologyCycle(references) {
+    const adjacency = new Map();
+    const indegree = new Map();
+    for (const { source, target } of references) {
+        const targets = adjacency.get(source) || [];
+        targets.push(target);
+        adjacency.set(source, targets);
+        if (!adjacency.has(target)) adjacency.set(target, []);
+        if (!indegree.has(source)) indegree.set(source, 0);
+        indegree.set(target, (indegree.get(target) || 0) + 1);
+    }
+    const ready = [...indegree.entries()]
+        .filter(([, degree]) => degree === 0)
+        .map(([vertex]) => vertex);
+    let visited = 0;
+    while (ready.length > 0) {
+        const vertex = ready.pop();
+        visited += 1;
+        for (const target of adjacency.get(vertex) || []) {
+            const next = indegree.get(target) - 1;
+            indegree.set(target, next);
+            if (next === 0) ready.push(target);
+        }
+    }
+    return visited !== indegree.size;
+}
+
+
 function plannedConnection(sourceId, targetId, specification) {
     return {
         source_node_id: sourceId,
@@ -591,6 +926,30 @@ function plannedConnection(sourceId, targetId, specification) {
 
 
 function desiredConnections(request, aliases, pathConnections) {
+    const replacement = request.replacement;
+    if (request.operation === "append") {
+        const connections = [plannedConnection(
+            replacement.primary_input.source_node_id,
+            aliases[replacement.primary_input.target_alias],
+            replacement.primary_input,
+        )];
+        for (const sideInput of replacement.side_inputs) {
+            connections.push(plannedConnection(
+                sideInput.source_node_id,
+                aliases[sideInput.target_alias],
+                sideInput,
+            ));
+        }
+        for (const internal of replacement.connections) {
+            connections.push(plannedConnection(
+                aliases[internal.source_alias],
+                aliases[internal.target_alias],
+                internal,
+            ));
+        }
+        return connections;
+    }
+
     const firstPath = pathConnections[0];
     const lastPath = pathConnections[pathConnections.length - 1];
     if (request.operation === "delete") {
@@ -605,7 +964,6 @@ function desiredConnections(request, aliases, pathConnections) {
         }];
     }
 
-    const replacement = request.replacement;
     const connections = [plannedConnection(
         firstPath.source_node_id,
         aliases[replacement.input.target_alias],
@@ -617,6 +975,13 @@ function desiredConnections(request, aliases, pathConnections) {
             type: replacement.input.type ?? firstPath.type,
         },
     )];
+    for (const sideInput of replacement.side_inputs) {
+        connections.push(plannedConnection(
+            sideInput.source_node_id,
+            aliases[sideInput.target_alias],
+            sideInput,
+        ));
+    }
     for (const internal of replacement.connections) {
         connections.push(plannedConnection(
             aliases[internal.source_alias],
@@ -703,6 +1068,61 @@ function snapshotNodeFacts(snapshot) {
 }
 
 
+const MUTATION_OWNED_WORKFLOW_FIELDS = new Set([
+    "nodes",
+    "links",
+    "last_node_id",
+    "last_link_id",
+    "revision",
+]);
+
+
+function comparableWorkflowExtra(extra) {
+    if (extra === undefined || extra === null) return {};
+    if (!isRecord(extra)) return extra;
+    return Object.fromEntries(
+        Object.entries(extra)
+            .filter(([key]) => key !== "ds" && key !== REFINEMENT_LEDGER_KEY)
+            .map(([key, value]) => [key, clone(value)]),
+    );
+}
+
+
+function comparableWorkflowState(state) {
+    if (state === undefined || state === null) return {};
+    if (!isRecord(state)) return state;
+    return Object.fromEntries(
+        Object.entries(state)
+            .filter(([key]) => key !== "lastNodeId" && key !== "lastLinkId")
+            .map(([key, value]) => [key, clone(value)]),
+    );
+}
+
+
+function changedWorkflowEnvelopeFields(beforeSnapshot, observedSnapshot) {
+    const keys = new Set([
+        ...Object.keys(isRecord(beforeSnapshot) ? beforeSnapshot : {}),
+        ...Object.keys(isRecord(observedSnapshot) ? observedSnapshot : {}),
+    ]);
+    const changed = [];
+    for (const key of keys) {
+        if (MUTATION_OWNED_WORKFLOW_FIELDS.has(key)) continue;
+        const beforeValue = key === "extra"
+            ? comparableWorkflowExtra(beforeSnapshot?.extra)
+            : key === "state"
+                ? comparableWorkflowState(beforeSnapshot?.state)
+                : beforeSnapshot?.[key];
+        const observedValue = key === "extra"
+            ? comparableWorkflowExtra(observedSnapshot?.extra)
+            : key === "state"
+                ? comparableWorkflowState(observedSnapshot?.state)
+                : observedSnapshot?.[key];
+        if (!valuesEqual(observedValue, beforeValue)) changed.push(key);
+    }
+    return changed.sort();
+}
+
+
 async function verifyRefinement(
     request,
     adapter,
@@ -712,6 +1132,19 @@ async function verifyRefinement(
     aliases,
 ) {
     const issues = [];
+    const observedSnapshot = await adapter.captureWorkflow();
+    const observedNodeFacts = snapshotNodeFacts(observedSnapshot);
+    const changedWorkflowFields = changedWorkflowEnvelopeFields(
+        beforeSnapshot,
+        observedSnapshot,
+    );
+    if (changedWorkflowFields.length > 0) {
+        issues.push({
+            code: "workflow_metadata_changed",
+            fields: changedWorkflowFields,
+            message: "A workflow-level field outside the refined graph changed during refinement.",
+        });
+    }
     const observedRaw = await adapter.listConnections();
     const observed = Array.isArray(observedRaw)
         ? observedRaw.map(normalizeConnection).filter(Boolean)
@@ -723,7 +1156,7 @@ async function verifyRefinement(
     )) {
         issues.push({
             code: "refinement_topology_mismatch",
-            message: "The resulting graph does not contain exactly the preserved siblings and new chain.",
+            message: "The resulting graph does not contain exactly the preserved and planned connections.",
         });
     }
     const observedExactCounts = countKeys(observed, exactConnectionKey);
@@ -743,12 +1176,24 @@ async function verifyRefinement(
             issues.push({
                 code: "refinement_connection_mismatch",
                 connection,
-                message: `Expected exactly one new chain connection; found ${matches.length}.`,
+                message: `Expected exactly one planned graph connection; found ${matches.length}.`,
             });
         }
     }
 
     const removedIds = request.expected_path.nodes.map(node => node.node_id);
+    const expectedNodeKeys = new Set(snapshotNodeFacts(beforeSnapshot).keys());
+    for (const id of removedIds) expectedNodeKeys.delete(idKey(id));
+    for (const id of Object.values(aliases)) expectedNodeKeys.add(idKey(id));
+    if (
+        observedNodeFacts.size !== expectedNodeKeys.size
+        || [...expectedNodeKeys].some(key => !observedNodeFacts.has(key))
+    ) {
+        issues.push({
+            code: "refinement_node_set_mismatch",
+            message: "The resulting graph contains a missing or undeclared node.",
+        });
+    }
     for (const id of removedIds) {
         if (await adapter.getNode(id)) {
             issues.push({
@@ -831,6 +1276,27 @@ async function verifyRefinement(
         }
     }
 
+    if (request.operation === "append" && request.replacement?.output) {
+        const output = request.replacement.output;
+        const observedNode = await adapter.getNode(aliases[output.source_alias]);
+        const observedOutput = indexedSlot(
+            observedNode,
+            "outputs",
+            output.source_output_index,
+        );
+        if (
+            !isRecord(observedOutput)
+            || observedOutput.name !== output.source_output
+            || observedOutput.type !== output.type
+        ) {
+            issues.push({
+                code: "replacement_output_mismatch",
+                alias: output.source_alias,
+                message: `The final output ${output.source_alias}.${output.source_output} is not exact.`,
+            });
+        }
+    }
+
     return {
         valid: issues.length === 0,
         issues,
@@ -875,7 +1341,8 @@ async function restoreSnapshot(adapter, snapshot, expectedGraphHash) {
 
 
 /**
- * Apply one hash-pinned, strictly linear chain splice through a pure canvas adapter.
+ * Apply one hash-pinned graph refinement through a pure canvas adapter. Created
+ * nodes form an ordered spine, while exact existing sources may fan into it.
  * The engine never queues execution and restores the complete pre-mutation snapshot
  * after every failure that may have touched the graph.
  */
@@ -899,7 +1366,12 @@ export async function applyWorkflowRefinementAtomic(rawRequest, adapter) {
         beforeSnapshot = await adapter.captureWorkflow();
         beforeGraphHash = await workflowGraphHash(beforeSnapshot);
         const ledger = readLedger(beforeSnapshot);
-        const existing = ledger.entries[request.application_id];
+        const existing = Object.prototype.hasOwnProperty.call(
+            ledger.entries,
+            request.application_id,
+        )
+            ? ledger.entries[request.application_id]
+            : null;
         if (existing) {
             if (existing.refinement_hash !== request.refinement_hash) {
                 throw refinementError(
@@ -942,7 +1414,7 @@ export async function applyWorkflowRefinementAtomic(rawRequest, adapter) {
             );
         }
 
-        const { allConnections, pathObservation } = await withAdapterReadGuard(
+        const { allConnections, pathObservation, inputObservation } = await withAdapterReadGuard(
             adapter,
             async () => {
                 const rawConnections = await adapter.listConnections();
@@ -967,9 +1439,11 @@ export async function applyWorkflowRefinementAtomic(rawRequest, adapter) {
                     adapter,
                     observedConnections,
                 );
+                const observedInputs = await observeExistingInputs(request, adapter);
                 return {
                     allConnections: observedConnections,
                     pathObservation: observedPath,
+                    inputObservation: observedInputs,
                 };
             },
         );
@@ -981,6 +1455,14 @@ export async function applyWorkflowRefinementAtomic(rawRequest, adapter) {
                 { issues: pathObservation.issues },
             );
         }
+        if (!inputObservation.valid) {
+            verification = inputObservation;
+            throw refinementError(
+                "external_input_mismatch",
+                "An exact existing-node graph input is no longer available.",
+                { issues: inputObservation.issues },
+            );
+        }
         const oldPathKeys = countKeys(pathObservation.connections, connectionKey);
         const siblingConnections = allConnections.filter(connection => {
             const key = connectionKey(connection);
@@ -989,6 +1471,12 @@ export async function applyWorkflowRefinementAtomic(rawRequest, adapter) {
             oldPathKeys.set(key, remaining - 1);
             return false;
         });
+        if (findTopologyCycle(plannedTopologyReferences(request, siblingConnections))) {
+            throw refinementError(
+                "refinement_cycle",
+                "The planned workflow graph would contain a cycle.",
+            );
+        }
 
         for (const connection of pathObservation.connections) {
             mutationStarted = true;
