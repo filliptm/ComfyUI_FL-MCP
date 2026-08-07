@@ -461,6 +461,7 @@ def test_intent_tool_filter_keeps_core_and_adds_narrow_groups():
     assert "node_library_search" in basic
     assert "node_library_get_details" in basic
     assert "node_library_status" in basic
+    assert "resolve_workflow_spec" in basic
     assert "plan_workflow" in basic
     assert "apply_workflow_plan" in basic
     assert "registry_search_packages" in basic
@@ -509,6 +510,9 @@ def test_exact_registry_request_gets_tools_and_source_guardrails():
     assert "does not prove that a package is installed" in instructions
     assert "not an authoritative whole-Registry search" in instructions
     assert "call `plan_workflow` with the current catalog hash" in instructions
+    assert "call `resolve_workflow_spec` against the current catalog hash" in instructions
+    assert "never silently substitute it" in instructions
+    assert "partner/auth/cost/privacy" in instructions
     assert "returns `valid=true` and a plan hash" in instructions
     assert "call `apply_workflow_plan`" in instructions
     assert "Do not replace this atomic call" in instructions
