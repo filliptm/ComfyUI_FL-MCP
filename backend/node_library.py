@@ -270,6 +270,11 @@ class NodeLibraryCache:
                 "expires_at": self._snapshot.expires_at,
             }
 
+    async def snapshot(self) -> NodeCatalogSnapshot | None:
+        """Return the current data and identity as one atomic generation."""
+        async with self._lock:
+            return self._snapshot
+
     async def invalidate(self):
         """Clear cache."""
         async with self._lock:
@@ -352,6 +357,18 @@ class NodeLibraryClient:
             except Exception as exc:
                 logger.error(f"[NodeLibrary] Unexpected error: {exc}")
                 raise NodeLibraryConnectionError(f"Failed to fetch node library: {exc}") from exc
+
+    async def catalog_snapshot(
+        self,
+        *,
+        force_refresh: bool = False,
+    ) -> NodeCatalogSnapshot:
+        """Return one internally consistent catalog data/hash generation."""
+        await self.fetch_node_library(force_refresh=force_refresh)
+        snapshot = await self.cache.snapshot()
+        if snapshot is None:
+            raise NodeLibraryError("Loaded-node catalog snapshot is unavailable")
+        return snapshot
 
     async def catalog_status(self, *, refresh: bool = False) -> dict[str, Any]:
         status = await self.cache.status(self.source)

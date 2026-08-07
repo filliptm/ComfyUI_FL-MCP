@@ -88,6 +88,16 @@ test("tool summaries expose human outcomes for core canvas operations", () => {
         result: '{"catalog":{"node_count":1701}}',
     }), "Cataloged 1,701 loaded nodes");
     assert.equal(summarizeToolStep({
+        name: "plan_workflow",
+        status: "done",
+        result: '{"valid":true,"plan":{"nodes":[{},{}]},"error_count":0}',
+    }), "Validated workflow plan · 2 nodes");
+    assert.equal(summarizeToolStep({
+        name: "plan_workflow",
+        status: "done",
+        result: '{"valid":false,"plan":{"nodes":[{}]},"error_count":2}',
+    }), "Plan needs fixes · 2 errors");
+    assert.equal(summarizeToolStep({
         name: "registry_search_packages",
         status: "done",
         result: '{"count":3,"results":[{},{},{}]}',

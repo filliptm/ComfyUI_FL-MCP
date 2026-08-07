@@ -312,6 +312,21 @@ def test_cached_fetch_and_force_refresh_replace_catalog_generation(monkeypatch):
     assert first_status["catalog_hash"] != second_status["catalog_hash"]
 
 
+def test_catalog_snapshot_binds_data_source_and_hash_to_one_generation(monkeypatch):
+    catalog = {"KSampler": node_info(display_name="Pinned")}
+    install_fake_http(monkeypatch, [(200, catalog)])
+
+    async def run():
+        client = NodeLibraryClient("http://comfy")
+        return await client.catalog_snapshot()
+
+    snapshot = asyncio.run(run())
+
+    assert snapshot.data == catalog
+    assert snapshot.source == "http://comfy/object_info"
+    assert snapshot.catalog_hash == catalog_contract_hash(snapshot.data)
+
+
 def test_refresh_keeps_contract_hash_stable_for_runtime_widget_defaults(monkeypatch):
     first = node_info()
     first["input"]["required"]["image"][1]["default"] = "19327504_cache"

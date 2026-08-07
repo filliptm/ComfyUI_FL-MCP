@@ -74,6 +74,7 @@ from node_library import (
     NodeLibraryConnectionError,
     NodeTypeNotFoundError
 )
+from workflow_planner import PlanWorkflowRequest, compile_workflow_plan
 from comfy_registry import ComfyRegistryClient, normalize_github_repository_url
 
 from comfy_manager import (
@@ -1886,7 +1887,11 @@ async def find_node(request: FindNodeRequest, ctx: Context) -> Dict[str, Any]:
 
 @mcp.tool()
 async def create_nodes(request: CreateNodesRequest, ctx: Context) -> List[Dict[str, Any]]:
-    """Create one or more new nodes in the workflow. BEFORE CALLING THIS TOOL: check to see that the node exists by searching using node_library_search tool.
+    """Create one or more new nodes in the workflow.
+
+    Before calling this tool, prove every node type is locally loaded with
+    node_library_search. For a new workflow or topology change, validate the
+    intended graph with plan_workflow and proceed only from a valid plan hash.
 
     This is a TRUE BATCH operation - all nodes are created in a single frontend execution without round-trips per node.
     Placement is collision-aware: each node is measured after creation, moved
@@ -3384,6 +3389,44 @@ async def node_library_status(request: NodeLibraryStatusRequest, ctx: Context) -
         raise RuntimeError(f"Node library status failed: {e}")
     except Exception as e:
         logger.error(f"Unexpected error in node_library_status: {e}")
+        raise RuntimeError(f"Tool execution failed: {e}")
+
+
+@mcp.tool()
+async def plan_workflow(request: PlanWorkflowRequest, ctx: Context) -> Dict[str, Any]:
+    """Validate a deterministic workflow plan without changing the canvas.
+
+    Call this after discovering loaded nodes with node_library_search and
+    inspecting their exact schemas with node_library_get_details. It resolves
+    semantic aliases against one pinned /object_info catalog, validates widget
+    values (without relying on mutable defaults) and exact connection slots
+    (including supported Comfy v3 dynamic inputs), rejects cycles, and returns
+    a stable plan hash only when valid.
+
+    This is a dry run. It never creates, edits, connects, queues, or installs
+    anything. If valid=false, correct every reported error and plan again before
+    using canvas-edit tools.
+    """
+    await _report_tool_activity(ctx, "plan_workflow")
+
+    try:
+        client = get_node_library_client(
+            server_url=settings.comfyui_server_url,
+            timeout=settings.comfyui_api_timeout,
+        )
+        snapshot = await client.catalog_snapshot()
+        return compile_workflow_plan(
+            request,
+            snapshot.data,
+            catalog_hash=snapshot.catalog_hash,
+            source=snapshot.source,
+        )
+    except NodeLibraryConnectionError as e:
+        raise RuntimeError(f"ComfyUI server connection failed: {e}")
+    except NodeLibraryError as e:
+        raise RuntimeError(f"Workflow planning failed: {e}")
+    except Exception as e:
+        logger.error(f"Unexpected error in plan_workflow: {e}")
         raise RuntimeError(f"Tool execution failed: {e}")
 
 
