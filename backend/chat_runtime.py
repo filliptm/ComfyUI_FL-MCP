@@ -113,6 +113,17 @@ WEB_IMAGE_INTENT_PATTERNS = (
     re.compile(r"\bwhat\b.{0,100}\blooks?\s+like\b", re.IGNORECASE),
 )
 
+NODE_KNOWLEDGE_INTENT_PATTERNS = (
+    re.compile(
+        r"\b(?:local|persistent|remembered|learned)\s+(?:node\s+)?"
+        r"(?:knowledge|memory|catalog|index|lessons?)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\b(?:verified\s+)?connection[- ]lessons?\b", re.IGNORECASE),
+    re.compile(r"\b(?:first|last)[- ]seen\s+generation\b", re.IGNORECASE),
+    re.compile(r"\bnode_knowledge_search\b", re.IGNORECASE),
+)
+
 CORE_CHAT_TOOLS = {
     "workflow_overview",
     "workflow_get_current_json",
@@ -206,13 +217,28 @@ def explicit_web_research_requested(message: str) -> bool:
         1,
     )[0].casefold()
     return bool(
-        re.search(r"\b(?:search|browse|research|look[ -]?up|web search)\b", visible)
+        re.search(
+            r"\b(?:search|browse|research|look[ -]?up)\b.{0,40}"
+            r"\b(?:web|internet|online)\b",
+            visible,
+        )
+        or re.search(r"\bweb\s+search\b", visible)
         or re.search(
             r"\b(?:exact|current|latest)\b.{0,40}\b(?:pricing|price|cost|policy|"
             r"privacy|terms)\b",
             visible,
         )
     )
+
+
+def explicit_node_knowledge_requested(message: str) -> bool:
+    """Keep the persistent search tool when a combined build asks for its facts."""
+
+    visible = str(message or "").split(
+        "\n\nThe user attached ComfyUI input image(s)",
+        1,
+    )[0]
+    return any(pattern.search(visible) for pattern in NODE_KNOWLEDGE_INTENT_PATTERNS)
 
 
 def normalize_chat_attachments(value: Any) -> list[dict[str, Any]]:
@@ -746,6 +772,8 @@ def tools_for_message(message: str, search_mode: str = "off") -> set[str]:
         # already contains catalog, schema, attachment, plan, and partner-review
         # evidence, while atomic application verifies the created subgraph.
         selected.difference_update(COMPILER_FIRST_REDUNDANT_TOOLS)
+        if explicit_node_knowledge_requested(message):
+            selected.add("node_knowledge_search")
         if not explicit_web_research_requested(message):
             selected.difference_update({"web_search", "web_fetch_page"})
     return selected
