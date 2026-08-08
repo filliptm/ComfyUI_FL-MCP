@@ -59,6 +59,9 @@ class ChatStore:
                     title TEXT NOT NULL,
                     provider TEXT,
                     model TEXT,
+                    workflow_id TEXT,
+                    workflow_path TEXT,
+                    workflow_name TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     archived_at TEXT,
@@ -119,6 +122,9 @@ class ChatStore:
                 "active_leaf_message_id",
                 "TEXT",
             )
+            self._ensure_column(connection, "conversations", "workflow_id", "TEXT")
+            self._ensure_column(connection, "conversations", "workflow_path", "TEXT")
+            self._ensure_column(connection, "conversations", "workflow_name", "TEXT")
             self._ensure_column(connection, "messages", "parent_message_id", "TEXT")
             self._ensure_column(connection, "messages", "revision_root_id", "TEXT")
             self._ensure_column(
@@ -131,6 +137,12 @@ class ChatStore:
                 """
                 CREATE INDEX IF NOT EXISTS idx_messages_revision
                 ON messages(conversation_id, revision_root_id, revision_index)
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_conversations_workflow_updated
+                ON conversations(workflow_id, updated_at DESC)
                 """
             )
             self._migrate_linear_message_history(connection)
@@ -193,6 +205,9 @@ class ChatStore:
         provider: Optional[str] = None,
         model: Optional[str] = None,
         conversation_id: Optional[str] = None,
+        workflow_id: Optional[str] = None,
+        workflow_path: Optional[str] = None,
+        workflow_name: Optional[str] = None,
     ) -> Dict[str, Any]:
         now = utc_now()
         identifier = conversation_id or str(uuid.uuid4())
@@ -200,10 +215,21 @@ class ChatStore:
             connection.execute(
                 """
                 INSERT INTO conversations
-                    (id, title, provider, model, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?)
+                    (id, title, provider, model, workflow_id, workflow_path,
+                     workflow_name, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (identifier, title, provider, model, now, now),
+                (
+                    identifier,
+                    title,
+                    provider,
+                    model,
+                    workflow_id,
+                    workflow_path,
+                    workflow_name,
+                    now,
+                    now,
+                ),
             )
         return self.get_conversation(identifier) or {}
 
@@ -212,32 +238,51 @@ class ChatStore:
         conversation_id: str,
         provider: Optional[str],
         model: Optional[str],
+        workflow_id: Optional[str] = None,
+        workflow_path: Optional[str] = None,
+        workflow_name: Optional[str] = None,
     ) -> Dict[str, Any]:
         existing = self.get_conversation(conversation_id)
         if existing:
+            existing_workflow = existing["workflow"]
+            if existing_workflow and not workflow_id:
+                raise ValueError("This conversation requires its workflow to be active.")
+            if workflow_id and not existing_workflow:
+                raise ValueError("Attach this unassigned conversation to the workflow before continuing.")
+            if workflow_id and existing_workflow["id"] != workflow_id:
+                raise ValueError("This conversation belongs to a different workflow.")
             return existing
         return self.create_conversation(
             provider=provider,
             model=model,
             conversation_id=conversation_id,
+            workflow_id=workflow_id,
+            workflow_path=workflow_path,
+            workflow_name=workflow_name,
         )
 
     def list_conversations(
         self,
         limit: int = 100,
         view: str = "active",
+        workflow_id: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         if view not in {"active", "archived"}:
             raise ValueError("Conversation view must be 'active' or 'archived'.")
         archive_filter = "archived_at IS NULL" if view == "active" else "archived_at IS NOT NULL"
+        workflow_filter = " AND workflow_id = ?" if workflow_id else ""
+        values: List[Any] = []
+        if workflow_id:
+            values.append(workflow_id)
+        values.append(max(1, min(int(limit), 500)))
         with self._lock, self._connect() as connection:
             rows = connection.execute(
                 f"""
                 SELECT * FROM conversations
-                WHERE {archive_filter}
+                WHERE {archive_filter}{workflow_filter}
                 ORDER BY updated_at DESC LIMIT ?
                 """,
-                (max(1, min(int(limit), 500)),),
+                values,
             ).fetchall()
         return [self._conversation(row) for row in rows]
 
@@ -257,10 +302,18 @@ class ChatStore:
         provider: Optional[str] = None,
         model: Optional[str] = None,
         archived: Optional[bool] = None,
+        workflow_path: Optional[str] = None,
+        workflow_name: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         fields = ["updated_at = ?"]
         values: List[Any] = [utc_now()]
-        for field, value in (("title", title), ("provider", provider), ("model", model)):
+        for field, value in (
+            ("title", title),
+            ("provider", provider),
+            ("model", model),
+            ("workflow_path", workflow_path),
+            ("workflow_name", workflow_name),
+        ):
             if value is not None:
                 fields.append(f"{field} = ?")
                 values.append(value)
@@ -272,6 +325,30 @@ class ChatStore:
             connection.execute(
                 f"UPDATE conversations SET {', '.join(fields)} WHERE id = ?",
                 values,
+            )
+        return self.get_conversation(conversation_id)
+
+    def bind_conversation(
+        self,
+        conversation_id: str,
+        workflow_id: str,
+        workflow_path: Optional[str] = None,
+        workflow_name: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        conversation = self.get_conversation(conversation_id)
+        if not conversation:
+            return None
+        current = conversation["workflow"]
+        if current and current["id"] != workflow_id:
+            raise ValueError("This conversation already belongs to a different workflow.")
+        with self._lock, self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE conversations
+                SET workflow_id = ?, workflow_path = ?, workflow_name = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (workflow_id, workflow_path, workflow_name, utc_now(), conversation_id),
             )
         return self.get_conversation(conversation_id)
 
@@ -722,6 +799,13 @@ class ChatStore:
 
     @staticmethod
     def _conversation(row: sqlite3.Row) -> Dict[str, Any]:
+        workflow = None
+        if row["workflow_id"]:
+            workflow = {
+                "id": row["workflow_id"],
+                "path": row["workflow_path"],
+                "name": row["workflow_name"] or row["workflow_path"] or "Workflow",
+            }
         return {
             "id": row["id"],
             "title": row["title"],
@@ -730,6 +814,7 @@ class ChatStore:
             "createdAt": row["created_at"],
             "updatedAt": row["updated_at"],
             "archivedAt": row["archived_at"],
+            "workflow": workflow,
         }
 
     @staticmethod

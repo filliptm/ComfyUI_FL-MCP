@@ -937,6 +937,27 @@ def ren_instructions(search_mode: str) -> str:
     )
 
 
+def workflow_context_instructions(workflow: dict[str, Any] | None) -> str:
+    if not workflow:
+        return ""
+    path = f" at `{workflow['path']}`" if workflow.get("path") else ""
+    return (
+        "\n\nActive workflow context:\n"
+        f"- This run is scoped to `{workflow['name']}`{path}.\n"
+        f"- Its workflow ID is `{workflow['id']}`.\n"
+        "- Reinspect the canvas before relying on node IDs or graph details from earlier turns.\n"
+        "- Canvas tools must not operate if this workflow is no longer active."
+    )
+
+
+def workflow_context_environment(workflow: dict[str, Any] | None) -> dict[str, str]:
+    return {
+        "FL_MCP_WORKFLOW_ID": str((workflow or {}).get("id") or ""),
+        "FL_MCP_WORKFLOW_NAME": str((workflow or {}).get("name") or ""),
+        "FL_MCP_WORKFLOW_PATH": str((workflow or {}).get("path") or ""),
+    }
+
+
 def web_search_environment(
     settings: dict[str, Any],
     user_message: str = "",
@@ -1038,6 +1059,7 @@ class ActiveRun:
     run_id: str
     conversation_id: str
     session_id: str
+    workflow: dict[str, Any] | None = None
     settings: dict[str, Any] | None = None
     user_message_id: str | None = None
     events: list[str] = field(default_factory=list)
@@ -1101,6 +1123,7 @@ class ChatRuntime:
         search_mode: str | None = None,
         edit_message_id: str | None = None,
         attachments: Any = None,
+        workflow: dict[str, Any] | None = None,
     ) -> ActiveRun:
         text = message.strip()
         normalized_attachments: list[dict[str, Any]] | None = None
@@ -1129,6 +1152,9 @@ class ChatRuntime:
             identifier,
             settings["provider"],
             settings["model"],
+            workflow_id=workflow["id"] if workflow else None,
+            workflow_path=workflow.get("path") if workflow else None,
+            workflow_name=workflow.get("name") if workflow else None,
         )
         edit_source = None
         if edit_message_id:
@@ -1149,6 +1175,8 @@ class ChatRuntime:
             identifier,
             provider=settings["provider"],
             model=settings["model"],
+            workflow_path=workflow.get("path") if workflow else None,
+            workflow_name=workflow.get("name") if workflow else None,
         )
         if conversation["title"] == "New chat":
             title_source = text or "Attached " + ", ".join(
@@ -1191,6 +1219,7 @@ class ChatRuntime:
                 run_id,
                 identifier,
                 session_id,
+                workflow=workflow,
                 settings=settings,
                 user_message_id=user_message["id"],
             )
@@ -1288,7 +1317,7 @@ class ChatRuntime:
         state = self.runs.get(run_id)
         if not state or state.done or not state.task:
             return False
-        state.interruption_reason = "steered" if reason == "steered" else "stopped"
+        state.interruption_reason = reason if reason in {"steered", "workflow_switched"} else "stopped"
         self._expire_approvals(state.run_id)
         interrupt_task = None
         if state.cancel_callback is not None:
@@ -1320,10 +1349,13 @@ class ChatRuntime:
         reasoning_effort: str = "default",
         search_mode: str | None = None,
         attachments: Any = None,
+        workflow: dict[str, Any] | None = None,
     ) -> ActiveRun:
         previous = self.runs.get(run_id)
         if not previous or previous.done:
             raise ValueError("The response is no longer active.")
+        if (previous.workflow or {}).get("id") != (workflow or {}).get("id"):
+            raise ValueError("The active workflow changed; start a new message from its Ren chat.")
         conversation_id = previous.conversation_id
         if not await self.cancel(run_id, reason="steered"):
             raise ValueError("The response could not be interrupted.")
@@ -1334,6 +1366,7 @@ class ChatRuntime:
             reasoning_effort=reasoning_effort,
             search_mode=search_mode,
             attachments=attachments,
+            workflow=workflow,
         )
 
     def _persist_interrupted_assistant(self, state: ActiveRun) -> None:
@@ -1471,7 +1504,10 @@ class ChatRuntime:
                 if self.model_factory is not None
                 else self._build_model(settings)
             )
-            prompt = ren_instructions(str(settings.get("search_mode") or "off"))
+            prompt = (
+                ren_instructions(str(settings.get("search_mode") or "off"))
+                + workflow_context_instructions(state.workflow)
+            )
             latest_user_item = next(
                 (
                     item
@@ -1569,6 +1605,7 @@ class ChatRuntime:
                 "FL_MCP_SESSION_ID": state.session_id,
                 "FL_MCP_WS_URL": self._ws_url(),
                 "FL_MCP_CLIENT_ID": f"embedded-chat-{state.run_id}",
+                **workflow_context_environment(state.workflow),
                 **web_search_environment(
                     settings,
                     str(latest_user_item.get("content") or ""),
@@ -1703,7 +1740,10 @@ class ChatRuntime:
                 "Install Claude Code and run `claude auth login`."
             )
 
-        prompt = ren_instructions(str(settings.get("search_mode") or "off"))
+        prompt = (
+            ren_instructions(str(settings.get("search_mode") or "off"))
+            + workflow_context_instructions(state.workflow)
+        )
         claude_prompt = (
             f"{prompt}\n\n"
             "Claude Code integration rules:\n"
@@ -1755,6 +1795,7 @@ class ChatRuntime:
             "FL_MCP_SESSION_ID": state.session_id,
             "FL_MCP_WS_URL": self._ws_url(),
             "FL_MCP_CLIENT_ID": f"embedded-claude-{state.run_id}",
+            **workflow_context_environment(state.workflow),
             "FL_MCP_ALLOWED_TOOLS": ",".join(sorted(allowed_tools)),
             **web_search_environment(
                 settings,
@@ -2110,7 +2151,10 @@ class ChatRuntime:
             TurnStatus,
         )
 
-        prompt = ren_instructions(str(settings.get("search_mode") or "off"))
+        prompt = (
+            ren_instructions(str(settings.get("search_mode") or "off"))
+            + workflow_context_instructions(state.workflow)
+        )
         codex_prompt = (
             f"{prompt}\n\n"
             "Codex integration rules:\n"
@@ -2158,6 +2202,7 @@ class ChatRuntime:
             "FL_MCP_SESSION_ID": state.session_id,
             "FL_MCP_WS_URL": self._ws_url(),
             "FL_MCP_CLIENT_ID": f"embedded-codex-{state.run_id}",
+            **workflow_context_environment(state.workflow),
             "FL_MCP_ALLOWED_TOOLS": ",".join(sorted(allowed_tools)),
             **web_search_environment(
                 settings,

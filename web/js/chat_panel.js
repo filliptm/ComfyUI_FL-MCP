@@ -33,6 +33,7 @@ const TOOL_HISTORY_INITIAL_STEPS = 60;
 const MAX_CHAT_ATTACHMENTS = 8;
 const MAX_CHAT_ATTACHMENT_BYTES = 32 * 1024 * 1024;
 const CHAT_IMAGE_TYPES = new Set(["image/png", "image/jpeg", "image/webp", "image/gif"]);
+const WORKFLOW_CONVERSATIONS_KEY = "fl_mcp_workflow_conversations_v1";
 
 export class AssistantPanel {
     constructor(container, sessionManager, options = {}) {
@@ -47,6 +48,9 @@ export class AssistantPanel {
             selectedCount: 0,
         }));
         this.subscribeCanvasContext = options.subscribeCanvasContext;
+        this.getWorkflowContext = options.getWorkflowContext || (() => null);
+        this.subscribeWorkflowContext = options.subscribeWorkflowContext;
+        this.activateWorkflow = options.activateWorkflow;
         this.loadBridgeSettings = options.loadBridgeSettings;
         this.updateBridgeSettings = options.updateBridgeSettings;
         this.uploadChatImage = options.uploadChatImage;
@@ -60,6 +64,11 @@ export class AssistantPanel {
         this.archivedConversations = [];
         this.historyView = "active";
         this.conversationId = null;
+        this.workflowContext = this.getWorkflowContext();
+        this.workflowGeneration = 0;
+        this.workflowConversationIds = this.loadWorkflowConversationIds();
+        this.workflowDrafts = new Map();
+        this.conversationScopeMismatch = false;
         this.running = false;
         this.stopping = false;
         this.steering = false;
@@ -77,6 +86,7 @@ export class AssistantPanel {
         this.jumpingToLatest = false;
         this.jumpScrollTimer = null;
         this.followFrame = null;
+        this.threadResizeObserver = null;
         this.activeSheet = null;
         this.sheetReturnFocus = null;
         this.undoTimer = null;
@@ -90,6 +100,7 @@ export class AssistantPanel {
         this.lastArchivedConversation = null;
         this.pendingDeleteConversationId = null;
         this.contextUnsubscribe = null;
+        this.workflowContextUnsubscribe = null;
         this.olderMessagesCursor = null;
         this.hasOlderMessages = false;
         this.loadingOlderMessages = false;
@@ -539,6 +550,9 @@ export class AssistantPanel {
         `;
         this.scrollElement = this.container.querySelector(".fl-chat-messages");
         this.messagesElement = this.container.querySelector(".fl-chat-thread");
+        this.threadResizeObserver = new ResizeObserver(() => this.handleThreadResize());
+        this.threadResizeObserver.observe(this.scrollElement);
+        this.threadResizeObserver.observe(this.messagesElement);
         this.welcomeElement = this.container.querySelector(".ren-welcome");
         this.errorElement = this.container.querySelector(".fl-chat-error");
         this.errorCopy = this.container.querySelector(".fl-chat-error-copy");
@@ -651,6 +665,9 @@ export class AssistantPanel {
         this.contextUnsubscribe = this.subscribeCanvasContext?.(
             () => this.refreshCanvasContext(),
         ) || null;
+        this.workflowContextUnsubscribe = this.subscribeWorkflowContext?.(
+            () => this.refreshWorkflowContext(),
+        ) || null;
     }
 
     bind() {
@@ -705,6 +722,8 @@ export class AssistantPanel {
             if (action === "clear-always-allowed") this.clearAlwaysAllowedTools();
             if (action === "history-view") this.setHistoryView(actionElement.dataset.view);
             if (action === "select-conversation") this.selectConversation(actionElement.dataset.conversationId);
+            if (action === "attach-conversation") this.attachConversation(actionElement.dataset.conversationId);
+            if (action === "activate-conversation-workflow") this.activateConversationWorkflow(actionElement.dataset.conversationId);
             if (action === "rename-conversation") this.renameConversation(actionElement.dataset.conversationId);
             if (action === "save-rename") this.saveConversationRename(actionElement.dataset.conversationId);
             if (action === "cancel-rename") this.renderHistory();
@@ -958,6 +977,7 @@ export class AssistantPanel {
             ]);
             this.populateSettings();
             this.populateBridgeSettings();
+            await this.adoptLatestLegacyConversation();
             await this.refreshConversations();
             this.updateStatus();
             this.updateComposerState();
@@ -1681,36 +1701,192 @@ export class AssistantPanel {
         }
     }
 
-    async refreshConversations(preferredId = this.conversationId) {
-        const [active, archived] = await Promise.all([
+    loadWorkflowConversationIds() {
+        try {
+            const value = JSON.parse(localStorage.getItem(WORKFLOW_CONVERSATIONS_KEY) || "{}");
+            return value && typeof value === "object" ? value : {};
+        } catch (_) {
+            return {};
+        }
+    }
+
+    saveWorkflowConversationIds() {
+        try {
+            localStorage.setItem(
+                WORKFLOW_CONVERSATIONS_KEY,
+                JSON.stringify(this.workflowConversationIds),
+            );
+        } catch (_) {
+            // The latest workflow conversation still falls back to backend ordering.
+        }
+    }
+
+    rememberWorkflowConversation(conversationId, workflowId = this.workflowContext?.id) {
+        if (!workflowId) return;
+        if (conversationId) {
+            this.workflowConversationIds[workflowId] = conversationId;
+        } else {
+            delete this.workflowConversationIds[workflowId];
+        }
+        this.saveWorkflowConversationIds();
+    }
+
+    async adoptLatestLegacyConversation() {
+        if (!this.workflowContext?.id) return;
+        const result = await this.chat.listConversations("active");
+        const conversations = result.conversations || [];
+        const preferredId = this.workflowConversationIds[this.workflowContext.id];
+        const preferred = conversations.find(
+            item => item.id === preferredId && !item.workflow,
+        );
+        if (preferred) {
+            await this.chat.updateConversation(preferred.id, {
+                workflow: this.workflowContext,
+            });
+            this.rememberWorkflowConversation(preferred.id);
+            return;
+        }
+        if (conversations.some(item => item.workflow)) return;
+        const conversation = conversations.find(item => !item.workflow);
+        if (!conversation) return;
+        await this.chat.updateConversation(conversation.id, {
+            workflow: this.workflowContext,
+        });
+        this.rememberWorkflowConversation(conversation.id);
+    }
+
+    saveWorkflowDraft() {
+        if (!this.workflowContext?.id || !this.textarea) return;
+        this.workflowDrafts.set(this.workflowContext.id, {
+            text: this.textarea.value,
+            attachments: this.pendingAttachments.map(item => ({ ...item })),
+        });
+    }
+
+    restoreWorkflowDraft() {
+        const draft = this.workflowDrafts.get(this.workflowContext?.id) || {};
+        this.textarea.value = draft.text || "";
+        this.pendingAttachments = (draft.attachments || []).map(item => ({ ...item }));
+        this.renderPendingAttachments();
+        this.resizeComposer();
+        this.updateComposerState();
+    }
+
+    async refreshWorkflowContext() {
+        let next = this.getWorkflowContext?.() || null;
+        if ((next?.id || null) === (this.workflowContext?.id || null)) {
+            this.workflowContext = next;
+            this.updateConversationTitle();
+            return;
+        }
+
+        this.saveWorkflowDraft();
+        const previousWorkflow = this.workflowContext;
+        const previousConversation = this.conversations.find(
+            item => item.id === this.conversationId,
+        );
+        if (
+            previousWorkflow?.id
+            && previousConversation
+            && !previousConversation.workflow
+            && !this.conversationScopeMismatch
+        ) {
+            try {
+                const result = await this.chat.updateConversation(previousConversation.id, {
+                    workflow: previousWorkflow,
+                });
+                previousConversation.workflow = result.conversation.workflow;
+                this.rememberWorkflowConversation(previousConversation.id, previousWorkflow.id);
+            } catch (error) {
+                this.showError(`Conversation could not be attached: ${error.message}`);
+            }
+            next = this.getWorkflowContext?.() || null;
+            if ((next?.id || null) === (this.workflowContext?.id || null)) {
+                this.workflowContext = next;
+                this.updateConversationTitle();
+                return;
+            }
+        }
+
+        const generation = ++this.workflowGeneration;
+        if (this.running) {
+            void this.chat.cancel("workflow_switched").catch(() => {});
+            this.chat.detach();
+            this.running = false;
+            this.stopping = false;
+            this.steering = false;
+            this.activeRunPromise = null;
+            this.currentRunContext = null;
+            this.currentAssistant = null;
+        }
+        this.discardMaskReviews?.();
+        this.workflowContext = next;
+        this.conversationId = null;
+        this.conversationScopeMismatch = false;
+        this.olderMessagesCursor = null;
+        this.hasOlderMessages = false;
+        this.renderMessages([]);
+        this.restoreWorkflowDraft();
+        const preferredId = next?.id ? this.workflowConversationIds[next.id] : null;
+        await this.refreshConversations(preferredId, generation);
+    }
+
+    async refreshConversations(
+        preferredId = this.conversationId
+            || this.workflowConversationIds[this.workflowContext?.id]
+            || null,
+        generation = this.workflowGeneration,
+    ) {
+        const workflowId = this.workflowContext?.id || null;
+        const requests = [
             this.chat.listConversations("active"),
             this.chat.listConversations("archived"),
-        ]);
+        ];
+        if (workflowId) requests.push(this.chat.listConversations("active", workflowId));
+        const [active, archived, scoped] = await Promise.all(requests);
+        if (generation !== this.workflowGeneration) return;
         this.conversations = active.conversations || [];
         this.archivedConversations = archived.conversations || [];
         this.renderHistory();
-        if (!this.conversations.length) {
+        const available = workflowId
+            ? (scoped?.conversations || [])
+            : this.conversations.filter(item => !item.workflow);
+        if (!available.length) {
             this.conversationId = null;
+            this.conversationScopeMismatch = false;
+            this.rememberWorkflowConversation(null);
             this.updateConversationTitle();
             this.renderMessages([]);
+            this.updateComposerState();
             return;
         }
-        const nextId = this.conversations.some((item) => item.id === preferredId)
+        const nextId = available.some((item) => item.id === preferredId)
             ? preferredId
-            : this.conversations[0].id;
-        await this.loadConversation(nextId);
+            : available[0].id;
+        await this.loadConversation(nextId, generation);
     }
 
-    async loadConversation(conversationId) {
+    async loadConversation(conversationId, generation = this.workflowGeneration) {
         if (!conversationId || this.running) return;
         try {
             const result = await this.chat.loadConversation(conversationId);
+            if (generation !== this.workflowGeneration) return;
             this.conversationId = conversationId;
+            const ownerId = result.conversation?.workflow?.id || null;
+            this.conversationScopeMismatch = Boolean(
+                this.workflowContext?.id && ownerId !== this.workflowContext.id
+            );
+            if (!this.conversationScopeMismatch && ownerId) {
+                this.rememberWorkflowConversation(conversationId);
+            } else if (ownerId) {
+                this.rememberWorkflowConversation(conversationId, ownerId);
+            }
             this.olderMessagesCursor = result.nextBefore || null;
             this.hasOlderMessages = Boolean(result.hasMore);
             this.updateConversationTitle();
             this.renderHistory();
             this.renderMessages(result.messages || []);
+            this.updateComposerState();
         } catch (error) {
             this.showError(`Conversation could not load: ${error.message}`);
         }
@@ -1718,8 +1894,13 @@ export class AssistantPanel {
 
     async newConversation() {
         if (this.running) return;
+        if (!this.workflowContext) {
+            this.showError("Open a workflow before starting a Ren chat.");
+            return;
+        }
         try {
-            const result = await this.chat.createConversation();
+            const result = await this.chat.createConversation(this.workflowContext);
+            this.rememberWorkflowConversation(result.conversation.id);
             await this.refreshConversations(result.conversation.id);
             this.closeSheet();
             this.textarea.focus();
@@ -1729,7 +1910,7 @@ export class AssistantPanel {
     }
 
     updateConversationTitle() {
-        this.conversationTitle.textContent = "History";
+        this.conversationTitle.textContent = this.workflowContext?.name || "History";
     }
 
     setHistoryView(view) {
@@ -1749,7 +1930,9 @@ export class AssistantPanel {
             : this.conversations;
         const query = this.historySearch?.value.trim().toLowerCase() || "";
         const visible = conversations.filter(item => (
-            !query || item.title.toLowerCase().includes(query)
+            !query
+            || item.title.toLowerCase().includes(query)
+            || (item.workflow?.name || "Unassigned").toLowerCase().includes(query)
         ));
         this.historyList.replaceChildren();
         if (!visible.length) {
@@ -1777,7 +1960,7 @@ export class AssistantPanel {
             const title = document.createElement("strong");
             title.textContent = conversation.title;
             const updated = document.createElement("span");
-            updated.textContent = this.formatRelativeDate(conversation.updatedAt);
+            updated.textContent = `${conversation.workflow?.name || "Unassigned"} · ${this.formatRelativeDate(conversation.updatedAt)}`;
             select.append(title, updated);
 
             const actions = document.createElement("div");
@@ -1802,6 +1985,26 @@ export class AssistantPanel {
                     "Archive conversation",
                 );
             actions.append(rename, stateAction);
+            if (
+                conversation.workflow
+                && conversation.workflow.id !== this.workflowContext?.id
+                && this.activateWorkflow
+            ) {
+                actions.prepend(this.iconAction(
+                    "activate-conversation-workflow",
+                    conversation.id,
+                    "pi pi-external-link",
+                    `Switch to ${conversation.workflow.name}`,
+                ));
+            }
+            if (!conversation.workflow && this.workflowContext) {
+                actions.prepend(this.iconAction(
+                    "attach-conversation",
+                    conversation.id,
+                    "pi pi-link",
+                    `Use with ${this.workflowContext.name}`,
+                ));
+            }
             if (this.historyView === "archived") {
                 actions.appendChild(this.iconAction(
                     "delete-conversation",
@@ -1866,6 +2069,33 @@ export class AssistantPanel {
         if (!conversationId || this.running) return;
         await this.loadConversation(conversationId);
         this.closeSheet();
+    }
+
+    async attachConversation(conversationId) {
+        if (!conversationId || !this.workflowContext || this.running) return;
+        try {
+            await this.chat.updateConversation(conversationId, {
+                workflow: this.workflowContext,
+            });
+            this.rememberWorkflowConversation(conversationId);
+            await this.refreshConversations(conversationId);
+            this.closeSheet();
+        } catch (error) {
+            this.showError(`Conversation could not be attached: ${error.message}`);
+        }
+    }
+
+    async activateConversationWorkflow(conversationId) {
+        const conversation = [...this.conversations, ...this.archivedConversations]
+            .find(item => item.id === conversationId);
+        if (!conversation?.workflow || !this.activateWorkflow || this.running) return;
+        try {
+            this.rememberWorkflowConversation(conversationId, conversation.workflow.id);
+            await this.activateWorkflow(conversation.workflow.id);
+            this.closeSheet();
+        } catch (error) {
+            this.showError(`Workflow could not be opened: ${error.message}`);
+        }
     }
 
     renameConversation(conversationId) {
@@ -3111,6 +3341,14 @@ export class AssistantPanel {
         steerRunId = null,
     ) {
         if ((!message && !attachments.length) || (this.running && !steerRunId)) return;
+        if (!this.workflowContext) {
+            this.showError("Open a workflow before messaging Ren.");
+            return;
+        }
+        if (this.conversationScopeMismatch) {
+            this.showError("This conversation belongs to another workflow. Open that workflow to continue.");
+            return;
+        }
         if (!this.status?.configured) {
             this.openSheet("settings");
             this.showError("Choose and test a model before sending a message.");
@@ -3122,7 +3360,9 @@ export class AssistantPanel {
         this.lastFailedSearchMode = searchMode;
         this.lastFailedAttachments = attachments.map(item => ({ ...item }));
         this.running = true;
-        const runContext = { runId: null, assistant: null };
+        const generation = this.workflowGeneration;
+        const workflow = { ...this.workflowContext };
+        const runContext = { runId: null, assistant: null, generation, workflowId: workflow.id };
         this.currentRunContext = runContext;
         this.currentAssistant = null;
         this.followOutput = true;
@@ -3139,16 +3379,23 @@ export class AssistantPanel {
                 searchMode,
                 editMessageId,
                 attachments,
+                workflow,
                 steerRunId,
                 onReady: ({ runId, conversationId, userMessage }) => {
+                    if (generation !== this.workflowGeneration) return;
                     runContext.runId = runId;
                     this.conversationId = conversationId;
+                    this.rememberWorkflowConversation(conversationId);
                     this.applyUserMessageMetadata(
                         optimisticUser?.article,
                         userMessage,
                     );
                 },
-                onEvent: (event) => this.handleEvent(event, runContext),
+                onEvent: (event) => {
+                    if (generation === this.workflowGeneration) {
+                        this.handleEvent(event, runContext);
+                    }
+                },
             });
         } catch (error) {
             if (error.name !== "AbortError") {
@@ -3159,7 +3406,9 @@ export class AssistantPanel {
                 this.running = false;
                 this.updateComposerState();
             }
-            await this.refreshConversations(this.conversationId);
+            if (generation === this.workflowGeneration) {
+                await this.refreshConversations(this.conversationId, generation);
+            }
         }
     }
 
@@ -3338,6 +3587,8 @@ export class AssistantPanel {
         this.sendButton.disabled = this.uploadingAttachments
             || this.stopping
             || this.steering
+            || !this.workflowContext
+            || this.conversationScopeMismatch
             || !hasDraft;
         this.sendButton.title = this.running
             ? "Steer Ren with this message (Enter)"
@@ -3712,6 +3963,10 @@ export class AssistantPanel {
         this.jumpLatestButton.hidden = this.followOutput;
     }
 
+    handleThreadResize() {
+        if (this.followOutput) this.maybeFollowOutput();
+    }
+
     maybeFollowOutput(force = false) {
         if (this.jumpingToLatest && !force) {
             this.smoothScrollToLatest();
@@ -3774,6 +4029,10 @@ export class AssistantPanel {
         this.diagnostics?.destroy();
         this.contextUnsubscribe?.();
         this.contextUnsubscribe = null;
+        this.workflowContextUnsubscribe?.();
+        this.workflowContextUnsubscribe = null;
+        this.threadResizeObserver?.disconnect();
+        this.threadResizeObserver = null;
         clearTimeout(this.undoTimer);
         clearTimeout(this.jumpScrollTimer);
         if (this.followFrame !== null) cancelAnimationFrame(this.followFrame);

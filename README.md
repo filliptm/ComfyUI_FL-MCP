@@ -136,7 +136,9 @@ Routine canvas edits can run without an extra prompt. Queueing, workflow deletio
 ### Using the built-in chat
 
 - The fixed top bar shows **MCP**, connection status, and the active provider and model.
+- Each open workflow tab has its own selected conversation and unsent draft. Switching tabs restores that workflow's chat and stops any response that was still running in the previous tab.
 - Select **History** to search, rename, archive, restore, or permanently delete conversations.
+- History remains global: use **Switch workflow** for a conversation whose workflow is open, or attach an older unassigned conversation to the active workflow.
 - Tool calls stay at their chronological position in the conversation. Consecutive identical calls collapse into a single row with an `×N` count while retaining each call's details.
 - Approval cards support **Deny**, **Allow once**, and persistent per-tool **Always allow** decisions. Saved rules can be cleared from **Settings → Tool approvals**.
 - **Bypass all approval prompts** disables the chat approval layer globally. It does not override the server-side workflow, file, Git, Manager, or process safety gates.

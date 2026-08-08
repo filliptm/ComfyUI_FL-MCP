@@ -135,6 +135,30 @@ async def test_handshake_includes_explicit_client_identity(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_embedded_tool_requests_include_expected_workflow(monkeypatch):
+    socket = FakeClientSocket()
+
+    async def connect(_url):
+        return socket
+
+    monkeypatch.setattr(mcp_server.websockets, "connect", connect)
+    monkeypatch.setenv("FL_MCP_WORKFLOW_ID", "workflow-a")
+    monkeypatch.setenv("FL_MCP_WORKFLOW_NAME", "A")
+    monkeypatch.setenv("FL_MCP_WORKFLOW_PATH", "workflows/a.json")
+    client = mcp_server.MCPWebSocketClient("session", "ws://bridge/ws")
+
+    await client.execute_tool("workflow_overview", {})
+
+    request = next(item for item in socket.sent if item["type"] == "tool_request")
+    assert request["workflow"] == {
+        "id": "workflow-a",
+        "name": "A",
+        "path": "workflows/a.json",
+    }
+    await client.disconnect()
+
+
+@pytest.mark.asyncio
 async def test_embedded_tool_filter_removes_unselected_tools(monkeypatch):
     class Tool:
         def __init__(self, name):

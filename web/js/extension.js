@@ -34,6 +34,30 @@ function getCanvasContext() {
     };
 }
 
+function getWorkflowContext() {
+    return toolExecutor?.flApi.getActiveWorkflowContext() || null;
+}
+
+function subscribeWorkflowContext(callback) {
+    let lastId = getWorkflowContext()?.id || null;
+    const notify = () => {
+        requestAnimationFrame(() => {
+            const context = getWorkflowContext();
+            const nextId = context?.id || null;
+            if (nextId === lastId) return;
+            lastId = nextId;
+            callback(context);
+        });
+    };
+    const workflowStore = app.extensionManager?.workflow;
+    const unsubscribeStore = workflowStore?.$subscribe?.(notify);
+    api.addEventListener("graphChanged", notify);
+    return () => {
+        unsubscribeStore?.();
+        api.removeEventListener("graphChanged", notify);
+    };
+}
+
 function subscribeCanvasContext(callback) {
     let frame = null;
     const notify = () => {
@@ -284,6 +308,7 @@ app.registerExtension({
 
     afterConfigureGraph() {
         toolExecutor?.flApi.restoreNestedImageReferences();
+        assistantPanel?.refreshWorkflowContext();
     },
 
     async setup() {
@@ -412,6 +437,11 @@ app.registerExtension({
                             ),
                             getCanvasContext,
                             subscribeCanvasContext,
+                            getWorkflowContext,
+                            subscribeWorkflowContext,
+                            activateWorkflow: workflowId => (
+                                toolExecutor.flApi.activateWorkflowContext(workflowId)
+                            ),
                             loadBridgeSettings,
                             updateBridgeSettings,
                             uploadChatImage: (file, subfolder) => (

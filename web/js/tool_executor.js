@@ -139,6 +139,18 @@ export class ToolExecutor {
         console.log(`[ToolExecutor] Parameters:`, parameters);
         
         try {
+            const expectedWorkflow = message.workflow;
+            if (expectedWorkflow?.id) {
+                const activeWorkflow = this.flApi.getActiveWorkflowContext();
+                if (!activeWorkflow || activeWorkflow.id !== expectedWorkflow.id) {
+                    const activeName = activeWorkflow?.name || "no workflow";
+                    throw new Error(
+                        `workflow_context_changed: Ren started on "${expectedWorkflow.name || "Workflow"}", `
+                        + `but "${activeName}" is active. Retry from the active workflow's Ren chat.`
+                    );
+                }
+            }
+
             // Find handler
             const handler = this.toolHandlers[tool_name];
             if (!handler) {

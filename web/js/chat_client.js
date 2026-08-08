@@ -89,10 +89,10 @@ export class ChatClient {
         });
     }
 
-    listConversations(view = "active") {
-        return this.request(
-            `/api/chat/conversations?view=${encodeURIComponent(view)}`,
-        );
+    listConversations(view = "active", workflowId = null) {
+        const params = new URLSearchParams({ view });
+        if (workflowId) params.set("workflow_id", workflowId);
+        return this.request(`/api/chat/conversations?${params}`);
     }
 
     loadConversation(conversationId, { before = null, limit = 50 } = {}) {
@@ -103,10 +103,10 @@ export class ChatClient {
         );
     }
 
-    createConversation() {
+    createConversation(workflow = null) {
         return this.request("/api/chat/conversations", {
             method: "POST",
-            body: JSON.stringify({}),
+            body: JSON.stringify({ workflow }),
         });
     }
 
@@ -146,6 +146,7 @@ export class ChatClient {
         searchMode,
         editMessageId,
         attachments = [],
+        workflow = null,
         steerRunId = null,
         onEvent,
         onReady,
@@ -184,6 +185,7 @@ export class ChatClient {
                     searchMode: searchMode || "free",
                     editMessageId: editMessageId || null,
                     attachments,
+                    workflow,
                 }),
                 signal: this.abortController.signal,
             });
@@ -260,12 +262,12 @@ export class ChatClient {
         }
     }
 
-    async cancel() {
+    async cancel(reason = "stopped") {
         const runId = this.runId || await this.runReady;
         if (!runId) return false;
         await this.request(`/api/chat/runs/${encodeURIComponent(runId)}/cancel`, {
             method: "POST",
-            body: JSON.stringify({}),
+            body: JSON.stringify({ reason }),
         });
         return true;
     }

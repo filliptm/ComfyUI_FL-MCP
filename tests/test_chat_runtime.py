@@ -34,6 +34,8 @@ from chat_runtime import (
     web_image_requested,
     web_search_environment,
     web_search_instructions,
+    workflow_context_environment,
+    workflow_context_instructions,
 )
 from chat_store import ChatStore
 
@@ -681,6 +683,22 @@ def test_embedded_mcp_uses_loaded_bridge_port(monkeypatch):
 
     assert ChatRuntime._ws_url() == "ws://127.0.0.1:18000/ws"
     assert chat_runtime_module.mcp_tool_timeout_seconds() == 3630
+
+
+def test_workflow_context_is_shared_by_prompts_and_mcp_environment():
+    workflow = {
+        "id": "workflow-a",
+        "name": "A",
+        "path": "workflows/a.json",
+    }
+
+    assert "workflow-a" in workflow_context_instructions(workflow)
+    assert "`A`" in workflow_context_instructions(workflow)
+    assert workflow_context_environment(workflow) == {
+        "FL_MCP_WORKFLOW_ID": "workflow-a",
+        "FL_MCP_WORKFLOW_NAME": "A",
+        "FL_MCP_WORKFLOW_PATH": "workflows/a.json",
+    }
 
 
 def test_empty_request_retry_uses_same_approval_fingerprint():
