@@ -121,7 +121,7 @@ To use a Claude Pro, Max, Team, or Enterprise subscription, install Claude Code 
 claude auth login
 ```
 
-Then choose **Claude subscription** under **Settings → Model & provider**. FL-MCP checks the official Claude Code login, does not read or copy its OAuth credentials, and keeps direct Anthropic API-key access as a separate provider.
+Then choose **Claude subscription** under **Settings → Connection**. FL-MCP checks the official Claude Code login, does not read or copy its OAuth credentials, and keeps direct Anthropic API-key access as a separate provider.
 
 To use a ChatGPT Plus, Pro, Business, Edu, or Enterprise subscription with Codex, install the Codex CLI and sign in once:
 
@@ -129,9 +129,9 @@ To use a ChatGPT Plus, Pro, Business, Edu, or Enterprise subscription with Codex
 codex login
 ```
 
-Then choose **Codex subscription** under **Settings → Model & provider**. FL-MCP uses the official Codex SDK and its existing ChatGPT login without reading or copying OAuth credentials. Direct OpenAI API-key access remains a separate provider and billing path.
+Then choose **Codex subscription** under **Settings → Connection**. FL-MCP uses the official Codex SDK and its existing ChatGPT login without reading or copying OAuth credentials. Direct OpenAI API-key access remains a separate provider and billing path.
 
-Routine canvas edits can run without an extra prompt. Queueing, workflow deletion, package changes, file writes, Git operations, and process restarts display an approval card before the tool runs by default. Choose **Always allow** on a card to remember that MCP tool, or enable **Bypass all approval prompts** under **Settings → Tool approvals** to skip every chat approval. The server-side safety gates described below still apply in either mode.
+Routine canvas edits can run without an extra prompt. Queueing, workflow deletion, package changes, file writes, Git operations, and process restarts display an approval card before the tool runs by default. Choose **Always allow** on a card to remember that MCP tool, or enable **Bypass all approval prompts** under **Settings → Permissions** to skip every chat approval. The server-side safety gates described below still apply in either mode.
 
 ### Using the built-in chat
 
@@ -140,7 +140,7 @@ Routine canvas edits can run without an extra prompt. Queueing, workflow deletio
 - Select **History** to search, rename, archive, restore, or permanently delete conversations.
 - History remains global: use **Switch workflow** for a conversation whose workflow is open, or attach an older unassigned conversation to the active workflow.
 - Tool calls stay at their chronological position in the conversation. Consecutive identical calls collapse into a single row with an `×N` count while retaining each call's details.
-- Approval cards support **Deny**, **Allow once**, and persistent per-tool **Always allow** decisions. Saved rules can be cleared from **Settings → Tool approvals**.
+- Approval cards support **Deny**, **Allow once**, and persistent per-tool **Always allow** decisions. Saved rules can be cleared from **Settings → Permissions**.
 - **Bypass all approval prompts** disables the chat approval layer globally. It does not override the server-side workflow, file, Git, Manager, or process safety gates.
 - **Wait for generation completion by default** keeps a single `queue_workflow` tool call open while ComfyUI runs, avoiding repeated model-driven status requests. Each call can override the saved behavior and timeout.
 - The composer remains fixed below the scrollable conversation. **Jump to present** scrolls smoothly when new activity arrives out of view.
@@ -542,7 +542,7 @@ claude auth status
 codex login status
 ```
 
-Return to **Settings → Model & provider**, select the subscription provider, and use its refresh action. FL-MCP never substitutes an API key provider for a subscription provider.
+Return to **Settings → Connection**, select the subscription provider, and use its refresh action. FL-MCP never substitutes an API key provider for a subscription provider.
 
 </details>
 

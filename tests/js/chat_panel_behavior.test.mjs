@@ -24,6 +24,62 @@ async function loadAssistantPanel() {
 }
 
 
+test("settings accordion opens the requested section and closes its siblings", async () => {
+    const AssistantPanel = await loadAssistantPanel();
+    const panel = Object.create(AssistantPanel.prototype);
+    const connection = { dataset: { settingsSection: "model" }, open: true };
+    const search = { dataset: { settingsSection: "search" }, open: false };
+    const diagnostics = { dataset: { settingsSection: "diagnostics" }, open: false };
+    panel.settingsDisclosures = [connection, search, diagnostics];
+
+    assert.equal(panel.openSettingsSection("diagnostics"), diagnostics);
+    assert.equal(connection.open, false);
+    assert.equal(search.open, false);
+    assert.equal(diagnostics.open, true);
+
+    search.open = true;
+    panel.handleSettingsDisclosureToggle(search);
+    assert.equal(connection.open, false);
+    assert.equal(search.open, true);
+    assert.equal(diagnostics.open, false);
+
+    search.open = false;
+    diagnostics.open = true;
+    panel.handleSettingsDisclosureToggle(search);
+    assert.equal(diagnostics.open, true);
+    assert.equal(panel.openSettingsSection("missing"), null);
+});
+
+
+test("closed settings sections are excluded from keyboard focus", async () => {
+    const AssistantPanel = await loadAssistantPanel();
+    const panel = Object.create(AssistantPanel.prototype);
+    const visibleSummary = {
+        hidden: false,
+        closest: selector => selector === "details:not([open])" ? {} : null,
+        matches: selector => selector === "summary",
+    };
+    const closedInput = {
+        hidden: false,
+        closest: selector => selector === "details:not([open])" ? {} : null,
+        matches: () => false,
+    };
+    const visibleButton = {
+        hidden: false,
+        closest: () => null,
+        matches: () => false,
+    };
+    const host = {
+        querySelectorAll: () => [visibleSummary, closedInput, visibleButton],
+    };
+
+    assert.deepEqual(
+        Array.from(panel.focusableElements(host)),
+        [visibleSummary, visibleButton],
+    );
+});
+
+
 test("runMessage renders the user request before starting the backend run", async () => {
     const AssistantPanel = await loadAssistantPanel();
     const panel = Object.create(AssistantPanel.prototype);

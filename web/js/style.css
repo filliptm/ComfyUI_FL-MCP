@@ -1865,68 +1865,61 @@
 .fl-settings-content {
     display: flex;
     flex-direction: column;
-    gap: 10px;
+    gap: 6px;
     padding: 10px;
     scroll-padding: 10px;
 }
 
+.fl-settings-group-label {
+    margin: 7px 3px 0;
+    color: var(--ren-text-faint);
+    font-size: 9px;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+}
+
 .fl-settings-card {
-    --ren-settings-accent: var(--ren-accent);
     position: relative;
     flex: 0 0 auto;
     overflow: hidden;
     border: 1px solid var(--ren-border);
-    border-radius: 10px;
-    background:
-        linear-gradient(180deg, rgba(255, 255, 255, 0.025), transparent 76px),
-        var(--ren-surface);
-    box-shadow:
-        0 4px 14px rgba(0, 0, 0, 0.12),
-        inset 0 1px rgba(255, 255, 255, 0.02);
+    border-radius: 9px;
+    background: rgba(255, 255, 255, 0.018);
+    box-shadow: none;
 }
 
-.fl-settings-card-approvals {
-    --ren-settings-accent: var(--ren-warning);
-}
-
-.fl-settings-card-search {
-    --ren-settings-accent: var(--ren-info);
-}
-
-.fl-settings-card-diagnostics {
-    --ren-settings-accent: var(--ren-info);
+.fl-settings-card[open] {
+    border-color: var(--ren-border-strong);
+    background: var(--ren-surface);
 }
 
 .fl-settings-card-header {
     display: flex;
-    flex-wrap: wrap;
     align-items: center;
     justify-content: space-between;
-    min-height: 58px;
-    gap: 8px;
-    padding: 10px 12px;
+    min-height: 48px;
+    gap: 7px;
+    padding: 8px 10px;
 }
 
 .fl-settings-card-heading {
     display: flex;
     min-width: 0;
-    flex: 1 1 185px;
+    flex: 1 1 auto;
     align-items: center;
-    gap: 9px;
+    gap: 7px;
 }
 
 .fl-settings-card-icon {
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    width: 28px;
-    height: 28px;
+    width: 20px;
+    height: 20px;
     flex: 0 0 auto;
-    border: 1px solid color-mix(in srgb, var(--ren-settings-accent) 34%, transparent);
-    border-radius: 7px;
-    background: color-mix(in srgb, var(--ren-settings-accent) 11%, transparent);
-    color: color-mix(in srgb, var(--ren-settings-accent) 78%, white);
-    font-size: 12px;
+    color: var(--ren-text-muted);
+    font-size: 11px;
 }
 
 .fl-settings-card-heading > div {
@@ -1942,21 +1935,30 @@
 }
 
 .fl-settings-card-heading p {
+    display: none;
     margin: 2px 0 0;
     color: var(--ren-text-muted);
     font-size: 11px;
     line-height: 1.35;
 }
 
+.fl-settings-card[open] .fl-settings-card-heading p {
+    display: block;
+}
+
+.fl-settings-card[open] .fl-settings-card-icon {
+    color: var(--ren-accent-hover);
+}
+
 .fl-settings-state {
     display: inline-flex;
     align-items: center;
-    min-height: 22px;
+    min-height: 20px;
     flex: 0 0 auto;
-    padding: 0 7px;
-    border: 1px solid var(--ren-border);
-    border-radius: 11px;
-    background: rgba(255, 255, 255, 0.035);
+    gap: 5px;
+    padding: 0;
+    border: 0;
+    background: transparent;
     color: var(--ren-text-muted);
     font-size: 10px;
     font-weight: 650;
@@ -1964,20 +1966,35 @@
     white-space: nowrap;
 }
 
+.fl-settings-state::before {
+    width: 6px;
+    height: 6px;
+    flex: 0 0 auto;
+    border-radius: 50%;
+    background: currentColor;
+    content: "";
+}
+
 .fl-settings-state.ready {
-    border-color: rgba(115, 211, 145, 0.28);
-    background: rgba(115, 211, 145, 0.08);
     color: color-mix(in srgb, var(--ren-success) 74%, white);
 }
 
 .fl-settings-state.warning {
+    padding: 0 7px;
     border-color: rgba(210, 169, 104, 0.34);
+    border-style: solid;
+    border-width: 1px;
+    border-radius: 10px;
     background: rgba(210, 169, 104, 0.09);
     color: color-mix(in srgb, var(--ren-warning) 76%, white);
 }
 
 .fl-settings-state.error {
+    padding: 0 7px;
     border-color: rgba(239, 130, 120, 0.34);
+    border-style: solid;
+    border-width: 1px;
+    border-radius: 10px;
     background: rgba(239, 130, 120, 0.09);
     color: color-mix(in srgb, var(--ren-danger) 74%, white);
 }
@@ -1985,14 +2002,14 @@
 .fl-settings-card-body {
     display: flex;
     flex-direction: column;
-    gap: 9px;
-    padding: 0 12px 12px;
+    gap: 8px;
+    padding: 10px 11px 11px;
 }
 
 .fl-settings-fields {
     display: flex;
     flex-direction: column;
-    gap: 9px;
+    gap: 8px;
 }
 
 .fl-settings-card-footer {
@@ -2001,39 +2018,33 @@
     align-items: center;
     justify-content: space-between;
     gap: 8px;
-    padding: 9px 12px;
-    border-top: 1px solid var(--ren-border);
-    background: rgba(0, 0, 0, 0.09);
+    padding: 0 11px 11px;
 }
 
 .fl-approval-toggle {
     display: flex;
     align-items: flex-start;
     gap: 9px;
-    padding: 10px;
-    border: 1px solid var(--ren-border);
-    border-radius: 8px;
-    background: rgba(0, 0, 0, 0.16);
+    padding: 8px 0;
+    border: 0;
+    background: transparent;
     cursor: pointer;
-    transition:
-        border-color 160ms ease,
-        background-color 160ms ease;
 }
 
 .fl-settings-toggle {
     display: flex;
     align-items: flex-start;
     gap: 9px;
-    padding: 10px;
-    border: 1px solid var(--ren-border);
-    border-radius: 8px;
-    background: rgba(0, 0, 0, 0.12);
+    padding: 8px 0;
+    border: 0;
+    border-top: 1px solid var(--ren-border);
+    border-bottom: 1px solid var(--ren-border);
+    background: transparent;
     cursor: pointer;
 }
 
 .fl-settings-toggle:has(input:checked) {
-    border-color: rgba(114, 161, 235, 0.4);
-    background: rgba(114, 161, 235, 0.07);
+    color: var(--ren-text);
 }
 
 .fl-settings-toggle:has(input:disabled) {
@@ -2090,8 +2101,7 @@
 }
 
 .fl-approval-toggle:has(input:checked) {
-    border-color: rgba(210, 169, 104, 0.48);
-    background: rgba(210, 169, 104, 0.08);
+    color: var(--ren-text);
 }
 
 .fl-approval-toggle:has(input:disabled) {
@@ -2134,10 +2144,9 @@
     display: flex;
     align-items: center;
     gap: 9px;
-    padding: 8px 10px;
-    border: 1px solid var(--ren-border);
-    border-radius: 8px;
-    background: rgba(0, 0, 0, 0.08);
+    padding: 8px 0;
+    border-top: 1px solid var(--ren-border);
+    border-bottom: 1px solid var(--ren-border);
 }
 
 .fl-approval-rules button {
@@ -2150,10 +2159,10 @@
     align-items: flex-start;
     gap: 7px;
     margin: 0;
-    padding: 7px 8px;
+    padding: 7px 0;
     border: 1px solid transparent;
     border-radius: 7px;
-    background: rgba(255, 255, 255, 0.018);
+    background: transparent;
     color: var(--ren-text-muted);
     font-size: 11px;
     line-height: 1.45;
@@ -2169,6 +2178,7 @@
 }
 
 .fl-approval-warning.active {
+    padding: 7px 8px;
     border-color: rgba(210, 169, 104, 0.24);
     background: rgba(210, 169, 104, 0.07);
     color: #dfc28c;
@@ -2211,10 +2221,10 @@
     align-items: center;
     justify-content: space-between;
     gap: 10px;
-    padding: 10px;
-    border: 1px solid var(--ren-border);
-    border-radius: 8px;
-    background: var(--ren-surface-deep);
+    padding: 9px 0;
+    border-top: 1px solid var(--ren-border);
+    border-bottom: 1px solid var(--ren-border);
+    background: transparent;
 }
 
 .fl-subscription-connection[hidden] {
@@ -2261,23 +2271,27 @@
 }
 
 .fl-bridge-settings-body {
-    gap: 10px;
+    gap: 0;
 }
 
 .fl-bridge-settings-group {
     display: flex;
     min-width: 0;
     flex-direction: column;
-    gap: 9px;
+    gap: 8px;
     margin: 0;
-    padding: 10px;
-    border: 1px solid var(--ren-border);
-    border-radius: 8px;
-    background: rgba(0, 0, 0, 0.1);
+    padding: 11px 0;
+    border: 0;
+    border-top: 1px solid var(--ren-border);
+}
+
+.fl-bridge-settings-group:first-child {
+    padding-top: 0;
+    border-top: 0;
 }
 
 .fl-bridge-settings-group legend {
-    padding: 0 5px;
+    padding: 0;
     color: var(--ren-text);
     font-size: 11px;
     font-weight: 700;
@@ -2321,17 +2335,17 @@
 .fl-bridge-toggle-grid {
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
-    gap: 6px;
+    column-gap: 12px;
+    row-gap: 0;
 }
 
 .fl-bridge-toggle {
     display: flex;
     align-items: flex-start;
     gap: 7px;
-    padding: 7px 8px;
-    border: 1px solid var(--ren-border);
-    border-radius: 7px;
-    background: rgba(255, 255, 255, 0.018);
+    padding: 7px 0;
+    border: 0;
+    background: transparent;
     color: var(--ren-text-muted);
     cursor: pointer;
     font-size: 10px;
@@ -2339,8 +2353,6 @@
 }
 
 .fl-bridge-toggle:has(input:checked) {
-    border-color: rgba(106, 174, 232, 0.4);
-    background: rgba(106, 174, 232, 0.07);
     color: var(--ren-text);
 }
 
@@ -2355,7 +2367,11 @@
 .fl-bridge-capability-list {
     display: flex;
     flex-direction: column;
-    gap: 6px;
+    gap: 0;
+}
+
+.fl-bridge-capability-list > label + label {
+    border-top: 1px solid var(--ren-border);
 }
 
 .fl-bridge-settings-help {
@@ -2385,11 +2401,11 @@
 }
 
 .fl-settings-disclosure > summary:hover {
-    background: rgba(255, 255, 255, 0.025);
+    background: rgba(255, 255, 255, 0.02);
 }
 
-.fl-settings-disclosure > summary:focus-visible {
-    box-shadow: inset 0 0 0 2px #b888ee;
+.fl-chat-layout .fl-settings-disclosure > summary:focus-visible {
+    outline-offset: -2px;
 }
 
 .fl-settings-summary-state {
@@ -2414,7 +2430,7 @@
 }
 
 .fl-diagnostics-card-body {
-    padding-top: 10px;
+    padding-top: 9px;
 }
 
 .fl-dialog-scrim {
@@ -2506,29 +2522,29 @@
 
 .fl-mcp-grid {
     display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-    gap: 6px;
+    grid-template-columns: minmax(0, 1fr);
+    gap: 0;
 }
 
 .fl-mcp-metric {
+    display: grid;
+    grid-template-columns: 72px minmax(0, 1fr);
+    align-items: center;
     min-width: 0;
-    padding: 8px;
-    border: 1px solid var(--ren-border);
-    border-radius: 7px;
-    background: var(--ren-surface-deep);
+    gap: 8px;
+    padding: 7px 0;
+    border-bottom: 1px solid var(--ren-border);
 }
 
 .fl-mcp-metric.wide {
-    grid-column: 1 / -1;
+    grid-column: auto;
 }
 
 .fl-mcp-label {
     display: block;
-    margin-bottom: 3px;
+    margin: 0;
     color: var(--ren-text-muted);
     font-size: 10px;
-    letter-spacing: 0.04em;
-    text-transform: uppercase;
 }
 
 .fl-mcp-metric strong,
@@ -2587,13 +2603,11 @@
 .fl-mcp-tools {
     display: flex;
     flex-direction: column;
-    gap: 4px;
+    gap: 0;
 }
 
 .fl-mcp-tools.empty {
-    padding: 8px;
-    border: 1px dashed var(--ren-border);
-    border-radius: 6px;
+    padding: 8px 0;
     color: var(--ren-text-muted);
 }
 
@@ -2602,11 +2616,9 @@
     align-items: center;
     justify-content: space-between;
     gap: 8px;
-    min-height: 29px;
-    padding: 5px 8px;
-    border: 1px solid var(--ren-border);
-    border-radius: 6px;
-    background: var(--ren-surface-deep);
+    min-height: 30px;
+    padding: 5px 0;
+    border-bottom: 1px solid var(--ren-border);
 }
 
 .fl-mcp-tool span {

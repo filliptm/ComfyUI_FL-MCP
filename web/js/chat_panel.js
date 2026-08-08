@@ -123,7 +123,7 @@ export class AssistantPanel {
                             </div>
                         </div>
                         <div class="fl-chat-header-right">
-                            <button class="fl-provider-badge" data-action="settings" data-provider="unknown" type="button" title="Open settings" aria-label="Open settings">
+                            <button class="fl-provider-badge" data-action="settings" data-section="model" data-provider="unknown" type="button" title="Open settings" aria-label="Open settings">
                                 <span class="fl-provider-mark" aria-hidden="true">AI</span>
                                 <span class="fl-provider-copy">
                                     <span class="fl-provider-name">Model</span>
@@ -247,17 +247,20 @@ export class AssistantPanel {
                         <span class="fl-sheet-header-spacer"></span>
                     </header>
                     <div class="fl-sheet-content fl-settings-content">
-                        <section class="fl-settings-card fl-settings-card-model" data-settings-section="model" aria-labelledby="fl-settings-model-title">
-                            <header class="fl-settings-card-header">
+                        <details class="fl-settings-card fl-settings-disclosure fl-settings-card-model" data-settings-section="model" open>
+                            <summary class="fl-settings-card-header">
                                 <div class="fl-settings-card-heading">
                                     <span class="fl-settings-card-icon" aria-hidden="true"><i class="pi pi-sliders-h"></i></span>
                                     <div>
-                                        <h3 id="fl-settings-model-title">Model &amp; provider</h3>
+                                        <h3 id="fl-settings-model-title">Connection</h3>
                                         <p>Choose how Ren thinks and connects.</p>
                                     </div>
                                 </div>
-                                <span class="fl-settings-state neutral" data-settings-state="model" role="status">Checking</span>
-                            </header>
+                                <span class="fl-settings-summary-state">
+                                    <span class="fl-settings-state neutral" data-settings-state="model" role="status">Checking</span>
+                                    <i class="pi pi-chevron-down fl-settings-chevron" aria-hidden="true"></i>
+                                </span>
+                            </summary>
                             <div class="fl-settings-card-body">
                                 <div class="fl-settings-fields">
                                     <label class="fl-field">
@@ -305,10 +308,10 @@ export class AssistantPanel {
                                 <div class="fl-credential-status" role="status" aria-live="polite"></div>
                                 <button class="fl-primary-button fl-settings-save" data-action="save-settings" type="button">Save and test</button>
                             </footer>
-                        </section>
+                        </details>
 
-                        <section class="fl-settings-card fl-settings-card-search" data-settings-section="search" aria-labelledby="fl-settings-search-title">
-                            <header class="fl-settings-card-header">
+                        <details class="fl-settings-card fl-settings-disclosure fl-settings-card-search" data-settings-section="search">
+                            <summary class="fl-settings-card-header">
                                 <div class="fl-settings-card-heading">
                                     <span class="fl-settings-card-icon" aria-hidden="true"><i class="pi pi-globe"></i></span>
                                     <div>
@@ -316,8 +319,11 @@ export class AssistantPanel {
                                         <p>Choose free search or Tavily for each request.</p>
                                     </div>
                                 </div>
-                                <span class="fl-settings-state neutral" data-settings-state="search" role="status">Checking</span>
-                            </header>
+                                <span class="fl-settings-summary-state">
+                                    <span class="fl-settings-state neutral" data-settings-state="search" role="status">Checking</span>
+                                    <i class="pi pi-chevron-down fl-settings-chevron" aria-hidden="true"></i>
+                                </span>
+                            </summary>
                             <div class="fl-settings-card-body">
                                 <label class="fl-field">
                                     <span>Default search</span>
@@ -340,19 +346,22 @@ export class AssistantPanel {
                                 <div class="fl-search-credential-status" role="status" aria-live="polite"></div>
                                 <button class="fl-primary-button" data-action="save-search-settings" type="button">Save search</button>
                             </footer>
-                        </section>
+                        </details>
 
-                        <section class="fl-settings-card fl-settings-card-approvals" data-settings-section="approvals" aria-labelledby="fl-settings-approvals-title">
-                            <header class="fl-settings-card-header">
+                        <details class="fl-settings-card fl-settings-disclosure fl-settings-card-approvals" data-settings-section="approvals">
+                            <summary class="fl-settings-card-header">
                                 <div class="fl-settings-card-heading">
                                     <span class="fl-settings-card-icon" aria-hidden="true"><i class="pi pi-shield"></i></span>
                                     <div>
-                                        <h3 id="fl-settings-approvals-title">Tool approvals</h3>
+                                        <h3 id="fl-settings-approvals-title">Permissions</h3>
                                         <p>Control when Ren asks before acting.</p>
                                     </div>
                                 </div>
-                                <span class="fl-settings-state neutral" data-settings-state="approvals" role="status">Prompts on</span>
-                            </header>
+                                <span class="fl-settings-summary-state">
+                                    <span class="fl-settings-state neutral" data-settings-state="approvals" role="status">Prompts on</span>
+                                    <i class="pi pi-chevron-down fl-settings-chevron" aria-hidden="true"></i>
+                                </span>
+                            </summary>
                             <div class="fl-settings-card-body">
                                 <label class="fl-approval-toggle">
                                     <input data-setting="approval_bypass" type="checkbox">
@@ -373,7 +382,9 @@ export class AssistantPanel {
                                     <span>Server-side workflow, file, Git, Manager, and process safety gates still apply.</span>
                                 </p>
                             </div>
-                        </section>
+                        </details>
+
+                        <div class="fl-settings-group-label">Advanced</div>
 
                         <details class="fl-settings-card fl-settings-disclosure fl-settings-card-bridge" data-settings-section="bridge">
                             <summary class="fl-settings-card-header">
@@ -644,6 +655,9 @@ export class AssistantPanel {
         this.bridgeSettingsSaveButton = this.container.querySelector(
             '[data-action="save-bridge-settings"]',
         );
+        this.settingsDisclosures = [
+            ...this.container.querySelectorAll(".fl-settings-disclosure"),
+        ];
         this.diagnosticsSettingsState = this.container.querySelector(
             '[data-settings-state="diagnostics"]',
         );
@@ -676,7 +690,9 @@ export class AssistantPanel {
             if (!actionElement) return;
             const action = actionElement.dataset.action;
             if (action === "toggle-menu") this.toggleMenu(actionElement);
-            if (action === "settings") this.openSheet("settings");
+            if (action === "settings") {
+                this.openSheet("settings", actionElement.dataset.section || null);
+            }
             if (action === "diagnostics") this.openSheet("settings", "diagnostics");
             if (action === "history") this.openSheet("history");
             if (action === "close-sheet") this.closeSheet();
@@ -759,6 +775,12 @@ export class AssistantPanel {
                 this.bridgeSettingsMessage.textContent =
                     "Save these changes, then restart ComfyUI to apply them.";
             });
+        });
+        this.settingsDisclosures.forEach((disclosure) => {
+            disclosure.addEventListener(
+                "toggle",
+                () => this.handleSettingsDisclosureToggle(disclosure),
+            );
         });
         this.settingsSearchSelect.addEventListener(
             "change",
@@ -858,15 +880,35 @@ export class AssistantPanel {
         this.activeSheet = sheet;
         this.container.querySelector(".fl-chat-layout").classList.add("sheet-open");
         if (name === "history") this.renderHistory();
+        if (name === "settings" && section) this.openSettingsSection(section);
         requestAnimationFrame(() => {
             if (section) {
                 const target = sheet.querySelector(
                     `[data-settings-section="${CSS.escape(section)}"]`,
                 );
-                if (target instanceof HTMLDetailsElement) target.open = true;
                 target?.scrollIntoView({ block: "start" });
+                target?.querySelector("summary")?.focus({ preventScroll: true });
+                return;
             }
             this.focusableElements(sheet)[0]?.focus();
+        });
+    }
+
+    openSettingsSection(section) {
+        const target = this.settingsDisclosures.find(
+            item => item.dataset.settingsSection === section,
+        );
+        if (!target) return null;
+        this.settingsDisclosures.forEach((item) => {
+            item.open = item === target;
+        });
+        return target;
+    }
+
+    handleSettingsDisclosureToggle(disclosure) {
+        if (!disclosure.open) return;
+        this.settingsDisclosures.forEach((item) => {
+            if (item !== disclosure) item.open = false;
         });
     }
 
@@ -883,7 +925,11 @@ export class AssistantPanel {
     focusableElements(host) {
         return [...host.querySelectorAll(
             'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), summary, [tabindex]:not([tabindex="-1"])',
-        )].filter(element => !element.hidden && !element.closest("[hidden]"));
+        )].filter(element => (
+            !element.hidden
+            && !element.closest("[hidden]")
+            && (!element.closest("details:not([open])") || element.matches("summary"))
+        ));
     }
 
     handleKeydown(event) {
@@ -926,6 +972,10 @@ export class AssistantPanel {
     handleStatusAction() {
         if (this.statusState === "warning" || this.statusState === "error") {
             this.openSheet("settings", "diagnostics");
+            return;
+        }
+        if (this.statusState === "setup") {
+            this.openSheet("settings", "model");
             return;
         }
         this.openSheet("settings");
@@ -981,7 +1031,7 @@ export class AssistantPanel {
             await this.refreshConversations();
             this.updateStatus();
             this.updateComposerState();
-            if (!this.status.configured) this.openSheet("settings");
+            if (!this.status.configured) this.openSheet("settings", "model");
         } catch (error) {
             this.showError(`Assistant setup could not load: ${error.message}`);
             this.updateStatus("error");
@@ -3271,7 +3321,7 @@ export class AssistantPanel {
             || this.steering
         ) return;
         if (!this.status?.configured) {
-            this.openSheet("settings");
+            this.openSheet("settings", "model");
             this.showError("Choose and test a model before sending a message.");
             return;
         }
@@ -3350,7 +3400,7 @@ export class AssistantPanel {
             return;
         }
         if (!this.status?.configured) {
-            this.openSheet("settings");
+            this.openSheet("settings", "model");
             this.showError("Choose and test a model before sending a message.");
             return;
         }
