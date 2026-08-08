@@ -330,7 +330,24 @@ test("composer can steer an active response and exposes real stop progress", asy
     assert.match(styles, /\.fl-inline-action:disabled/);
     assert.match(
         styles,
-        /\.fl-chat-layout \.fl-chat-input:focus-visible\s*\{[^}]*outline:\s*0;[^}]*box-shadow:\s*inset 0 0 0 1px #b888ee/s,
+        /\.fl-chat-input-container:focus-within\s*\{[^}]*border-color:\s*rgba\(184, 136, 238, 0\.82\);[^}]*box-shadow:[^}]*0 0 16px rgba\(153, 102, 217, 0\.14\)/s,
+    );
+});
+
+
+test("composer defaults to three lines with a rounded focused shell", async () => {
+    const panel = await readFile(new URL("web/js/chat_panel.js", root), "utf8");
+    const styles = await readFile(new URL("web/js/style.css", root), "utf8");
+
+    assert.match(panel, /class="fl-chat-input" rows="3"/);
+    assert.match(
+        styles,
+        /\.fl-chat-input-container\s*\{[^}]*margin:\s*0 10px 14px;[^}]*border-radius:\s*12px;/s,
+    );
+    assert.match(styles, /\.fl-chat-input\s*\{[^}]*min-height:\s*76px;[^}]*padding:\s*7px 4px 12px 10px;/s);
+    assert.match(
+        styles,
+        /\.fl-chat-layout \.fl-chat-input:focus-visible\s*\{[^}]*outline:\s*0;[^}]*box-shadow:\s*none;/s,
     );
 });
 

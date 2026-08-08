@@ -212,7 +212,7 @@ export class AssistantPanel {
                                 <i class="pi pi-paperclip" aria-hidden="true"></i>
                             </button>
                             <input class="fl-chat-file-input" type="file" accept="image/png,image/jpeg,image/webp,image/gif" multiple hidden>
-                            <textarea class="fl-chat-input" rows="1" placeholder="Ask Ren about this workflow…" aria-label="Message"></textarea>
+                            <textarea class="fl-chat-input" rows="3" placeholder="Ask Ren about this workflow…" aria-label="Message"></textarea>
                             <button class="fl-chat-send" data-action="send" type="button" title="Send message (Enter)" aria-label="Send message" disabled>
                                 <i class="pi pi-arrow-up" aria-hidden="true"></i>
                             </button>
