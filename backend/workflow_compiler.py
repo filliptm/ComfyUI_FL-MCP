@@ -25,9 +25,22 @@ from workflow_resolver import (
     WorkflowCapabilitySpec,
     resolve_workflow_spec,
 )
+from workflow_schema_capabilities import materialize_inputs, normalize_node_schema
 
 WORKFLOW_COMPILER_SCHEMA = "fl-mcp.workflow-spec-compiler.v1"
 _NORMALIZED_NAME = re.compile(r"[^a-z0-9]+")
+_CAMEL_BOUNDARY = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
+_GENERIC_WIDGET_NAME_TERMS = {
+    "choice",
+    "method",
+    "mode",
+    "option",
+    "parameter",
+    "selector",
+    "setting",
+    "type",
+    "value",
+}
 
 
 class WorkflowSpecNode(WorkflowCapabilitySpec):
@@ -112,16 +125,60 @@ def _runtime_name_matches(requested: str, available: list[str]) -> list[str]:
     )
 
 
+def _semantic_widget_name_terms(value: str) -> tuple[str, ...]:
+    """Return conservative leaf-name terms for unique widget-key aliases."""
+
+    leaf = value.rsplit(".", 1)[-1]
+    expanded = _CAMEL_BOUNDARY.sub(" ", leaf)
+    words = [
+        item
+        for item in _NORMALIZED_NAME.split(expanded.casefold())
+        if item and item not in _GENERIC_WIDGET_NAME_TERMS
+    ]
+    stemmed: set[str] = set()
+    for word in words:
+        stem = word
+        for suffix in ("ments", "ment", "ings", "ing", "ed"):
+            if stem.endswith(suffix) and len(stem) - len(suffix) >= 4:
+                stem = stem[: -len(suffix)]
+                break
+        stemmed.add(stem)
+    return tuple(sorted(stemmed))
+
+
+def _semantic_widget_name_matches(
+    requested: str,
+    available: list[str],
+) -> list[str]:
+    requested_terms = _semantic_widget_name_terms(requested)
+    if not requested_terms:
+        return []
+    requested_set = set(requested_terms)
+    matches: list[str] = []
+    for name in available:
+        candidate_terms = _semantic_widget_name_terms(name)
+        if candidate_terms == requested_terms or (
+            len(candidate_terms) == 1 and set(candidate_terms) < requested_set
+        ):
+            matches.append(name)
+    return sorted(matches)
+
+
 def _resolve_runtime_name(
     requested: str,
     available: list[str],
     *,
     path: str,
     kind: str,
+    allow_semantic_widget_alias: bool = False,
 ) -> tuple[str | None, list[dict[str, str]]]:
     matches = _runtime_name_matches(requested, available)
     if len(matches) == 1:
         return matches[0], []
+    if not matches and allow_semantic_widget_alias:
+        matches = _semantic_widget_name_matches(requested, available)
+        if len(matches) == 1:
+            return matches[0], []
     if not matches:
         return None, [
             _issue(
@@ -137,6 +194,178 @@ def _resolve_runtime_name(
             f"{requested!r} matches multiple runtime names: {', '.join(matches)}.",
         )
     ]
+
+
+def _selector_option_value(value: Any, options: tuple[Any, ...]) -> Any | None:
+    """Return one exact live selector option for an exact/normalized value."""
+
+    exact = [option for option in options if type(option) is type(value) and option == value]
+    if len(exact) == 1:
+        return exact[0]
+    if not isinstance(value, str):
+        return None
+    token = _normalized(value)
+    normalized = [
+        option
+        for option in options
+        if isinstance(option, str) and _normalized(option) == token
+    ]
+    return normalized[0] if len(normalized) == 1 else None
+
+
+def _selector_alias_name_related(requested: str, selector_path: str) -> bool:
+    """Require a meaningful name relationship for value-driven aliases."""
+
+    requested_token = _normalized(requested)
+    selector_token = _normalized(selector_path.rsplit(".", 1)[-1])
+    shared_prefix = 0
+    for left, right in zip(requested_token, selector_token, strict=False):
+        if left != right:
+            break
+        shared_prefix += 1
+    if shared_prefix >= 4:
+        return True
+    ignored = {"choice", "mode", "option", "selector", "type", "value"}
+    requested_words = {
+        item for item in _NORMALIZED_NAME.split(requested.casefold()) if item
+    } - ignored
+    selector_words = {
+        item
+        for item in _NORMALIZED_NAME.split(
+            selector_path.rsplit(".", 1)[-1].casefold()
+        )
+        if item
+    } - ignored
+    return bool(requested_words & selector_words)
+
+
+def _canonicalize_dynamic_selector_aliases(
+    requested_values: Mapping[str, Any],
+    node_info: Mapping[str, Any],
+    *,
+    path: str,
+) -> tuple[dict[str, Any], list[dict[str, str]]]:
+    """Resolve unique semantic selector names/options from the loaded schema.
+
+    This accepts exact selector names, a related semantic name whose value names
+    one unique live option (``resize_mode='scale dimensions'``), or a key that
+    itself names one unique live option (``scale_dimensions``). No option or
+    selector is guessed when the schema leaves more than one candidate.
+    """
+
+    node_type = str(node_info.get("name") or node_info.get("display_name") or "Node")
+    capabilities = normalize_node_schema(node_type, node_info)
+    selectors = [
+        item
+        for item in capabilities.inputs
+        if item.kind == "dynamic_selector" and not item.hidden
+    ]
+    if not selectors:
+        return dict(requested_values), []
+
+    selector_paths = [item.path for item in selectors]
+    selector_by_path = {item.path: item for item in selectors}
+    consumed: set[str] = set()
+    canonical: dict[str, Any] = {}
+    issues: list[dict[str, str]] = []
+
+    def accept(requested: str, selector_path: str, value: Any) -> None:
+        consumed.add(requested)
+        previous = canonical.get(selector_path)
+        if selector_path in canonical and previous != value:
+            issues.append(
+                _issue(
+                    "conflicting_selector_aliases",
+                    f"{path}.{requested}",
+                    f"Multiple values resolve to selector {selector_path!r}.",
+                )
+            )
+            return
+        canonical[selector_path] = value
+
+    # Exact/normalized selector names are authoritative and order-independent.
+    for requested in sorted(requested_values):
+        matches = _runtime_name_matches(requested, selector_paths)
+        if len(matches) != 1:
+            continue
+        selector_path = matches[0]
+        selector = selector_by_path[selector_path]
+        value = requested_values[requested]
+        canonical_value = _selector_option_value(value, selector.enum_options)
+        accept(
+            requested,
+            selector_path,
+            canonical_value if canonical_value is not None else value,
+        )
+
+    for requested in sorted(requested_values):
+        if requested in consumed:
+            continue
+        requested_value = requested_values[requested]
+        key_candidates = [
+            (selector.path, option)
+            for selector in selectors
+            for option in selector.enum_options
+            if isinstance(option, str)
+            and _normalized(requested) == _normalized(option)
+        ]
+        if len(key_candidates) == 1:
+            selector_path, option = key_candidates[0]
+            selector = selector_by_path[selector_path]
+            value_option = _selector_option_value(
+                requested_value,
+                selector.enum_options,
+            )
+            if value_option is not None and value_option != option:
+                issues.append(
+                    _issue(
+                        "conflicting_selector_alias_value",
+                        f"{path}.{requested}",
+                        f"Key {requested!r} names option {option!r}, but its value "
+                        f"names {value_option!r}.",
+                    )
+                )
+                consumed.add(requested)
+                continue
+            accept(requested, selector_path, option)
+            continue
+        if len(key_candidates) > 1:
+            issues.append(
+                _issue(
+                    "ambiguous_selector_option_alias",
+                    f"{path}.{requested}",
+                    f"{requested!r} names an option on multiple dynamic selectors.",
+                )
+            )
+            consumed.add(requested)
+            continue
+
+        value_candidates = []
+        for selector in selectors:
+            if not _selector_alias_name_related(requested, selector.path):
+                continue
+            option = _selector_option_value(requested_value, selector.enum_options)
+            if option is not None:
+                value_candidates.append((selector.path, option))
+        if len(value_candidates) == 1:
+            accept(requested, *value_candidates[0])
+        elif len(value_candidates) > 1:
+            issues.append(
+                _issue(
+                    "ambiguous_selector_value_alias",
+                    f"{path}.{requested}",
+                    f"{requested!r} and its value match multiple dynamic selectors.",
+                )
+            )
+            consumed.add(requested)
+
+    result = {
+        key: value
+        for key, value in requested_values.items()
+        if key not in consumed
+    }
+    result.update(canonical)
+    return result, issues
 
 
 def _stable_default(spec: Any) -> tuple[bool, Any]:
@@ -163,8 +392,16 @@ def _stable_default(spec: Any) -> tuple[bool, Any]:
 def _dynamic_selector_defaults(
     node_info: Mapping[str, Any],
     requested_values: Mapping[str, Any],
+    connection_hints: set[str],
 ) -> dict[str, Any]:
-    """Choose stable first options so their dependent dotted inputs can expand."""
+    """Choose selector options from requested dotted slots before using defaults.
+
+    Comfy partner nodes often expose materially different inputs under each
+    ``COMFY_DYNAMICCOMBO_V3`` option.  Selecting the first option before looking at
+    requested values/connections makes a valid non-default socket appear unknown.
+    Score every option by the exact or uniquely-suffixed runtime names it activates;
+    use a unique best match, otherwise retain the schema's stable default.
+    """
 
     defaults: dict[str, Any] = {}
     inputs = node_info.get("input")
@@ -175,9 +412,36 @@ def _dynamic_selector_defaults(
         if not isinstance(specs, Mapping):
             continue
         for input_name, spec in specs.items():
-            input_type, _ = _input_parts(spec)
+            input_type, metadata = _input_parts(spec)
             if input_type != "COMFY_DYNAMICCOMBO_V3" or input_name in requested_values:
                 continue
+            options = metadata.get("options")
+            records = [item for item in options if isinstance(item, Mapping)] if isinstance(options, list) else []
+            hints = [
+                name
+                for name in [*requested_values, *sorted(connection_hints)]
+                if name != input_name
+            ]
+            scored: list[tuple[int, int, Any]] = []
+            for position, record in enumerate(records):
+                key = record.get("key")
+                if key is None:
+                    continue
+                candidate_values = {**requested_values, input_name: key}
+                candidate_inputs, _ = _expanded_inputs(
+                    node_info,
+                    candidate_values,
+                    connection_hints,
+                )
+                available = sorted(candidate_inputs)
+                score = sum(bool(_runtime_name_matches(hint, available)) for hint in hints)
+                scored.append((score, -position, key))
+            if scored:
+                best_score = max(item[0] for item in scored)
+                best = [item for item in scored if item[0] == best_score]
+                if best_score > 0 and len(best) == 1:
+                    defaults[input_name] = best[0][2]
+                    continue
             has_default, default = _stable_default(spec)
             if has_default:
                 defaults[input_name] = default
@@ -197,38 +461,92 @@ def _expanded_inputs(
     return {**groups["required"], **groups["optional"]}, issues
 
 
+def _capability_inputs(
+    node_info: Mapping[str, Any],
+    values: Mapping[str, Any],
+    connected_inputs: set[str],
+) -> dict[str, Any]:
+    node_type = str(node_info.get("name") or node_info.get("display_name") or "Node")
+    capabilities = normalize_node_schema(node_type, node_info)
+    return {
+        item.capability.path: [
+            item.capability.declared_type,
+            dict(item.capability.metadata),
+        ]
+        for item in materialize_inputs(
+            capabilities,
+            values=values,
+            connected_inputs=connected_inputs,
+        )
+        if not item.capability.hidden
+    }
+
+
+def _supported_dynamic_paths(node_info: Mapping[str, Any]) -> set[str]:
+    node_type = str(node_info.get("name") or node_info.get("display_name") or "Node")
+    return {
+        item.path
+        for item in normalize_node_schema(node_type, node_info).inputs
+        if item.connectable or item.widget or item.widget_convertible
+    }
+
+
 def _canonicalize_node_values(
     node: WorkflowSpecNode,
     node_info: Mapping[str, Any],
     attachment_inputs: set[str],
     connection_hints: set[str],
 ) -> tuple[dict[str, Any], dict[str, Any], list[dict[str, str]]]:
-    issues: list[dict[str, str]] = []
-    seed_values = dict(node.values)
-    selector_defaults = _dynamic_selector_defaults(node_info, seed_values)
+    seed_values, issues = _canonicalize_dynamic_selector_aliases(
+        node.values,
+        node_info,
+        path=f"nodes.{node.alias}.values",
+    )
+    selector_defaults = _dynamic_selector_defaults(
+        node_info,
+        seed_values,
+        connection_hints,
+    )
     seed_values.update(selector_defaults)
     first_inputs, _ = _expanded_inputs(node_info, seed_values, connection_hints)
+    first_inputs.update(_capability_inputs(node_info, seed_values, connection_hints))
     available = sorted(first_inputs)
     values: dict[str, Any] = dict(selector_defaults)
-    for requested, value in node.values.items():
+    for requested, value in seed_values.items():
         resolved, name_issues = _resolve_runtime_name(
             requested,
             available,
             path=f"nodes.{node.alias}.values.{requested}",
             kind="widget",
+            allow_semantic_widget_alias=True,
         )
         issues.extend(name_issues)
         if resolved is not None:
             values[resolved] = value
 
     active_inputs, dynamic_issues = _expanded_inputs(node_info, values, connection_hints)
+    active_inputs.update(_capability_inputs(node_info, values, connection_hints))
+    supported_dynamic_paths = _supported_dynamic_paths(node_info)
+    dynamic_issues = [
+        item
+        for item in dynamic_issues
+        if not (
+            item["code"] == "unsupported_dynamic_input"
+            and item["path"].removeprefix("inputs.") in supported_dynamic_paths
+        )
+    ]
     for item in dynamic_issues:
         issues.append(
             {**item, "path": f"nodes.{node.alias}.{item['path']}"}
         )
 
     for input_name, spec in active_inputs.items():
-        if input_name in values or input_name in attachment_inputs or _is_connectable(spec):
+        if (
+            input_name in values
+            or input_name in attachment_inputs
+            or input_name in connection_hints
+            or _is_connectable(spec)
+        ):
             continue
         has_default, default = _stable_default(spec)
         if has_default:
@@ -239,6 +557,15 @@ def _canonicalize_node_values(
         values,
         connection_hints,
     )
+    active_inputs.update(_capability_inputs(node_info, values, connection_hints))
+    final_dynamic_issues = [
+        item
+        for item in final_dynamic_issues
+        if not (
+            item["code"] == "unsupported_dynamic_input"
+            and item["path"].removeprefix("inputs.") in supported_dynamic_paths
+        )
+    ]
     existing_dynamic_paths = {(item["code"], item["path"]) for item in issues}
     for item in final_dynamic_issues:
         item = {**item, "path": f"nodes.{node.alias}.{item['path']}"}
@@ -278,7 +605,7 @@ def compile_workflow_spec(
     *,
     catalog_hash: str,
     source: str,
-    validated_attachment_values: Mapping[tuple[str, str], str],
+    validated_attachment_values: Mapping[tuple[str, str], Any],
 ) -> dict[str, Any]:
     """Resolve, canonicalize, default, and validate one bounded workflow request."""
 
@@ -298,9 +625,15 @@ def compile_workflow_spec(
         source=source,
     )
     selected = resolution["selected_node_types"]
-    issues = [item for item in resolution["issues"] if item["severity"] == "error"]
+    # Resolution warnings are safety-relevant evidence (partner/privacy,
+    # experimental classes, unknown provenance).  Keep them in the one-pass
+    # compiler result instead of silently dropping everything except errors.
+    issues = list(resolution["issues"])
     partner_review = _partner_review(selected, catalog)
-    if issues:
+    resolution_error_count = sum(
+        item["severity"] == "error" for item in issues
+    )
+    if resolution_error_count:
         return {
             "valid": False,
             "compiler_schema": WORKFLOW_COMPILER_SCHEMA,
@@ -310,8 +643,8 @@ def compile_workflow_spec(
             "selected_node_types": selected,
             "partner_review": partner_review,
             "issues": issues,
-            "error_count": len(issues),
-            "warning_count": 0,
+            "error_count": resolution_error_count,
+            "warning_count": sum(item["severity"] == "warning" for item in issues),
             "apply_request": None,
         }
 
@@ -344,7 +677,7 @@ def compile_workflow_spec(
         active_inputs_by_alias[node.alias] = active_inputs
 
     exact_attachments: list[WorkflowPlanAttachment] = []
-    exact_attachment_values: dict[tuple[str, str], str] = {}
+    exact_attachment_values: dict[tuple[str, str], Any] = {}
     for index, binding in enumerate(request.attachments):
         active_inputs = active_inputs_by_alias.get(binding.node_alias, {})
         resolved, name_issues = _resolve_runtime_name(
@@ -412,7 +745,7 @@ def compile_workflow_spec(
             "partner_review": partner_review,
             "issues": issues,
             "error_count": error_count,
-            "warning_count": 0,
+            "warning_count": sum(item["severity"] == "warning" for item in issues),
             "apply_request": None,
         }
 
@@ -437,6 +770,20 @@ def compile_workflow_spec(
             "plan_hash": compiled["plan_hash"],
             "application_id": request.application_id,
         }
+    combined_issues = [*issues, *compiled["issues"]]
+    # Keep deterministic ordering while avoiding byte-identical duplicates.
+    deduplicated_issues: list[dict[str, str]] = []
+    seen_issues: set[tuple[str, str, str, str]] = set()
+    for item in combined_issues:
+        key = (
+            item["severity"],
+            item["code"],
+            item["path"],
+            item["message"],
+        )
+        if key not in seen_issues:
+            seen_issues.add(key)
+            deduplicated_issues.append(item)
     return {
         "valid": compiled["valid"],
         "compiler_schema": WORKFLOW_COMPILER_SCHEMA,
@@ -446,8 +793,12 @@ def compile_workflow_spec(
         "selected_node_types": selected,
         "plan": compiled["plan"],
         "partner_review": partner_review,
-        "issues": compiled["issues"],
-        "error_count": compiled["error_count"],
-        "warning_count": compiled["warning_count"],
+        "issues": deduplicated_issues,
+        "error_count": sum(
+            item["severity"] == "error" for item in deduplicated_issues
+        ),
+        "warning_count": sum(
+            item["severity"] == "warning" for item in deduplicated_issues
+        ),
         "apply_request": apply_request,
     }

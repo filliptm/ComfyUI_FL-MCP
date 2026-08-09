@@ -124,6 +124,66 @@ test("tool summaries expose human outcomes for core canvas operations", () => {
     }), "Couldn’t search official Comfy Registry");
 });
 
+test("GraphPatch summaries use neutral workflow language and report every nonzero delta", () => {
+    const delta = {
+        created_node_count: 2,
+        updated_node_count: 1,
+        removed_node_count: 3,
+        added_edge_count: 4,
+        removed_edge_count: 1,
+    };
+    const expected = (
+        "2 new nodes · 1 updated node · 3 removed nodes · "
+        + "4 added connections · 1 removed connection"
+    );
+    assert.equal(summarizeToolStep({
+        name: "compile_workflow_refinement_spec",
+        status: "done",
+        result: JSON.stringify({ valid: true, plan: { expected_delta: delta } }),
+    }), `Planned workflow · ${expected}`);
+    assert.equal(summarizeToolStep({
+        name: "apply_workflow_graph_patch",
+        status: "done",
+        arguments: JSON.stringify({ plan: { expected_delta: delta } }),
+        result: '{"success":true,"created_node_ids":[1,2],"removed_node_ids":[3,4,5]}',
+    }), `Built workflow · ${expected}`);
+    assert.equal(summarizeToolStep({
+        name: "apply_workflow_graph_patch",
+        status: "done",
+        arguments: JSON.stringify({
+            plan: {
+                expected_delta: {
+                    created_node_count: 0,
+                    updated_node_count: 1,
+                    removed_node_count: 1,
+                    added_edge_count: 0,
+                    removed_edge_count: 2,
+                },
+            },
+        }),
+        result: '{"success":true,"created_node_ids":[],"removed_node_ids":[9]}',
+    }), "Built workflow · 1 updated node · 1 removed node · 2 removed connections");
+    assert.equal(summarizeToolStep({
+        name: "compile_workflow_refinement_spec",
+        status: "done",
+        result: '{"valid":false,"needs_choice":true,"error_count":1}',
+    }), "Workflow plan needs your choice");
+    assert.equal(summarizeToolStep({
+        name: "apply_workflow_graph_patch",
+        status: "done",
+        result: '{"success":false}',
+    }), "Workflow build failed safely");
+    assert.equal(summarizeToolStep({
+        name: "apply_workflow_graph_patch",
+        status: "failed",
+    }), "Couldn’t build workflow");
+    assert.equal(summarizeToolStep({
+        name: "apply_workflow_graph_patch",
+        status: "done",
+        result: '{"success":true,"already_applied":true}',
+    }), "Workflow change already applied");
+});
+
 test("image review and mask summaries report the visible outcome", () => {
     assert.equal(summarizeToolStep({
         name: "view_output_image",

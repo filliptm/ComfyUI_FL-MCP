@@ -21,6 +21,17 @@ function sameId(left, right) {
 }
 
 
+function comfySameId(left, right) {
+    return String(left) === String(right);
+}
+
+
+function serializedComfyId(value) {
+    const text = String(value);
+    return /^-?\d+$/.test(text) ? Number(text) : value;
+}
+
+
 function edge(id, sourceId, sourceSlot, targetId, targetSlot, type = "IMAGE") {
     return {
         id,
@@ -247,6 +258,78 @@ class FakeRefinementAdapter {
 }
 
 
+/**
+ * ComfyUI 0.29 can serialize numeric node IDs while exposing the same IDs as
+ * strings through live LiteGraph nodes and links. Keep that split deliberate
+ * here so verification exercises the production identity boundary.
+ */
+class MixedComfyIdAdapter extends FakeRefinementAdapter {
+    getNode(nodeId) {
+        const stored = this.workflow.nodes.find(item => comfySameId(item.id, nodeId));
+        if (!stored) return null;
+        const liveId = String(stored.id);
+        return {
+            id: liveId,
+            node_id: liveId,
+            type: stored.type,
+            node_type: stored.type,
+            values: structuredClone(stored.values || {}),
+            properties: structuredClone(stored.properties || {}),
+            position: { x: stored.pos[0], y: stored.pos[1] },
+            size: { width: stored.size[0], height: stored.size[1] },
+            serialized_node: structuredClone(stored),
+        };
+    }
+
+    listConnections() {
+        return this.workflow.links.map(connection => ({
+            ...structuredClone(connection),
+            source_node_id: String(connection.source_node_id),
+            target_node_id: String(connection.target_node_id),
+        }));
+    }
+
+    createNode(plannedNode) {
+        this.createCalls += 1;
+        const serializedId = this.workflow.last_node_id + 1;
+        this.workflow.last_node_id = serializedId;
+        if (this.workflow.state) this.workflow.state.lastNodeId = serializedId;
+        this.workflow.nodes.push(node(serializedId, plannedNode.node_type, plannedNode.values));
+        const liveId = String(serializedId);
+        return { id: liveId, node_id: liveId };
+    }
+
+    setNodeMetadata(nodeId, metadata) {
+        const stored = this.workflow.nodes.find(item => comfySameId(item.id, nodeId));
+        if (!stored) throw new Error("metadata node missing");
+        stored.properties[WORKFLOW_REFINEMENT_PROPERTY] = structuredClone(metadata);
+    }
+
+    connectNodes(sourceId, targetId, connection) {
+        this.connectCalls += 1;
+        const occupied = this.workflow.links.some(link => (
+            comfySameId(link.target_node_id, targetId)
+            && link.target_input_index === connection.target_input_index
+        ));
+        if (occupied) throw new Error("target input is occupied");
+        const id = this.workflow.last_link_id + 1;
+        this.workflow.last_link_id = id;
+        if (this.workflow.state) this.workflow.state.lastLinkId = id;
+        this.workflow.links.push({
+            id,
+            source_node_id: serializedComfyId(sourceId),
+            source_output_index: connection.source_output_index,
+            source_output: connection.source_output,
+            target_node_id: serializedComfyId(targetId),
+            target_input_index: connection.target_input_index,
+            target_input: connection.target_input,
+            type: connection.type,
+        });
+        return { connected: true, id };
+    }
+}
+
+
 function pathConnections(workflow) {
     return workflow.links.slice(0, 3).map(connection => ({
         source_node_id: connection.source_node_id,
@@ -354,6 +437,41 @@ function appendWorkflow() {
             edge(107, 52, 0, 61, 0),
             edge(108, 48, 0, 61, 1),
             edge(109, 52, 0, 60, 1),
+        ],
+        groups: [],
+        config: {},
+        extra: { ds: { scale: 0.9, offset: [12, -8] }, theme: "dark" },
+    };
+}
+
+
+function productionWaveletWorkflow() {
+    return {
+        id: "97d55d32-5cd4-435b-9b58-80625783b470",
+        version: 0.4,
+        revision: 0,
+        last_node_id: 59,
+        last_link_id: 49,
+        nodes: [
+            node(48, "LoadImage", { image: "industrial-background.png" }),
+            node(49, "LoadImage", { image: "main-portrait.png" }),
+            node(50, "GeminiNanoBanana2V2", { prompt: "lighting pass" }),
+            node(53, "PreviewImage"),
+            node(54, "PreviewImage"),
+            node(51, "GeminiNanoBanana2V2", { prompt: "depth pass" }),
+            node(52, "GeminiNanoBanana2V2", { prompt: "final pass" }),
+        ],
+        links: [
+            edge(37, 51, 0, 52, 5),
+            edge(38, 50, 0, 51, 5),
+            edge(39, 49, 0, 50, 5),
+            edge(40, 49, 0, 52, 6),
+            edge(41, 49, 0, 51, 6),
+            edge(42, 48, 0, 51, 7),
+            edge(43, 48, 0, 50, 6),
+            edge(44, 48, 0, 52, 7),
+            edge(45, 50, 0, 53, 0),
+            edge(46, 51, 0, 54, 0),
         ],
         groups: [],
         config: {},
@@ -538,6 +656,80 @@ test("append builds Wavelet fan-in plus terminal SaveImage and preserves source 
         ["node", "node", "connection", "connection", "connection"],
     );
     assert.equal(result.verification.valid, true);
+    assert.equal(result.verification.preserved_sibling_connection_count, 10);
+    assert.equal(result.queued, false);
+});
+
+
+test("append accepts numeric serialized IDs with string live LiteGraph IDs", async () => {
+    const adapter = new MixedComfyIdAdapter(productionWaveletWorkflow());
+    const original = adapter.captureWorkflow();
+    const request = await waveletAppendRequest(adapter);
+    request.application_id = "ren-append-wavelet-color-fix-save-20260808-v1";
+    request.plan.replacement.nodes[1].values.filename_prefix = "ComfyUI";
+
+    const result = await applyWorkflowRefinementAtomic(request, adapter);
+
+    assert.equal(result.success, true);
+    assert.equal(result.applied, true);
+    assert.equal(result.operation, "append");
+    assert.deepEqual(result.aliases, { wavelet_fix: "60", save_image: "61" });
+    assert.deepEqual(result.created_node_ids, ["60", "61"]);
+    assert.deepEqual(result.removed_node_ids, []);
+    assert.equal(result.rollback.attempted, false);
+    assert.equal(adapter.restoreCalls, 0);
+    assert.equal(original.nodes.length, 7);
+    assert.equal(original.links.length, 10);
+    assert.equal(adapter.workflow.nodes.length, 9);
+    assert.equal(adapter.workflow.links.length, 13);
+    assert.deepEqual(adapter.workflow.nodes.slice(0, 7), original.nodes);
+    assert.deepEqual(adapter.workflow.links.slice(0, 10), original.links);
+    assert.deepEqual(
+        adapter.listConnections().slice(10).map(connection => ({
+            source_node_id: connection.source_node_id,
+            source_output_index: connection.source_output_index,
+            source_output: connection.source_output,
+            target_node_id: connection.target_node_id,
+            target_input_index: connection.target_input_index,
+            target_input: connection.target_input,
+            type: connection.type,
+        })),
+        [
+            {
+                source_node_id: "52",
+                source_output_index: 0,
+                source_output: "IMAGE",
+                target_node_id: "60",
+                target_input_index: 0,
+                target_input: "target_image",
+                type: "IMAGE",
+            },
+            {
+                source_node_id: "48",
+                source_output_index: 0,
+                source_output: "IMAGE",
+                target_node_id: "60",
+                target_input_index: 1,
+                target_input: "source_image",
+                type: "IMAGE",
+            },
+            {
+                source_node_id: "60",
+                source_output_index: 0,
+                source_output: "image",
+                target_node_id: "61",
+                target_input_index: 0,
+                target_input: "images",
+                type: "IMAGE",
+            },
+        ],
+    );
+    assert.deepEqual(
+        adapter.events.map(event => event.phase),
+        ["node", "node", "connection", "connection", "connection"],
+    );
+    assert.equal(result.verification.valid, true);
+    assert.equal(result.verification.connection_count, 13);
     assert.equal(result.verification.preserved_sibling_connection_count, 10);
     assert.equal(result.queued, false);
 });

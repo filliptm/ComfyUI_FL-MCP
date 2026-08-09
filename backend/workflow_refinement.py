@@ -78,6 +78,7 @@ class NormalizedGraphNode(BaseModel):
 
     node_id: NodeId
     node_type: str = Field(..., min_length=1, max_length=256)
+    widget_values: list[Any] = Field(default_factory=list, max_length=2_000)
 
 
 class NormalizedGraphEdge(BaseModel):
@@ -119,7 +120,7 @@ class NormalizedGraphSnapshot(BaseModel):
         alias="schema",
     )
     complete: Literal[True] = True
-    nodes: list[NormalizedGraphNode] = Field(..., min_length=1, max_length=5_000)
+    nodes: list[NormalizedGraphNode] = Field(default_factory=list, max_length=5_000)
     outputs: list[NormalizedGraphOutput] = Field(default_factory=list, max_length=20_000)
     edges: list[NormalizedGraphEdge] = Field(default_factory=list, max_length=20_000)
 
@@ -436,10 +437,19 @@ class CanonicalAppendReplacement(BaseModel):
         return self
 
 
+class CanonicalExpectedNode(BaseModel):
+    """Stable path identity without graph-only dynamic widget observations."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    node_id: NodeId
+    node_type: str = Field(..., min_length=1, max_length=256)
+
+
 class CanonicalExpectedPath(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    nodes: list[NormalizedGraphNode] = Field(default_factory=list, max_length=199)
+    nodes: list[CanonicalExpectedNode] = Field(default_factory=list, max_length=199)
     connections: list[NormalizedGraphEdge] = Field(
         default_factory=list,
         max_length=200,
@@ -680,7 +690,15 @@ def normalize_workflow_graph(workflow: Mapping[str, Any]) -> NormalizedGraphSnap
                 )
             )
         node_slots[key] = (inputs, outputs)
-        normalized_nodes.append(NormalizedGraphNode(node_id=node_id, node_type=node_type))
+        raw_widget_values = raw_node.get("widgets_values", [])
+        widget_values = list(raw_widget_values) if isinstance(raw_widget_values, list) else []
+        normalized_nodes.append(
+            NormalizedGraphNode(
+                node_id=node_id,
+                node_type=node_type,
+                widget_values=widget_values,
+            )
+        )
 
     raw_links = workflow.get("links", [])
     if isinstance(raw_links, list):
@@ -1632,7 +1650,10 @@ def compile_workflow_refinement(
         "expected_workflow_identity": request.expected_workflow_identity,
         "expected_graph_hash": request.expected_graph_hash,
         "expected_path": {
-            "nodes": [node.model_dump(mode="json") for node in internal_nodes],
+            "nodes": [
+                {"node_id": node.node_id, "node_type": node.node_type}
+                for node in internal_nodes
+            ],
             "connections": [edge.model_dump(mode="json") for edge in path_edges],
         },
         "replacement": replacement_plan,

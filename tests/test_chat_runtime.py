@@ -7,6 +7,7 @@ import pytest
 from chat_config import ChatSettingsStore
 from chat_runtime import (
     CONTEXT_MAX_CHARS,
+    REFINEMENT_COMPILER_TOOLS,
     ActiveRun,
     ChatRuntime,
     PendingApproval,
@@ -34,6 +35,7 @@ from chat_runtime import (
     web_image_requested,
     web_search_environment,
     web_search_instructions,
+    workflow_graph_change_requested,
     workflow_refinement_requested,
 )
 from chat_store import ChatStore
@@ -63,7 +65,7 @@ def test_chat_attachments_are_validated_and_added_to_model_context():
     assert attachments[0]["type"] == "input"
     assert "Use this image" in model_content
     assert "view_chat_image" in model_content
-    assert "compile_workflow_spec" in model_content
+    assert "compile_workflow_refinement_spec" in model_content
     assert "original full-resolution files" in model_content
     assert '"subfolder":"ren-chat/session-1"' in model_content
     with pytest.raises(ValueError, match="outside Ren's upload folder"):
@@ -504,7 +506,11 @@ def test_complete_new_workflow_uses_only_compiler_application_route():
     assert compiler_first_workflow_requested(request) is True
 
     selected = tools_for_message(request, "free")
-    assert {"view_chat_image", "compile_workflow_spec", "apply_workflow_plan"} <= selected
+    assert selected == {
+        "view_chat_image",
+        "compile_workflow_refinement_spec",
+        "apply_workflow_graph_patch",
+    }
     assert "web_search" not in selected
     assert "web_fetch_page" not in selected
     assert "workflow_overview" not in selected
@@ -513,13 +519,44 @@ def test_complete_new_workflow_uses_only_compiler_application_route():
     assert "resolve_workflow_spec" not in selected
     assert "node_library_get_details" not in selected
     assert "plan_workflow" not in selected
+    assert "compile_workflow_spec" not in selected
+    assert "apply_workflow_plan" not in selected
     assert "place_chat_image_in_node" not in selected
     assert "get_layout" not in selected
     assert "modify_layout" not in selected
 
+    for natural_build in (
+        "On an empty canvas, create EmptyImage into SaveImage.",
+        "Build me a simple image generator from scratch.",
+        "Make EmptyImage connect to SaveImage.",
+        "Add a SaveImage node.",
+        "Give this workflow an upscaler.",
+        "Build onto my current workflow with a detail pass.",
+        "Put KSampler on the canvas.",
+        "Set up EmptyImage and SaveImage.",
+        "Use SaveImage after the output.",
+    ):
+        assert workflow_graph_change_requested(natural_build) is True
+        assert tools_for_message(natural_build, "free") == {
+            "compile_workflow_refinement_spec",
+            "apply_workflow_graph_patch",
+        }
+
+    no_run = tools_for_message("Build a workflow and don’t run it.")
+    assert no_run == REFINEMENT_COMPILER_TOOLS
+    assert "queue_workflow" not in no_run
+
+    manager_request = "Install or update this custom node pack with Manager."
+    assert workflow_graph_change_requested(manager_request) is False
+    assert "manager_queue_action" in tools_for_message(manager_request)
+
     edit = "Change the seed on the selected KSampler node to 7."
     assert compiler_first_workflow_requested(edit) is False
-    assert "get_node_values" in tools_for_message(edit)
+    assert workflow_refinement_requested(edit) is True
+    assert tools_for_message(edit) == {
+        "compile_workflow_refinement_spec",
+        "apply_workflow_graph_patch",
+    }
 
     researched = request.replace(
         "and don't run it yet",
@@ -537,8 +574,8 @@ def test_complete_new_workflow_uses_only_compiler_application_route():
     assert compiler_first_workflow_requested(build_then_inspect_knowledge) is True
     assert explicit_web_research_requested(build_then_inspect_knowledge) is False
     assert {
-        "compile_workflow_spec",
-        "apply_workflow_plan",
+        "compile_workflow_refinement_spec",
+        "apply_workflow_graph_patch",
         "node_knowledge_search",
     } <= selected_with_knowledge
     assert "node_library_status" not in selected_with_knowledge
@@ -551,12 +588,21 @@ def test_existing_chain_edit_uses_only_atomic_refinement_route():
     assert workflow_refinement_requested(request) is True
 
     selected = tools_for_message(request, "free")
-    assert {"plan_workflow_refinement", "apply_workflow_refinement"} <= selected
+    assert selected == {
+        "compile_workflow_refinement_spec",
+        "apply_workflow_graph_patch",
+    }
+    assert "plan_workflow_refinement" not in selected
+    assert "apply_workflow_refinement" not in selected
     assert "compile_workflow_spec" not in selected
     assert "apply_workflow_plan" not in selected
     assert "create_nodes" not in selected
     assert "remove_nodes" not in selected
     assert "connect_nodes_batch" not in selected
+    assert "workflow_overview" not in selected
+    assert "workflow_get_current_json" not in selected
+    assert "node_library_search" not in selected
+    assert "node_library_get_details" not in selected
     assert "web_search" not in selected
     assert "web_fetch_page" not in selected
 
@@ -567,6 +613,10 @@ def test_existing_chain_edit_uses_only_atomic_refinement_route():
     assert workflow_refinement_requested("Add a sharpen pass to this workflow")
     assert workflow_refinement_requested("Replace KSampler with SamplerCustom")
     assert workflow_refinement_requested("Delete INTConstant")
+    assert workflow_refinement_requested("Change the seed on the selected KSampler node")
+    assert workflow_refinement_requested("Move this node to the right")
+    assert workflow_refinement_requested("Connect this output to the selected node input")
+    assert workflow_refinement_requested("Use this image in the selected LoadImage node")
     assert not workflow_refinement_requested("Replace blue with red in the image")
     assert not workflow_refinement_requested("Replace input.png with output.png")
     assert not workflow_refinement_requested("Delete workflow.json")
@@ -581,16 +631,79 @@ def test_existing_chain_edit_uses_only_atomic_refinement_route():
     assert compiler_first_workflow_requested(multibranch) is False
     assert explicit_web_research_requested(multibranch) is False
     multibranch_tools = tools_for_message(multibranch, "free")
-    assert {"plan_workflow_refinement", "apply_workflow_refinement"} <= multibranch_tools
+    assert multibranch_tools == {
+        "compile_workflow_refinement_spec",
+        "apply_workflow_graph_patch",
+    }
     assert "web_search" not in multibranch_tools
     assert "web_fetch_page" not in multibranch_tools
     assert "create_nodes" not in multibranch_tools
     assert "connect_nodes_batch" not in multibranch_tools
+    assert "workflow_overview" not in multibranch_tools
+    assert "workflow_get_current_json" not in multibranch_tools
+    assert "node_knowledge_search" not in multibranch_tools
+    assert "node_library_get_details" not in multibranch_tools
+    # Referring to an image connection must not expose execution diagnostics.
+    assert "comfy_get_logs" not in multibranch_tools
+    assert "get_execution_details" not in multibranch_tools
+
+    researched_refinement = (
+        "Search the web for current Video Combine documentation, then add that node "
+        "after the current output."
+    )
+    researched_tools = tools_for_message(researched_refinement, "free")
+    assert workflow_refinement_requested(researched_refinement) is True
+    assert {"web_search", "web_fetch_page"} <= researched_tools
+
+    refinement_with_attachment = (
+        multibranch
+        + "\n\nThe user attached ComfyUI input image(s) to this message."
+    )
+    attachment_tools = tools_for_message(refinement_with_attachment, "free")
+    assert "view_chat_image" in attachment_tools
+    assert not ({"view_node_mask", "edit_node_mask", "confirm_mask_review"} & attachment_tools)
+
+    mask_tools = tools_for_message(
+        "Add this mask to the current workflow and let me review it before running.",
+        "free",
+    )
+    assert {"view_node_mask", "edit_node_mask", "confirm_mask_review"} <= mask_tools
+    assert not ({"queue_workflow", "wait", "get_execution_history"} & mask_tools)
+
+    run_tools = tools_for_message(
+        "Add a Wavelet node after this branch, run it, and review the final output.",
+        "free",
+    )
+    assert {
+        "queue_workflow",
+        "wait",
+        "get_execution_history",
+        "view_output_image",
+        "get_queue_status",
+    } <= run_tools
+
+    # Outside refinement intent, image review keeps the richer diagnostic surface.
+    assert "comfy_get_logs" in tools_for_message("Please show me this image.")
 
     instructions = registry_discovery_instructions()
-    assert "terminal_source" in instructions
-    assert "side_input_mappings" in instructions
-    assert "existing fan-out" in instructions
+    assert "compile_workflow_refinement_spec" in instructions
+    assert "apply_workflow_graph_patch" in instructions
+    assert "fan-in, fan-out, multiple sinks" in instructions
+    assert "widget-to-input conversion" in instructions
+    assert "alphabetical guess" in instructions
+    assert "prefers a direct compatible connection" in instructions
+    assert "unique bounded supported local converter route" in instructions
+    assert "set `allow_inferred_converters=false`" in instructions
+    assert "verified lessons internally as ranking priors" in instructions
+
+    prompt = ren_instructions("free")
+    assert "compile_workflow_refinement_spec" in prompt
+    assert "apply_workflow_graph_patch" in prompt
+    assert "normal two workflow-building calls" in prompt
+    assert "never accept an alphabetical guess" in prompt
+    assert "prefers a direct compatible connection" in prompt
+    assert "set `allow_inferred_converters=false`" in prompt
+    assert "verified lessons internally as ranking priors" in prompt
 
 
 def test_exact_registry_request_gets_tools_and_source_guardrails():
@@ -614,16 +727,18 @@ def test_exact_registry_request_gets_tools_and_source_guardrails():
     assert "Never invent or reconstruct either URL" in instructions
     assert "does not prove that a package is installed" in instructions
     assert "not an authoritative whole-Registry search" in instructions
-    assert "call `compile_workflow_spec` first" in instructions
+    assert "both a complete new workflow and any edit" in instructions
+    assert "call `compile_workflow_refinement_spec` first" in instructions
     assert "do not browse for authentication, cost, or privacy" in instructions
-    assert "pass that request unchanged" in instructions
+    assert "pass its `apply_request` unchanged" in instructions
     assert "call `plan_workflow` with the current catalog hash" in instructions
     assert "call `resolve_workflow_spec` against the current catalog hash" in instructions
     assert "never silently substitute it" in instructions
     assert "partner/auth/cost/privacy" in instructions
     assert "returns `valid=true` and a plan hash" in instructions
-    assert "call `apply_workflow_plan`" in instructions
-    assert "Do not replace this atomic call" in instructions
+    assert "pass its `apply_request` unchanged" in instructions
+    assert "`apply_workflow_graph_patch`" in instructions
+    assert "normal two workflow-building calls" in instructions
     assert "Treat the user's requested graph as the plan boundary" in instructions
     assert "Existing local assets are never implicit defaults" in instructions
     assert "If the user says exactly, only, or no extras" in instructions

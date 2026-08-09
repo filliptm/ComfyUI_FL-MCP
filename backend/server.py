@@ -27,7 +27,12 @@ sys.path.insert(0, str(Path(__file__).parent))
 from comfy_supervisor import comfy_supervisor
 from config import DATA_DIR, settings
 from manager import manager
-from models import Handshake, ScreenshotMessage, ToolResult
+from models import (
+    Handshake,
+    REQUIRED_FRONTEND_TOOL_CONTRACT_REVISIONS,
+    ScreenshotMessage,
+    ToolResult,
+)
 from node_catalog_store import NodeCatalogStore
 from node_library import get_node_library_client
 from process_utils import pid_is_running
@@ -490,11 +495,96 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
         connection_type = handshake.connection_type or (
             "mcp" if "mcp" in version else "frontend"
         )
+        if connection_type != "frontend" and (
+            handshake.supported_tools is not None
+            or handshake.tool_manifest_hash is not None
+            or handshake.tool_contract_revisions is not None
+            or handshake.tool_contract_manifest_hash is not None
+        ):
+            await websocket.send_json({
+                "type": "error",
+                "error_code": "INVALID_HANDSHAKE_DATA",
+                "message": "Only frontend clients may advertise tool manifests.",
+            })
+            await websocket.close()
+            return
+        required_tool = "apply_workflow_graph_patch"
+        required_revision = REQUIRED_FRONTEND_TOOL_CONTRACT_REVISIONS[required_tool]
+        advertised_revision = (
+            handshake.tool_contract_revisions.get(required_tool)
+            if handshake.tool_contract_revisions is not None
+            else None
+        )
+        frontend_outdated_reason = None
+        if connection_type == "frontend":
+            if handshake.supported_tools is None:
+                frontend_outdated_reason = "capability_manifest_missing"
+            elif required_tool not in handshake.supported_tools:
+                frontend_outdated_reason = "required_capability_missing"
+            elif handshake.tool_contract_revisions is None:
+                frontend_outdated_reason = "contract_revision_manifest_missing"
+            elif advertised_revision is None:
+                frontend_outdated_reason = "required_contract_revision_missing"
+            elif advertised_revision < required_revision:
+                frontend_outdated_reason = "tool_contract_revision_outdated"
+            elif handshake.tool_contract_manifest_hash is None:
+                frontend_outdated_reason = "contract_revision_hash_missing"
+        if frontend_outdated_reason is not None:
+            await websocket.send_json({
+                "type": "error",
+                "error_code": "frontend_bridge_outdated",
+                "message": (
+                    "The connected ComfyUI browser bridge is outdated. Reload the "
+                    "ComfyUI frontend before using Ren workflow tools."
+                ),
+                "error_details": {
+                    "bridge_state": "frontend_bridge_outdated",
+                    "capability_code": "frontend_capability_missing",
+                    "reason": frontend_outdated_reason,
+                    "requested_tool": required_tool,
+                    "supported_tool_count": (
+                        len(handshake.supported_tools)
+                        if handshake.supported_tools is not None
+                        else None
+                    ),
+                    "tool_manifest_hash": handshake.tool_manifest_hash,
+                    "required_contract_revision": required_revision,
+                    "advertised_contract_revision": advertised_revision,
+                    "tool_contract_manifest_hash": (
+                        handshake.tool_contract_manifest_hash
+                    ),
+                },
+            })
+            # A clean close is terminal even for legacy browser clients, so an
+            # outdated tab cannot reconnect-loop or contend with a capable tab.
+            await websocket.close(code=1000, reason="frontend_bridge_outdated")
+            return
         client_id = handshake.client_id or (
             "legacy-mcp" if connection_type == "mcp" else "browser"
         )
         is_reconnect = manager.has_connection(session_id, connection_type, client_id)
-        await manager.connect(websocket, session_id, connection_type, client_id)
+        await manager.connect(
+            websocket,
+            session_id,
+            connection_type,
+            client_id,
+            supported_tools=(
+                handshake.supported_tools if connection_type == "frontend" else None
+            ),
+            tool_manifest_hash=(
+                handshake.tool_manifest_hash if connection_type == "frontend" else None
+            ),
+            tool_contract_revisions=(
+                handshake.tool_contract_revisions
+                if connection_type == "frontend"
+                else None
+            ),
+            tool_contract_manifest_hash=(
+                handshake.tool_contract_manifest_hash
+                if connection_type == "frontend"
+                else None
+            ),
+        )
         await manager.send_handshake_ack(
             session_id,
             is_reconnect,
@@ -654,6 +744,29 @@ async def route_tool_request_to_frontend(
             "request_id": data.get("request_id"),
             "success": False,
             "error": error_msg,
+            "execution_time_ms": 0,
+        }, target="mcp", client_id=client_id)
+        return
+
+    tool_name = str(data.get("tool_name") or "")
+    capability_failure = manager.frontend_tool_capability_failure(
+        session_id,
+        tool_name,
+    )
+    if capability_failure is not None:
+        manager.resolve_tool_request(session_id, request_id)
+        logger.warning(
+            "Frontend capability guard rejected tool %s for session %s: %s",
+            tool_name,
+            session_id,
+            capability_failure["error_code"],
+        )
+        await manager.send_message(session_id, {
+            "type": "tool_result",
+            "session_id": session_id,
+            "request_id": request_id,
+            "success": False,
+            **capability_failure,
             "execution_time_ms": 0,
         }, target="mcp", client_id=client_id)
         return

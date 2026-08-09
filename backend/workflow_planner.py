@@ -24,6 +24,7 @@ _PRIMITIVE_INPUT_TYPES = {"BOOLEAN", "COMBO", "FLOAT", "INT", "STRING"}
 _DYNAMIC_COMBO = "COMFY_DYNAMICCOMBO_V3"
 _AUTOGROW = "COMFY_AUTOGROW_V3"
 _DYNAMIC_SLOT = "COMFY_DYNAMICSLOT_V3"
+_MAX_DYNAMIC_INPUTS = 512
 
 
 class WorkflowPlanNode(BaseModel):
@@ -309,19 +310,50 @@ def _expand_input_groups(
                     continue
                 template_group, template_spec = template_input
                 names = template.get("names") if isinstance(template, dict) else None
-                minimum = int(template.get("min", 0)) if isinstance(template, dict) else 0
+                try:
+                    minimum = int(template.get("min", 0)) if isinstance(template, dict) else 0
+                except (TypeError, ValueError):
+                    issues.append(
+                        _issue(
+                            "invalid_autogrow_schema",
+                            f"inputs.{name}",
+                            f"Autogrow input {name} has an invalid minimum.",
+                        )
+                    )
+                    continue
                 if not isinstance(names, list):
                     prefix_name = (
                         str(template.get("prefix") or "input")
                         if isinstance(template, dict)
                         else "input"
                     )
-                    maximum = (
-                        int(template.get("max", max(minimum, 1)))
-                        if isinstance(template, dict)
-                        else max(minimum, 1)
-                    )
+                    try:
+                        maximum = (
+                            int(template.get("max", max(minimum, 1)))
+                            if isinstance(template, dict)
+                            else max(minimum, 1)
+                        )
+                    except (TypeError, ValueError):
+                        maximum = -1
+                    if maximum < 0 or maximum > _MAX_DYNAMIC_INPUTS:
+                        issues.append(
+                            _issue(
+                                "dynamic_input_limit_exceeded",
+                                f"inputs.{name}",
+                                f"Autogrow inputs must be between 0 and {_MAX_DYNAMIC_INPUTS}.",
+                            )
+                        )
+                        continue
                     names = [f"{prefix_name}{index}" for index in range(maximum)]
+                elif len(names) > _MAX_DYNAMIC_INPUTS:
+                    issues.append(
+                        _issue(
+                            "dynamic_input_limit_exceeded",
+                            f"inputs.{name}",
+                            f"Autogrow inputs must not exceed {_MAX_DYNAMIC_INPUTS}.",
+                        )
+                    )
+                    continue
                 for index, item_name in enumerate(names):
                     nested_name = _join_input_name(name, str(item_name))
                     nested_group = (
@@ -558,13 +590,27 @@ def _public_node_record(record: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _validated_attachment_widget_value(value: Any) -> str | None:
+    """Read the widget value from a backend attachment attestation.
+
+    Plain strings remain accepted for the legacy pure planner tests/callers;
+    GraphPatch compilation requires the full integrity mapping separately.
+    """
+
+    if isinstance(value, str):
+        return value
+    if isinstance(value, Mapping) and isinstance(value.get("widget_value"), str):
+        return value["widget_value"]
+    return None
+
+
 def compile_workflow_plan(
     request: PlanWorkflowRequest,
     catalog: Mapping[str, Any],
     *,
     catalog_hash: str,
     source: str,
-    validated_attachment_values: Mapping[tuple[str, str], str] | None = None,
+    validated_attachment_values: Mapping[tuple[str, str], Any] | None = None,
 ) -> dict[str, Any]:
     """Resolve and validate a plan against one immutable catalog snapshot."""
 
@@ -578,7 +624,11 @@ def compile_workflow_plan(
             )
         )
 
-    attachment_values = dict(validated_attachment_values or {})
+    attachment_values = {
+        key: widget_value
+        for key, value in (validated_attachment_values or {}).items()
+        if (widget_value := _validated_attachment_widget_value(value)) is not None
+    }
     declared_attachment_keys = {
         (binding.node_alias, binding.input_name)
         for binding in request.attachments

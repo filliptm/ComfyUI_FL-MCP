@@ -3,6 +3,13 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 import vm from "node:vm";
 
+import {
+    applyWorkflowGraphPatchAtomic,
+    WORKFLOW_GRAPH_PATCH_PROPERTY,
+} from "../../web/js/workflow_graph_patch_apply.js";
+import { workflowGraphHash } from "../../web/js/graph_precondition.js";
+import { enrichGraphPatchNode } from "../../web/js/node_schema_contract.js";
+
 
 const root = new URL("../../", import.meta.url);
 
@@ -103,20 +110,71 @@ function flApiHarness() {
 }
 
 
-async function loadFlApi(harness) {
+async function loadFlApi(harness, globals = {}) {
     return loadBrowserClass("web/js/fl_api.js", "FL_API", {
         app: harness.app,
         api: harness.browserApi,
         LiteGraph: { createNode() { return null; } },
         GRAPH_PRECONDITION_SCHEMA: "test.graph.v1",
         workflowGraphHash: async workflow => `hash:${workflow.marker || "graph"}`,
+        workflowGraphHashExcludingExtra: async workflow => `content-hash:${workflow.marker || "graph"}`,
         nodeIdsEqual: (left, right) => (
             typeof left === typeof right && JSON.stringify(left) === JSON.stringify(right)
         ),
         findNonOverlappingPosition: value => ({ x: value.x, y: value.y }),
         getGraphInsertionOrigin: () => ({ x: 0, y: 0 }),
+        convertComfyWidgetToInput: async (node, widget) => {
+            const input = { name: widget.name, type: widget.options?.input_type || "*" };
+            node.inputs ||= [];
+            node.inputs.push(input);
+            return input;
+        },
+        formatImageWidgetRef: ref => (
+            [ref.subfolder, ref.filename].filter(Boolean).join("/") + ` [${ref.type || "input"}]`
+        ),
+        parseImageWidgetRef: value => {
+            if (typeof value !== "string") return null;
+            const match = value.match(/^(.*?)(?:\s+\[(input|output|temp)\])?$/);
+            const parts = (match?.[1] || "").split("/").filter(Boolean);
+            const filename = parts.pop();
+            return filename ? {
+                filename,
+                subfolder: parts.join("/"),
+                type: match?.[2] || "input",
+            } : null;
+        },
+        ...globals,
     });
 }
+
+
+test("ToolExecutor derives its advertised tools from the registered handler map", async () => {
+    const { Class: ToolExecutor } = await loadBrowserClass(
+        "web/js/tool_executor.js",
+        "ToolExecutor",
+        {
+            FL_API: class {},
+            QueryExecutor: class {},
+        },
+    );
+    const executor = Object.create(ToolExecutor.prototype);
+    executor.toolHandlers = executor._registerHandlers();
+
+    const supportedTools = executor.getSupportedTools();
+    const contractRevisions = executor.getToolContractRevisions();
+    assert.deepEqual(
+        Array.from(supportedTools),
+        Object.keys(executor.toolHandlers).sort(),
+    );
+    assert.deepEqual(
+        Object.keys(contractRevisions),
+        Object.keys(executor.toolHandlers).sort(),
+    );
+    assert.ok(supportedTools.includes("apply_workflow_graph_patch"));
+    assert.equal(contractRevisions.apply_workflow_graph_patch, 2);
+    assert.equal(contractRevisions.find_node, 1);
+    assert.deepEqual(Array.from(supportedTools), [...supportedTools].sort());
+});
 
 
 function refinementParams(workflowIdentity) {
@@ -331,6 +389,141 @@ test("Map-backed links are enumerated and exact refinement connects trust return
 });
 
 
+test("FL_API exact values defer absent dotted widgets until their selector materializes", async () => {
+    const harness = flApiHarness();
+    const selector = {
+        name: "model",
+        type: "combo",
+        value: "basic",
+        callback(value, _canvas, node) {
+            if (value === "advanced" && !node.widgets.some(item => item.name === "model.detail")) {
+                node.widgets.push({ name: "model.detail", type: "number", value: 0 });
+            }
+        },
+    };
+    const node = {
+        id: 1,
+        type: "DynamicNode",
+        comfyClass: "DynamicNode",
+        widgets: [selector],
+        inputs: [],
+        outputs: [],
+    };
+    harness.graph._nodes = [node];
+    const { Class: FL_API } = await loadFlApi(harness);
+    const flApi = new FL_API();
+
+    const deferred = await flApi.setValuesExact(1, { "model.detail": 7 });
+    assert.deepEqual(Array.from(deferred.applied), []);
+
+    const applied = await flApi.setValuesExact(1, {
+        "model.detail": 7,
+        model: "advanced",
+    });
+
+    assert.deepEqual(new Set(applied.applied), new Set(["model", "model.detail"]));
+    assert.equal(node.widgets.find(item => item.name === "model.detail").value, 7);
+});
+
+
+test("FL_API attachment assignment verifies string refs without changing node properties", async () => {
+    const harness = flApiHarness();
+    const imageWidget = {
+        name: "image",
+        type: "combo",
+        value: "old.png [input]",
+        options: { values: ["old.png [input]"] },
+    };
+    const node = {
+        id: 2,
+        type: "LoadImage",
+        comfyClass: "LoadImage",
+        widgets: [imageWidget],
+        widgets_values: [imageWidget.value],
+        inputs: [],
+        outputs: [],
+        properties: { preserve: "exactly" },
+    };
+    harness.graph._nodes = [node];
+    const { Class: FL_API } = await loadFlApi(harness);
+    const flApi = new FL_API();
+    const attachment = {
+        input: "image",
+        filename: "approved.png",
+        subfolder: "ren-chat",
+        file_type: "output",
+    };
+
+    const assigned = flApi.assignAttachmentExact(2, attachment);
+
+    assert.equal(assigned.value, "ren-chat/approved.png [output]");
+    assert.equal(imageWidget.value, assigned.value);
+    assert.equal(node.widgets_values[0], assigned.value);
+    assert.equal(flApi.verifyAttachmentExact(2, attachment), true);
+    assert.deepEqual(node.properties, { preserve: "exactly" });
+});
+
+
+test("FL_API widget conversion accepts modern coexisting sockets and supported core conversion", async () => {
+    const harness = flApiHarness();
+    let coreConversions = 0;
+    const existingWidget = {
+        name: "frame_rate",
+        type: "number",
+        value: 24,
+        options: { input_type: "FLOAT" },
+    };
+    const existing = {
+        id: 3,
+        type: "VHS_VideoCombine",
+        comfyClass: "VHS_VideoCombine",
+        widgets: [existingWidget],
+        inputs: [{ name: "frame_rate", type: "FLOAT", widget: { name: "frame_rate" } }],
+        outputs: [],
+        convertWidgetToInput() { throw new Error("deprecated conversion must not run"); },
+    };
+    const convertibleWidget = {
+        name: "strength",
+        type: "number",
+        value: 1,
+        options: { input_type: "FLOAT" },
+    };
+    const convertible = {
+        id: 4,
+        type: "LegacyConvertible",
+        comfyClass: "LegacyConvertible",
+        widgets: [convertibleWidget],
+        inputs: [],
+        outputs: [],
+    };
+    harness.graph._nodes = [existing, convertible];
+    const { Class: FL_API } = await loadFlApi(harness, {
+        convertComfyWidgetToInput: async (node, widget) => {
+            coreConversions += 1;
+            const input = { name: widget.name, type: widget.options.input_type };
+            node.inputs.push(input);
+            return input;
+        },
+    });
+    const flApi = new FL_API();
+
+    const coexistence = await flApi.convertWidgetToInputExact(3, {
+        input: "frame_rate",
+        type: "FLOAT",
+        occurrence_index: 0,
+    });
+    const converted = await flApi.convertWidgetToInputExact(4, {
+        input: "strength",
+        type: "FLOAT",
+        occurrence_index: 0,
+    });
+
+    assert.equal(coexistence.socket_index, 0);
+    assert.equal(converted.socket_index, 0);
+    assert.equal(coreConversions, 1);
+});
+
+
 test("tool executor pins every refinement adapter call and closes transactions on failure", async () => {
     const calls = [];
     const workflowIdentity = "fl-mcp-workflow:test-session:1";
@@ -443,6 +636,507 @@ test("tool executor pins every refinement adapter call and closes transactions o
     );
     assert.equal(calls.at(-2), "end");
     assert.equal(calls.at(-1), "auto-restored");
+});
+
+
+test("tool executor registers and routes GraphPatch through the guarded real adapter", async () => {
+    const calls = [];
+    let failEndCleanup = false;
+    let failRestoreCleanup = false;
+    let failEngine = false;
+    const workflowIdentity = "fl-mcp-workflow:graph-patch-session:1";
+    const pin = { workflow: { key: "graph-patch-workflow" } };
+    const guard = { pin, expectedGraphHash: "hash:graph-patch" };
+    const childContext = { key: "new:child", node_type: "Child", schema_hash: "a".repeat(64) };
+    const flApi = {
+        pinActiveWorkflow(expected) {
+            assert.equal(expected, workflowIdentity);
+            calls.push("pin");
+            return pin;
+        },
+        async getNodeDefinitions(nodeTypes) {
+            assert.deepEqual(Array.from(nodeTypes), ["Child"]);
+            calls.push("catalog");
+            return { Child: { input: {}, output: [] } };
+        },
+        assertActiveWorkflow(received) { assert.equal(received, pin); calls.push("identity"); },
+        pauseAutoQueue() { calls.push("pause"); return { mode: "disabled" }; },
+        restoreAutoQueue() {
+            calls.push("auto-restored");
+            if (failRestoreCleanup) throw new Error("auto-queue cleanup failed");
+        },
+        beginWorkflowChangeTransaction(received) {
+            assert.equal(received, pin);
+            calls.push("begin");
+            return { pin };
+        },
+        endWorkflowChangeTransaction() {
+            calls.push("end");
+            if (failEndCleanup) throw new Error("transaction cleanup failed");
+        },
+        createWorkflowMutationGuard(received) {
+            assert.equal(received, pin);
+            calls.push("guard-start");
+            return guard;
+        },
+        assertWorkflowMutationGuard(received) {
+            assert.equal(received, guard);
+            calls.push("hash-check");
+        },
+        acceptWorkflowMutationGuard(received) {
+            assert.equal(received, guard);
+            calls.push("hash-accept");
+        },
+        captureWorkflowSnapshot(received) {
+            assert.equal(received, pin);
+            calls.push("capture");
+            return { nodes: [], links: [], extra: {} };
+        },
+        restoreWorkflowSnapshot(_snapshot, received) {
+            assert.equal(received, pin);
+            calls.push("restore");
+        },
+        getWorkflowNode(nodeId, received) {
+            assert.equal(received, pin);
+            calls.push(`node:${nodeId}`);
+            return { id: nodeId, node_id: nodeId, node_type: "Child", type: "Child" };
+        },
+        listWorkflowConnections(received) {
+            assert.equal(received, pin);
+            calls.push("links");
+            return [];
+        },
+        create(nodeType) { assert.equal(nodeType, "Child"); calls.push("create"); return { id: 7 }; },
+        setValuesExact(nodeId, values) {
+            assert.equal(nodeId, 7);
+            assert.deepEqual(values, { value: 3 });
+            calls.push("values");
+            return { applied: ["value"] };
+        },
+        setNodeProperty() { calls.push("metadata"); },
+        setRect() { calls.push("layout"); },
+        assignAttachmentExact() { calls.push("attachment"); },
+        verifyAttachmentExact() { calls.push("attachment-verify"); return true; },
+        convertWidgetToInputExact() { calls.push("convert"); return { socket_index: 0 }; },
+        disconnectWorkflowConnection() { calls.push("disconnect"); },
+        connectWorkflowNodesExact() { calls.push("connect"); },
+        remove() { calls.push("remove"); },
+        setWorkflowExtra(_key, _value, received) {
+            assert.equal(received, pin);
+            calls.push("extra");
+        },
+    };
+    const params = {
+        schema_contracts: { Child: { schema_hash: "a".repeat(64), schema: {} } },
+        plan: {
+            expected_workflow_identity: workflowIdentity,
+            assertions: { nodes: [], edges: [] },
+            create_nodes: [{ alias: "child", node_type: "Child" }],
+            update_nodes: [],
+            remove_nodes: [],
+        },
+    };
+    const { Class: ToolExecutor } = await loadBrowserClass(
+        "web/js/tool_executor.js",
+        "ToolExecutor",
+        {
+            FL_API: class {},
+            QueryExecutor: class {},
+            WORKFLOW_APPLICATION_PROPERTY: "application",
+            WORKFLOW_REFINEMENT_PROPERTY: "refinement",
+            WORKFLOW_GRAPH_PATCH_PROPERTY: "graph-patch",
+            applyWorkflowPlanAtomic: async () => ({}),
+            applyWorkflowRefinementAtomic: async () => ({}),
+            buildGraphPatchSchemaContexts: async (plan, catalog, contracts) => {
+                assert.equal(plan, params.plan);
+                assert.deepEqual(catalog, { Child: { input: {}, output: [] } });
+                assert.equal(contracts, params.schema_contracts);
+                calls.push("schema-context");
+                return new Map([["new:child", childContext]]);
+            },
+            enrichGraphPatchNode: (node, context) => {
+                assert.equal(context, childContext);
+                calls.push("enrich");
+                return { ...node, schema_hash: context.schema_hash };
+            },
+            applyWorkflowGraphPatchAtomic: async (received, adapter) => {
+                assert.equal(received, params);
+                calls.push("engine");
+                if (failEngine) throw new Error("graph patch engine failed");
+                assert.equal(typeof adapter.restoreWorkflow, "function");
+                assert.equal(typeof adapter.disconnectConnection, "function");
+                assert.equal(typeof adapter.connectNodes, "function");
+                assert.equal(typeof adapter.assignAttachmentExact, "function");
+                assert.equal(typeof adapter.verifyAttachmentExact, "function");
+                assert.equal(typeof adapter.convertWidgetToInput, "function");
+                await adapter.captureWorkflow();
+                const created = await adapter.createNode({ alias: "child", node_type: "Child" });
+                assert.equal(created.id, 7);
+                const observed = await adapter.getNode(7);
+                assert.equal(observed.schema_hash, childContext.schema_hash);
+                await adapter.setNodeValuesExact(7, { value: 3 });
+                await adapter.setNodeMetadata(7, {});
+                await adapter.setNodeLayoutExact(7, { x: 1, y: 2 });
+                await adapter.afterMutationStep({ phase: "node", delay_ms: 0 });
+                return { success: true, queued: false };
+            },
+            setTimeout: callback => { callback(); return 1; },
+        },
+    );
+    const executor = Object.create(ToolExecutor.prototype);
+    executor.flApi = flApi;
+    executor.queryExecutor = {};
+    executor.toolHandlers = executor._registerHandlers();
+
+    const result = await executor.toolHandlers.apply_workflow_graph_patch(params);
+
+    assert.deepEqual(result, { success: true, queued: false });
+    assert.ok(calls.indexOf("catalog") < calls.indexOf("pause"));
+    assert.ok(calls.includes("schema-context"));
+    assert.ok(calls.includes("engine"));
+    assert.equal(calls.at(-2), "end");
+    assert.equal(calls.at(-1), "auto-restored");
+
+    calls.length = 0;
+    failEndCleanup = true;
+    failRestoreCleanup = true;
+    const committedWithCleanupWarnings = await executor.toolHandlers.apply_workflow_graph_patch(params);
+    assert.equal(committedWithCleanupWarnings.success, true);
+    assert.deepEqual(
+        Array.from(committedWithCleanupWarnings.cleanup_warnings, item => ({ ...item })),
+        [
+            {
+                phase: "end_workflow_change_transaction",
+                message: "transaction cleanup failed",
+            },
+            {
+                phase: "restore_auto_queue",
+                message: "auto-queue cleanup failed",
+            },
+        ],
+    );
+    assert.equal(calls.at(-2), "end");
+    assert.equal(calls.at(-1), "auto-restored");
+
+    calls.length = 0;
+    failEngine = true;
+    await assert.rejects(
+        () => executor.toolHandlers.apply_workflow_graph_patch(params),
+        error => {
+            assert.equal(error.message, "graph patch engine failed");
+            assert.deepEqual(
+                Array.from(error.cleanup_warnings, item => ({ ...item })),
+                [
+                    {
+                        phase: "end_workflow_change_transaction",
+                        message: "transaction cleanup failed",
+                    },
+                    {
+                        phase: "restore_auto_queue",
+                        message: "auto-queue cleanup failed",
+                    },
+                ],
+            );
+            return true;
+        },
+    );
+    assert.equal(calls.at(-2), "end");
+    assert.equal(calls.at(-1), "auto-restored");
+});
+
+
+test("the guarded ToolExecutor adapter lets an edge unlock a deferred dynamic-slot value", async () => {
+    const workflowIdentity = "fl-mcp-workflow:dynamic-slot-adapter:1";
+    const catalogHash = "c".repeat(64);
+    const sourceSchema = "1".repeat(64);
+    const dynamicSchema = "2".repeat(64);
+    let workflow = {
+        version: 0.4,
+        last_node_id: 0,
+        last_link_id: 0,
+        nodes: [],
+        links: [],
+        groups: [],
+        config: {},
+        extra: {},
+    };
+    const calls = [];
+    const pin = { workflow: { key: "dynamic-slot-workflow" } };
+    const guard = { pin };
+    const clone = value => structuredClone(value);
+    const findNode = id => workflow.nodes.find(node => String(node.id) === String(id));
+    const sourceNode = id => ({
+        id,
+        type: "Source",
+        schema_hash: sourceSchema,
+        inputs: [],
+        schema_inputs: [],
+        outputs: [{ name: "IMAGE", type: "IMAGE", index: 0, links: [] }],
+        widgets: [],
+        values: {},
+        widgets_values: [],
+        properties: {},
+        pos: [0, 0],
+        size: [240, 140],
+        mode: 0,
+        flags: {},
+    });
+    const dynamicNode = id => ({
+        id,
+        type: "DynamicSlotValues",
+        schema_hash: dynamicSchema,
+        inputs: [{
+            name: "unrelated_video",
+            type: "VIDEO",
+            index: 9,
+            schema_index: 9,
+            socket_index: 0,
+            link: null,
+        }, {
+            name: "payload",
+            type: "*",
+            index: 0,
+            schema_index: 0,
+            socket_index: 1,
+            link: null,
+        }],
+        schema_inputs: [
+            {
+                name: "payload",
+                type: "COMFY_DYNAMICSLOT_V3",
+                resolved_type: "IMAGE",
+                accepted_types: ["IMAGE"],
+                index: 0,
+                kind: "socket",
+            },
+            { name: "payload.strength", type: "FLOAT", index: 1, kind: "widget" },
+        ],
+        outputs: [],
+        widgets: [],
+        values: {},
+        widgets_values: [],
+        properties: {},
+        pos: [300, 0],
+        size: [240, 140],
+        mode: 0,
+        flags: {},
+        dynamic_input_roots: ["payload"],
+    });
+    const observedNode = id => {
+        const node = findNode(id);
+        return node ? {
+            ...clone(node),
+            node_id: node.id,
+            node_type: node.type,
+            position: { x: node.pos[0], y: node.pos[1] },
+            size: { width: node.size[0], height: node.size[1] },
+            live_inputs: clone(node.inputs),
+            serialized_node: clone(node),
+        } : null;
+    };
+    const flApi = {
+        pinActiveWorkflow(expected) {
+            assert.equal(expected, workflowIdentity);
+            return pin;
+        },
+        async getNodeDefinitions(types) {
+            return Object.fromEntries(types.map(type => [type, { input: {}, output: [] }]));
+        },
+        assertActiveWorkflow(received) { assert.equal(received, pin); },
+        pauseAutoQueue() { return { disabled: true }; },
+        restoreAutoQueue() {},
+        beginWorkflowChangeTransaction() { return { pin }; },
+        endWorkflowChangeTransaction() {},
+        createWorkflowMutationGuard() { return guard; },
+        assertWorkflowMutationGuard() {},
+        acceptWorkflowMutationGuard() {},
+        captureWorkflowSnapshot() { return clone(workflow); },
+        restoreWorkflowSnapshot(snapshot) { workflow = clone(snapshot); },
+        getWorkflowNode(id) { return observedNode(id); },
+        listWorkflowConnections() { return clone(workflow.links); },
+        create(type) {
+            const id = workflow.last_node_id + 1;
+            workflow.last_node_id = id;
+            workflow.nodes.push(type === "Source" ? sourceNode(id) : dynamicNode(id));
+            calls.push(`create:${type}`);
+            return { id };
+        },
+        setValuesExact(id, values) {
+            const node = findNode(id);
+            const applied = [];
+            for (const [name, value] of Object.entries(values)) {
+                const target = node.widgets.find(widget => widget.name === name);
+                if (!target) continue;
+                target.value = clone(value);
+                node.values[name] = clone(value);
+                applied.push(name);
+            }
+            if (node.type === "DynamicSlotValues" && applied.length > 0) {
+                node.size = [390, 260];
+            }
+            node.widgets_values = Object.values(clone(node.values));
+            calls.push(`values:${applied.length ? applied.join(",") : "deferred"}`);
+            return { applied };
+        },
+        setNodeProperty(id, key, value) { findNode(id).properties[key] = clone(value); },
+        setRect(id, layout) {
+            const node = findNode(id);
+            node.pos = [layout.x, layout.y];
+            if (layout.width !== undefined) node.size[0] = layout.width;
+            if (layout.height !== undefined) node.size[1] = layout.height;
+        },
+        connectWorkflowNodesExact(sourceId, targetId, connection) {
+            const id = workflow.last_link_id + 1;
+            workflow.last_link_id = id;
+            workflow.links.push({ id, ...clone(connection) });
+            const target = findNode(targetId);
+            target.widgets.push({
+                name: "payload.strength",
+                type: "FLOAT",
+                schema_index: 1,
+                value: 0.5,
+            });
+            target.values["payload.strength"] = 0.5;
+            target.widgets_values = Object.values(clone(target.values));
+            target.size = [360, 230];
+            calls.push(`connect:${sourceId}->${targetId}`);
+            return { id };
+        },
+        disconnectWorkflowConnection() {},
+        assignAttachmentExact() {},
+        verifyAttachmentExact() { return true; },
+        convertWidgetToInputExact() { return { socket_index: 0 }; },
+        remove(ids) {
+            const removed = new Set(ids.map(String));
+            workflow.nodes = workflow.nodes.filter(node => !removed.has(String(node.id)));
+        },
+        setWorkflowExtra(key, value) { workflow.extra[key] = clone(value); },
+    };
+    const request = {
+        application_id: "dynamic-slot-real-adapter-test",
+        expected_catalog_hash: catalogHash,
+        patch_hash: "d".repeat(64),
+        schema_contracts: {
+            Source: { schema_hash: sourceSchema, schema: {} },
+            DynamicSlotValues: { schema_hash: dynamicSchema, schema: {} },
+        },
+        plan: {
+            operation: "patch",
+            expected_workflow_identity: workflowIdentity,
+            expected_graph_hash: await workflowGraphHash(workflow),
+            assertions: { nodes: [], edges: [] },
+            create_nodes: [
+                {
+                    alias: "dynamic_slot",
+                    node_type: "DynamicSlotValues",
+                    schema_hash: dynamicSchema,
+                    values: { "payload.strength": 0.75 },
+                    layout_hint: { x: 300, y: 0, width: 240, height: 140 },
+                },
+                {
+                    alias: "source",
+                    node_type: "Source",
+                    schema_hash: sourceSchema,
+                    values: {},
+                },
+            ],
+            update_nodes: [],
+            remove_edges: [],
+            add_edges: [{
+                source: {
+                    ref: { alias: "source" },
+                    output_index: 0,
+                    output: "IMAGE",
+                    type: "IMAGE",
+                },
+                target: {
+                    ref: { alias: "dynamic_slot" },
+                    input_index: 0,
+                    occurrence_index: 0,
+                    socket_index: 0,
+                    input: "payload",
+                    type: "IMAGE",
+                    mode: "slot",
+                },
+            }],
+            remove_nodes: [],
+            attachments: [],
+            expected_delta: {
+                created_node_count: 2,
+                updated_node_count: 0,
+                removed_node_count: 0,
+                added_edge_count: 1,
+                removed_edge_count: 0,
+                final_node_count: 2,
+                final_edge_count: 1,
+            },
+        },
+    };
+    const contexts = new Map([
+        ["new:source", {
+            key: "new:source",
+            node_type: "Source",
+            schema_hash: sourceSchema,
+            schema_inputs: [],
+            schema_outputs: [{ index: 0, name: "IMAGE", type: "IMAGE" }],
+            dynamic_selector_names: [],
+            dynamic_input_roots: [],
+        }],
+        ["new:dynamic_slot", {
+            key: "new:dynamic_slot",
+            node_type: "DynamicSlotValues",
+            schema_hash: dynamicSchema,
+            schema_inputs: [{
+                index: 0,
+                occurrence_index: 0,
+                name: "payload",
+                type: "IMAGE",
+                kind: "socket",
+                socket_index: 0,
+            }],
+            schema_outputs: [],
+            dynamic_selector_names: [],
+            dynamic_input_roots: ["payload"],
+        }],
+    ]);
+    const { Class: ToolExecutor } = await loadBrowserClass(
+        "web/js/tool_executor.js",
+        "ToolExecutor",
+        {
+            FL_API: class {},
+            QueryExecutor: class {},
+            WORKFLOW_APPLICATION_PROPERTY: "application",
+            WORKFLOW_REFINEMENT_PROPERTY: "refinement",
+            WORKFLOW_GRAPH_PATCH_PROPERTY,
+            applyWorkflowPlanAtomic: async () => ({}),
+            applyWorkflowRefinementAtomic: async () => ({}),
+            buildGraphPatchSchemaContexts: async () => contexts,
+            enrichGraphPatchNode,
+            applyWorkflowGraphPatchAtomic,
+            setTimeout: callback => { callback(); return 1; },
+        },
+    );
+    const executor = Object.create(ToolExecutor.prototype);
+    executor.flApi = flApi;
+    executor.queryExecutor = {};
+    executor.toolHandlers = executor._registerHandlers();
+
+    const result = await executor.toolHandlers.apply_workflow_graph_patch(request);
+
+    assert.equal(result.success, true);
+    assert.equal(result.queued, false);
+    assert.equal(workflow.nodes.length, 2);
+    assert.equal(workflow.links.length, 1);
+    assert.equal(workflow.links[0].target_input_index, 1);
+    assert.equal(workflow.links[0].target_input, "payload");
+    const finalDynamic = findNode(result.aliases.dynamic_slot);
+    assert.equal(finalDynamic.values["payload.strength"], 0.75);
+    assert.deepEqual(finalDynamic.pos, [300, 0]);
+    assert.deepEqual(finalDynamic.size, [240, 140]);
+    const deferred = calls.indexOf("values:deferred");
+    const connected = calls.findIndex(item => item.startsWith("connect:"));
+    const applied = calls.indexOf("values:payload.strength");
+    assert.ok(deferred >= 0 && deferred < connected && connected < applied);
 });
 
 

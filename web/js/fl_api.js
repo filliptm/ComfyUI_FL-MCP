@@ -10,6 +10,7 @@
 
 import { app } from "../../../../scripts/app.js";
 import { api } from "../../../../scripts/api.js";
+import { convertToInput as convertComfyWidgetToInput } from "../../../extensions/core/widgetInputs.js";
 import {
     findNonOverlappingPosition,
     getGraphInsertionOrigin,
@@ -18,6 +19,7 @@ import { nodeIdsEqual } from "./node_identity.js";
 import {
     GRAPH_PRECONDITION_SCHEMA,
     workflowGraphHash,
+    workflowGraphHashExcludingExtra,
 } from "./graph_precondition.js";
 import {
     formatImageWidgetRef,
@@ -28,6 +30,7 @@ import {
 } from "./mask_utils.js";
 
 const WORKFLOW_IDENTITY_SCHEMA = "fl-mcp.workflow-instance.v1";
+const GRAPH_PATCH_LEDGER_KEY = "fl_mcp_graph_patch_ledger";
 
 const WORKFLOW_IDENTITY_TOKENS = new WeakMap();
 const WORKFLOW_IDENTITY_SESSION = (() => {
@@ -445,8 +448,44 @@ export class FL_API {
             properties: structuredClone(node.properties || {}),
             position: { x: node.pos[0], y: node.pos[1] },
             size: { width: node.size[0], height: node.size[1] },
+            outputs: (node.outputs || []).map((output, index) => ({
+                index,
+                name: output.name,
+                type: output.type,
+                links: structuredClone(output.links || []),
+            })),
+            live_inputs: (node.inputs || []).map((input, socketIndex) => ({
+                socket_index: socketIndex,
+                name: input.name,
+                type: input.type,
+                link: input.link ?? null,
+            })),
+            widgets: (node.widgets || []).map((widget, widgetIndex) => ({
+                widget_index: widgetIndex,
+                name: widget.name,
+                type: widget.type,
+                input_type: widget.options?.input_type ?? widget.options?.type ?? null,
+                value: structuredClone(widget.value),
+            })),
             serialized_node: serializedNode,
         };
+    }
+
+    /** Fetch one fresh browser-visible /object_info generation for touched node types. */
+    async getNodeDefinitions(nodeTypes = []) {
+        const response = await api.fetchApi("/object_info", { cache: "no-store" });
+        if (!response.ok) {
+            throw new Error(`Could not read browser node definitions (${response.status}).`);
+        }
+        const catalog = await response.json();
+        const selected = {};
+        for (const nodeType of new Set(nodeTypes)) {
+            if (!catalog?.[nodeType] || typeof catalog[nodeType] !== "object") {
+                throw new Error(`Node type ${nodeType} is not registered in this ComfyUI tab.`);
+            }
+            selected[nodeType] = catalog[nodeType];
+        }
+        return selected;
     }
 
     /** Remove exactly one expected link; never delegate target replacement to LiteGraph. */
@@ -1014,6 +1053,156 @@ export class FL_API {
             console.error("[FL_API] setValues error:", error);
             throw error;
         }
+    }
+
+    /** Apply every requested widget exactly or fail for transactional rollback. */
+    async setValuesExact(nodeId, values) {
+        const node = this._findNode(nodeId);
+        if (!node) throw new Error(`Node not found: ${nodeId}`);
+        const pending = new Map(Object.entries(values || {}));
+        const applied = [];
+        let stalledRounds = 0;
+        while (pending.size > 0 && stalledRounds < 5) {
+            let progress = false;
+            for (const [name, value] of [...pending.entries()]) {
+                const matches = (node.widgets || []).filter(widget => widget.name === name);
+                if (matches.length > 1) {
+                    throw new Error(
+                        `Expected one live widget named ${name} on node ${node.id}; found ${matches.length}.`,
+                    );
+                }
+                if (matches.length === 0) continue;
+                this._setWidgetValueExact(node, matches[0], structuredClone(value));
+                await Promise.resolve();
+                const observed = (node.widgets || []).filter(widget => widget.name === name);
+                if (
+                    observed.length !== 1
+                    || JSON.stringify(observed[0].value) !== JSON.stringify(value)
+                ) {
+                    throw new Error(`Widget ${name} did not retain its exact requested value.`);
+                }
+                pending.delete(name);
+                applied.push(name);
+                progress = true;
+            }
+            if (progress) {
+                stalledRounds = 0;
+                continue;
+            }
+            stalledRounds += 1;
+            await new Promise(resolve => {
+                if (typeof globalThis.requestAnimationFrame === "function") {
+                    globalThis.requestAnimationFrame(() => resolve());
+                } else {
+                    setTimeout(resolve, 0);
+                }
+            });
+        }
+        // GraphPatch owns the outer dependency fixpoint. A dotted widget may
+        // legitimately be absent until another selector value has been
+        // applied, so report the names that made progress and let the executor
+        // retry the remainder after the selector settles. Duplicate widgets
+        // and values that fail to persist still fail immediately above.
+        if (applied.length > 0) this._markGraphChanged();
+        return { applied };
+    }
+
+    /** Promote one exact primitive widget to a live input socket. */
+    async convertWidgetToInputExact(nodeId, expected) {
+        const node = this._findNode(nodeId);
+        if (!node) throw new Error(`Node not found: ${nodeId}`);
+        const existingInputs = (node.inputs || [])
+            .map((input, socketIndex) => ({ input, socketIndex }))
+            .filter(item => item.input.name === expected.input && item.input.type === expected.type);
+        if (existingInputs[expected.occurrence_index]) {
+            return { socket_index: existingInputs[expected.occurrence_index].socketIndex };
+        }
+        const widgets = (node.widgets || []).filter(widget => widget.name === expected.input);
+        const widget = widgets[expected.occurrence_index];
+        if (!widget) {
+            throw new Error(
+                `Widget ${expected.input} occurrence ${expected.occurrence_index} is unavailable.`,
+            );
+        }
+        const beforeInputs = new Set(node.inputs || []);
+        const converted = typeof convertComfyWidgetToInput === "function"
+            ? await convertComfyWidgetToInput(node, widget)
+            : typeof node.convertWidgetToInput === "function"
+                ? await node.convertWidgetToInput(widget)
+                : false;
+        if (converted === false) {
+            throw new Error(`Node ${node.id} refused to convert widget ${expected.input}.`);
+        }
+        let selected = null;
+        for (let attempt = 0; attempt < 6 && !selected; attempt += 1) {
+            await Promise.resolve();
+            const exactNew = (node.inputs || [])
+                .map((input, socketIndex) => ({ input, socketIndex }))
+                .filter(item => (
+                    !beforeInputs.has(item.input)
+                    && item.input.name === expected.input
+                    && item.input.type === expected.type
+                ));
+            const exactAll = (node.inputs || [])
+                .map((input, socketIndex) => ({ input, socketIndex }))
+                .filter(item => item.input.name === expected.input && item.input.type === expected.type);
+            selected = exactNew.length === 1
+                ? exactNew[0]
+                : exactAll[expected.occurrence_index] || null;
+            if (!selected && typeof globalThis.requestAnimationFrame === "function") {
+                await new Promise(resolve => globalThis.requestAnimationFrame(() => resolve()));
+            }
+        }
+        if (!selected) {
+            throw new Error(
+                `Converting ${expected.input} did not create one exact ${expected.type} socket.`,
+            );
+        }
+        this._markGraphChanged();
+        return { socket_index: selected.socketIndex };
+    }
+
+    /** Assign one already-validated Comfy image reference to an exact widget. */
+    assignAttachmentExact(nodeId, attachment) {
+        const node = this._findNode(nodeId);
+        if (!node) throw new Error(`Node not found: ${nodeId}`);
+        const widgets = (node.widgets || []).filter(widget => widget.name === attachment.input);
+        if (widgets.length !== 1) {
+            throw new Error(
+                `Expected one attachment widget named ${attachment.input}; found ${widgets.length}.`,
+            );
+        }
+        const image = {
+            filename: attachment.filename,
+            subfolder: attachment.subfolder || "",
+            type: attachment.file_type || "input",
+        };
+        const value = formatImageWidgetRef(image);
+        if (!value) throw new Error("The attachment image reference is invalid.");
+        const widget = widgets[0];
+        const optionValues = widget.options?.values;
+        if (Array.isArray(optionValues) && !optionValues.includes(value)) optionValues.push(value);
+        this._setWidgetValueExact(node, widget, value);
+        if (Array.isArray(node.widgets_values)) {
+            const index = node.widgets.indexOf(widget);
+            if (index >= 0) node.widgets_values[index] = value;
+        }
+        this._markGraphChanged();
+        return { assigned: true, value };
+    }
+
+    verifyAttachmentExact(nodeId, attachment) {
+        const node = this._findNode(nodeId);
+        if (!node) return false;
+        const widgets = (node.widgets || []).filter(widget => widget.name === attachment.input);
+        if (widgets.length !== 1) return false;
+        const observed = parseImageWidgetRef(widgets[0].value);
+        return Boolean(
+            observed
+            && observed.filename === attachment.filename
+            && (observed.subfolder || "") === (attachment.subfolder || "")
+            && (observed.type || "input") === (attachment.file_type || "input")
+        );
     }
 
     getNodeImageRef(nodeId) {
@@ -2336,6 +2525,10 @@ export class FL_API {
             const editableWorkflow = app.graph.serialize();
             const prompt = await app.graphToPrompt();
             const graphHash = await workflowGraphHash(editableWorkflow);
+            const graphPatchContentHash = await workflowGraphHashExcludingExtra(
+                editableWorkflow,
+                [GRAPH_PATCH_LEDGER_KEY],
+            );
             assertSameWorkflow();
             return {
                 api_format: true,
@@ -2345,11 +2538,16 @@ export class FL_API {
                 workflow_identity_schema: WORKFLOW_IDENTITY_SCHEMA,
                 graph_hash: graphHash,
                 graph_hash_schema: GRAPH_PRECONDITION_SCHEMA,
+                graph_patch_content_hash: graphPatchContentHash,
             };
         }
 
         const workflow = app.graph.serialize();
         const graphHash = await workflowGraphHash(workflow);
+        const graphPatchContentHash = await workflowGraphHashExcludingExtra(
+            workflow,
+            [GRAPH_PATCH_LEDGER_KEY],
+        );
         assertSameWorkflow();
         return {
             api_format: false,
@@ -2358,6 +2556,7 @@ export class FL_API {
             workflow_identity_schema: WORKFLOW_IDENTITY_SCHEMA,
             graph_hash: graphHash,
             graph_hash_schema: GRAPH_PRECONDITION_SCHEMA,
+            graph_patch_content_hash: graphPatchContentHash,
         };
     }
 
@@ -2919,6 +3118,13 @@ export class FL_API {
         } catch (error) {
             console.debug(`[FL_API] Node widget change hook failed for ${widget.name}:`, error);
         }
+    }
+
+    _setWidgetValueExact(node, widget, value) {
+        const oldValue = widget.value;
+        widget.value = value;
+        widget.callback?.call(widget, value, app.canvas, node, app.canvas?.graph_mouse, {});
+        node.onWidgetChanged?.(widget.name, value, oldValue, widget);
     }
 
     _serializeCommand(command) {

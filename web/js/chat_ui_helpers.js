@@ -135,6 +135,20 @@ function plural(count, singular, pluralForm = `${singular}s`) {
     return `${count} ${count === 1 ? singular : pluralForm}`;
 }
 
+function workflowDeltaParts(delta) {
+    const normalized = delta && typeof delta === "object" ? delta : {};
+    return [
+        [normalized.created_node_count, "new node"],
+        [normalized.updated_node_count, "updated node"],
+        [normalized.removed_node_count, "removed node"],
+        [normalized.added_edge_count, "added connection"],
+        [normalized.removed_edge_count, "removed connection"],
+    ]
+        .map(([count, label]) => [Number(count || 0), label])
+        .filter(([count]) => Number.isFinite(count) && count > 0)
+        .map(([count, label]) => plural(count, label));
+}
+
 const PROVIDER_MARKS = {
     lmstudio: "LM",
     ollama: "OL",
@@ -220,6 +234,8 @@ export function summarizeToolStep(step, config = {}) {
             web_search: "Couldn’t search the web",
             web_fetch_page: "Couldn’t read the web page",
             compile_workflow_spec: "Couldn’t compile workflow",
+            compile_workflow_refinement_spec: "Couldn’t plan workflow",
+            apply_workflow_graph_patch: "Couldn’t build workflow",
             plan_workflow: "Couldn’t validate workflow plan",
             registry_search_packages: "Couldn’t search official Comfy Registry",
             registry_get_package: "Couldn’t inspect Registry package",
@@ -387,6 +403,34 @@ export function summarizeToolStep(step, config = {}) {
         if (result?.success === false) return "Workflow refinement failed safely";
         if (result?.already_applied) return "Workflow refinement already applied";
         return `Refined workflow · ${result?.operation || "updated graph"}`;
+    }
+    if (name === "compile_workflow_refinement_spec") {
+        if (result?.valid === false) {
+            if (result?.needs_choice) return "Workflow plan needs your choice";
+            return `Workflow plan needs fixes · ${plural(Number(result?.error_count || 0), "error")}`;
+        }
+        const delta = result?.plan?.expected_delta || {};
+        const parts = workflowDeltaParts(delta);
+        return parts.length > 0
+            ? `Planned workflow · ${parts.join(" · ")}`
+            : "Planned workflow";
+    }
+    if (name === "apply_workflow_graph_patch") {
+        if (result?.success === false) return "Workflow build failed safely";
+        if (result?.already_applied) return "Workflow change already applied";
+        const declared = request?.plan?.expected_delta || result?.expected_delta;
+        const fallback = {
+            created_node_count: Array.isArray(result?.created_node_ids)
+                ? result.created_node_ids.length
+                : 0,
+            removed_node_count: Array.isArray(result?.removed_node_ids)
+                ? result.removed_node_ids.length
+                : 0,
+        };
+        const parts = workflowDeltaParts(declared || fallback);
+        return parts.length > 0
+            ? `Built workflow · ${parts.join(" · ")}`
+            : "Built workflow";
     }
     if (name === "compile_workflow_spec") {
         const nodeCount = Array.isArray(result?.plan?.nodes)

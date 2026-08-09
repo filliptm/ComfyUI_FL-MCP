@@ -4,11 +4,13 @@ This module defines MCP tools for controlling and inspecting ComfyUI.
 """
 
 import asyncio
+import hashlib
 import io
 import json
 import logging
 import mimetypes
 import os
+import re
 import sys
 import uuid
 from contextlib import asynccontextmanager
@@ -71,6 +73,7 @@ from comfy_tools import get_comfy_tools, ComfyUIError, ComfyUINotFoundError
 from chat_images import ChatImageReference
 from node_library import (
     get_node_library_client,
+    normalize_node_schema_contract,
     NodeLibraryError,
     NodeLibraryConnectionError,
     NodeTypeNotFoundError
@@ -100,6 +103,18 @@ from workflow_refinement import (
     WorkflowRefinementSideInputMapping,
     compile_workflow_refinement,
     normalize_workflow_graph,
+)
+from workflow_graph_patch import (
+    ApplyGraphPatchRequest,
+    GRAPH_PATCH_SCHEMA,
+    MAX_GRAPH_PATCH_ATTACHMENT_BYTES,
+    compile_graph_patch,
+    graph_patch_request_from_apply,
+)
+from workflow_capability_graph import VerifiedCapabilityLesson
+from workflow_refinement_compiler import (
+    CompileWorkflowRefinementSpecRequest,
+    compile_workflow_refinement_spec as compile_semantic_refinement,
 )
 from comfy_registry import ComfyRegistryClient, normalize_github_repository_url
 
@@ -540,6 +555,45 @@ def _node_knowledge_store(ctx: Context) -> NodeCatalogStore | None:
         return None
     store = lifespan_context.get("node_catalog_store")
     return store if isinstance(store, NodeCatalogStore) else None
+
+
+def _active_verified_capability_lessons(
+    ctx: Context,
+) -> tuple[VerifiedCapabilityLesson, ...]:
+    """Load current-schema lessons as optional compiler ranking priors.
+
+    Lesson retrieval is best-effort and never weakens live catalog validation.
+    Invalid or stale rows are ignored by the schema-scoped capability graph.
+    """
+
+    store = _node_knowledge_store(ctx)
+    if store is None:
+        return ()
+    try:
+        rows = store.get_all_active_verified_lessons()
+    except Exception as exc:
+        logger.warning("Could not load verified capability lessons: %s", exc)
+        return ()
+    lessons: list[VerifiedCapabilityLesson] = []
+    for row in rows:
+        node_type = row.get("node_type") if isinstance(row, dict) else None
+        schema_hash = row.get("schema_hash") if isinstance(row, dict) else None
+        payload = row.get("payload") if isinstance(row, dict) else None
+        if (
+            isinstance(node_type, str)
+            and node_type
+            and isinstance(schema_hash, str)
+            and re.fullmatch(r"[0-9a-f]{64}", schema_hash)
+            and isinstance(payload, dict)
+        ):
+            lessons.append(
+                VerifiedCapabilityLesson(
+                    node_type=node_type,
+                    schema_hash=schema_hash,
+                    payload=payload,
+                )
+            )
+    return tuple(lessons)
 
 
 def _comfy_base_url() -> str:
@@ -3670,20 +3724,121 @@ async def node_knowledge_search(
 
 
 def _validated_plan_attachment_values(
-    request: PlanWorkflowRequest | CompileWorkflowSpecRequest,
-) -> Dict[tuple[str, str], str]:
-    """Validate every declared chat image and return its exact widget value."""
+    request: Any,
+) -> Dict[tuple[str, str], Dict[str, Any]]:
+    """Attest every declared chat image and return its exact immutable facts."""
 
     if not request.attachments:
         return {}
 
     comfy_tools = get_comfy_tools()
-    values: Dict[tuple[str, str], str] = {}
+    values: Dict[tuple[str, str], Dict[str, Any]] = {}
     for binding in request.attachments:
         image = binding.image.model_dump(mode="json")
-        _resolve_comfy_image_path(comfy_tools, image)
-        values[(binding.node_alias, binding.input_name)] = binding.image.widget_value()
+        path = _resolve_comfy_image_path(comfy_tools, image)
+        integrity = _stable_graph_patch_attachment_integrity(path)
+        alias = getattr(binding, "node_alias", None) or getattr(
+            binding,
+            "target_alias",
+            None,
+        )
+        input_name = getattr(binding, "input_name", None) or getattr(
+            binding,
+            "target_input",
+            None,
+        )
+        if not isinstance(alias, str) or not isinstance(input_name, str):
+            raise ValueError("Attachment bindings need a semantic node alias and input name")
+        values[(alias, input_name)] = {
+            "widget_value": binding.image.widget_value(),
+            **integrity,
+        }
     return values
+
+
+GRAPH_PATCH_ATTACHMENT_HASH_CHUNK_BYTES = 1024 * 1024
+
+
+def _attachment_stat_identity(value: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
+
+
+def _stable_graph_patch_attachment_integrity(path: Path) -> Dict[str, Any]:
+    """Hash one bounded regular file and reject replacement during the read."""
+
+    try:
+        digest = hashlib.sha256()
+        byte_count = 0
+        with path.open("rb") as file_obj:
+            before = os.fstat(file_obj.fileno())
+            if before.st_size <= 0 or before.st_size > MAX_GRAPH_PATCH_ATTACHMENT_BYTES:
+                raise ComfyUIError("Chat attachment size is outside the supported range.")
+            while True:
+                chunk = file_obj.read(GRAPH_PATCH_ATTACHMENT_HASH_CHUNK_BYTES)
+                if not chunk:
+                    break
+                byte_count += len(chunk)
+                if byte_count > MAX_GRAPH_PATCH_ATTACHMENT_BYTES:
+                    raise ComfyUIError("Chat attachment exceeds the supported size limit.")
+                digest.update(chunk)
+            after = os.fstat(file_obj.fileno())
+        current = path.stat()
+    except ComfyUIError:
+        raise
+    except OSError as exc:
+        raise ComfyUIError("Chat attachment could not be read safely.") from exc
+    if (
+        byte_count != before.st_size
+        or _attachment_stat_identity(before) != _attachment_stat_identity(after)
+        or _attachment_stat_identity(after) != _attachment_stat_identity(current)
+    ):
+        raise ComfyUIError("Chat attachment changed while it was being validated.")
+    return {"size_bytes": byte_count, "sha256": digest.hexdigest()}
+
+
+def _graph_patch_attachment_integrity_issues(
+    request: ApplyGraphPatchRequest,
+) -> List[Dict[str, str]]:
+    """Re-resolve and verify compiler-pinned attachments before browser mutation."""
+
+    if not request.plan.attachments:
+        return []
+    comfy_tools = get_comfy_tools()
+    issues: List[Dict[str, str]] = []
+    for index, binding in enumerate(request.plan.attachments):
+        image = {
+            "filename": binding.filename,
+            "subfolder": binding.subfolder,
+            "type": binding.file_type,
+        }
+        try:
+            path = _resolve_comfy_image_path(comfy_tools, image)
+            observed = _stable_graph_patch_attachment_integrity(path)
+        except ComfyUIError:
+            issues.append({
+                "severity": "error",
+                "code": "attachment_missing_or_changed",
+                "path": f"plan.attachments[{index}]",
+                "message": "The compiler-attested Ren chat image is no longer available.",
+            })
+            continue
+        if (
+            observed["size_bytes"] != binding.size_bytes
+            or observed["sha256"] != binding.sha256
+        ):
+            issues.append({
+                "severity": "error",
+                "code": "attachment_missing_or_changed",
+                "path": f"plan.attachments[{index}]",
+                "message": "The Ren chat image changed after workflow compilation.",
+            })
+    return issues
 
 
 def _record_verified_connection_lessons(
@@ -3711,9 +3866,11 @@ def _record_verified_connection_lessons(
             continue
         identity = {
             "source_node_type": source.get("node_type"),
+            "source_schema_hash": source.get("schema_hash"),
             "source_output": connection.get("source_output"),
             "source_output_index": connection.get("source_output_index"),
             "target_node_type": target.get("node_type"),
+            "target_schema_hash": target.get("schema_hash"),
             "target_input": connection.get("target_input"),
         }
         lesson_id = uuid.uuid5(
@@ -3743,6 +3900,91 @@ def _record_verified_connection_lessons(
             logger.warning("Could not persist verified node connection lesson: %s", exc)
 
 
+def _record_verified_graph_patch_lessons(
+    store: NodeCatalogStore | None,
+    *,
+    plan: Dict[str, Any],
+    patch_hash: str,
+    application_id: str,
+) -> None:
+    """Learn every exact added edge, including existing-to-new GraphPatch edges."""
+
+    if store is None:
+        return
+
+    def ref_key(ref: Any) -> tuple[str, Any] | None:
+        if not isinstance(ref, dict):
+            return None
+        if set(ref) == {"alias"}:
+            return "new", str(ref["alias"])
+        if set(ref) == {"node_id"}:
+            value = ref["node_id"]
+            return "existing", (type(value).__name__, value)
+        return None
+
+    facts: Dict[tuple[str, Any], Dict[str, Any]] = {}
+    for item in plan.get("create_nodes", []):
+        if isinstance(item, dict) and item.get("alias"):
+            facts[("new", str(item["alias"]))] = item
+    for item in plan.get("assertions", {}).get("nodes", []):
+        if not isinstance(item, dict):
+            continue
+        key = ref_key(item.get("ref"))
+        if key is not None:
+            facts[key] = item
+
+    for connection in plan.get("add_edges", []):
+        if not isinstance(connection, dict):
+            continue
+        source_endpoint = connection.get("source")
+        target_endpoint = connection.get("target")
+        if not isinstance(source_endpoint, dict) or not isinstance(target_endpoint, dict):
+            continue
+        source = facts.get(ref_key(source_endpoint.get("ref")))
+        target = facts.get(ref_key(target_endpoint.get("ref")))
+        if source is None or target is None:
+            continue
+        identity = {
+            "source_node_type": source.get("node_type"),
+            "source_schema_hash": source.get("schema_hash"),
+            "source_output": source_endpoint.get("output"),
+            "source_output_index": source_endpoint.get("output_index"),
+            "source_type": source_endpoint.get("type"),
+            "target_node_type": target.get("node_type"),
+            "target_schema_hash": target.get("schema_hash"),
+            "target_input": target_endpoint.get("input"),
+            "target_input_index": target_endpoint.get("input_index"),
+            "target_occurrence_index": target_endpoint.get("occurrence_index"),
+            "target_type": target_endpoint.get("type"),
+            "target_mode": target_endpoint.get("mode"),
+        }
+        lesson_id = uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            json.dumps(identity, sort_keys=True, separators=(",", ":")),
+        ).hex
+        evidence = {
+            **identity,
+            "evidence": "atomic_graph_patch_application",
+            "patch_hash": patch_hash,
+            "application_id": application_id,
+        }
+        try:
+            store.record_verified_lesson(
+                str(source["node_type"]),
+                str(source["schema_hash"]),
+                f"downstream-connection:{lesson_id}",
+                {**evidence, "direction": "downstream"},
+            )
+            store.record_verified_lesson(
+                str(target["node_type"]),
+                str(target["schema_hash"]),
+                f"upstream-connection:{lesson_id}",
+                {**evidence, "direction": "upstream"},
+            )
+        except Exception as exc:
+            logger.warning("Could not persist verified GraphPatch lesson: %s", exc)
+
+
 def _typed_workflow_node_id_equal(left: Any, right: Any) -> bool:
     """Match the frontend graph-hash domain without conflating ``2`` and ``"2"``."""
 
@@ -3765,6 +4007,7 @@ async def _active_editable_workflow(ctx: Context) -> Dict[str, Any]:
     workflow_identity_schema = result.get("workflow_identity_schema")
     graph_hash = result.get("graph_hash")
     graph_hash_schema = result.get("graph_hash_schema")
+    graph_patch_content_hash = result.get("graph_patch_content_hash")
     if not isinstance(workflow, dict):
         raise RuntimeError("The browser bridge returned no editable workflow JSON.")
     if (
@@ -3791,6 +4034,7 @@ async def _active_editable_workflow(ctx: Context) -> Dict[str, Any]:
         "workflow_identity_schema": workflow_identity_schema,
         "graph_hash": graph_hash,
         "graph_hash_schema": graph_hash_schema,
+        "graph_patch_content_hash": graph_patch_content_hash,
     }
 
 
@@ -4273,6 +4517,462 @@ async def apply_workflow_refinement(
 
 
 @mcp.tool()
+async def compile_workflow_refinement_spec(
+    request: CompileWorkflowRefinementSpecRequest,
+    ctx: Context,
+) -> Dict[str, Any]:
+    """Compile a new workflow or existing-workflow change into GraphPatch v2.
+
+    This is the default planning tool for both an empty canvas and edits to an
+    active graph. It resolves deterministic existing-node selectors and every
+    requested native/custom/partner role against one refreshed local catalog,
+    infers active dynamic selectors and stable defaults, validates exact
+    arbitrary-DAG edges (including widget-to-input conversion), prefers direct
+    connections, and may synthesize one unique safe schema-derived converter
+    route of at most two local nodes. Exact-schema verified lessons influence
+    ranking only; the refreshed live schema remains authoritative. The result
+    includes compact endpoint/route candidates when a choice is required and
+    one hash-pinned ``apply_request`` when valid. It never mutates or queues the
+    canvas.
+
+    If ``valid=true``, pass ``apply_request`` unchanged to
+    ``apply_workflow_graph_patch``. Use lower-level JSON/search/details/planner
+    tools only when this compiler returns ``needs_choice`` or a classified
+    unsupported schema.
+    """
+
+    await _report_tool_activity(ctx, "compile_workflow_refinement_spec")
+    try:
+        active = await _active_editable_workflow(ctx)
+        selected_node_ids = None
+        if any(selector.selected for selector in request.existing_nodes):
+            selection = await _execute_tool(ctx, "get_selected_nodes", {})
+            selected_nodes = selection.get("nodes") if isinstance(selection, dict) else None
+            if not isinstance(selected_nodes, list):
+                raise ValueError("current canvas selection did not return a nodes array")
+            selected_node_ids = []
+            selected_keys = set()
+            for index, node in enumerate(selected_nodes):
+                node_id = node.get("id") if isinstance(node, dict) else None
+                if isinstance(node_id, bool) or not isinstance(node_id, (int, str)):
+                    raise ValueError(
+                        f"current canvas selection node {index} has an invalid exact ID"
+                    )
+                key = (type(node_id).__name__, node_id)
+                if key in selected_keys:
+                    raise ValueError(
+                        f"current canvas selection repeats node ID {node_id!r}"
+                    )
+                selected_keys.add(key)
+                selected_node_ids.append(node_id)
+        client = get_node_library_client(
+            server_url=settings.comfyui_server_url,
+            timeout=settings.comfyui_api_timeout,
+        )
+        snapshot = await client.catalog_snapshot(force_refresh=True)
+        attachment_values = _validated_plan_attachment_values(request)
+        return compile_semantic_refinement(
+            request,
+            active["workflow"],
+            workflow_identity=active["workflow_identity"],
+            graph_hash=active["graph_hash"],
+            catalog=snapshot.data,
+            catalog_hash=snapshot.catalog_hash,
+            source=snapshot.source,
+            validated_attachment_values=attachment_values,
+            selected_node_ids=selected_node_ids,
+            verified_lessons=_active_verified_capability_lessons(ctx),
+        )
+    except NodeLibraryConnectionError as exc:
+        raise RuntimeError(f"ComfyUI server connection failed: {exc}") from exc
+    except NodeLibraryError as exc:
+        raise RuntimeError(f"Workflow refinement compilation failed: {exc}") from exc
+    except ComfyUIError as exc:
+        raise RuntimeError(f"Workflow attachment validation failed: {exc}") from exc
+    except ValueError as exc:
+        raise RuntimeError(f"Active workflow refinement input is invalid: {exc}") from exc
+    except Exception as exc:
+        logger.error("Unexpected error in compile_workflow_refinement_spec: %s", exc)
+        raise RuntimeError(f"Tool execution failed: {exc}") from exc
+
+
+def _graph_patch_validation_summary(compiled: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "valid": compiled.get("valid") is True,
+        "schema": compiled.get("schema"),
+        "patch_hash": compiled.get("patch_hash"),
+        "catalog": compiled.get("catalog"),
+        "expected_final": compiled.get("expected_final"),
+        "issues": compiled.get("issues", []),
+        "error_count": compiled.get("error_count", 0),
+    }
+
+
+def _graph_patch_schema_contracts(
+    plan: Dict[str, Any],
+    catalog: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Provide browser-verifiable normalized schemas for only touched node classes."""
+
+    facts: Dict[str, str] = {}
+    for item in [
+        *plan.get("assertions", {}).get("nodes", []),
+        *plan.get("create_nodes", []),
+        *plan.get("update_nodes", []),
+        *plan.get("remove_nodes", []),
+    ]:
+        if not isinstance(item, dict):
+            continue
+        node_type = item.get("node_type")
+        schema_hash = item.get("schema_hash")
+        if not isinstance(node_type, str) or not isinstance(schema_hash, str):
+            continue
+        previous = facts.setdefault(node_type, schema_hash)
+        if previous != schema_hash:
+            raise ValueError(f"GraphPatch has conflicting schema hashes for {node_type}")
+    contracts: Dict[str, Any] = {}
+    for node_type, schema_hash in sorted(facts.items()):
+        node_info = catalog.get(node_type)
+        if not isinstance(node_info, dict):
+            raise ValueError(f"GraphPatch node type {node_type} is absent from the catalog")
+        contracts[node_type] = {
+            "schema_hash": schema_hash,
+            "schema": normalize_node_schema_contract(node_info),
+        }
+    return contracts
+
+
+def _graph_patch_failure(
+    request: ApplyGraphPatchRequest,
+    *,
+    code: str,
+    message: str,
+    validation: Dict[str, Any],
+) -> Dict[str, Any]:
+    return {
+        "success": False,
+        "applied": False,
+        "already_applied": False,
+        "application_id": request.application_id,
+        "patch_hash": request.patch_hash,
+        "error": {"code": code, "message": message},
+        "validation": validation,
+        "rollback": {
+            "attempted": False,
+            "complete": True,
+            "snapshot_restored": False,
+            "hash_verified": False,
+            "errors": [],
+        },
+        "queued": False,
+    }
+
+
+def _completed_graph_patch_result(
+    active: Dict[str, Any],
+    request: ApplyGraphPatchRequest,
+) -> Dict[str, Any] | None:
+    """Return a verified idempotent result from the persisted GraphPatch ledger."""
+
+    if active.get("workflow_identity") != request.plan.expected_workflow_identity:
+        return None
+
+    workflow = active.get("workflow")
+    extra = workflow.get("extra") if isinstance(workflow, dict) else None
+    ledger = extra.get("fl_mcp_graph_patch_ledger") if isinstance(extra, dict) else None
+    if ledger is None:
+        return None
+    if not (
+        isinstance(ledger, dict)
+        and ledger.get("schema") == "fl-mcp.workflow-graph-patch.v2"
+        and isinstance(ledger.get("order"), list)
+        and isinstance(ledger.get("entries"), dict)
+    ):
+        return _graph_patch_failure(
+            request,
+            code="invalid_graph_patch_ledger",
+            message="The persisted GraphPatch ledger is malformed; the canvas was not edited.",
+            validation={"valid": False, "issues": [], "error_count": 1},
+        )
+    entry = ledger["entries"].get(request.application_id)
+    if entry is None:
+        return None
+    if not isinstance(entry, dict) or entry.get("patch_hash") != request.patch_hash:
+        return _graph_patch_failure(
+            request,
+            code="graph_patch_idempotency_conflict",
+            message="This application ID is already bound to a different GraphPatch.",
+            validation={"valid": False, "issues": [], "error_count": 1},
+        )
+    current_content_hash = active.get("graph_patch_content_hash")
+    if (
+        not isinstance(current_content_hash, str)
+        or current_content_hash != entry.get("result_content_hash")
+    ):
+        return _graph_patch_failure(
+            request,
+            code="graph_patch_idempotency_conflict",
+            message="The workflow changed after this GraphPatch was applied.",
+            validation={"valid": False, "issues": [], "error_count": 1},
+        )
+    return {
+        "success": True,
+        "applied": False,
+        "already_applied": True,
+        "patch_schema": "fl-mcp.workflow-graph-patch.v2",
+        "application_id": request.application_id,
+        "patch_hash": request.patch_hash,
+        "operation": "patch",
+        "expected_workflow_identity": request.plan.expected_workflow_identity,
+        "workflow_identity": active.get("workflow_identity"),
+        "graph_hash": active.get("graph_hash"),
+        "aliases": entry.get("aliases", {}),
+        "created_node_ids": entry.get("created_node_ids", []),
+        "removed_node_ids": entry.get("removed_node_ids", []),
+        "verification": {"valid": True, "issues": [], "idempotency_verified": True},
+        "rollback": {
+            "attempted": False,
+            "complete": True,
+            "snapshot_restored": False,
+            "hash_verified": False,
+            "errors": [],
+        },
+        "validation": {
+            "valid": True,
+            "patch_hash": request.patch_hash,
+            "issues": [],
+            "error_count": 0,
+            "idempotency_verified": True,
+        },
+        "queued": False,
+    }
+
+
+def _attest_graph_patch_frontend_result(
+    result: Any,
+    request: ApplyGraphPatchRequest,
+) -> Dict[str, Any]:
+    """Bind a bridge response to this exact request before trusting success."""
+
+    if not isinstance(result, dict):
+        raise RuntimeError("The frontend returned a non-object GraphPatch result.")
+    expected_facts = {
+        "patch_schema": GRAPH_PATCH_SCHEMA,
+        "application_id": request.application_id,
+        "patch_hash": request.patch_hash,
+        "operation": "patch",
+        "expected_workflow_identity": request.plan.expected_workflow_identity,
+    }
+    mismatches = [
+        field
+        for field, expected in expected_facts.items()
+        if result.get(field) != expected
+    ]
+    if mismatches:
+        raise RuntimeError(
+            "The frontend GraphPatch result failed request attestation: "
+            + ", ".join(mismatches)
+        )
+    for field in ("success", "applied", "already_applied"):
+        if type(result.get(field)) is not bool:
+            raise RuntimeError(f"The frontend GraphPatch result has invalid {field} state.")
+    if result.get("queued") is not False:
+        raise RuntimeError("The frontend GraphPatch result did not attest queued=false.")
+    if result["success"] is not True:
+        if result["applied"] or result["already_applied"]:
+            raise RuntimeError("A failed GraphPatch result claimed a committed application.")
+        return result
+    if result["applied"] == result["already_applied"]:
+        raise RuntimeError(
+            "A successful GraphPatch result must be applied or already_applied, exclusively."
+        )
+    verification = result.get("verification")
+    if not (
+        isinstance(verification, dict)
+        and verification.get("valid") is True
+        and verification.get("issues") == []
+    ):
+        raise RuntimeError("The frontend GraphPatch success lacks exact clean verification.")
+    rollback = result.get("rollback")
+    if not (
+        isinstance(rollback, dict)
+        and rollback.get("attempted") is False
+        and rollback.get("complete") is True
+        and rollback.get("errors") == []
+    ):
+        raise RuntimeError("The frontend GraphPatch success has an invalid rollback state.")
+    aliases = result.get("aliases")
+    created_node_ids = result.get("created_node_ids")
+    removed_node_ids = result.get("removed_node_ids")
+    if not isinstance(aliases, dict) or not isinstance(created_node_ids, list):
+        raise RuntimeError("The frontend GraphPatch success lacks created-node identity facts.")
+    if not isinstance(removed_node_ids, list):
+        raise RuntimeError("The frontend GraphPatch success lacks removed-node identity facts.")
+    expected_aliases = {item.alias for item in request.plan.create_nodes}
+    if set(aliases) != expected_aliases or len(created_node_ids) != len(expected_aliases):
+        raise RuntimeError("The frontend GraphPatch created-node facts do not match the plan.")
+    if any(type(value) not in (int, str) for value in created_node_ids):
+        raise RuntimeError("The frontend GraphPatch returned an invalid created node ID.")
+    typed_created = {(type(value).__name__, value) for value in created_node_ids}
+    if len(typed_created) != len(created_node_ids):
+        raise RuntimeError("The frontend GraphPatch returned duplicate created node IDs.")
+    if {(type(value).__name__, value) for value in aliases.values()} != typed_created:
+        raise RuntimeError("The frontend alias mapping disagrees with created node IDs.")
+    expected_removed = [item.ref.node_id for item in request.plan.remove_nodes]
+    if removed_node_ids != expected_removed:
+        raise RuntimeError("The frontend removed-node facts do not match the plan.")
+    graph_hash = result.get("graph_hash")
+    if not isinstance(graph_hash, str) or re.fullmatch(r"[0-9a-f]{64}", graph_hash) is None:
+        raise RuntimeError("The frontend GraphPatch success lacks a valid final graph hash.")
+    if result["already_applied"] and verification.get("idempotency_verified") is not True:
+        raise RuntimeError("The frontend idempotent GraphPatch result was not verified.")
+    return result
+
+
+@mcp.tool()
+async def apply_workflow_graph_patch(
+    request: ApplyGraphPatchRequest,
+    ctx: Context,
+) -> Dict[str, Any]:
+    """Atomically apply one unchanged semantic GraphPatch v2 envelope.
+
+    The backend rereads the active graph, refreshes the local node catalog, and
+    recompiles the supplied canonical plan. Any workflow, graph, catalog, schema,
+    slot, value, or hash drift stops before browser mutation. The frontend then
+    applies the arbitrary DAG delta under one canvas lock with exact verification,
+    idempotency, full snapshot rollback, visible bounded pacing, and no queue call.
+    """
+
+    await _report_tool_activity(ctx, "apply_workflow_graph_patch")
+    if not settings.enable_workflow_writes:
+        return _disabled_by_config("FL_MCP_ENABLE_WORKFLOW_WRITES")
+    try:
+        active = await _active_editable_workflow(ctx)
+        empty_validation = {
+            "valid": False,
+            "schema": None,
+            "patch_hash": None,
+            "catalog": None,
+            "expected_final": None,
+            "issues": [],
+            "error_count": 0,
+        }
+        attachment_issues = _graph_patch_attachment_integrity_issues(request)
+        if attachment_issues:
+            return _graph_patch_failure(
+                request,
+                code="attachment_missing_or_changed",
+                message=(
+                    "A compiler-attested Ren chat image is missing or changed; "
+                    "compile the workflow refinement again."
+                ),
+                validation={
+                    **empty_validation,
+                    "issues": attachment_issues,
+                    "error_count": len(attachment_issues),
+                },
+            )
+        completed = _completed_graph_patch_result(active, request)
+        if completed is not None:
+            return completed
+        if active["workflow_identity"] != request.plan.expected_workflow_identity:
+            return _graph_patch_failure(
+                request,
+                code="workflow_identity_changed",
+                message="The active workflow tab changed; the canvas was not edited.",
+                validation=empty_validation,
+            )
+        if active["graph_hash"] != request.plan.expected_graph_hash:
+            return _graph_patch_failure(
+                request,
+                code="graph_changed",
+                message="The active workflow graph changed; compile the refinement again.",
+                validation=empty_validation,
+            )
+        graph = normalize_workflow_graph(active["workflow"])
+        client = get_node_library_client(
+            server_url=settings.comfyui_server_url,
+            timeout=settings.comfyui_api_timeout,
+        )
+        snapshot = await client.catalog_snapshot(force_refresh=True)
+        canonical_request = graph_patch_request_from_apply(request, graph)
+        compiled = compile_graph_patch(
+            canonical_request,
+            snapshot.data,
+            catalog_hash=snapshot.catalog_hash,
+            source=snapshot.source,
+        )
+        validation = _graph_patch_validation_summary(compiled)
+        if not compiled["valid"]:
+            return _graph_patch_failure(
+                request,
+                code="patch_invalid",
+                message="The graph patch is no longer valid; the canvas was not edited.",
+                validation=validation,
+            )
+        if (
+            compiled["patch_hash"] != request.patch_hash
+            or compiled["plan"] != request.plan.model_dump(mode="json")
+        ):
+            return _graph_patch_failure(
+                request,
+                code="patch_hash_mismatch",
+                message="The current canonical graph patch differs from the supplied plan.",
+                validation=validation,
+            )
+        # Catalog refresh and recompilation are awaited operations. Recheck the
+        # compiler-pinned bytes at the last backend boundary before the browser
+        # is allowed to mutate the canvas, closing that apply-time TOCTOU gap.
+        attachment_issues = _graph_patch_attachment_integrity_issues(request)
+        if attachment_issues:
+            return _graph_patch_failure(
+                request,
+                code="attachment_missing_or_changed",
+                message=(
+                    "A compiler-attested Ren chat image is missing or changed; "
+                    "compile the workflow refinement again."
+                ),
+                validation={
+                    **empty_validation,
+                    "issues": attachment_issues,
+                    "error_count": len(attachment_issues),
+                },
+            )
+        result = await _execute_tool(
+            ctx,
+            "apply_workflow_graph_patch",
+            {
+                **compiled["apply_request"],
+                "schema_contracts": _graph_patch_schema_contracts(
+                    compiled["plan"],
+                    snapshot.data,
+                ),
+            },
+            timeout_ms=240000,
+        )
+        result = _attest_graph_patch_frontend_result(result, request)
+        if result.get("success") is True and (
+            result.get("applied") is True or result.get("already_applied") is True
+        ):
+            _record_verified_graph_patch_lessons(
+                _node_knowledge_store(ctx),
+                plan=compiled["plan"],
+                patch_hash=request.patch_hash,
+                application_id=request.application_id,
+            )
+        return {**result, "validation": validation}
+    except NodeLibraryConnectionError as exc:
+        raise RuntimeError(f"ComfyUI server connection failed: {exc}") from exc
+    except NodeLibraryError as exc:
+        raise RuntimeError(f"Graph-patch application failed: {exc}") from exc
+    except ValueError as exc:
+        raise RuntimeError(f"Active workflow graph is invalid: {exc}") from exc
+    except Exception as exc:
+        logger.error("Unexpected error in apply_workflow_graph_patch: %s", exc)
+        raise RuntimeError(f"Tool execution failed: {exc}") from exc
+
+
+@mcp.tool()
 async def plan_workflow(request: PlanWorkflowRequest, ctx: Context) -> Dict[str, Any]:
     """Validate a deterministic workflow plan without changing the canvas.
 
@@ -4294,7 +4994,7 @@ async def plan_workflow(request: PlanWorkflowRequest, ctx: Context) -> Dict[str,
             server_url=settings.comfyui_server_url,
             timeout=settings.comfyui_api_timeout,
         )
-        snapshot = await client.catalog_snapshot()
+        snapshot = await client.catalog_snapshot(force_refresh=True)
         attachment_values = _validated_plan_attachment_values(request)
         return compile_workflow_plan(
             request,
@@ -4339,7 +5039,7 @@ async def compile_workflow_spec(
             server_url=settings.comfyui_server_url,
             timeout=settings.comfyui_api_timeout,
         )
-        snapshot = await client.catalog_snapshot()
+        snapshot = await client.catalog_snapshot(force_refresh=True)
         attachment_values = _validated_plan_attachment_values(request)
         return compile_semantic_workflow(
             request,
@@ -4386,7 +5086,7 @@ async def resolve_workflow_spec(
             server_url=settings.comfyui_server_url,
             timeout=settings.comfyui_api_timeout,
         )
-        snapshot = await client.catalog_snapshot()
+        snapshot = await client.catalog_snapshot(force_refresh=True)
         return resolve_workflow_capabilities(
             request,
             snapshot.data,
@@ -4429,7 +5129,7 @@ async def apply_workflow_plan(
             server_url=settings.comfyui_server_url,
             timeout=settings.comfyui_api_timeout,
         )
-        snapshot = await client.catalog_snapshot()
+        snapshot = await client.catalog_snapshot(force_refresh=True)
         plan_request = PlanWorkflowRequest(
             nodes=request.nodes,
             connections=request.connections,
@@ -4548,8 +5248,10 @@ async def node_library_search(request: NodeLibrarySearchRequest, ctx: Context) -
     - "Find LoRA loaders" → query="lora"
     
     RETURNS:
-    Array of matching node type definitions with inputs, outputs, categories.
-    Use node_library_get_details() for comprehensive info on a specific type.
+    A compact ranked candidate list. Full input schemas are intentionally omitted
+    so a broad search cannot inject hundreds of kilobytes into the chat context.
+    Use node_library_get_details() only for a chosen exact type; normal workflow
+    builds/refinements should prefer their one-pass semantic compiler instead.
     """
     await _report_tool_activity(ctx, "node_library_search")
     
@@ -4576,8 +5278,9 @@ async def node_library_search(request: NodeLibrarySearchRequest, ctx: Context) -
                 "display_name": r.display_name,
                 "category": r.category,
                 "description": r.description,
-                "inputs": r.inputs,
-                "outputs": r.outputs,
+                "output_types": sorted(
+                    {str(item) for item in r.outputs if isinstance(item, str)}
+                ),
                 "match_reason": r.match_reason,
                 "origin": r.origin,
                 "python_module": r.python_module,
@@ -4592,6 +5295,8 @@ async def node_library_search(request: NodeLibrarySearchRequest, ctx: Context) -
             "results": formatted_results,
             "total_results": len(formatted_results),
             "truncated": truncated,
+            "compact": True,
+            "schema_details_tool": "node_library_get_details",
             "catalog": await client.catalog_status(),
         }
         
