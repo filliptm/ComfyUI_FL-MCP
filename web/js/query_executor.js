@@ -519,7 +519,7 @@ export class QueryExecutor {
         // We'll use several heuristics to determine if an input is required:
         
         // 1. Check if the input type ends with "?" (optional marker)
-        if (input.type && input.type.endsWith('?')) {
+        if (typeof input.type === 'string' && input.type.endsWith('?')) {
             return false;
         }
         

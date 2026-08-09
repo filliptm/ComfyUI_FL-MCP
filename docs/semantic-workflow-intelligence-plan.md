@@ -86,7 +86,7 @@ compiler should not return a full catalog dump or invite repeated schema guesses
 
 ## Implemented validation snapshot
 
-- 612 Python tests and 185 JavaScript tests pass.
+- 617 Python tests and 196 JavaScript tests pass.
 - A saved 1,701-class local catalog produces 1,980 bounded profiles with zero
   derivation issues in about 0.55 seconds.
 - Direct `IMAGE` to `IMAGE` remains a zero-node route.

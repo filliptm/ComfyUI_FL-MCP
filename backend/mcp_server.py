@@ -198,6 +198,14 @@ class MCPWebSocketClient:
         self.session_id = session_id
         self.ws_url = ws_url
         self.client_id = client_id or os.getenv("FL_MCP_CLIENT_ID") or f"mcp-{os.getpid()}"
+        workflow_id = os.getenv("FL_MCP_WORKFLOW_ID", "").strip()
+        self.workflow = None
+        if workflow_id:
+            self.workflow = {
+                "id": workflow_id,
+                "name": os.getenv("FL_MCP_WORKFLOW_NAME", "").strip() or "Workflow",
+                "path": os.getenv("FL_MCP_WORKFLOW_PATH", "").strip() or None,
+            }
         self.ws = None
         self.pending_requests = {}  # request_id -> (Future, connection generation)
         self.connected = False
@@ -312,14 +320,17 @@ class MCPWebSocketClient:
         logger.info(f"[MCP-WS] Executing tool: {tool_name} (request_id: {request_id})")
         
         try:
-            await websocket.send(json.dumps({
+            message = {
                 'type': 'tool_request',
                 'session_id': self.session_id,
                 'request_id': request_id,
                 'tool_name': tool_name,
                 'parameters': parameters,
                 'timeout_ms': timeout_ms,
-            }))
+            }
+            if self.workflow:
+                message['workflow'] = self.workflow
+            await websocket.send(json.dumps(message))
             
             timeout_seconds = timeout_ms / 1000.0
             result = await asyncio.wait_for(future, timeout=timeout_seconds)

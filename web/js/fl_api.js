@@ -2586,6 +2586,38 @@ export class FL_API {
         };
     }
 
+    getActiveWorkflowContext() {
+        const workflowStore = this._unwrap(app.extensionManager?.workflow);
+        const workflow = this._unwrap(workflowStore?.activeWorkflow);
+        if (!workflow) return null;
+
+        const workflowId = this._workflowId(workflow) || app.rootGraph?.id;
+        if (!workflowId) return null;
+
+        return {
+            id: String(workflowId),
+            name: workflow.name || workflow.filename || workflow.fullFilename || workflow.key || "Untitled Workflow",
+            path: workflow.path || null,
+            temporary: Boolean(workflow.isTemporary)
+        };
+    }
+
+    async activateWorkflowContext(workflowId) {
+        const workflowStore = this._unwrap(app.extensionManager?.workflow);
+        const openWorkflows = this._unwrap(workflowStore?.openWorkflows) || [];
+        const workflow = Array.from(openWorkflows).find(item => (
+            String(this._serializeWorkflowTab(item)?.id || "") === String(workflowId)
+        ));
+        if (!workflow) {
+            throw new Error("The conversation's workflow is not open");
+        }
+        if (typeof workflowStore?.openWorkflow !== "function") {
+            throw new Error("ComfyUI workflow switching is unavailable");
+        }
+        await workflowStore.openWorkflow(workflow);
+        return this.getActiveWorkflowContext();
+    }
+
     async listWorkflowFiles() {
         if (api.listUserDataFullInfo) {
             return {
@@ -3165,12 +3197,27 @@ export class FL_API {
         }
 
         return {
-            id: workflow.id || workflow.key || null,
+            id: this._workflowId(workflow),
             name: workflow.name || workflow.path || workflow.filename || "Untitled",
             path: workflow.path || null,
             filename: workflow.filename || null,
             is_modified: Boolean(workflow.isModified || workflow.modified || workflow.dirty)
         };
+    }
+
+    _workflowId(workflow) {
+        const activeState = this._unwrap(workflow?.activeState) || {};
+        if (activeState.id) return String(activeState.id);
+        if (typeof workflow?.content === "string") {
+            try {
+                const contentId = JSON.parse(workflow.content)?.id;
+                if (contentId) return String(contentId);
+            } catch (_) {
+                // Fall back to the tab identity while malformed content is loading.
+            }
+        }
+        const fallback = workflow?.id || workflow?.key || workflow?.path;
+        return fallback ? String(fallback) : null;
     }
 
     _normalizeWorkflowPath(path) {

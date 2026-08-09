@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any, Literal
 
 import httpx
@@ -196,10 +197,30 @@ async def refresh_codex_status() -> dict[str, Any]:
 async def list_conversations(
     limit: int = 100,
     view: Literal["active", "archived"] = "active",
+    workflow_id: str | None = Query(default=None),
 ) -> dict[str, Any]:
     return {
-        "conversations": chat_store.list_conversations(limit, view),
+        "conversations": chat_store.list_conversations(limit, view, workflow_id),
         "view": view,
+    }
+
+
+def _workflow_context(value: Any) -> dict[str, str | None] | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("workflow must be an object.")
+    workflow_id = str(value.get("id") or "").replace("\r", " ").replace("\n", " ").replace("`", "'").strip()
+    if not workflow_id:
+        raise ValueError("workflow.id is required.")
+    if len(workflow_id) > 200:
+        raise ValueError("workflow.id is too long.")
+    workflow_name = str(value.get("name") or "").replace("\r", " ").replace("\n", " ").replace("`", "'").strip()
+    workflow_path = str(value.get("path") or "").replace("\r", " ").replace("\n", " ").replace("`", "'").strip()
+    return {
+        "id": workflow_id,
+        "path": workflow_path[:1000] or None,
+        "name": workflow_name[:200] or "Workflow",
     }
 
 
@@ -207,10 +228,17 @@ async def list_conversations(
 async def create_conversation(request: Request) -> JSONResponse:
     data = await request.json()
     settings = chat_settings.load()
+    try:
+        workflow = _workflow_context(data.get("workflow"))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     conversation = chat_store.create_conversation(
         title=str(data.get("title") or "New chat")[:120],
         provider=settings["provider"],
         model=settings["model"],
+        workflow_id=workflow["id"] if workflow else None,
+        workflow_path=workflow["path"] if workflow else None,
+        workflow_name=workflow["name"] if workflow else None,
     )
     return JSONResponse({"conversation": conversation}, status_code=201)
 
@@ -262,18 +290,32 @@ async def select_message_version(
 @router.patch("/conversations/{conversation_id}")
 async def update_conversation(conversation_id: str, request: Request) -> dict[str, Any]:
     data = await request.json()
-    allowed = {"title", "archived"}
+    allowed = {"title", "archived", "workflow"}
     unknown = set(data) - allowed
     if unknown:
         raise HTTPException(
             status_code=400,
             detail=f"Unsupported updates: {', '.join(sorted(unknown))}",
         )
-    conversation = chat_store.update_conversation(
-        conversation_id,
-        title=str(data["title"])[:120] if "title" in data else None,
-        archived=bool(data["archived"]) if "archived" in data else None,
-    )
+    try:
+        workflow = _workflow_context(data.get("workflow")) if "workflow" in data else None
+        if workflow:
+            conversation = chat_store.bind_conversation(
+                conversation_id,
+                workflow["id"],
+                workflow["path"],
+                workflow["name"],
+            )
+        else:
+            conversation = chat_store.get_conversation(conversation_id)
+        if conversation and ({"title", "archived"} & set(data)):
+            conversation = chat_store.update_conversation(
+                conversation_id,
+                title=str(data["title"])[:120] if "title" in data else None,
+                archived=bool(data["archived"]) if "archived" in data else None,
+            )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     if not conversation:
         raise HTTPException(status_code=404, detail="Conversation not found.")
     return {"conversation": conversation}
@@ -308,12 +350,14 @@ def _run_request_values(data: dict[str, Any]) -> dict[str, Any]:
     ).strip().lower()
     if search_mode not in SEARCH_MODES:
         raise ValueError(f"Unsupported web search mode: {search_mode}")
+    workflow = _workflow_context(data.get("workflow"))
     return {
         "session_id": session_id,
         "message": str(data.get("message") or ""),
         "reasoning_effort": reasoning_effort,
         "search_mode": search_mode,
         "attachments": data.get("attachments"),
+        "workflow": workflow,
     }
 
 
@@ -385,8 +429,13 @@ async def attach_run(run_id: str) -> StreamingResponse:
 
 
 @router.post("/runs/{run_id}/cancel")
-async def cancel_run(run_id: str) -> dict[str, bool]:
-    if not await chat_runtime.cancel(run_id):
+async def cancel_run(run_id: str, request: Request) -> dict[str, bool]:
+    body = await request.body()
+    data = json.loads(body) if body else {}
+    reason = str(data.get("reason") or "stopped")
+    if reason not in {"stopped", "workflow_switched"}:
+        raise HTTPException(status_code=400, detail="Unsupported cancellation reason.")
+    if not await chat_runtime.cancel(run_id, reason=reason):
         raise HTTPException(status_code=404, detail="Active run not found.")
     return {"cancelled": True}
 

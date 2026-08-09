@@ -90,13 +90,13 @@ test("chat shell has compact two-row chrome and full-panel sheets", async () => 
 });
 
 
-test("settings use defined cards with live state and collapsed diagnostics", async () => {
+test("settings use a compact single-open accordion with live state", async () => {
     const panel = await readFile(new URL("web/js/chat_panel.js", root), "utf8");
     const styles = await readFile(new URL("web/js/style.css", root), "utf8");
 
     assert.match(panel, /<h2 id="fl-settings-title">Settings<\/h2>/);
     assert.match(panel, /fl-settings-card-model/);
-    assert.match(panel, /Model &amp; provider/);
+    assert.match(panel, /<h3 id="fl-settings-model-title">Connection<\/h3>/);
     assert.match(panel, /fl-settings-card-search/);
     assert.match(panel, /Free · no cost/);
     assert.match(panel, /data-settings-state="search"/);
@@ -104,7 +104,8 @@ test("settings use defined cards with live state and collapsed diagnostics", asy
     assert.match(panel, /data-setting="show_action_buttons"/);
     assert.match(panel, /data-setting="tavily_credential"/);
     assert.match(panel, /fl-settings-card-approvals/);
-    assert.match(panel, /Tool approvals/);
+    assert.match(panel, /<h3 id="fl-settings-approvals-title">Permissions<\/h3>/);
+    assert.match(panel, /<div class="fl-settings-group-label">Advanced<\/div>/);
     assert.match(panel, /fl-settings-card-bridge/);
     assert.match(panel, /Bridge &amp; safety/);
     assert.match(panel, /data-bridge-setting="ws_port"/);
@@ -116,22 +117,29 @@ test("settings use defined cards with live state and collapsed diagnostics", asy
     assert.match(panel, /pendingRestartFields/);
     assert.match(
         panel,
-        /<details class="fl-settings-card fl-settings-disclosure fl-settings-card-diagnostics"/,
+        /<details class="fl-settings-card fl-settings-disclosure fl-settings-card-model"[^>]*\sopen>/,
     );
-    assert.doesNotMatch(
-        panel,
-        /<details class="fl-settings-card fl-settings-disclosure fl-settings-card-diagnostics"[^>]*\sopen/,
+    assert.equal(
+        panel.match(/<details class="fl-settings-card fl-settings-disclosure/g)?.length,
+        5,
     );
+    assert.equal(panel.match(/data-settings-section="[^"]+" open/g)?.length, 1);
     assert.match(panel, /data-settings-state="model"/);
     assert.match(panel, /data-settings-state="approvals"/);
     assert.match(panel, /data-settings-state="diagnostics"/);
-    assert.match(panel, /target instanceof HTMLDetailsElement/);
-    assert.match(panel, /target\.open = true/);
+    assert.match(panel, /this\.settingsDisclosures/);
+    assert.match(panel, /openSettingsSection\(section\)/);
+    assert.match(panel, /handleSettingsDisclosureToggle\(disclosure\)/);
+    assert.match(panel, /data-section="model"/);
     assert.match(panel, /updateModelSettingsState/);
     assert.match(panel, /updateDiagnosticsSettingsState/);
-    assert.match(styles, /\.fl-settings-content\s*\{[^}]*gap:\s*10px/s);
-    assert.match(styles, /\.fl-settings-card\s*\{[^}]*border-radius:\s*10px/s);
+    assert.match(styles, /\.fl-settings-content\s*\{[^}]*gap:\s*6px/s);
+    assert.match(styles, /\.fl-settings-card\s*\{[^}]*border-radius:\s*9px[^}]*box-shadow:\s*none/s);
+    assert.match(styles, /\.fl-settings-card-header\s*\{[^}]*min-height:\s*48px/s);
+    assert.match(styles, /\.fl-settings-state::before\s*\{[^}]*border-radius:\s*50%/s);
     assert.match(styles, /\.fl-bridge-settings-grid\s*\{[^}]*display:\s*grid/s);
+    assert.match(styles, /\.fl-bridge-settings-group\s*\{[^}]*border-top:\s*1px solid var\(--ren-border\)/s);
+    assert.match(styles, /\.fl-mcp-metric\s*\{[^}]*grid-template-columns:\s*72px minmax\(0, 1fr\)/s);
     assert.match(styles, /\.fl-settings-disclosure > summary\s*\{[^}]*list-style:\s*none/s);
     assert.match(
         styles,
@@ -348,7 +356,24 @@ test("composer can steer an active response and exposes real stop progress", asy
     assert.match(styles, /\.fl-inline-action:disabled/);
     assert.match(
         styles,
-        /\.fl-chat-layout \.fl-chat-input:focus-visible\s*\{[^}]*outline:\s*0;[^}]*box-shadow:\s*inset 0 0 0 1px #b888ee/s,
+        /\.fl-chat-input-container:focus-within\s*\{[^}]*border-color:\s*rgba\(184, 136, 238, 0\.82\);[^}]*box-shadow:[^}]*0 0 16px rgba\(153, 102, 217, 0\.14\)/s,
+    );
+});
+
+
+test("composer defaults to three lines with a rounded focused shell", async () => {
+    const panel = await readFile(new URL("web/js/chat_panel.js", root), "utf8");
+    const styles = await readFile(new URL("web/js/style.css", root), "utf8");
+
+    assert.match(panel, /class="fl-chat-input" rows="3"/);
+    assert.match(
+        styles,
+        /\.fl-chat-input-container\s*\{[^}]*margin:\s*0 10px 14px;[^}]*border-radius:\s*12px;/s,
+    );
+    assert.match(styles, /\.fl-chat-input\s*\{[^}]*min-height:\s*76px;[^}]*padding:\s*7px 4px 12px 10px;/s);
+    assert.match(
+        styles,
+        /\.fl-chat-layout \.fl-chat-input:focus-visible\s*\{[^}]*outline:\s*0;[^}]*box-shadow:\s*none;/s,
     );
 });
 

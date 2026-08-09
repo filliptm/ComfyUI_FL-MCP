@@ -53,6 +53,73 @@ def test_conversation_list_rejects_unknown_view(tmp_path):
         raise AssertionError("Unknown conversation view should be rejected")
 
 
+def test_conversations_are_scoped_to_workflows_without_reassigning_history(tmp_path):
+    store = ChatStore(tmp_path / "chat.db", tmp_path / "missing.db")
+    first = store.create_conversation(
+        workflow_id="workflow-a",
+        workflow_path="workflows/a.json",
+        workflow_name="A",
+    )
+    second = store.create_conversation(
+        workflow_id="workflow-b",
+        workflow_path="workflows/b.json",
+        workflow_name="B",
+    )
+    legacy = store.create_conversation()
+
+    assert [item["id"] for item in store.list_conversations(workflow_id="workflow-a")] == [
+        first["id"]
+    ]
+    assert store.get_conversation(second["id"])["workflow"] == {
+        "id": "workflow-b",
+        "path": "workflows/b.json",
+        "name": "B",
+    }
+    assert store.get_conversation(legacy["id"])["workflow"] is None
+
+    attached = store.bind_conversation(
+        legacy["id"],
+        "workflow-a",
+        "workflows/a.json",
+        "A",
+    )
+    assert attached["workflow"]["id"] == "workflow-a"
+
+    try:
+        store.bind_conversation(legacy["id"], "workflow-b")
+    except ValueError as exc:
+        assert "different workflow" in str(exc)
+    else:
+        raise AssertionError("A bound conversation must not be reassigned")
+
+
+def test_existing_conversation_database_adds_workflow_columns(tmp_path):
+    database = tmp_path / "chat.db"
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            """
+            CREATE TABLE conversations (
+                id TEXT PRIMARY KEY, title TEXT NOT NULL, provider TEXT,
+                model TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                archived_at TEXT, active_leaf_message_id TEXT
+            )
+            """
+        )
+        connection.execute(
+            "INSERT INTO conversations VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            ("legacy", "Legacy", None, None, "now", "now", None, None),
+        )
+
+    store = ChatStore(database, tmp_path / "missing.db")
+
+    assert store.get_conversation("legacy")["workflow"] is None
+    columns = {
+        row[1]
+        for row in sqlite3.connect(database).execute("PRAGMA table_info(conversations)")
+    }
+    assert {"workflow_id", "workflow_path", "workflow_name"} <= columns
+
+
 def test_message_pages_return_newest_branch_items_with_stable_cursor(tmp_path):
     store = ChatStore(tmp_path / "chat.db", tmp_path / "missing.db")
     conversation = store.create_conversation()
