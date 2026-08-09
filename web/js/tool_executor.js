@@ -13,11 +13,101 @@ import {
     applyWorkflowPlanAtomic,
     WORKFLOW_APPLICATION_PROPERTY,
 } from "./workflow_plan_apply.js";
+import {
+    applyWorkflowRefinementAtomic,
+    WORKFLOW_REFINEMENT_PROPERTY,
+} from "./workflow_refinement_apply.js";
+import {
+    applyWorkflowGraphPatchAtomic,
+    WORKFLOW_GRAPH_PATCH_PROPERTY,
+} from "./workflow_graph_patch_apply.js";
+import {
+    buildGraphPatchSchemaContexts,
+    enrichGraphPatchNode,
+} from "./node_schema_contract.js";
 
 const WORKFLOW_REVEAL_DELAYS_MS = Object.freeze({
     node: 500,
     connection: 500,
 });
+
+const CANVAS_MUTATION_TOOL_NAMES = new Set([
+    "frontend_execute_command",
+    "create_node",
+    "create_nodes_batch",
+    "apply_workflow_plan",
+    "apply_workflow_refinement",
+    "apply_workflow_graph_patch",
+    "remove_nodes",
+    "bypass_nodes",
+    "unbypass_nodes",
+    "pin_nodes",
+    "unpin_nodes",
+    "place_chat_image_in_node",
+    "edit_node_mask",
+    "confirm_mask_review",
+    "set_node_values",
+    "connect_nodes",
+    "connect_nodes_batch",
+    "auto_connect_workflow",
+    "set_node_rect",
+    "modify_layout",
+    "position_node_left",
+    "position_node_right",
+    "position_node_top",
+    "position_node_bottom",
+    "move_node_right",
+    "move_node_bottom",
+    "queue_workflow",
+    "enable_auto_queue",
+    "disable_auto_queue",
+    "set_batch_count",
+    "workflow_load_json",
+    "workflow_save_current",
+    "workflow_rename_file",
+    "workflow_delete_file",
+    "workflow_close_current",
+    "workflow_duplicate_current",
+]);
+
+let canvasMutationActive = false;
+
+const TOOL_CONTRACT_REVISION = Symbol("flMcpToolContractRevision");
+
+
+function withToolContractRevision(handler, revision) {
+    Object.defineProperty(handler, TOOL_CONTRACT_REVISION, {
+        value: revision,
+        enumerable: false,
+        configurable: false,
+        writable: false,
+    });
+    return handler;
+}
+
+
+function toolContractRevision(handler) {
+    return handler?.[TOOL_CONTRACT_REVISION] ?? 1;
+}
+
+
+/** Own the one frontend canvas mutation slot or fail before any delayed work is queued. */
+async function withCanvasMutationLock(operation) {
+    if (canvasMutationActive) {
+        const error = new Error(
+            "Another canvas mutation is already active; retry after it finishes.",
+        );
+        error.code = "canvas_mutation_busy";
+        error.details = { retryable: true };
+        throw error;
+    }
+    canvasMutationActive = true;
+    try {
+        return await operation();
+    } finally {
+        canvasMutationActive = false;
+    }
+}
 
 /**
  * ToolExecutor class - Executes tools and manages execution history
@@ -42,11 +132,34 @@ export class ToolExecutor {
     }
 
     /**
+     * Return the exact handler manifest implemented by this runtime instance.
+     */
+    getSupportedTools() {
+        return Object.keys(this.toolHandlers).sort();
+    }
+
+    /**
+     * Return per-handler wire contract revisions from the same registered map.
+     * A revision changes when an existing tool name gains execution semantics
+     * that an older browser runtime cannot safely provide.
+     */
+    getToolContractRevisions() {
+        return Object.fromEntries(
+            Object.keys(this.toolHandlers)
+                .sort()
+                .map(toolName => [
+                    toolName,
+                    toolContractRevision(this.toolHandlers[toolName]),
+                ]),
+        );
+    }
+
+    /**
      * Register all tool handlers
      * @private
      */
     _registerHandlers() {
-        return {
+        const handlers = {
             // Query & Analysis
             "query_workflow": this._handleQueryWorkflow.bind(this),
             "workflow_overview": this._handleWorkflowOverview.bind(this),
@@ -60,6 +173,11 @@ export class ToolExecutor {
             "create_node": this._handleCreateNode.bind(this),
             "create_nodes_batch": this._handleCreateNodesBatch.bind(this),
             "apply_workflow_plan": this._handleApplyWorkflowPlan.bind(this),
+            "apply_workflow_refinement": this._handleApplyWorkflowRefinement.bind(this),
+            "apply_workflow_graph_patch": withToolContractRevision(
+                this._handleApplyWorkflowGraphPatch.bind(this),
+                2,
+            ),
             "remove_nodes": this._handleRemoveNodes.bind(this),
             "bypass_nodes": this._handleBypassNodes.bind(this),
             "unbypass_nodes": this._handleUnbypassNodes.bind(this),
@@ -125,6 +243,24 @@ export class ToolExecutor {
             "generate_int": this._handleGenerateInt.bind(this),
             "random_choice": this._handleRandomChoice.bind(this)
         };
+        for (const toolName of CANVAS_MUTATION_TOOL_NAMES) {
+            // Refinement owns the shared lock inside its public handler so direct
+            // calls and registered calls follow the same path without nesting.
+            if (["apply_workflow_refinement", "apply_workflow_graph_patch"].includes(toolName)) {
+                continue;
+            }
+            const handler = handlers[toolName];
+            if (handler) {
+                const wrappedHandler = params => withCanvasMutationLock(
+                    () => handler(params),
+                );
+                handlers[toolName] = withToolContractRevision(
+                    wrappedHandler,
+                    toolContractRevision(handler),
+                );
+            }
+        }
+        return handlers;
     }
 
     /**
@@ -191,6 +327,9 @@ export class ToolExecutor {
             
         } catch (error) {
             const executionTime = performance.now() - startTime;
+            const errorCode = typeof error?.code === "string"
+                ? error.code
+                : "tool_execution_failed";
             
             console.error(`[ToolExecutor] ❌ ERROR in ${tool_name}:`, error);
             
@@ -201,6 +340,8 @@ export class ToolExecutor {
                 parameters,
                 success: false,
                 error: error.message,
+                error_code: errorCode,
+                ...(error?.details ? { error_details: error.details } : {}),
                 execution_time_ms: executionTime
             });
             
@@ -211,6 +352,8 @@ export class ToolExecutor {
                 request_id: request_id,
                 success: false,
                 error: error.message,
+                error_code: errorCode,
+                ...(error?.details ? { error_details: error.details } : {}),
                 execution_time_ms: executionTime
             });
             
@@ -447,6 +590,258 @@ export class ToolExecutor {
             return await applyWorkflowPlanAtomic(params, adapter);
         } finally {
             this.flApi.restoreAutoQueue(autoQueueState);
+        }
+    }
+
+    async _handleApplyWorkflowRefinement(params) {
+        return await withCanvasMutationLock(
+            () => this._applyWorkflowRefinementSerialized(params),
+        );
+    }
+
+    async _handleApplyWorkflowGraphPatch(params) {
+        return await withCanvasMutationLock(
+            () => this._applyWorkflowGraphPatchSerialized(params),
+        );
+    }
+
+    async _applyWorkflowGraphPatchSerialized(params) {
+        const expectedWorkflowIdentity = params?.plan?.expected_workflow_identity;
+        const workflowPin = this.flApi.pinActiveWorkflow(expectedWorkflowIdentity);
+        const plan = params?.plan || {};
+        const nodeTypes = new Set([
+            ...(plan.assertions?.nodes || []).map(item => item.node_type),
+            ...(plan.create_nodes || []).map(item => item.node_type),
+            ...(plan.update_nodes || []).map(item => item.node_type),
+            ...(plan.remove_nodes || []).map(item => item.node_type),
+        ]);
+        const catalog = await this.flApi.getNodeDefinitions([...nodeTypes]);
+        this.flApi.assertActiveWorkflow(workflowPin);
+        const schemaContexts = await buildGraphPatchSchemaContexts(
+            plan,
+            catalog,
+            params?.schema_contracts,
+        );
+        this.flApi.assertActiveWorkflow(workflowPin);
+        const createdContextsById = new Map();
+        const contextForId = nodeId => (
+            createdContextsById.get(String(nodeId))
+            || schemaContexts.get(`existing:${String(nodeId)}`)
+            || null
+        );
+        const autoQueueState = this.flApi.pauseAutoQueue();
+        let changeTransaction = null;
+        let result;
+        let operationError = null;
+        try {
+            changeTransaction = this.flApi.beginWorkflowChangeTransaction(workflowPin);
+            const mutationGuard = await this.flApi.createWorkflowMutationGuard(workflowPin);
+            const readGuarded = async operation => {
+                await this.flApi.assertWorkflowMutationGuard(mutationGuard);
+                const result = await operation();
+                await this.flApi.assertWorkflowMutationGuard(mutationGuard);
+                return result;
+            };
+            const mutationGuarded = async operation => {
+                await this.flApi.assertWorkflowMutationGuard(mutationGuard);
+                const result = await operation();
+                await this.flApi.acceptWorkflowMutationGuard(mutationGuard);
+                return result;
+            };
+            const adapter = {
+                withReadGuard: operation => readGuarded(operation),
+                captureWorkflow: () => readGuarded(
+                    () => this.flApi.captureWorkflowSnapshot(workflowPin),
+                ),
+                restoreWorkflow: async snapshot => {
+                    const restored = await this.flApi.restoreWorkflowSnapshot(
+                        snapshot,
+                        workflowPin,
+                    );
+                    await this.flApi.acceptWorkflowMutationGuard(mutationGuard);
+                    return restored;
+                },
+                getNode: nodeId => readGuarded(() => {
+                    const observed = this.flApi.getWorkflowNode(nodeId, workflowPin);
+                    return enrichGraphPatchNode(observed, contextForId(nodeId));
+                }),
+                listConnections: () => readGuarded(
+                    () => this.flApi.listWorkflowConnections(workflowPin),
+                ),
+                createNode: plannedNode => mutationGuarded(() => {
+                    const created = this.flApi.create(plannedNode.node_type, {}, null);
+                    const context = schemaContexts.get(`new:${plannedNode.alias}`);
+                    if (!context) {
+                        throw new Error(`No schema context exists for ${plannedNode.alias}.`);
+                    }
+                    createdContextsById.set(String(created.id), context);
+                    return created;
+                }),
+                setNodeValuesExact: (nodeId, values) => mutationGuarded(
+                    () => this.flApi.setValuesExact(nodeId, values),
+                ),
+                setNodeMetadata: (nodeId, metadata) => mutationGuarded(
+                    () => this.flApi.setNodeProperty(
+                        nodeId,
+                        WORKFLOW_GRAPH_PATCH_PROPERTY,
+                        metadata,
+                    ),
+                ),
+                setNodeLayoutExact: (nodeId, layout) => mutationGuarded(
+                    () => this.flApi.setRect(nodeId, layout),
+                ),
+                assignAttachmentExact: (nodeId, attachment) => mutationGuarded(
+                    () => this.flApi.assignAttachmentExact(nodeId, attachment),
+                ),
+                verifyAttachmentExact: (nodeId, attachment) => readGuarded(
+                    () => this.flApi.verifyAttachmentExact(nodeId, attachment),
+                ),
+                convertWidgetToInput: (nodeId, expected) => mutationGuarded(
+                    () => this.flApi.convertWidgetToInputExact(nodeId, expected),
+                ),
+                disconnectConnection: edge => mutationGuarded(
+                    () => this.flApi.disconnectWorkflowConnection(edge, workflowPin),
+                ),
+                connectNodes: (sourceId, targetId, connection) => mutationGuarded(
+                    () => this.flApi.connectWorkflowNodesExact(
+                        sourceId,
+                        targetId,
+                        connection,
+                        workflowPin,
+                    ),
+                ),
+                removeNodes: nodeIds => mutationGuarded(() => this.flApi.remove(nodeIds)),
+                setWorkflowExtra: (key, value) => mutationGuarded(
+                    () => this.flApi.setWorkflowExtra(key, value, workflowPin),
+                ),
+                afterMutationStep: async step => {
+                    await this.flApi.assertWorkflowMutationGuard(mutationGuard);
+                    await new Promise(resolve => setTimeout(
+                        resolve,
+                        Number.isInteger(step?.delay_ms) ? step.delay_ms : 160,
+                    ));
+                    await this.flApi.assertWorkflowMutationGuard(mutationGuard);
+                },
+            };
+            result = await applyWorkflowGraphPatchAtomic(params, adapter);
+        } catch (error) {
+            operationError = error;
+        }
+
+        const cleanupWarnings = [];
+        if (changeTransaction) {
+            try {
+                await this.flApi.endWorkflowChangeTransaction(changeTransaction);
+            } catch (error) {
+                cleanupWarnings.push({
+                    phase: "end_workflow_change_transaction",
+                    message: String(error?.message || error),
+                });
+            }
+        }
+        try {
+            await this.flApi.restoreAutoQueue(autoQueueState);
+        } catch (error) {
+            cleanupWarnings.push({
+                phase: "restore_auto_queue",
+                message: String(error?.message || error),
+            });
+        }
+
+        if (operationError) {
+            if (cleanupWarnings.length > 0 && operationError && typeof operationError === "object") {
+                operationError.cleanup_warnings = cleanupWarnings;
+            }
+            throw operationError;
+        }
+        if (cleanupWarnings.length > 0 && result && typeof result === "object") {
+            return { ...result, cleanup_warnings: cleanupWarnings };
+        }
+        return result;
+    }
+
+    async _applyWorkflowRefinementSerialized(params) {
+        const expectedWorkflowIdentity = params?.plan?.expected_workflow_identity;
+        const workflowPin = this.flApi.pinActiveWorkflow(expectedWorkflowIdentity);
+        const autoQueueState = this.flApi.pauseAutoQueue();
+        let changeTransaction = null;
+        try {
+            changeTransaction = this.flApi.beginWorkflowChangeTransaction(workflowPin);
+            const mutationGuard = await this.flApi.createWorkflowMutationGuard(workflowPin);
+            const readGuarded = async operation => {
+                await this.flApi.assertWorkflowMutationGuard(mutationGuard);
+                const result = await operation();
+                await this.flApi.assertWorkflowMutationGuard(mutationGuard);
+                return result;
+            };
+            const mutationGuarded = async operation => {
+                await this.flApi.assertWorkflowMutationGuard(mutationGuard);
+                const result = await operation();
+                await this.flApi.acceptWorkflowMutationGuard(mutationGuard);
+                return result;
+            };
+            const adapter = {
+                withReadGuard: operation => readGuarded(operation),
+                captureWorkflow: () => readGuarded(
+                    () => this.flApi.captureWorkflowSnapshot(workflowPin),
+                ),
+                restoreWorkflow: async snapshot => {
+                    const restored = await this.flApi.restoreWorkflowSnapshot(
+                        snapshot,
+                        workflowPin,
+                    );
+                    await this.flApi.acceptWorkflowMutationGuard(mutationGuard);
+                    return restored;
+                },
+                getNode: nodeId => this.flApi.getWorkflowNode(nodeId, workflowPin),
+                listConnections: () => this.flApi.listWorkflowConnections(workflowPin),
+                createNode: plannedNode => mutationGuarded(() => {
+                    const created = this.flApi.create(plannedNode.node_type, {}, null);
+                    if (Object.keys(plannedNode.values || {}).length > 0) {
+                        this.flApi.setValues(created.id, plannedNode.values);
+                    }
+                    return created;
+                }),
+                setNodeMetadata: (nodeId, metadata) => mutationGuarded(
+                    () => this.flApi.setNodeProperty(
+                        nodeId,
+                        WORKFLOW_REFINEMENT_PROPERTY,
+                        metadata,
+                    ),
+                ),
+                disconnectConnection: edge => mutationGuarded(
+                    () => this.flApi.disconnectWorkflowConnection(edge, workflowPin),
+                ),
+                connectNodes: (sourceId, targetId, connection) => mutationGuarded(
+                    () => this.flApi.connectWorkflowNodesExact(
+                        sourceId,
+                        targetId,
+                        connection,
+                        workflowPin,
+                    ),
+                ),
+                removeNodes: nodeIds => mutationGuarded(() => this.flApi.remove(nodeIds)),
+                setWorkflowExtra: (key, value) => mutationGuarded(
+                    () => this.flApi.setWorkflowExtra(key, value, workflowPin),
+                ),
+                afterMutationStep: async step => {
+                    await this.flApi.assertWorkflowMutationGuard(mutationGuard);
+                    await new Promise(resolve => setTimeout(
+                        resolve,
+                        WORKFLOW_REVEAL_DELAYS_MS[step?.phase] ?? 160,
+                    ));
+                    await this.flApi.assertWorkflowMutationGuard(mutationGuard);
+                },
+            };
+            return await applyWorkflowRefinementAtomic(params, adapter);
+        } finally {
+            try {
+                if (changeTransaction) {
+                    this.flApi.endWorkflowChangeTransaction(changeTransaction);
+                }
+            } finally {
+                this.flApi.restoreAutoQueue(autoQueueState);
+            }
         }
     }
 

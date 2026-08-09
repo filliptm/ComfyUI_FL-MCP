@@ -8,6 +8,91 @@
  * - Event-driven architecture for message handling
  */
 
+const CONNECTION_REPLACED_CLOSE_CODE = 4000;
+const CONNECTION_REPLACED_CLOSE_REASON = 'replaced by a newer connection';
+
+
+export function canonicalSupportedTools(toolNames) {
+    if (!Array.isArray(toolNames)) {
+        throw new TypeError('Supported tools must be an array');
+    }
+    const normalized = toolNames.map(toolName => {
+        if (typeof toolName !== 'string' || toolName.length === 0) {
+            throw new TypeError('Supported tool names must be non-empty strings');
+        }
+        return toolName;
+    });
+    return [...new Set(normalized)].sort();
+}
+
+
+export async function supportedToolsManifestHash(toolNames) {
+    const canonicalTools = canonicalSupportedTools(toolNames);
+    const subtle = globalThis.crypto?.subtle;
+    if (!subtle) {
+        throw new Error('Web Crypto is required to attest frontend tool capabilities');
+    }
+    const digest = await subtle.digest(
+        'SHA-256',
+        new TextEncoder().encode(JSON.stringify(canonicalTools)),
+    );
+    return Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, '0')).join('');
+}
+
+
+export function canonicalToolContractRevisions(toolNames, revisions = null) {
+    const supportedTools = canonicalSupportedTools(toolNames);
+    const supplied = revisions == null
+        ? Object.fromEntries(supportedTools.map(toolName => [toolName, 1]))
+        : revisions;
+    if (
+        supplied === null
+        || typeof supplied !== 'object'
+        || Array.isArray(supplied)
+    ) {
+        throw new TypeError('Tool contract revisions must be an object');
+    }
+    const revisionKeys = Object.keys(supplied).sort();
+    if (
+        revisionKeys.length !== supportedTools.length
+        || revisionKeys.some((toolName, index) => toolName !== supportedTools[index])
+    ) {
+        throw new TypeError('Tool contract revisions must exactly cover supported tools');
+    }
+    return Object.fromEntries(revisionKeys.map(toolName => {
+        const revision = supplied[toolName];
+        if (!Number.isInteger(revision) || revision < 1) {
+            throw new TypeError(
+                `Tool contract revision for ${toolName} must be a positive integer`,
+            );
+        }
+        return [toolName, revision];
+    }));
+}
+
+
+export async function toolContractManifestHash(toolNames, revisions = null) {
+    const canonicalRevisions = canonicalToolContractRevisions(toolNames, revisions);
+    const subtle = globalThis.crypto?.subtle;
+    if (!subtle) {
+        throw new Error('Web Crypto is required to attest frontend tool contracts');
+    }
+    const digest = await subtle.digest(
+        'SHA-256',
+        new TextEncoder().encode(JSON.stringify(canonicalRevisions)),
+    );
+    return Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, '0')).join('');
+}
+
+
+function isConnectionReplacementClose(event) {
+    return (
+        event?.code === CONNECTION_REPLACED_CLOSE_CODE
+        && event?.reason === CONNECTION_REPLACED_CLOSE_REASON
+    );
+}
+
+
 /**
  * Simple EventEmitter implementation
  */
@@ -49,6 +134,10 @@ class WSClient extends EventEmitter {
             maxReconnectDelay: config.maxReconnectDelay || 30000, // 30 seconds
             clientVersion: config.clientVersion || '1.0.0',
             clientId: config.clientId || 'browser',
+            supportedTools: null,
+            toolManifestHash: null,
+            toolContractRevisions: null,
+            toolContractManifestHash: null,
         };
         
         // State
@@ -69,6 +158,33 @@ class WSClient extends EventEmitter {
         
         console.log('[FL-MCP WS] Initialized with session:', this.sessionId);
         console.log('[FL-MCP WS] WebSocket URL:', this.config.url);
+    }
+
+    /**
+     * Pin the exact browser handler manifest advertised on every handshake.
+     * This must be called from the instantiated ToolExecutor before connect().
+     */
+    async setSupportedTools(toolNames, revisions = null) {
+        const supportedTools = canonicalSupportedTools(toolNames);
+        const toolManifestHash = await supportedToolsManifestHash(supportedTools);
+        const toolContractRevisions = canonicalToolContractRevisions(
+            supportedTools,
+            revisions,
+        );
+        const toolContractHash = await toolContractManifestHash(
+            supportedTools,
+            toolContractRevisions,
+        );
+        this.config.supportedTools = Object.freeze(supportedTools);
+        this.config.toolManifestHash = toolManifestHash;
+        this.config.toolContractRevisions = Object.freeze(toolContractRevisions);
+        this.config.toolContractManifestHash = toolContractHash;
+        return {
+            supported_tools: [...supportedTools],
+            tool_manifest_hash: toolManifestHash,
+            tool_contract_revisions: {...toolContractRevisions},
+            tool_contract_manifest_hash: toolContractHash,
+        };
     }
 
     /**
@@ -129,6 +245,12 @@ class WSClient extends EventEmitter {
             client_version: this.config.clientVersion,
             connection_type: 'frontend',
             client_id: this.config.clientId,
+            ...(this.config.supportedTools ? {
+                supported_tools: [...this.config.supportedTools],
+                tool_manifest_hash: this.config.toolManifestHash,
+                tool_contract_revisions: {...this.config.toolContractRevisions},
+                tool_contract_manifest_hash: this.config.toolContractManifestHash,
+            } : {}),
         };
         
         console.log('[FL-MCP WS] Sending handshake:', handshake);
@@ -146,8 +268,18 @@ class WSClient extends EventEmitter {
         this.handshakeComplete = false;
         
         this.emit('disconnected', event);
-        
-        // Attempt reconnection if not a clean close
+
+        // A newer browser bridge now owns this session. Reconnecting this
+        // displaced client would evict the winner and make both tabs fight in
+        // a permanent one-second replacement loop.
+        if (isConnectionReplacementClose(event)) {
+            console.info(
+                '[FL-MCP WS] A newer browser connection owns this session; staying disconnected'
+            );
+            return;
+        }
+
+        // Attempt reconnection for genuine failures, but not clean closes.
         if (event.code !== 1000) {
             this.scheduleReconnect();
         }

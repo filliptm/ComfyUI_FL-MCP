@@ -6,10 +6,12 @@ import hashlib
 import json
 import re
 from collections.abc import Mapping
+from html import unescape
 from typing import Any, Literal
 
 from node_library import classify_node_origin, node_schema_hash
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from workflow_schema_capabilities import normalize_node_schema
 
 WORKFLOW_SPEC_RESOLUTION_SCHEMA = "fl-mcp.workflow-spec-resolution.v1"
 _ALIAS_PATTERN = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
@@ -19,6 +21,24 @@ _DYNAMIC_INPUT_TYPES = {
     "COMFY_AUTOGROW_V3",
     "COMFY_DYNAMICCOMBO_V3",
     "COMFY_DYNAMICSLOT_V3",
+}
+_GENERIC_IDENTITY_TERMS = {
+    "a",
+    "an",
+    "and",
+    "for",
+    "from",
+    "image",
+    "input",
+    "node",
+    "of",
+    "output",
+    "the",
+    "to",
+    "use",
+    "using",
+    "video",
+    "with",
 }
 NodeOrigin = Literal["native", "custom", "partner", "unknown"]
 
@@ -37,7 +57,7 @@ class WorkflowCapabilitySpec(BaseModel):
     capability: str = Field(
         ...,
         min_length=1,
-        max_length=200,
+        max_length=1_000,
         description="Concise functional terms, for example 'load image' or 'upscale image'.",
     )
     requested_node_type: str | None = Field(
@@ -84,6 +104,19 @@ class WorkflowCapabilitySpec(BaseModel):
         description="Maximum ranked local candidates returned for this role.",
     )
 
+    @field_validator(
+        "preferred_node_types",
+        "required_input_types",
+        "required_output_types",
+        "allowed_origins",
+        mode="before",
+    )
+    @classmethod
+    def canonicalize_set_fields(cls, value: Any) -> Any:
+        if isinstance(value, list) and all(isinstance(item, str) for item in value):
+            return sorted(set(value), key=lambda item: (item.casefold(), item))
+        return value
+
     @model_validator(mode="after")
     def validate_contract(self) -> WorkflowCapabilitySpec:
         if not _ALIAS_PATTERN.fullmatch(self.alias):
@@ -91,6 +124,9 @@ class WorkflowCapabilitySpec(BaseModel):
                 "alias must start with a lowercase letter and contain only lowercase "
                 "letters, digits, and underscores"
             )
+        # Pydantic does not run before-validators for omitted defaults. Apply the
+        # same canonical ordering after defaults are populated so an omitted
+        # allowed_origins set hashes exactly like its explicit equivalent.
         for field_name in (
             "preferred_node_types",
             "required_input_types",
@@ -98,8 +134,11 @@ class WorkflowCapabilitySpec(BaseModel):
             "allowed_origins",
         ):
             values = getattr(self, field_name)
-            if len(values) != len(set(values)):
-                raise ValueError(f"{field_name} must not contain duplicates")
+            setattr(
+                self,
+                field_name,
+                sorted(set(values), key=lambda value: (value.casefold(), value)),
+            )
         return self
 
 
@@ -166,66 +205,88 @@ def _normalized_text(value: Any) -> str:
     return " ".join(_words(value))
 
 
+def _longest_contiguous_identity_phrase(
+    capability_words: list[str],
+    identity_words: list[str],
+) -> tuple[str, ...]:
+    """Return the longest exact ordered identity phrase present in the intent."""
+
+    if len(capability_words) < 2 or len(identity_words) < 2:
+        return ()
+    capability = tuple(capability_words)
+    maximum = min(len(capability), len(identity_words))
+    for length in range(maximum, 1, -1):
+        capability_phrases = {
+            capability[index : index + length]
+            for index in range(len(capability) - length + 1)
+        }
+        for index in range(len(identity_words) - length + 1):
+            phrase = tuple(identity_words[index : index + length])
+            if phrase in capability_phrases and any(
+                word not in _GENERIC_IDENTITY_TERMS
+                and (len(word) >= 3 or any(character.isdigit() for character in word))
+                for word in phrase
+            ):
+                return phrase
+    return ()
+
+
 def _term_matches(token: str, field_word: str) -> bool:
     if token == field_word:
         return True
     common = 0
-    for left, right in zip(token, field_word):
+    for left, right in zip(token, field_word, strict=False):
         if left != right:
             break
         common += 1
     return common >= 5
 
 
-def _input_types(node_info: Mapping[str, Any]) -> set[str]:
-    """Collect exact connectable input types, including nested v3 dynamic schemas."""
+def _schema_types(
+    node_type: str,
+    node_info: Mapping[str, Any],
+) -> tuple[set[str], set[str], dict[str, Any]]:
+    """Return normalized socket types and classified schema evidence."""
 
-    found: set[str] = set()
-    visited: set[int] = set()
-
-    def visit_spec(value: Any) -> None:
-        if not isinstance(value, (list, tuple)) or not value:
-            return
-        if isinstance(value[0], str):
-            input_type = value[0]
-            if input_type not in _DYNAMIC_INPUT_TYPES:
-                found.add(input_type)
-        if len(value) > 1:
-            visit_metadata(value[1])
-
-    def visit_metadata(value: Any) -> None:
-        if isinstance(value, (dict, list, tuple)):
-            identity = id(value)
-            if identity in visited:
-                return
-            visited.add(identity)
-        if isinstance(value, Mapping):
-            for key, nested in value.items():
-                if key in {"required", "optional"} and isinstance(nested, Mapping):
-                    for spec in nested.values():
-                        visit_spec(spec)
-                else:
-                    visit_metadata(nested)
-            return
-        if isinstance(value, (list, tuple)):
-            for nested in value:
-                visit_metadata(nested)
-
-    inputs = node_info.get("input")
-    if isinstance(inputs, Mapping):
-        for group in ("required", "optional"):
-            specs = inputs.get(group)
-            if isinstance(specs, Mapping):
-                for spec in specs.values():
-                    visit_spec(spec)
-    return found
+    capabilities = normalize_node_schema(node_type, node_info)
+    input_types = {
+        value
+        for item in capabilities.inputs
+        if item.connectable or item.kind == "matchtype"
+        for value in item.accepted_types
+    }
+    output_types = {
+        value
+        for item in capabilities.outputs
+        for value in item.produced_types
+    }
+    return input_types, output_types, capabilities.classification.as_dict()
 
 
-def _output_types(node_info: Mapping[str, Any]) -> set[str]:
-    outputs = node_info.get("output")
-    if not isinstance(outputs, (list, tuple)):
-        return set()
-    return {str(item) for item in outputs if isinstance(item, str)}
+def _signature_input_types(
+    node_type: str,
+    node_info: Mapping[str, Any],
+) -> set[str]:
+    """Return every input type the graph-patch executor can supply.
+
+    Normal capability ranking intentionally reports only sockets and MATCHTYPE
+    declarations.  A signature-only fallback must additionally account for
+    primitive widgets that GraphPatch can convert to sockets (for example
+    ``CreateVideo.fps``).  Keeping this evidence private avoids changing the
+    established candidate result contract.
+    """
+
+    capabilities = normalize_node_schema(node_type, node_info)
+    return {
+        value
+        for item in capabilities.inputs
+        if item.connectable or item.kind == "matchtype" or item.widget_convertible
+        for value in item.accepted_types
+    }
+
+
+def _supports_required_types(required: list[str], available: set[str]) -> bool:
+    return all(value in available or "*" in available for value in required)
 
 
 def _search_fields(node_type: str, node_info: Mapping[str, Any]) -> list[tuple[str, str, int]]:
@@ -251,7 +312,8 @@ def _capability_score(
     capability: str,
 ) -> tuple[int, list[str]]:
     phrase = _normalized_text(capability)
-    tokens = list(dict.fromkeys(_words(capability)))
+    capability_words = _words(capability)
+    tokens = list(dict.fromkeys(capability_words))
     if not phrase or not tokens:
         return 0, []
 
@@ -286,6 +348,40 @@ def _capability_score(
         score += phrase_score
         reasons.append(reason)
 
+    # Ordered identity phrases distinguish semantic variants that share most of
+    # their vocabulary. For example, "Seedance 2.0 reference to video" is much
+    # stronger evidence for a Reference variant than the unrelated word "first"
+    # elsewhere in "first available reference input". Exact order is required;
+    # equal phrase evidence remains an explicit-choice tie below.
+    identity_phrase_matches: list[tuple[int, int, str, tuple[str, ...]]] = []
+    for field_index, (label, value, _weight) in enumerate(fields):
+        if label not in {"node type", "display name", "search alias"}:
+            continue
+        overlap = _longest_contiguous_identity_phrase(
+            capability_words,
+            value.split(),
+        )
+        if not overlap:
+            continue
+        qualifier_count = sum(
+            word not in _GENERIC_IDENTITY_TERMS
+            and (len(word) >= 3 or any(character.isdigit() for character in word))
+            for word in overlap
+        )
+        phrase_bonus = len(overlap) * 80 + qualifier_count * 120
+        identity_phrase_matches.append(
+            (phrase_bonus, -field_index, label, overlap)
+        )
+    if identity_phrase_matches:
+        phrase_bonus, _, label, overlap = max(
+            identity_phrase_matches,
+            key=lambda item: item[:2],
+        )
+        score += phrase_bonus
+        reasons.append(
+            f"contiguous {label} phrase: " + " ".join(overlap)
+        )
+
     token_score = 0
     matched_tokens: list[str] = []
     for token in tokens:
@@ -299,7 +395,12 @@ def _capability_score(
     required_token_matches = (
         1 if len(tokens) == 1 else 2 if len(tokens) == 2 else (len(tokens) + 1) // 2
     )
-    if len(matched_tokens) < required_token_matches and not phrase_matches:
+    if (
+        len(matched_tokens) < required_token_matches
+        and not phrase_matches
+        and not identity_matches
+        and not identity_phrase_matches
+    ):
         return 0, []
     if matched_tokens:
         score += token_score
@@ -313,10 +414,20 @@ def _origin_bonus(origin: str) -> int:
     return {"native": 60, "custom": 40, "partner": 20, "unknown": 0}.get(origin, 0)
 
 
+def _compact_description(value: Any, *, limit: int = 320) -> str:
+    """Keep resolver evidence useful without returning custom-node HTML manuals."""
+
+    plain = unescape(re.sub(r"<[^>]*>", " ", str(value or "")))
+    compact = " ".join(plain.split())
+    return compact if len(compact) <= limit else compact[: limit - 1].rstrip() + "…"
+
+
 def _candidate(
     spec: WorkflowCapabilitySpec,
     node_type: str,
     node_info: Mapping[str, Any],
+    *,
+    signature_only: bool = False,
 ) -> dict[str, Any] | None:
     origin = classify_node_origin(dict(node_info))
     if origin not in spec.allowed_origins:
@@ -324,18 +435,37 @@ def _candidate(
     if bool(node_info.get("deprecated")) and not spec.allow_deprecated:
         return None
 
-    input_types = _input_types(node_info)
-    output_types = _output_types(node_info)
-    if not set(spec.required_input_types).issubset(input_types):
+    input_types, output_types, compatibility = _schema_types(node_type, node_info)
+    eligible_input_types = (
+        _signature_input_types(node_type, node_info)
+        if signature_only
+        else input_types
+    )
+    if signature_only and ("*" in eligible_input_types or "*" in output_types):
+        # A graph-scoped MATCHTYPE wildcard is not an exact I/O signature.  It
+        # needs surrounding edge constraints and must never become a resolver
+        # shortcut for an otherwise unrelated semantic role.
         return None
-    if not set(spec.required_output_types).issubset(output_types):
+    if not _supports_required_types(spec.required_input_types, eligible_input_types):
+        return None
+    if not _supports_required_types(spec.required_output_types, output_types):
         return None
 
     text_score, reasons = _capability_score(node_type, node_info, spec.capability)
+    primary_identity_match = any(
+        reason in {
+            "capability explicitly names node type",
+            "capability explicitly names display name",
+        }
+        for reason in reasons
+    )
     explicitly_requested = node_type == spec.requested_node_type
     preferred = node_type in spec.preferred_node_types
-    if not explicitly_requested and not preferred and text_score <= 0:
+    if not explicitly_requested and not preferred and text_score <= 0 and not signature_only:
         return None
+
+    if signature_only and text_score <= 0:
+        reasons.append("exact I/O signature satisfies the role constraints")
 
     score = text_score + _origin_bonus(origin)
     if preferred:
@@ -350,7 +480,7 @@ def _candidate(
         "node_type": node_type,
         "display_name": str(node_info.get("display_name") or node_type),
         "category": str(node_info.get("category") or ""),
-        "description": str(node_info.get("description") or ""),
+        "description": _compact_description(node_info.get("description")),
         "origin": origin,
         "python_module": str(node_info.get("python_module") or ""),
         "api_node": bool(node_info.get("api_node")),
@@ -359,8 +489,11 @@ def _candidate(
         "input_types": sorted(input_types, key=lambda value: (value.casefold(), value)),
         "output_types": sorted(output_types, key=lambda value: (value.casefold(), value)),
         "schema_hash": node_schema_hash(node_type, dict(node_info)),
+        "schema_compatibility": compatibility,
         "score": score,
         "match_reasons": reasons,
+        "_primary_identity_match": primary_identity_match,
+        "_signature_only": signature_only and text_score <= 0,
     }
 
 
@@ -370,40 +503,102 @@ def _resolve_capability(
 ) -> tuple[dict[str, Any], list[dict[str, str]]]:
     issues: list[dict[str, str]] = []
     path = f"capabilities.{spec.alias}"
+    effective_spec = spec
 
     if spec.requested_node_type and spec.requested_node_type not in catalog:
-        issues.append(
-            _issue(
-                "requested_node_not_loaded",
-                f"{path}.requested_node_type",
-                f"Explicitly requested class {spec.requested_node_type!r} is not loaded; "
-                "no substitute was selected.",
+        requested_display = spec.requested_node_type.strip().casefold()
+        display_matches = [
+            node_type
+            for node_type, node_info in catalog.items()
+            if isinstance(node_info, Mapping)
+            and isinstance(node_info.get("display_name"), str)
+            and node_info["display_name"].strip().casefold() == requested_display
+        ]
+        display_matches.sort(key=lambda value: (value.casefold(), value))
+        if len(display_matches) == 1:
+            effective_spec = spec.model_copy(
+                update={"requested_node_type": display_matches[0]}
             )
-        )
-        return {
-            "alias": spec.alias,
-            "capability": spec.capability,
-            "selected": None,
-            "candidates": [],
-        }, issues
+        else:
+            code = (
+                "requested_node_display_ambiguous"
+                if display_matches
+                else "requested_node_not_loaded"
+            )
+            message = (
+                f"Explicit node identity {spec.requested_node_type!r} matches multiple "
+                "loaded display names; choose one exact class: "
+                + ", ".join(display_matches)
+                if display_matches
+                else f"Explicitly requested class or unique display name "
+                f"{spec.requested_node_type!r} is not loaded; no substitute was selected."
+            )
+            issues.append(
+                _issue(code, f"{path}.requested_node_type", message)
+            )
+            return {
+                "alias": spec.alias,
+                "capability": spec.capability,
+                "selected": None,
+                "candidates": [],
+            }, issues
 
     candidates: list[dict[str, Any]] = []
     for node_type in sorted(catalog, key=lambda value: (value.casefold(), value)):
         node_info = catalog[node_type]
         if not isinstance(node_info, Mapping):
             continue
-        resolved = _candidate(spec, node_type, node_info)
+        resolved = _candidate(effective_spec, node_type, node_info)
         if resolved is not None:
             candidates.append(resolved)
 
-    if spec.requested_node_type:
+    signature_fallback = False
+    if (
+        not candidates
+        and effective_spec.requested_node_type is None
+        and effective_spec.required_input_types
+        and effective_spec.required_output_types
+    ):
+        # Verbose intent can contain no stable name tokens even when its exact
+        # I/O contract identifies one locally loaded class.  Apply this only
+        # after origin/deprecation/type safety filters, and never choose among
+        # multiple signature-compatible classes.
+        for node_type in sorted(catalog, key=lambda value: (value.casefold(), value)):
+            node_info = catalog[node_type]
+            if not isinstance(node_info, Mapping):
+                continue
+            resolved = _candidate(
+                effective_spec,
+                node_type,
+                node_info,
+                signature_only=True,
+            )
+            if resolved is not None:
+                candidates.append(resolved)
+        signature_fallback = bool(candidates)
+
+    if effective_spec.requested_node_type:
         candidates = [
-            item for item in candidates if item["node_type"] == spec.requested_node_type
+            item
+            for item in candidates
+            if item["node_type"] == effective_spec.requested_node_type
         ]
 
+    def candidate_rank(item: Mapping[str, Any]) -> tuple[bool, int]:
+        # An exact node/display identity written into the capability is stronger
+        # than a merely preferred historical class. Explicit requested_node_type
+        # remains absolute because it filters the candidate set above.
+        return bool(item.get("_primary_identity_match")), int(item["score"])
+
     candidates.sort(
-        key=lambda item: (-item["score"], item["node_type"].casefold(), item["node_type"])
+        key=lambda item: (
+            -int(bool(item.get("_primary_identity_match"))),
+            -item["score"],
+            item["node_type"].casefold(),
+            item["node_type"],
+        )
     )
+    signature_candidate_count = len(candidates) if signature_fallback else 0
     candidates = candidates[: spec.max_candidates]
     selected = candidates[0] if candidates else None
 
@@ -417,18 +612,34 @@ def _resolve_capability(
         )
         issues.append(_issue(code, path, message))
     else:
-        tied = [item["node_type"] for item in candidates if item["score"] == selected["score"]]
-        if len(tied) > 1:
+        selected_rank = candidate_rank(selected)
+        tied = (
+            [item["node_type"] for item in candidates]
+            if signature_fallback and signature_candidate_count > 1
+            else [
+                item["node_type"]
+                for item in candidates
+                if candidate_rank(item) == selected_rank
+            ]
+        )
+        if len(tied) > 1 or (signature_fallback and signature_candidate_count > 1):
+            omitted = signature_candidate_count - len(tied)
+            suffix = f" (and {omitted} more)" if omitted > 0 else ""
             issues.append(
                 _issue(
-                    "lexical_tiebreak_applied",
+                    "ambiguous_local_candidate",
                     path,
-                    "Equivalent top scores were resolved by stable lexical class order: "
-                    + ", ".join(tied),
-                    severity="warning",
+                    "Multiple locally loaded classes are equally suitable. Choose one "
+                    "explicitly before compiling: " + ", ".join(tied) + suffix,
                 )
             )
-        if selected["origin"] == "partner":
+            selected = None
+        elif selected is not None and signature_fallback:
+            selected["match_reasons"].insert(
+                0,
+                "unique local class matching the exact I/O signature",
+            )
+        if selected is not None and selected["origin"] == "partner":
             issues.append(
                 _issue(
                     "partner_authentication_cost_privacy_review_required",
@@ -439,7 +650,7 @@ def _resolve_capability(
                     severity="warning",
                 )
             )
-        if selected["origin"] == "unknown":
+        if selected is not None and selected["origin"] == "unknown":
             issues.append(
                 _issue(
                     "unknown_loaded_node_origin",
@@ -449,7 +660,8 @@ def _resolve_capability(
                     severity="warning",
                 )
             )
-        if selected["experimental"]:
+
+        if selected is not None and selected["experimental"]:
             issues.append(
                 _issue(
                     "experimental_node_selected",
@@ -458,6 +670,24 @@ def _resolve_capability(
                     severity="warning",
                 )
             )
+        if (
+            selected is not None
+            and selected["schema_compatibility"]["status"] == "adapter_required"
+        ):
+            issues.append(
+                _issue(
+                    "schema_adapter_required",
+                    path,
+                    "The selected class uses a loaded schema feature that requires "
+                    "runtime graph adaptation. The compiler must materialize and "
+                    "verify that adapter before mutation.",
+                    severity="warning",
+                )
+            )
+
+    for candidate in candidates:
+        candidate.pop("_primary_identity_match", None)
+        candidate.pop("_signature_only", None)
 
     return {
         "alias": spec.alias,
@@ -505,6 +735,11 @@ def resolve_workflow_spec(
 
     return {
         "valid": valid,
+        "needs_choice": any(
+            item["code"]
+            in {"ambiguous_local_candidate", "requested_node_display_ambiguous"}
+            for item in issues
+        ),
         "resolution_schema": WORKFLOW_SPEC_RESOLUTION_SCHEMA,
         "resolution_hash": resolution_hash,
         "catalog": {
@@ -514,14 +749,15 @@ def resolve_workflow_spec(
         },
         "policy": {
             "selection_order": [
-                "explicit requested class",
+                "explicit requested class or unique exact display name",
+                "explicit node or display identity in capability",
                 "preferred existing or verified-pattern class",
                 "semantic capability score",
                 "native origin",
                 "custom origin",
                 "partner origin",
                 "unknown origin",
-                "lexical node-class tie-break",
+                "explicit user choice when top candidates remain tied",
             ],
             "registry_candidates_eligible": False,
             "local_catalog_only": True,

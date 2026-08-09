@@ -3,8 +3,12 @@ from types import SimpleNamespace
 import mcp_server
 import pytest
 from node_catalog_store import NodeCatalogStore
-from node_library import CompatibleNode, NodeCatalogSnapshot, NodeSearchResult
-from node_library import node_schema_hash
+from node_library import (
+    CompatibleNode,
+    NodeCatalogSnapshot,
+    NodeSearchResult,
+    node_schema_hash,
+)
 
 
 def fake_context(node_catalog_store=None):
@@ -84,6 +88,10 @@ async def test_mcp_search_preserves_provenance_and_exact_truncation(monkeypatch)
     assert [item["node_type"] for item in result["results"]] == ["Exact", "Second"]
     assert result["results"][0]["origin"] == "custom"
     assert result["results"][0]["python_module"] == "custom_nodes.example"
+    assert result["results"][0]["output_types"] == ["IMAGE"]
+    assert "inputs" not in result["results"][0]
+    assert result["compact"] is True
+    assert result["schema_details_tool"] == "node_library_get_details"
     assert result["catalog"]["catalog_hash"] == "a" * 64
 
 
@@ -172,6 +180,136 @@ def test_verified_connection_lessons_are_scoped_to_exact_node_schemas():
         assert source_lessons[0]["payload"]["direction"] == "downstream"
         assert target_lessons[0]["payload"]["direction"] == "upstream"
         assert target_lessons[0]["payload"]["target_input"] == "image"
+        assert source_lessons[0]["payload"]["source_schema_hash"] == (
+            node_schema_hash("Source", catalog["Source"])
+        )
+        assert target_lessons[0]["payload"]["target_schema_hash"] == (
+            node_schema_hash("Target", catalog["Target"])
+        )
+    finally:
+        store.close()
+
+
+def test_verified_graph_patch_lessons_include_existing_to_new_edges():
+    store = NodeCatalogStore(":memory:")
+    catalog = {
+        "Source": {
+            "python_module": "nodes",
+            "input": {"required": {}},
+            "output": ["FLOAT"],
+            "output_name": ["fps"],
+        },
+        "Target": {
+            "python_module": "custom_nodes.target",
+            "input": {"required": {"frame_rate": ["FLOAT", {"default": 8.0}]}},
+            "output": [],
+            "output_name": [],
+        },
+    }
+    try:
+        store.reconcile(catalog, source="object_info")
+        plan = {
+            "assertions": {
+                "nodes": [
+                    {
+                        "ref": {"node_id": 7},
+                        "node_type": "Source",
+                        "schema_hash": node_schema_hash("Source", catalog["Source"]),
+                    }
+                ]
+            },
+            "create_nodes": [
+                {
+                    "alias": "target",
+                    "node_type": "Target",
+                    "schema_hash": node_schema_hash("Target", catalog["Target"]),
+                }
+            ],
+            "add_edges": [
+                {
+                    "source": {
+                        "ref": {"node_id": 7},
+                        "output_index": 0,
+                        "output": "fps",
+                        "type": "FLOAT",
+                    },
+                    "target": {
+                        "ref": {"alias": "target"},
+                        "input_index": 0,
+                        "occurrence_index": 0,
+                        "socket_index": None,
+                        "input": "frame_rate",
+                        "type": "FLOAT",
+                        "mode": "convert_widget",
+                    },
+                }
+            ],
+        }
+
+        mcp_server._record_verified_graph_patch_lessons(
+            store,
+            plan=plan,
+            patch_hash="b" * 64,
+            application_id="verified-graph-patch-0001",
+        )
+
+        source = store.get_verified_lessons("Source")[0]["payload"]
+        target = store.get_verified_lessons("Target")[0]["payload"]
+        assert source["direction"] == "downstream"
+        assert target["direction"] == "upstream"
+        assert target["target_mode"] == "convert_widget"
+        assert target["target_input_index"] == 0
+        assert source["source_schema_hash"] == node_schema_hash(
+            "Source", catalog["Source"]
+        )
+        assert target["target_schema_hash"] == node_schema_hash(
+            "Target", catalog["Target"]
+        )
+    finally:
+        store.close()
+
+
+def test_active_verified_lessons_become_internal_capability_priors():
+    store = NodeCatalogStore(":memory:")
+    catalog = {
+        "Converter": {
+            "display_name": "Converter",
+            "input": {"required": {"source": ["IMAGE"]}},
+            "output": ["VIDEO"],
+            "output_name": ["video"],
+            "python_module": "custom_nodes.converter",
+        },
+        "SaveVideo": {
+            "display_name": "Save Video",
+            "input": {"required": {"video": ["VIDEO"]}},
+            "output": [],
+            "output_name": [],
+            "python_module": "nodes",
+            "output_node": True,
+        },
+    }
+    try:
+        store.reconcile(catalog, source="object_info")
+        schema_hash = node_schema_hash("Converter", catalog["Converter"])
+        save_hash = node_schema_hash("SaveVideo", catalog["SaveVideo"])
+        store.record_verified_lesson(
+            "Converter",
+            schema_hash,
+            "downstream:test",
+            {
+                "evidence": "atomic_graph_patch_application",
+                "source_node_type": "Converter",
+                "source_schema_hash": schema_hash,
+                "target_node_type": "SaveVideo",
+                "target_schema_hash": save_hash,
+            },
+        )
+
+        lessons = mcp_server._active_verified_capability_lessons(fake_context(store))
+        assert len(lessons) == 1
+        assert lessons[0].node_type == "Converter"
+        assert lessons[0].schema_hash == schema_hash
+        assert lessons[0].payload["evidence"] == "atomic_graph_patch_application"
     finally:
         store.close()
 
@@ -254,7 +392,8 @@ class FakePlannerClient:
             }
         }
 
-    async def catalog_snapshot(self):
+    async def catalog_snapshot(self, *, force_refresh=False):
+        self.force_refresh = force_refresh
         return NodeCatalogSnapshot(
             data=self.catalog,
             source=self.source,
@@ -280,6 +419,7 @@ async def test_mcp_plan_workflow_is_a_read_only_catalog_pinned_dry_run(monkeypat
     )
 
     assert result["valid"] is True
+    assert client.force_refresh is True
     assert result["catalog"]["catalog_hash"] == "c" * 64
     assert result["plan"]["nodes"][0]["schema_hash"]
 
@@ -305,6 +445,7 @@ async def test_mcp_resolves_semantic_roles_against_one_catalog_snapshot(monkeypa
     )
 
     assert result["valid"] is True
+    assert client.force_refresh is True
     assert result["selected_node_types"] == {"source": "Source"}
     assert result["catalog"]["catalog_hash"] == "c" * 64
     assert result["resolution_hash"]

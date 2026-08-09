@@ -1,9 +1,45 @@
 """Pydantic models for bridge messages and workflow query DSL."""
 
+import hashlib
+import json
+import re
 from datetime import datetime
-from typing import Any, Dict, List, Literal, Optional, Union
+from typing import Annotated, Any, Dict, List, Literal, Optional, Union
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StrictInt, StrictStr, model_validator
+
+_TOOL_NAME_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
+REQUIRED_FRONTEND_TOOL_CONTRACT_REVISIONS = {
+    "apply_workflow_graph_patch": 2,
+}
+ToolContractRevision = Annotated[StrictInt, Field(ge=1, le=2_147_483_647)]
+
+
+def canonical_tool_manifest_hash(supported_tools: List[str]) -> str:
+    """Hash the exact sorted frontend tool manifest shared with JavaScript."""
+
+    canonical = json.dumps(
+        supported_tools,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def canonical_tool_contract_manifest_hash(
+    tool_contract_revisions: Dict[str, int],
+) -> str:
+    """Hash the exact sorted per-tool implementation contract manifest."""
+
+    canonical = json.dumps(
+        {
+            name: tool_contract_revisions[name]
+            for name in sorted(tool_contract_revisions)
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
 
 
 class BaseMessage(BaseModel):
@@ -29,6 +65,95 @@ class Handshake(BaseMessage):
         max_length=128,
         description="Stable identity used to reconnect one client without replacing others.",
     )
+    supported_tools: Optional[List[StrictStr]] = Field(
+        None,
+        max_length=512,
+        description=(
+            "Exact lexicographically sorted frontend handler names. Browser clients "
+            "that omit this legacy-compatible field cannot receive tool requests."
+        ),
+    )
+    tool_manifest_hash: Optional[StrictStr] = Field(
+        None,
+        pattern=r"^[0-9a-f]{64}$",
+        description=(
+            "Optional SHA-256 of compact canonical JSON for supported_tools."
+        ),
+    )
+    tool_contract_revisions: Optional[Dict[StrictStr, ToolContractRevision]] = Field(
+        None,
+        max_length=512,
+        description=(
+            "Exact sorted frontend implementation-contract revision for every "
+            "advertised tool handler."
+        ),
+    )
+    tool_contract_manifest_hash: Optional[StrictStr] = Field(
+        None,
+        pattern=r"^[0-9a-f]{64}$",
+        description=(
+            "Optional SHA-256 of compact sorted-key JSON for tool_contract_revisions."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def validate_tool_manifest(self) -> "Handshake":
+        if self.supported_tools is None:
+            if self.tool_manifest_hash is not None:
+                raise ValueError("tool_manifest_hash requires supported_tools")
+            if self.tool_contract_revisions is not None:
+                raise ValueError("tool_contract_revisions requires supported_tools")
+            if self.tool_contract_manifest_hash is not None:
+                raise ValueError(
+                    "tool_contract_manifest_hash requires tool_contract_revisions"
+                )
+            return self
+
+        if self.connection_type == "mcp":
+            raise ValueError("tool manifests are only valid for frontend clients")
+
+        if any(_TOOL_NAME_RE.fullmatch(name) is None for name in self.supported_tools):
+            raise ValueError(
+                "supported_tools entries must be 1-128 character tool identifiers"
+            )
+        if self.supported_tools != sorted(set(self.supported_tools)):
+            raise ValueError("supported_tools must be unique and lexicographically sorted")
+
+        expected_hash = canonical_tool_manifest_hash(self.supported_tools)
+        if (
+            self.tool_manifest_hash is not None
+            and self.tool_manifest_hash != expected_hash
+        ):
+            raise ValueError("tool_manifest_hash does not match supported_tools")
+
+        if self.tool_contract_revisions is None:
+            if self.tool_contract_manifest_hash is not None:
+                raise ValueError(
+                    "tool_contract_manifest_hash requires tool_contract_revisions"
+                )
+            return self
+        revision_names = list(self.tool_contract_revisions)
+        if any(_TOOL_NAME_RE.fullmatch(name) is None for name in revision_names):
+            raise ValueError(
+                "tool_contract_revisions keys must be 1-128 character tool identifiers"
+            )
+        if revision_names != sorted(revision_names):
+            raise ValueError("tool_contract_revisions keys must be lexicographically sorted")
+        if revision_names != self.supported_tools:
+            raise ValueError(
+                "tool_contract_revisions must contain every supported tool exactly once"
+            )
+        expected_contract_hash = canonical_tool_contract_manifest_hash(
+            self.tool_contract_revisions
+        )
+        if (
+            self.tool_contract_manifest_hash is not None
+            and self.tool_contract_manifest_hash != expected_contract_hash
+        ):
+            raise ValueError(
+                "tool_contract_manifest_hash does not match tool_contract_revisions"
+            )
+        return self
 
 
 class ToolResult(BaseMessage):

@@ -233,6 +233,72 @@ def test_lesson_payload_is_bounded(tmp_path):
         store.close()
 
 
+def test_all_active_verified_lessons_are_schema_scoped_and_deterministic(tmp_path):
+    store = NodeCatalogStore(tmp_path / "catalog.sqlite3")
+    first = {
+        "Source": node_info(display_name="Source"),
+        "Target": node_info(display_name="Target"),
+    }
+    try:
+        store.reconcile(first, source="object_info")
+        source_hash = node_schema_hash("Source", first["Source"])
+        target_hash = node_schema_hash("Target", first["Target"])
+        store.record_verified_lesson(
+            "Target",
+            target_hash,
+            "upstream:z",
+            {
+                "evidence": "atomic_graph_patch_application",
+                "source_node_type": "Source",
+                "source_schema_hash": source_hash,
+                "target_node_type": "Target",
+                "target_schema_hash": target_hash,
+                "target_input": "image",
+            },
+        )
+        store.record_verified_lesson(
+            "Source",
+            source_hash,
+            "downstream:a",
+            {
+                "evidence": "atomic_graph_patch_application",
+                "source_node_type": "Source",
+                "source_schema_hash": source_hash,
+                "target_node_type": "Target",
+                "target_schema_hash": target_hash,
+                "source_output": "IMAGE",
+            },
+        )
+        store.record_verified_lesson(
+            "Source",
+            source_hash,
+            "malformed:ignored",
+            {
+                "evidence": "atomic_graph_patch_application",
+                "source_node_type": ["Source"],
+                "source_schema_hash": source_hash,
+                "target_node_type": "Target",
+                "target_schema_hash": target_hash,
+            },
+        )
+
+        lessons = store.get_all_active_verified_lessons()
+        assert [(item["node_type"], item["lesson_key"]) for item in lessons] == [
+            ("Source", "downstream:a"),
+            ("Target", "upstream:z"),
+        ]
+
+        changed = {
+            "Source": node_info(display_name="Source", input_type="LATENT"),
+            "Target": first["Target"],
+        }
+        store.reconcile(changed, source="object_info")
+        remaining = store.get_all_active_verified_lessons()
+        assert remaining == []
+    finally:
+        store.close()
+
+
 def test_store_is_safe_for_concurrent_readers_and_writers(tmp_path):
     store = NodeCatalogStore(tmp_path / "catalog.sqlite3", prefer_fts=False)
     catalog = {

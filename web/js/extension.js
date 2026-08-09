@@ -328,6 +328,10 @@ app.registerExtension({
                 clientVersion: `${config.version}-frontend`,
             });
             toolExecutor = new ToolExecutor(wsClient);
+            await wsClient.setSupportedTools(
+                toolExecutor.getSupportedTools(),
+                toolExecutor.getToolContractRevisions(),
+            );
             toolExecutor.flApi.restoreNestedImageReferences();
 
             wsClient.on("connected", () => assistantPanel?.updateConnection());

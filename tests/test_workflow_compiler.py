@@ -1,5 +1,12 @@
 from node_library import catalog_contract_hash
-from workflow_compiler import CompileWorkflowSpecRequest, compile_workflow_spec
+from workflow_compiler import (
+    CompileWorkflowSpecRequest,
+    WorkflowSpecNode,
+    _canonicalize_node_values,
+    _dynamic_selector_defaults,
+    _resolve_runtime_name,
+    compile_workflow_spec,
+)
 
 
 def _catalog():
@@ -166,6 +173,210 @@ def _request():
     )
 
 
+def test_dynamic_selector_is_inferred_from_requested_non_default_socket():
+    node_info = {
+        "input": {
+            "required": {
+                "model": [
+                    "COMFY_DYNAMICCOMBO_V3",
+                    {
+                        "options": [
+                            {
+                                "key": "image",
+                                "inputs": {
+                                    "required": {"quality": ["INT", {"default": 1}]}
+                                },
+                            },
+                            {
+                                "key": "video",
+                                "inputs": {
+                                    "required": {
+                                        "duration": ["INT", {"default": 5}],
+                                        "reference": ["VIDEO"],
+                                    }
+                                },
+                            },
+                        ]
+                    },
+                ]
+            }
+        }
+    }
+
+    assert _dynamic_selector_defaults(
+        node_info,
+        {"duration": 7},
+        {"reference"},
+    ) == {"model": "video"}
+
+
+def test_connected_convertible_widget_does_not_receive_its_schema_default():
+    node = WorkflowSpecNode(
+        alias="video_combine",
+        capability="combine video frames",
+        requested_node_type="VHS_VideoCombine",
+        values={"filename_prefix": "AnimateDiff"},
+    )
+    info = {
+        "input": {
+            "required": {
+                "images": ["IMAGE"],
+                "frame_rate": ["FLOAT", {"default": 8.0}],
+                "filename_prefix": ["STRING", {"default": "AnimateDiff"}],
+            }
+        }
+    }
+
+    values, _, issues = _canonicalize_node_values(
+        node,
+        info,
+        set(),
+        {"images", "frame_rate"},
+    )
+
+    assert issues == []
+    assert values == {"filename_prefix": "AnimateDiff"}
+
+
+def test_unique_semantic_widget_leaf_aliases_use_exact_loaded_names():
+    wavelet = WorkflowSpecNode(
+        alias="wavelet",
+        capability="wavelet color alignment",
+        requested_node_type="WaveletColorFix",
+        values={"alignment": "wavelet"},
+    )
+    wavelet_info = {
+        "input": {
+            "required": {
+                "target_image": ["IMAGE"],
+                "source_image": ["IMAGE"],
+                "align_method": [["wavelet", "adain"], {"default": "wavelet"}],
+            }
+        }
+    }
+
+    values, _, issues = _canonicalize_node_values(
+        wavelet,
+        wavelet_info,
+        set(),
+        {"target_image", "source_image"},
+    )
+
+    assert issues == []
+    assert values == {"align_method": "wavelet"}
+
+    seedance = WorkflowSpecNode(
+        alias="seedance",
+        capability="reference video",
+        requested_node_type="ReferenceVideo",
+        values={
+            "model": "Seedance 2.0",
+            "aspect_ratio": "16:9",
+        },
+    )
+    seedance_info = {
+        "input": {
+            "required": {
+                "model": [
+                    "COMFY_DYNAMICCOMBO_V3",
+                    {
+                        "options": [{
+                            "key": "Seedance 2.0",
+                            "inputs": {
+                                "required": {
+                                    "ratio": [
+                                        ["adaptive", "16:9"],
+                                        {"default": "adaptive"},
+                                    ]
+                                }
+                            },
+                        }]
+                    },
+                ]
+            }
+        }
+    }
+
+    values, _, issues = _canonicalize_node_values(
+        seedance,
+        seedance_info,
+        set(),
+        set(),
+    )
+
+    assert issues == []
+    assert values == {
+        "model": "Seedance 2.0",
+        "model.ratio": "16:9",
+    }
+
+
+def test_semantic_widget_aliases_keep_exact_precedence_and_ambiguity_closed():
+    exact_node = WorkflowSpecNode(
+        alias="exact",
+        capability="alignment utility",
+        requested_node_type="ExactAlignment",
+        values={"alignment": "wavelet"},
+    )
+    exact_info = {
+        "input": {
+            "required": {
+                "alignment": [["wavelet", "adain"], {"default": "wavelet"}],
+                "align_method": [["wavelet", "adain"], {"default": "adain"}],
+            }
+        }
+    }
+    values, _, issues = _canonicalize_node_values(
+        exact_node,
+        exact_info,
+        set(),
+        set(),
+    )
+    assert issues == []
+    assert values["alignment"] == "wavelet"
+    assert values["align_method"] == "adain"
+
+    ambiguous_node = exact_node.model_copy(
+        update={"alias": "ambiguous", "values": {"aligning": "wavelet"}}
+    )
+    ambiguous_info = {
+        "input": {
+            "required": {
+                "align_method": [["wavelet", "adain"], {"default": "wavelet"}],
+                "align_mode": [["wavelet", "adain"], {"default": "wavelet"}],
+            }
+        }
+    }
+    reversed_info = {
+        "input": {
+            "required": dict(reversed(ambiguous_info["input"]["required"].items()))
+        }
+    }
+
+    for info in (ambiguous_info, reversed_info):
+        values, _, issues = _canonicalize_node_values(
+            ambiguous_node,
+            info,
+            set(),
+            set(),
+        )
+        assert values == {
+            "align_method": "wavelet",
+            "align_mode": "wavelet",
+        }
+        assert [item["code"] for item in issues] == ["ambiguous_widget"]
+
+    resolved, issues = _resolve_runtime_name(
+        "aspect_ratio",
+        ["model.ratio", "output.ratio"],
+        path="nodes.generator.values.aspect_ratio",
+        kind="widget",
+        allow_semantic_widget_alias=True,
+    )
+    assert resolved is None
+    assert [item["code"] for item in issues] == ["ambiguous_widget"]
+
+
 def test_semantic_compiler_produces_one_exact_attachment_aware_partner_plan():
     catalog = _catalog()
     catalog_hash = catalog_contract_hash(catalog)
@@ -183,6 +394,10 @@ def test_semantic_compiler_produces_one_exact_attachment_aware_partner_plan():
 
     assert result["valid"] is True
     assert result["error_count"] == 0
+    assert any(
+        item["code"] == "partner_authentication_cost_privacy_review_required"
+        for item in result["issues"]
+    )
     assert result["selected_node_types"]["generate"] == "GeminiNanoBanana2V2"
     generator = next(node for node in result["plan"]["nodes"] if node["alias"] == "generate")
     assert generator["values"]["model.aspect_ratio"] == "16:9"

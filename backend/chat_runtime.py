@@ -156,42 +156,77 @@ CORE_CHAT_TOOLS = {
     "resolve_workflow_spec",
     "plan_workflow",
     "apply_workflow_plan",
+    "plan_workflow_refinement",
+    "apply_workflow_refinement",
+    "compile_workflow_refinement_spec",
+    "apply_workflow_graph_patch",
     "registry_search_packages",
     "registry_get_package",
     "mcp_capability_audit",
 }
 
-COMPILER_FIRST_REDUNDANT_TOOLS = {
-    "workflow_overview",
-    "workflow_get_current_json",
-    "find_node",
-    "get_current_node_selection",
-    "get_node_values",
-    "get_node_slots",
-    "create_nodes",
-    "set_node_values",
-    "connect_nodes_batch",
-    "get_layout",
-    "modify_layout",
-    "take_screenshot",
-    "place_chat_image_in_node",
-    "node_library_search",
-    "node_library_get_details",
-    "node_library_status",
-    "node_knowledge_search",
-    "resolve_workflow_spec",
-    "plan_workflow",
-    "mcp_capability_audit",
+REFINEMENT_COMPILER_TOOLS = {
+    "compile_workflow_refinement_spec",
+    "apply_workflow_graph_patch",
 }
+
+REFINEMENT_EXECUTION_TOOLS = {
+    "queue_workflow",
+    "wait",
+    "get_execution_history",
+    "view_output_image",
+    "get_queue_status",
+}
+
+REFINEMENT_MASK_TOOLS = {
+    "view_node_mask",
+    "edit_node_mask",
+    "confirm_mask_review",
+}
+
+
+def _graph_compiler_optional_tools(message: str) -> set[str]:
+    """Expose follow-up tools only when the same request explicitly needs them."""
+
+    raw = str(message or "")
+    visible = raw.split(
+        "\n\nThe user attached ComfyUI input image(s)",
+        1,
+    )[0].casefold().replace("’", "'").replace("‘", "'")
+    selected: set[str] = set()
+    execution_denied = bool(
+        re.search(
+            r"\b(?:do\s+not|don't|dont)\s+(?:run|queue|execute)\b"
+            r"|\bwithout\s+(?:running|queueing|executing)\b"
+            r"|\bnot\s+(?:run|queued?)\b",
+            visible,
+        )
+    )
+    execution_requested = bool(
+        re.search(
+            r"\b(?:run|queue|execute|render)\b"
+            r"|\b(?:review|inspect|validate)\b.{0,40}\b(?:output|result)\b",
+            visible,
+        )
+    ) and not execution_denied
+    if execution_requested:
+        selected.update(REFINEMENT_EXECUTION_TOOLS)
+    if "\n\nThe user attached ComfyUI input image(s)" in raw:
+        selected.add("view_chat_image")
+    if re.search(r"\b(?:mask|inpaint|paint|erase)\b", visible):
+        selected.update(REFINEMENT_MASK_TOOLS)
+        selected.add("view_chat_image")
+    return selected
 
 
 def compiler_first_workflow_requested(message: str) -> bool:
     """Detect bounded new-workflow requests that the one-pass compiler owns."""
 
-    visible = str(message or "").split(
+    raw_visible = str(message or "").split(
         "\n\nThe user attached ComfyUI input image(s)",
         1,
-    )[0].casefold()
+    )[0]
+    visible = raw_visible.casefold()
     build_action = re.search(
         r"\b(?:build|create|make|assemble|construct|prepare|set[ -]?up)\b",
         visible,
@@ -201,12 +236,154 @@ def compiler_first_workflow_requested(message: str) -> bool:
         r"save prefix|filename prefix)\b",
         visible,
     )
+    blank_canvas_signal = re.search(
+        r"\b(?:empty|blank|new)\s+canvas\b|\bfrom\s+scratch\b",
+        visible,
+    )
+    exact_class_tokens = set(
+        re.findall(r"\b[A-Z][A-Za-z0-9_]*[A-Z0-9_][A-Za-z0-9_]*\b", raw_visible)
+    )
+    explicit_connection_graph = bool(
+        len(exact_class_tokens) >= 2
+        and re.search(r"(?:->|→|\b(?:connect|into|to)\b)", visible)
+    )
     existing_edit_signal = re.search(
         r"\b(?:selected|existing|current|this node|these nodes|change|edit|update|"
         r"fix|replace|rewire|disconnect|remove)\b",
         visible,
     )
-    return bool(build_action and complete_graph_signal and not existing_edit_signal)
+    return bool(
+        build_action
+        and (complete_graph_signal or blank_canvas_signal or explicit_connection_graph)
+        and not existing_edit_signal
+    )
+
+
+def workflow_refinement_requested(message: str) -> bool:
+    """Detect requests that splice nodes into or out of an existing graph path."""
+
+    raw_visible = str(message or "").split(
+        "\n\nThe user attached ComfyUI input image(s)",
+        1,
+    )[0]
+    visible = raw_visible.casefold()
+    replacement = re.search(
+        r"\b(?:replace|swap|remove|delete)\b.{0,100}\b(?:node|step|branch|chain)\b",
+        visible,
+    )
+    insertion = re.search(
+        r"\b(?:insert|add|put|place)\b.{0,120}\b(?:between|before|after)\b",
+        visible,
+    ) or re.search(
+        r"\b(?:insert|add|put|place)\b.{0,120}\b(?:to|into)\s+"
+        r"(?:(?:this|the|my)\s+)?(?:(?:existing|current|selected)\s+)?"
+        r"(?:workflow|graph|branch|chain)\b",
+        visible,
+    )
+    rewiring = re.search(
+        r"\b(?:splice|rewire|reconnect|connect|disconnect)\b.{0,100}"
+        r"\b(?:node|step|branch|chain|graph|output|input|socket)\b",
+        visible,
+    )
+    direct_refinement = re.search(
+        r"\b(?:refine|expand|extend)\b.{0,120}"
+        r"\b(?:this|the|existing|current|selected)\s+"
+        r"(?:workflow|graph|branch|chain)\b",
+        visible,
+    )
+    exact_class_edit = False
+    class_edit = re.search(
+        r"\b(?:replace|swap|remove|delete)\s+"
+        r"([A-Za-z_][A-Za-z0-9_.-]{1,255})"
+        r"(?:\s+(?:with|for)\s+([A-Za-z_][A-Za-z0-9_.-]{1,255}))?\b",
+        raw_visible,
+        flags=re.IGNORECASE,
+    )
+    if class_edit:
+        identifiers = [value for value in class_edit.groups() if value]
+        exact_class_edit = all(
+            any(char.isupper() or char.isdigit() for char in value)
+            for value in identifiers
+        )
+    value_or_layout_edit = re.search(
+        r"\b(?:change|update|set|adjust|modify|move|resize|position)\b.{0,140}"
+        r"\b(?:selected|existing|current|this)\b.{0,100}"
+        r"\b(?:node|widget|input|value|seed|steps?|cfg|sampler|scheduler|position|size)\b",
+        visible,
+    )
+    attachment_edit = re.search(
+        r"\b(?:attach|assign|place|use)\b.{0,100}\b(?:image|photo|attachment)\b"
+        r".{0,100}\b(?:selected|existing|current|this)\b.{0,80}\bnode\b",
+        visible,
+    )
+    return bool(
+        replacement
+        or insertion
+        or rewiring
+        or direct_refinement
+        or exact_class_edit
+        or value_or_layout_edit
+        or attachment_edit
+    )
+
+
+def workflow_graph_change_requested(message: str) -> bool:
+    """Route ordinary canvas mutations through the one semantic GraphPatch pair.
+
+    This deliberately recognizes human requests rather than requiring the user
+    to say “workflow” or “refine”.  It remains bounded to canvas/node language
+    and excludes package-management requests so installing/updating a custom
+    node cannot be mistaken for editing the active graph.
+    """
+
+    raw_visible = str(message or "").split(
+        "\n\nThe user attached ComfyUI input image(s)",
+        1,
+    )[0]
+    visible = raw_visible.casefold().replace("’", "'").replace("‘", "'")
+    if re.search(
+        r"\b(?:install|download|uninstall|update)\b.{0,80}"
+        r"\b(?:custom\s+node|node\s+pack|manager|registry|repository|repo)\b",
+        visible,
+    ):
+        return False
+    if compiler_first_workflow_requested(raw_visible) or workflow_refinement_requested(raw_visible):
+        return True
+
+    class_tokens = set(
+        re.findall(r"\b[A-Z][A-Za-z0-9_]*[A-Z0-9_][A-Za-z0-9_]*\b", raw_visible)
+    )
+    mutation = re.search(
+        r"\b(?:add|append|build|create|make|assemble|construct|prepare|set[ -]?up|"
+        r"put|place|insert|use|give|extend|expand|remove|delete|replace|swap|"
+        r"change|update|set|adjust|modify|move|resize|connect|disconnect|rewire)\b",
+        visible,
+    )
+    graph_context = re.search(
+        r"\b(?:workflow|canvas|graph|pipeline|branch|chain|subgraph|node|nodes)\b",
+        visible,
+    )
+    relative_connection = re.search(
+        r"\b(?:after|before|between|into|onto|from|to)\b.{0,80}"
+        r"\b(?:output|input|node|workflow|graph|branch|chain)\b"
+        r"|\b(?:output|input|node|workflow|graph|branch|chain)\b.{0,80}"
+        r"\b(?:after|before|between|into|onto|from|to)\b",
+        visible,
+    )
+    workflow_feature = re.search(
+        r"\b(?:workflow|canvas|graph|pipeline)\b.{0,100}"
+        r"\b(?:upscal(?:e|er)|detail\s+pass|processor|step|node|branch|output)\b",
+        visible,
+    )
+    return bool(
+        mutation
+        and (
+            graph_context
+            or len(class_tokens) >= 2
+            or (len(class_tokens) >= 1 and relative_connection)
+            or workflow_feature
+        )
+    )
 
 
 def explicit_web_research_requested(message: str) -> bool:
@@ -337,11 +514,11 @@ def message_content_for_model(message: dict[str, Any]) -> str:
     attachment_context = (
         "The user attached ComfyUI input image(s) to this message. "
         "Call view_chat_image with a listed reference before making visual claims. "
-        "For a complete new workflow or subgraph, bind every listed reference in the "
-        "attachments field of compile_workflow_spec; its apply_request assigns the "
+        "Bind every listed reference in the attachments field of "
+        "compile_workflow_refinement_spec; its apply_request assigns the "
         "original full-resolution files atomically. Do not call "
         "place_chat_image_in_node after atomic application. Use that lower-level tool "
-        "only when assigning an image to an already-existing selected Load Image node.\n"
+        "only when the graph compiler returns a classified unsupported schema.\n"
         + "\n".join(references)
     )
     return f"{content}\n\n{attachment_context}" if content else attachment_context
@@ -742,14 +919,20 @@ async def wait_for_codex_mcp_status(
 
 def tools_for_message(message: str, search_mode: str = "off") -> set[str]:
     text = message.lower()
+    graph_change_requested = workflow_graph_change_requested(message)
     selected = set(CORE_CHAT_TOOLS)
-    if any(
+    debug_requested = any(
         word in text
         for word in (
             "error", "broken", "debug", "failed", "queue", "output", "result",
-            "image", "review", "validate", "distortion", "artifact",
+            "review", "validate", "distortion", "artifact",
         )
-    ):
+    )
+    # A refinement request commonly says which image output should feed a new
+    # node. That noun alone is not an execution-debug request, and enabling the
+    # full diagnostics group only adds irrelevant tool choices. Visual, mask,
+    # and attachment tools remain in CORE_CHAT_TOOLS.
+    if debug_requested or ("image" in text and not graph_change_requested):
         selected.update(INTENT_TOOL_GROUPS["debug"])
     if any(
         word in text
@@ -767,14 +950,16 @@ def tools_for_message(message: str, search_mode: str = "off") -> set[str]:
         selected.update(INTENT_TOOL_GROUPS["files"])
     if search_mode != "off":
         selected.update({"web_search", "web_fetch_page"})
-    if compiler_first_workflow_requested(message):
-        # Keep one deterministic route for complete new graphs. The compiler result
-        # already contains catalog, schema, attachment, plan, and partner-review
-        # evidence, while atomic application verifies the created subgraph.
-        selected.difference_update(COMPILER_FIRST_REDUNDANT_TOOLS)
+    if graph_change_requested:
+        # Empty-canvas builds and existing-graph edits use the same arbitrary-DAG
+        # compiler, schema guards, transaction, rollback, and two-call surface.
+        selected.intersection_update(REFINEMENT_COMPILER_TOOLS)
+        selected.update(_graph_compiler_optional_tools(message))
         if explicit_node_knowledge_requested(message):
             selected.add("node_knowledge_search")
-        if not explicit_web_research_requested(message):
+        if explicit_web_research_requested(message) and search_mode != "off":
+            selected.update({"web_search", "web_fetch_page"})
+        else:
             selected.difference_update({"web_search", "web_fetch_page"})
     return selected
 
@@ -831,32 +1016,54 @@ def registry_discovery_instructions() -> str:
         "`node_library_status` inspect only node types currently loaded by this "
         "ComfyUI instance through `/object_info`. Use them to prove a node can be "
         "created locally.\n"
-        "- `node_knowledge_search` queries Ren's lightweight persistent index of the "
-        "last valid local catalog and schema-scoped, canvas-verified connection lessons. "
-        "Use it for fast discovery or diagnostics, especially after node-pack changes. "
+        "- `node_knowledge_search` is a diagnostic view of Ren's lightweight persistent "
+        "local index. The workflow compiler already consumes active exact-schema verified "
+        "lessons internally as ranking priors, so do not call it before a normal build. "
         "Its results are never build authority: stale records must not enter a plan, and "
-        "the compiler always revalidates against live `/object_info`.\n"
-        "- For a complete new workflow or subgraph described in user language, call "
-        "`compile_workflow_spec` first. Include every requested role, value, connection, "
-        "chat attachment binding, and a stable application ID in that one request. It "
-        "resolves exact local classes, canonicalizes unique short names to dotted runtime "
-        "inputs, fills stable schema defaults, validates the complete graph, and returns a "
-        "ready `apply_request`. If valid, pass that request unchanged to "
-        "`apply_workflow_plan`; its verification is sufficient unless the result reports a "
-        "mismatch. Do not separately call catalog status, capability resolution, node "
-        "details, plan validation, attachment placement, value reads, slot reads, or whole-"
-        "workflow JSON for facts already returned by the compiler or atomic apply. Partner "
-        "review facts returned by the compiler are sufficient for a build-only request; do "
-        "not browse for authentication, cost, or privacy unless the user explicitly asks "
-        "for exact current pricing or policy text.\n"
-        "- Use the lower-level discovery path only when the compiler reports ambiguity or an "
-        "unsupported schema. Translate each requested role into concise capabilities plus "
+        "the compiler always revalidates every class, route and slot against live "
+        "`/object_info`.\n"
+        "- For both a complete new workflow and any edit of the current workflow, call "
+        "`compile_workflow_refinement_spec` first with the whole requested graph change "
+        "and a stable application ID. Include every requested local node role or exact "
+        "class, value, attachment, update/removal and desired edge; when editing, include "
+        "deterministic existing-node selectors. The compiler reads the current graph "
+        "(including an empty canvas) and refreshed native/custom/partner catalog itself, "
+        "resolves prior semantic aliases, titles, safe values and topology, infers dynamic "
+        "endpoints and stable defaults, and compiles arbitrary DAG changes with "
+        "fan-in, fan-out, multiple sinks and explicit widget-to-input conversion into one "
+        "canonical GraphPatch v2. Describe desired endpoints instead of guessing dotted "
+        "paths or bridge classes. The compiler prefers a direct compatible connection and "
+        "may infer only a unique bounded supported local converter route; partner/API/heavy/"
+        "output nodes require explicit user intent. If the user says exactly, only, or no "
+        "extra nodes, set `allow_inferred_converters=false`. If valid, pass its "
+        "`apply_request` "
+        "unchanged to "
+        "`apply_workflow_graph_patch`. Its exact verification "
+        "is sufficient unless the "
+        "result reports a mismatch. These are the normal two workflow-building calls. Do "
+        "not separately call workflow JSON, overview, catalog status, node search/details, "
+        "values, slots, layout, legacy compiler/planner, attachment placement, or low-level "
+        "create/connect/remove tools around them. If `needs_choice=true`, present the "
+        "ranked node, endpoint, or route candidates and wait; never accept an alphabetical "
+        "guess. Partner review "
+        "facts returned by the compiler are sufficient for a build-only request; do not "
+        "browse for authentication, cost, or privacy unless the user explicitly asks for "
+        "exact current pricing or policy text. GraphPatch pins workflow, graph, catalog and "
+        "schema facts, preserves unrelated state, verifies the exact final graph, restores "
+        "the full snapshot on failure, builds visibly in deterministic order, and never "
+        "queues. A validation error is a safety stop, not permission to bypass the atomic "
+        "route.\n"
+        "- If the compiler reports an unsupported schema, stop and report its classified "
+        "reason. Lower-level schema diagnostics are available only in a focused follow-up "
+        "request; do not bypass the failed atomic build in the current run. In that "
+        "follow-up, translate each requested role into concise capabilities plus "
         "required input/output types and call `resolve_workflow_spec` against the current "
         "catalog hash. If the "
         "user explicitly named an exact loaded class, pass it as `requested_node_type`; "
         "never silently substitute it. Pass classes already used by the graph or a verified "
         "local pattern as `preferred_node_types`. The resolver is local-only and applies "
-        "stable scoring, origin policy, and lexical tie-breaking; Registry packages are "
+        "stable scoring and origin policy; equal top candidates require an explicit "
+        "choice and Registry packages are "
         "never eligible. Correct resolution errors and review partner/auth/cost/privacy or "
         "unknown-origin warnings before proceeding. Inspect each selected exact schema, "
         "assign stable lowercase aliases, and "
@@ -864,12 +1071,6 @@ def registry_discovery_instructions() -> str:
         "compiler check, not a canvas edit. Do not create or connect nodes unless "
         "it returns `valid=true` and a plan hash. Correct every issue and re-plan; "
         "if it reports `catalog_changed`, refresh discovery first.\n"
-        "- For a valid plan that creates a new subgraph, call `apply_workflow_plan` "
-        "with the exact planned nodes, connections, catalog hash, and plan hash. Use "
-        "a fresh stable application ID for an intentional new copy, and reuse that ID "
-        "only when retrying the same application. Do not replace this atomic call with "
-        "separate create, value, and connection calls. It verifies the result, rolls "
-        "back every created node on failure, and never queues.\n"
         "- Treat the user's requested graph as the plan boundary. Never add local "
         "filenames, uploaded/chat images, prompts, models, utility nodes, output "
         "nodes, or extra connections merely to make a richer example. Use an exact "

@@ -35,7 +35,7 @@ flowchart LR
 
 ## Highlights
 
-- **120 MCP tools** for workflow inspection, graph editing, queue control, Manager v4, model discovery, filesystem inspection, custom node development, and diagnostics.
+- **128 MCP tools** for workflow inspection, graph editing, queue control, Manager v4, model discovery, filesystem inspection, custom node development, and diagnostics.
 - **Built-in MCP chat**, powered by Ren, with streaming responses, persistent conversation history, chronological tool activity, and approval cards.
 - **Bring your own model** through LM Studio, Ollama, OpenAI, OpenRouter, Anthropic, Claude Code, Codex, or a custom OpenAI-compatible endpoint.
 - **Use existing subscriptions** from Claude Code or Codex without copying OAuth credentials into FL-MCP.
@@ -147,6 +147,39 @@ Routine canvas edits can run without an extra prompt. Queueing, workflow deletio
 - ComfyUI's native Fit View accounts for the visible canvas beside the open chat panel.
 - Automatic node insertion uses real node bounds and graph extents to avoid stacking new nodes on top of existing nodes.
 
+### Deterministic workflow building
+
+Ren uses the same two-step graph compiler for a new workflow, a small edit, or a
+multi-branch refinement:
+
+1. `compile_workflow_refinement_spec` resolves the request against the active
+   native, partner, and custom-node catalog, the current canvas (which may be
+   empty), exact node schemas, dynamic inputs, attachments, stable defaults,
+   and active exact-schema verified connection lessons.
+2. `apply_workflow_graph_patch` refreshes and recompiles that canonical plan,
+   then applies it as one guarded transaction without queueing the workflow.
+
+The GraphPatch v2 plan describes edges directly, so it can create fan-in,
+fan-out, merges, multiple terminal outputs, retained-node updates, removals,
+and widget-to-input connections such as wiring a video's FPS into Video
+Combine. Before changing the canvas it checks workflow, graph, catalog, schema,
+slot, value, attachment, and cycle preconditions. Afterward it verifies the
+exact final graph while preserving unrelated workflow state. Any mismatch
+restores the complete original snapshot. Ambiguous node selection is returned
+to the user as a choice instead of being resolved alphabetically.
+
+The compiler resolves semantic endpoint intent to exact dynamic paths and
+prefers direct connections. If source and target types are incompatible, it may
+search a bounded capability hypergraph for a unique supported local converter.
+This is schema-driven for every loaded class rather than hardcoded to named
+nodes. Equal routes require a user choice; partner/API/heavy/output nodes are
+never inferred without explicit intent, and exact/no-extra requests disable
+inference entirely.
+
+Node creation and connections remain visibly sequential on the canvas. Small
+graphs retain the deliberate step-by-step feel, while larger patches use a
+bounded animation budget so visual pacing does not make complex builds slow.
+
 ### External MCP clients
 
 To use FL-MCP from another client:
@@ -243,7 +276,7 @@ these gates, save, and restart ComfyUI.
 
 ## Tool Inventory
 
-FL-MCP currently exposes **109 tools**.
+FL-MCP currently exposes **128 tools**.
 
 <details open>
 <summary><strong>Capability and Utility Tools</strong></summary>
@@ -278,7 +311,11 @@ These generally require the browser bridge.
 | `workflow_duplicate_current` | Duplicates the active workflow tab |
 | `find_node` | Finds a node by ID, type, or title |
 | `create_nodes` | Creates one or more nodes |
+| `compile_workflow_refinement_spec` | Compiles a semantic new build or existing-workflow edit into one exact catalog-, schema-, graph-, and workflow-pinned GraphPatch v2 |
+| `apply_workflow_graph_patch` | Atomically applies an arbitrary-DAG graph patch with deterministic visible pacing, exact verification, idempotency, full-snapshot rollback, and no queue action |
 | `apply_workflow_plan` | Atomically creates and connects a validated catalog-pinned plan with idempotency, verification, and rollback |
+| `plan_workflow_refinement` | Validates exact linear edits or a terminal append with retained-source side-input fan-in against the current graph and live node schemas |
+| `apply_workflow_refinement` | Atomically applies a graph refinement while preserving unrelated nodes, edges, and source fan-out, with full-snapshot rollback and no queue action |
 | `remove_nodes` | Removes nodes |
 | `bypass_nodes` | Bypasses nodes |
 | `unbypass_nodes` | Unbypasses nodes |
@@ -298,6 +335,10 @@ These generally require the browser bridge.
 | `modify_layout` | Applies manual layout or auto-layout |
 
 </details>
+
+New clients should use `compile_workflow_refinement_spec` followed by the returned
+unchanged `apply_workflow_graph_patch` request for both new builds and edits. The
+older plan/apply workflow and linear-refinement tools remain compatibility APIs.
 
 <details>
 <summary><strong>Workflow Files and Tabs</strong></summary>
@@ -391,10 +432,14 @@ or stale records are discovery aids and can never authorize a build.
 | `node_knowledge_search` | Searches the last-valid local index with exact origin/schema identity while labeling it discovery-only |
 | `node_library_get_details` | Reads detailed metadata for a node type |
 | `node_library_find_compatible` | Finds compatible node types for connections |
-| `compile_workflow_spec` | Resolves a complete semantic request, canonicalizes dynamic inputs, binds trusted chat images, fills stable defaults, and returns one ready-to-apply valid plan |
+| `compile_workflow_refinement_spec` | Resolves a semantic build or refinement against the active canvas and all locally loaded native, partner, and custom nodes, then returns one ready-to-apply GraphPatch v2 |
+| `apply_workflow_graph_patch` | Recompiles and atomically applies the exact arbitrary-DAG patch without queueing, preserving unrelated graph and workflow state |
+| `compile_workflow_spec` *(legacy compatibility)* | Resolves a complete semantic request, canonicalizes dynamic inputs, binds trusted chat images, fills stable defaults, and returns one ready-to-apply valid plan |
 | `resolve_workflow_spec` | Deterministically resolves semantic roles to exact locally loaded classes with catalog pinning and origin guardrails |
-| `plan_workflow` | Dry-runs a catalog-pinned workflow plan and validates exact node schemas, values, and connections |
-| `apply_workflow_plan` | Recompiles and atomically applies an exact valid plan without queueing |
+| `plan_workflow` *(legacy compatibility)* | Dry-runs a catalog-pinned workflow plan and validates exact node schemas, values, and connections |
+| `apply_workflow_plan` *(legacy compatibility)* | Recompiles and atomically applies an exact valid plan without queueing |
+| `plan_workflow_refinement` *(legacy compatibility)* | Plans a catalog- and graph-pinned linear edit or terminal append, including exact retained-source side inputs |
+| `apply_workflow_refinement` *(legacy compatibility)* | Applies the exact refinement transactionally with unrelated-graph preservation, rollback on failure, and no queue action |
 | `registry_search_packages` | Searches all published packages in the official Comfy Registry and returns Registry + GitHub links |
 | `registry_get_package` | Inspects one official Registry package, its published nodes, and its Registry + GitHub links |
 

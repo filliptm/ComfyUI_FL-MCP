@@ -781,3 +781,76 @@ class NodeCatalogStore:
                 }
                 for row in rows
             ]
+
+    def get_all_active_verified_lessons(self) -> list[dict[str, Any]]:
+        """Return every lesson whose exact node schema is still active.
+
+        The semantic workflow compiler uses this bounded collection only as a
+        ranking prior. Both endpoints recorded in a connection lesson must
+        still have their exact schemas loaded. The live catalog and GraphPatch
+        validation remain the authority for every node, value, and connection.
+        """
+
+        with self._lock:
+            active_hashes = {
+                row["node_type"]: row["schema_hash"]
+                for row in self._connection.execute(
+                    """
+                    SELECT node_type, schema_hash
+                    FROM catalog_nodes
+                    WHERE active = 1
+                    """
+                )
+            }
+            rows = list(
+                self._connection.execute(
+                    """
+                    SELECT lessons.node_type, lessons.lesson_key,
+                           lessons.payload_json, lessons.schema_hash,
+                           lessons.verified_at
+                    FROM verified_node_lessons AS lessons
+                    JOIN catalog_nodes AS nodes
+                      ON nodes.node_type = lessons.node_type
+                     AND nodes.schema_hash = lessons.schema_hash
+                     AND nodes.active = 1
+                    ORDER BY lessons.node_type COLLATE NOCASE,
+                             lessons.node_type,
+                             lessons.lesson_key COLLATE NOCASE,
+                             lessons.lesson_key
+                    """
+                )
+            )
+            result: list[dict[str, Any]] = []
+            for row in rows:
+                try:
+                    payload = json.loads(row["payload_json"])
+                except (TypeError, ValueError):
+                    continue
+                if not isinstance(payload, dict):
+                    continue
+                source_type = payload.get("source_node_type")
+                source_hash = payload.get("source_schema_hash")
+                target_type = payload.get("target_node_type")
+                target_hash = payload.get("target_schema_hash")
+                if (
+                    not isinstance(source_type, str)
+                    or not isinstance(target_type, str)
+                    or not isinstance(source_hash, str)
+                    or not isinstance(target_hash, str)
+                    or _HASH_PATTERN.fullmatch(source_hash) is None
+                    or _HASH_PATTERN.fullmatch(target_hash) is None
+                    or active_hashes.get(source_type) != source_hash
+                    or active_hashes.get(target_type) != target_hash
+                    or row["node_type"] not in {source_type, target_type}
+                ):
+                    continue
+                result.append(
+                    {
+                        "node_type": row["node_type"],
+                        "lesson_key": row["lesson_key"],
+                        "payload": payload,
+                        "schema_hash": row["schema_hash"],
+                        "verified_at": float(row["verified_at"]),
+                    }
+                )
+            return result

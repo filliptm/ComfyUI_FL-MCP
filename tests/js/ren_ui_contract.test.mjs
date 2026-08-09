@@ -19,6 +19,24 @@ test("sidebar keeps the stable Ren entry and reads live canvas context", async (
 });
 
 
+test("browser bridge advertises its instantiated ToolExecutor before connecting", async () => {
+    const extension = await readFile(new URL("web/js/extension.js", root), "utf8");
+    const executor = await readFile(new URL("web/js/tool_executor.js", root), "utf8");
+
+    assert.match(
+        extension,
+        /await wsClient\.setSupportedTools\([\s\S]*?toolExecutor\.getSupportedTools\(\),[\s\S]*?toolExecutor\.getToolContractRevisions\(\),[\s\S]*?\)/,
+    );
+    const manifestIndex = extension.indexOf("await wsClient.setSupportedTools");
+    assert.ok(manifestIndex >= 0);
+    assert.ok(manifestIndex < extension.indexOf("wsClient.connect()", manifestIndex));
+    assert.match(executor, /getSupportedTools\(\)\s*\{\s*return Object\.keys\(this\.toolHandlers\)\.sort\(\)/s);
+    assert.match(executor, /getToolContractRevisions\(\)/);
+    assert.match(executor, /"apply_workflow_graph_patch": withToolContractRevision\([\s\S]*?,\s*2,/);
+    assert.doesNotMatch(extension, /supportedTools:\s*\[/);
+});
+
+
 test("run identity remains available across CORS and provider startup", async () => {
     const client = await readFile(new URL("web/js/chat_client.js", root), "utf8");
     const runtime = await readFile(new URL("backend/chat_runtime.py", root), "utf8");
@@ -477,6 +495,21 @@ test("deterministic workflow planning has clear human tool activity", async () =
     assert.match(tools, /"node_knowledge_search"\s*:\s*\{/);
     assert.match(tools, /label:\s*"Node Knowledge"/);
     assert.match(tools, /node_knowledge_search:\s*"Searching local node knowledge"/);
+    assert.match(tools, /"plan_workflow_refinement"\s*:\s*\{/);
+    assert.match(tools, /label:\s*"Plan Refinement"/);
+    assert.match(tools, /plan_workflow_refinement:\s*"Planning workflow refinement"/);
+    assert.match(tools, /"apply_workflow_refinement"\s*:\s*\{/);
+    assert.match(tools, /label:\s*"Refine Workflow"/);
+    assert.match(tools, /apply_workflow_refinement:\s*"Refining workflow graph"/);
+    assert.match(tools, /"compile_workflow_refinement_spec"\s*:\s*\{/);
+    assert.match(tools, /label:\s*"Plan Workflow"/);
+    assert.match(
+        tools,
+        /compile_workflow_refinement_spec:\s*"Planning workflow graph"/,
+    );
+    assert.match(tools, /"apply_workflow_graph_patch"\s*:\s*\{/);
+    assert.match(tools, /label:\s*"Build Workflow"/);
+    assert.match(tools, /apply_workflow_graph_patch:\s*"Building workflow graph"/);
 });
 
 
