@@ -1049,6 +1049,254 @@ def test_baseline_edge_separates_schema_declaration_and_live_socket_indexes():
     assert target["input"] == "image"
 
 
+def _dynamic_nano_baseline_fixture():
+    catalog = {
+        "ImageSource": {
+            "input": {},
+            "output": ["IMAGE"],
+            "output_name": ["image"],
+        },
+        "DynamicNanoTarget": {
+            "input": {
+                "required": {
+                    "prompt": ["STRING", {"default": ""}],
+                    "model": [
+                        "COMFY_DYNAMICCOMBO_V3",
+                        {
+                            "options": [
+                                {
+                                    "key": "nano",
+                                    "inputs": {
+                                        "required": {
+                                            "aspect_ratio": [["16:9", "21:9"]],
+                                            "resolution": [["1K", "2K"]],
+                                            "thinking_level": [["MINIMAL", "HIGH"]],
+                                            "images": [
+                                                "COMFY_AUTOGROW_V3",
+                                                {
+                                                    "template": {
+                                                        "input": {
+                                                            "required": {
+                                                                "image": ["IMAGE", {}]
+                                                            }
+                                                        },
+                                                        "names": ["image_1", "image_2"],
+                                                        "min": 0,
+                                                    }
+                                                },
+                                            ],
+                                        }
+                                    },
+                                },
+                                {
+                                    "key": "text-only",
+                                    "inputs": {
+                                        "required": {
+                                            "quality": [["fast", "high"]],
+                                        }
+                                    },
+                                },
+                            ]
+                        },
+                    ],
+                }
+            },
+            "output": ["IMAGE"],
+            "output_name": ["IMAGE"],
+        },
+        "ImageSink": {
+            "input": {"required": {"images": ["IMAGE", {}]}},
+            "output": [],
+        },
+    }
+    graph = NormalizedGraphSnapshot.model_validate(
+        {
+            "schema": "fl-mcp.normalized-workflow-graph.v1",
+            "complete": True,
+            "nodes": [
+                {"node_id": 1, "node_type": "ImageSource"},
+                {
+                    "node_id": 2,
+                    "node_type": "DynamicNanoTarget",
+                    "widget_values": ["prompt", "nano", "16:9", "1K", "MINIMAL"],
+                },
+            ],
+            "outputs": [
+                {
+                    "node_id": 1,
+                    "output": "image",
+                    "output_index": 0,
+                    "type": "IMAGE",
+                },
+                {
+                    "node_id": 2,
+                    "output": "IMAGE",
+                    "output_index": 0,
+                    "type": "IMAGE",
+                },
+            ],
+            "edges": [
+                {
+                    "source_node_id": 1,
+                    "source_output": "image",
+                    "source_output_index": 0,
+                    "target_node_id": 2,
+                    "target_input": "model.images.image_1",
+                    "target_input_index": 5,
+                    "type": "IMAGE",
+                }
+            ],
+        }
+    )
+    return catalog, graph
+
+
+def _dynamic_nano_baseline_request(catalog, graph):
+    return PlanGraphPatchRequest.model_validate(
+        {
+            "application_id": "graph-patch-dynamic-live-index",
+            "expected_workflow_identity": "workflow-dynamic-live-index",
+            "expected_graph_hash": "c" * 64,
+            "expected_catalog_hash": catalog_contract_hash(catalog),
+            "graph": graph.model_dump(mode="json"),
+            "assertions": {
+                "nodes": [_assertion(2, "DynamicNanoTarget", catalog)],
+            },
+            "create_nodes": [
+                {
+                    "alias": "image_sink",
+                    "node_type": "ImageSink",
+                    "schema_hash": node_schema_hash(
+                        "ImageSink",
+                        catalog["ImageSink"],
+                    ),
+                    "values": {},
+                }
+            ],
+            "add_edges": [
+                _edge(
+                    _existing(2),
+                    0,
+                    "IMAGE",
+                    "IMAGE",
+                    _new("image_sink"),
+                    0,
+                    "images",
+                    socket_index=0,
+                )
+            ],
+        }
+    )
+
+
+def test_existing_dynamic_baseline_preserves_live_socket_not_schema_projection():
+    catalog, graph = _dynamic_nano_baseline_fixture()
+    request = _dynamic_nano_baseline_request(catalog, graph)
+
+    result = compile_graph_patch(
+        request,
+        catalog,
+        catalog_hash=catalog_contract_hash(catalog),
+        source="fixture",
+    )
+
+    assert result["valid"] is True, result["issues"]
+    retained = next(
+        edge["target"]
+        for edge in result["expected_final"]["edges"]
+        if edge["target"]["ref"] == {"node_id": 2}
+    )
+    assert retained == {
+        "ref": {"node_id": 2},
+        "input_index": 5,
+        "occurrence_index": 0,
+        "socket_index": 5,
+        "input": "model.images.image_1",
+        "type": "IMAGE",
+        "mode": "slot",
+    }
+
+    reconstructed = graph_patch_request_from_apply(result["apply_request"], graph)
+    recompiled = compile_graph_patch(
+        reconstructed,
+        catalog,
+        catalog_hash=catalog_contract_hash(catalog),
+        source="fixture",
+    )
+    assert recompiled["valid"] is True, recompiled["issues"]
+    assert recompiled["patch_hash"] == result["patch_hash"]
+    assert recompiled["plan"] == result["plan"]
+
+
+def test_static_dotted_baseline_cannot_use_dynamic_socket_projection_exception():
+    catalog, graph = _dynamic_nano_baseline_fixture()
+    catalog["StaticDottedTarget"] = {
+        "input": {
+            "required": {
+                "prompt": ["STRING", {"default": ""}],
+                "model": [["nano"]],
+                "aspect_ratio": [["16:9"]],
+                "resolution": [["1K"]],
+                "thinking_level": [["MINIMAL"]],
+                "model.images.image_1": ["IMAGE", {}],
+            }
+        },
+        "output": ["IMAGE"],
+        "output_name": ["IMAGE"],
+    }
+    graph.nodes[1].node_type = "StaticDottedTarget"
+    request = _dynamic_nano_baseline_request(catalog, graph)
+    request.assertions.nodes[0].node_type = "StaticDottedTarget"
+    request.assertions.nodes[0].schema_hash = node_schema_hash(
+        "StaticDottedTarget",
+        catalog["StaticDottedTarget"],
+    )
+
+    result = compile_graph_patch(
+        request,
+        catalog,
+        catalog_hash=catalog_contract_hash(catalog),
+        source="fixture",
+    )
+
+    assert result["valid"] is False
+    assert "baseline_target_slot_unresolved" in _codes(result)
+    assert "target_socket_index_mismatch" in _codes(result)
+
+
+@pytest.mark.parametrize("scenario", ["wrong_path", "wrong_type", "inactive", "ambiguous"])
+def test_existing_dynamic_baseline_still_rejects_unproven_endpoint(scenario):
+    catalog, graph = _dynamic_nano_baseline_fixture()
+    if scenario == "wrong_path":
+        graph.edges[0].target_input = "model.images.image_99"
+    elif scenario == "wrong_type":
+        catalog["ImageSource"]["output"] = ["MASK"]
+        catalog["ImageSource"]["output_name"] = ["mask"]
+        graph.outputs[0].output = "mask"
+        graph.outputs[0].type = "MASK"
+        graph.edges[0].source_output = "mask"
+        graph.edges[0].type = "MASK"
+    elif scenario == "inactive":
+        graph.nodes[1].widget_values[1] = "text-only"
+    else:
+        options = catalog["DynamicNanoTarget"]["input"]["required"]["model"][1][
+            "options"
+        ]
+        options[1]["inputs"] = copy.deepcopy(options[0]["inputs"])
+        graph.nodes[1].widget_values = []
+    request = _dynamic_nano_baseline_request(catalog, graph)
+
+    result = compile_graph_patch(
+        request,
+        catalog,
+        catalog_hash=catalog_contract_hash(catalog),
+        source="fixture",
+    )
+
+    assert result["valid"] is False
+    assert "baseline_target_slot_unresolved" in _codes(result)
+
+
 def test_baseline_edge_preserves_an_already_converted_widget_socket():
     catalog = {
         "FloatSource": {

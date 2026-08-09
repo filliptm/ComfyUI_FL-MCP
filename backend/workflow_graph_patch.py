@@ -561,6 +561,50 @@ def _materialize_capability(
     )
 
 
+def _uses_dynamic_socket_projection(
+    capabilities: NodeSchemaCapabilities,
+    capability: InputCapability,
+) -> bool:
+    """Return whether a live socket index is runtime-defined for this input.
+
+    Dynamic combo, autogrow, and dynamic-slot inputs can be compacted or moved
+    by the browser after their selector/connection callbacks run.  Their schema
+    declaration remains authoritative, but the materializer's connectable-only
+    socket index is only a projection and need not equal LiteGraph's serialized
+    ``node.inputs`` index.
+    """
+
+    return any(
+        capability.path in group.generated_inputs
+        or (
+            group.kind == "dynamic_slot"
+            and capability.kind == "dynamic_slot"
+            and capability.path == group.path
+        )
+        for group in capabilities.dynamic_groups
+    )
+
+
+def _captured_dynamic_target_key(
+    *,
+    node_id: NodeId,
+    input_index: int,
+    occurrence_index: int,
+    socket_index: int | None,
+    input_name: str,
+    input_type: str,
+) -> tuple[Any, ...]:
+    return (
+        _id_key(node_id),
+        input_index,
+        occurrence_index,
+        socket_index,
+        input_name,
+        input_type,
+        "slot",
+    )
+
+
 def _baseline_edge(
     edge: NormalizedGraphEdge,
     *,
@@ -569,6 +613,7 @@ def _baseline_edge(
     connected_inputs: set[str],
     path: str,
     issues: list[dict[str, str]],
+    captured_dynamic_targets: set[tuple[Any, ...]] | None = None,
 ) -> GraphPatchEdge:
     """Translate a serialized baseline link into both schema and socket domains."""
 
@@ -595,7 +640,13 @@ def _baseline_edge(
         if materialized is not None and (
             (
                 capability.connectable
-                and materialized.socket_index == edge.target_input_index
+                and (
+                    materialized.socket_index == edge.target_input_index
+                    or _uses_dynamic_socket_projection(
+                        target_capabilities,
+                        capability,
+                    )
+                )
             )
             or capability.widget_convertible
         ):
@@ -617,6 +668,20 @@ def _baseline_edge(
     else:
         declaration_index = candidates[0][0].declaration_index
         occurrence_index = candidates[0][0].occurrence_index
+        if (
+            captured_dynamic_targets is not None
+            and _uses_dynamic_socket_projection(target_capabilities, candidates[0][0])
+        ):
+            captured_dynamic_targets.add(
+                _captured_dynamic_target_key(
+                    node_id=edge.target_node_id,
+                    input_index=declaration_index,
+                    occurrence_index=occurrence_index,
+                    socket_index=edge.target_input_index,
+                    input_name=edge.target_input,
+                    input_type=edge.type,
+                )
+            )
     return GraphPatchEdge(
         source={
             "ref": {"node_id": edge.source_node_id},
@@ -966,6 +1031,7 @@ def compile_graph_patch(
         require_baseline_schema(item.target.ref)
 
     baseline_edges: list[GraphPatchEdge] = []
+    captured_dynamic_targets: set[tuple[Any, ...]] = set()
     for index, edge in enumerate(request.graph.edges):
         source_is_strict = _id_key(edge.source_node_id) in strict_baseline_node_keys
         target_is_strict = _id_key(edge.target_node_id) in strict_baseline_node_keys
@@ -1033,6 +1099,7 @@ def compile_graph_patch(
                 ),
                 path=f"graph.edges[{index}].target_input_index",
                 issues=target_issues,
+                captured_dynamic_targets=captured_dynamic_targets,
             )
             if target_is_strict:
                 issues.extend(target_issues)
@@ -1469,6 +1536,7 @@ def compile_graph_patch(
         path: str,
         *,
         state: Literal["current", "future"] = "future",
+        allow_captured_dynamic_socket: bool = False,
     ) -> InputCapability | None:
         node_type, raw_info, _ = resolve_ref(endpoint.ref, path=f"{path}.ref")
         if raw_info is None or node_type is None:
@@ -1525,9 +1593,24 @@ def compile_graph_patch(
             )
             return None
         converted_existing = is_existing_converted_slot(endpoint, capability)
+        captured_dynamic_socket = (
+            allow_captured_dynamic_socket
+            and isinstance(endpoint.ref, ExistingNodeRef)
+            and _uses_dynamic_socket_projection(capabilities, capability)
+            and _captured_dynamic_target_key(
+                node_id=endpoint.ref.node_id,
+                input_index=endpoint.input_index,
+                occurrence_index=endpoint.occurrence_index,
+                socket_index=endpoint.socket_index,
+                input_name=endpoint.input,
+                input_type=endpoint.type,
+            )
+            in captured_dynamic_targets
+        )
         if (
             endpoint.mode == "slot"
             and not converted_existing
+            and not captured_dynamic_socket
             and endpoint.socket_index != materialized.socket_index
         ):
             issues.append(
@@ -1592,7 +1675,12 @@ def compile_graph_patch(
                 )
             )
         validate_source(edge.source, f"{path}.source")
-        validate_target(edge.target, f"{path}.target", state="current")
+        validate_target(
+            edge.target,
+            f"{path}.target",
+            state="current",
+            allow_captured_dynamic_socket=True,
+        )
         canonical_assertion_edges.append(baseline)
 
     canonical_remove_edges: list[GraphPatchEdge] = []
@@ -1612,7 +1700,12 @@ def compile_graph_patch(
         if key not in assertion_edge_keys:
             issues.append(_issue("missing_edge_assertion", path, "Removed edge lacks an exact baseline assertion."))
         validate_source(edge.source, f"{path}.source")
-        validate_target(edge.target, f"{path}.target", state="current")
+        validate_target(
+            edge.target,
+            f"{path}.target",
+            state="current",
+            allow_captured_dynamic_socket=True,
+        )
         if baseline is not None and edge.target.mode != baseline.target.mode:
             issues.append(
                 _issue(
@@ -1686,7 +1779,11 @@ def compile_graph_patch(
             else None
         )
         target_capability = (
-            validate_target(edge.target, f"retained_edges[{index}].target")
+            validate_target(
+                edge.target,
+                f"retained_edges[{index}].target",
+                allow_captured_dynamic_socket=True,
+            )
             if target_strict
             else None
         )
