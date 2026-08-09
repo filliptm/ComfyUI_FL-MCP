@@ -6,6 +6,10 @@ import chat_runtime as chat_runtime_module
 import pytest
 from chat_config import ChatSettingsStore
 from chat_runtime import (
+    BRANCH_COMPARISON_TOOLS,
+    BRANCH_DISCOVERY_TOOLS,
+    BRANCH_MUTATION_TOOLS,
+    BRANCH_NAVIGATION_TOOLS,
     CONTEXT_MAX_CHARS,
     REFINEMENT_COMPILER_TOOLS,
     ActiveRun,
@@ -14,11 +18,11 @@ from chat_runtime import (
     approval_fingerprint,
     bridge_settings,
     claude_tool_name,
-    compiler_first_workflow_requested,
-    explicit_web_research_requested,
     codex_tool_name,
     compact_messages_for_model,
+    compiler_first_workflow_requested,
     conversation_needs_compaction,
+    explicit_web_research_requested,
     install_codex_approval_handler,
     message_content_for_model,
     native_prompt_with_compaction,
@@ -35,10 +39,11 @@ from chat_runtime import (
     web_image_requested,
     web_search_environment,
     web_search_instructions,
-    workflow_graph_change_requested,
-    workflow_refinement_requested,
+    workflow_branch_intent,
     workflow_context_environment,
     workflow_context_instructions,
+    workflow_graph_change_requested,
+    workflow_refinement_requested,
 )
 from chat_store import ChatStore
 
@@ -706,6 +711,50 @@ def test_existing_chain_edit_uses_only_atomic_refinement_route():
     assert "prefers a direct compatible connection" in prompt
     assert "set `allow_inferred_converters=false`" in prompt
     assert "verified lessons internally as ranking priors" in prompt
+
+
+def test_whole_branch_intents_use_only_the_pinned_pr35_routes():
+    cases = {
+        "Find the upstream and downstream branches from this node.": (
+            "discover",
+            BRANCH_DISCOVERY_TOOLS,
+        ),
+        "Jump to the upscale branch.": ("navigate", BRANCH_NAVIGATION_TOOLS),
+        "Focus the preview output.": ("navigate", BRANCH_NAVIGATION_TOOLS),
+        "Compare the upscale and preview branches.": (
+            "compare",
+            BRANCH_COMPARISON_TOOLS,
+        ),
+        "Clone the entire upscale branch.": ("clone", BRANCH_MUTATION_TOOLS),
+        "Replace the whole preview branch.": ("replace", BRANCH_MUTATION_TOOLS),
+        "Delete the selected branch without reconnecting it.": (
+            "remove",
+            BRANCH_MUTATION_TOOLS,
+        ),
+    }
+    for message, (intent, expected_tools) in cases.items():
+        assert workflow_branch_intent(message) == intent
+        assert tools_for_message(message, "free") == expected_tools
+
+    # A branch used only as an edge anchor stays in the ordinary GraphPatch route.
+    ordinary = "Add a Wavelet node after the upscale branch and don't run it."
+    assert workflow_branch_intent(ordinary) is None
+    assert tools_for_message(ordinary, "free") == REFINEMENT_COMPILER_TOOLS
+
+    run_mutation = tools_for_message(
+        "Clone the upscale branch, run it, and review the result.",
+        "free",
+    )
+    assert BRANCH_MUTATION_TOOLS <= run_mutation
+    assert {"queue_workflow", "wait", "get_execution_history"} <= run_mutation
+
+    prompt = ren_instructions("off")
+    assert "workflow_branches_discover" in prompt
+    assert "workflow_branch_navigate" in prompt
+    assert "compile_workflow_branch_operation" in prompt
+    assert "resolve_workflow_branch_successor" in prompt
+    assert "pending locator" in prompt
+    assert "never navigate from a label or fingerprint" in prompt
 
 
 def test_exact_registry_request_gets_tools_and_source_guardrails():

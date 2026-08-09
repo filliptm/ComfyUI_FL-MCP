@@ -13,7 +13,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from concurrent.futures import CancelledError as FutureCancelledError
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from chat_config import (
     PROJECT_ROOT,
@@ -28,6 +28,8 @@ from claude_subscription import claude_subscription
 from config import (
     MAX_GENERATION_COMPLETION_TIMEOUT_SECONDS,
     MCP_TOOL_TIMEOUT_BUFFER_SECONDS,
+)
+from config import (
     settings as bridge_settings,
 )
 
@@ -168,6 +170,27 @@ CORE_CHAT_TOOLS = {
 REFINEMENT_COMPILER_TOOLS = {
     "compile_workflow_refinement_spec",
     "apply_workflow_graph_patch",
+}
+
+BRANCH_DISCOVERY_TOOLS = {
+    "workflow_branches_discover",
+}
+
+BRANCH_NAVIGATION_TOOLS = {
+    "workflow_branches_discover",
+    "workflow_branch_navigate",
+}
+
+BRANCH_COMPARISON_TOOLS = {
+    "workflow_branches_discover",
+    "workflow_branch_compare",
+}
+
+BRANCH_MUTATION_TOOLS = {
+    "workflow_branches_discover",
+    "compile_workflow_branch_operation",
+    "apply_workflow_graph_patch",
+    "resolve_workflow_branch_successor",
 }
 
 REFINEMENT_EXECUTION_TOOLS = {
@@ -384,6 +407,49 @@ def workflow_graph_change_requested(message: str) -> bool:
             or workflow_feature
         )
     )
+
+
+def workflow_branch_intent(
+    message: str,
+) -> Literal["discover", "navigate", "compare", "clone", "replace", "remove"] | None:
+    """Recognize whole-branch requests before generic node/edge refinement.
+
+    Mentioning a branch as an endpoint (for example, “add Wavelet after the
+    upscale branch”) remains an ordinary GraphPatch refinement.  Only explicit
+    branch discovery/navigation/comparison or whole-region verbs enter PR35.
+    """
+
+    visible = str(message or "").split(
+        "\n\nThe user attached ComfyUI input image(s)",
+        1,
+    )[0].casefold().replace("’", "'").replace("‘", "'")
+    branch_object = r"(?:branch(?:es)?|arms?|paths?|preview\s+outputs?|upscale\s+outputs?)"
+    if re.search(
+        rf"\b(?:compare|diff|contrast)\b.{{0,120}}\b{branch_object}\b"
+        rf"|\b{branch_object}\b.{{0,120}}\b(?:compare|difference|different)\b",
+        visible,
+    ):
+        return "compare"
+    if re.search(
+        rf"\b(?:jump|go|navigate|focus|zoom|show|reveal|select)\b.{{0,100}}\b{branch_object}\b",
+        visible,
+    ):
+        return "navigate"
+    for operation, verbs in (
+        ("clone", r"clone|copy|duplicate"),
+        ("replace", r"replace|swap"),
+        ("remove", r"remove|delete|drop"),
+    ):
+        if re.search(rf"\b(?:{verbs})\b.{{0,100}}\b{branch_object}\b", visible):
+            return operation  # type: ignore[return-value]
+    if re.search(
+        rf"\b(?:find|list|discover|inspect|identify|what|which)\b.{{0,100}}"
+        rf"\b(?:branches|arms|paths|upstream|downstream)\b"
+        rf"|\b(?:upstream|downstream)\b.{{0,80}}\b{branch_object}\b",
+        visible,
+    ):
+        return "discover"
+    return None
 
 
 def explicit_web_research_requested(message: str) -> bool:
@@ -919,6 +985,7 @@ async def wait_for_codex_mcp_status(
 
 def tools_for_message(message: str, search_mode: str = "off") -> set[str]:
     text = message.lower()
+    branch_intent = workflow_branch_intent(message)
     graph_change_requested = workflow_graph_change_requested(message)
     selected = set(CORE_CHAT_TOOLS)
     debug_requested = any(
@@ -950,6 +1017,19 @@ def tools_for_message(message: str, search_mode: str = "off") -> set[str]:
         selected.update(INTENT_TOOL_GROUPS["files"])
     if search_mode != "off":
         selected.update({"web_search", "web_fetch_page"})
+    if branch_intent is not None:
+        branch_tools = {
+            "discover": BRANCH_DISCOVERY_TOOLS,
+            "navigate": BRANCH_NAVIGATION_TOOLS,
+            "compare": BRANCH_COMPARISON_TOOLS,
+            "clone": BRANCH_MUTATION_TOOLS,
+            "replace": BRANCH_MUTATION_TOOLS,
+            "remove": BRANCH_MUTATION_TOOLS,
+        }[branch_intent]
+        selected = set(branch_tools)
+        if branch_intent in {"clone", "replace", "remove"}:
+            selected.update(_graph_compiler_optional_tools(message))
+        return selected
     if graph_change_requested:
         # Empty-canvas builds and existing-graph edits use the same arbitrary-DAG
         # compiler, schema guards, transaction, rollback, and two-call surface.

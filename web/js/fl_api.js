@@ -17,6 +17,7 @@ import {
 } from "./node_placement.js";
 import { nodeIdsEqual } from "./node_identity.js";
 import {
+    canonicalWorkflowJSON,
     GRAPH_PRECONDITION_SCHEMA,
     workflowGraphHash,
     workflowGraphHashExcludingExtra,
@@ -31,6 +32,7 @@ import {
 
 const WORKFLOW_IDENTITY_SCHEMA = "fl-mcp.workflow-instance.v1";
 const GRAPH_PATCH_LEDGER_KEY = "fl_mcp_graph_patch_ledger";
+const SHA256_PATTERN = /^[0-9a-f]{64}$/;
 
 const WORKFLOW_IDENTITY_TOKENS = new WeakMap();
 const WORKFLOW_IDENTITY_SESSION = (() => {
@@ -53,6 +55,27 @@ function workflowIdentityFor(workflow) {
         WORKFLOW_IDENTITY_TOKENS.set(workflow, identity);
     }
     return identity;
+}
+
+
+function branchNavigationError(code, message, details = null) {
+    const error = new Error(message);
+    error.code = code;
+    if (details !== null) error.details = details;
+    return error;
+}
+
+
+function graphPatchScopeError(code, message, details = null) {
+    const error = new Error(message);
+    error.code = code;
+    if (details !== null) error.details = details;
+    return error;
+}
+
+
+function typedValuesEqual(left, right) {
+    return typeof left === typeof right && Object.is(left, right);
 }
 
 /**
@@ -180,6 +203,37 @@ export class FL_API {
         }
     }
 
+    /** Create one node and return its canonical serialized workflow ID. */
+    createWorkflowNodeExact(nodeType, parameters = {}, position = null, options = {}, pin = null) {
+        if (pin) this.assertActiveWorkflow(pin);
+        const created = this.create(nodeType, parameters, position, options);
+        if (pin) this.assertActiveWorkflow(pin);
+        const graph = app.graph;
+        const liveMatches = this._graphNodes(graph).filter(node => (
+            typedValuesEqual(node?.id, created.id)
+        ));
+        if (liveMatches.length !== 1) {
+            throw this._nodeProjectionError(
+                "workflow_node_projection_ambiguous",
+                `Created workflow node ${String(created.id)} does not identify one live node.`,
+                created.id,
+                liveMatches.length,
+            );
+        }
+        const authority = structuredClone(graph.serialize());
+        const projection = this._projectRuntimeNode(
+            graph,
+            authority,
+            liveMatches[0],
+            { label: "Created workflow" },
+        );
+        return {
+            ...created,
+            id: projection.serializedId,
+            node_id: projection.serializedId,
+        };
+    }
+
     /** Return current-canvas nodes whose structured property field matches. */
     findNodesByProperty(propertyName, fieldName, expectedValue) {
         return (app.graph?._nodes || [])
@@ -198,6 +252,15 @@ export class FL_API {
     setNodeProperty(nodeId, propertyName, value) {
         const node = this._findNode(nodeId);
         if (!node) throw new Error(`Node not found: ${nodeId}`);
+        node.properties = node.properties || {};
+        node.properties[propertyName] = value;
+        this._markGraphChanged();
+        return value;
+    }
+
+    /** Persist metadata using one canonical serialized workflow node ID. */
+    setWorkflowNodePropertyExact(nodeId, propertyName, value, pin = null) {
+        const node = this._workflowNodeFromSerializedId(nodeId, pin);
         node.properties = node.properties || {};
         node.properties[propertyName] = value;
         this._markGraphChanged();
@@ -413,16 +476,31 @@ export class FL_API {
     /** Return every current graph edge in one normalized, name-enriched shape. */
     listWorkflowConnections(pin = null) {
         if (pin) this.assertActiveWorkflow(pin);
+        const graph = app.graph;
+        const authority = structuredClone(graph.serialize());
         return this._workflowLinkValues()
             .filter(Boolean)
             .map(link => {
-                const source = this._findNode(link.origin_id);
-                const target = this._findNode(link.target_id);
+                const source = this._findRuntimeEndpointNode(graph, link.origin_id, {
+                    serializedGraph: authority,
+                });
+                const target = this._findRuntimeEndpointNode(graph, link.target_id, {
+                    serializedGraph: authority,
+                });
+                if (!source || !target) {
+                    throw this._nodeProjectionError(
+                        "workflow_node_projection_missing",
+                        "A workflow connection endpoint has no exact live node.",
+                        !source ? link.origin_id : link.target_id,
+                    );
+                }
+                const sourceProjection = this._projectRuntimeNode(graph, authority, source);
+                const targetProjection = this._projectRuntimeNode(graph, authority, target);
                 return {
-                    source_node_id: link.origin_id,
+                    source_node_id: sourceProjection.serializedId,
                     source_output_index: link.origin_slot,
                     source_output: source?.outputs?.[link.origin_slot]?.name ?? null,
-                    target_node_id: link.target_id,
+                    target_node_id: targetProjection.serializedId,
                     target_input_index: link.target_slot,
                     target_input: target?.inputs?.[link.target_slot]?.name ?? null,
                     type: link.type ?? null,
@@ -432,19 +510,18 @@ export class FL_API {
 
     /** Return the exact live facts needed by atomic workflow refinement. */
     getWorkflowNode(nodeId, pin = null) {
-        if (pin) this.assertActiveWorkflow(pin);
-        const node = this._findNode(nodeId);
-        if (!node) return null;
-        const serializedNode = typeof node.serialize === "function"
-            ? structuredClone(node.serialize())
-            : null;
+        const projection = this._workflowNodeProjection(nodeId, pin, true);
+        if (!projection) return null;
+        const { node } = projection;
+        const serializedNode = projection.serializedNode
+            || this._serializeRuntimeNode(node);
         return {
-            id: node.id,
-            node_id: node.id,
+            id: projection.serializedId,
+            node_id: projection.serializedId,
             node_type: node.comfyClass || node.type,
             type: node.comfyClass || node.type,
             title: node.title,
-            values: this.getValues(node.id),
+            values: this.getValues(node),
             properties: structuredClone(node.properties || {}),
             position: { x: node.pos[0], y: node.pos[1] },
             size: { width: node.size[0], height: node.size[1] },
@@ -471,6 +548,708 @@ export class FL_API {
         };
     }
 
+    /**
+     * Resolve one exact native Subgraph and expose the same mutation surface
+     * used by the root GraphPatch adapter. Boundary runtime IDs are private to
+     * the caller and map only to inputNode/outputNode slot APIs.
+     */
+    createWorkflowGraphPatchScopeRuntime(descriptor, pin = null) {
+        if (pin) this.assertActiveWorkflow(pin);
+        const scope = descriptor?.scope;
+        if (
+            !scope
+            || typeof scope !== "object"
+            || !Array.isArray(scope.scope_path)
+            || scope.scope_path.length === 0
+            || typeof scope.definition_id !== "string"
+            || !scope.definition_id
+            || !Number.isInteger(descriptor?.input_runtime_id)
+            || !Number.isInteger(descriptor?.output_runtime_id)
+        ) {
+            throw graphPatchScopeError(
+                "invalid_scoped_graph_patch_adapter",
+                "An exact scoped GraphPatch runtime descriptor is required.",
+            );
+        }
+        const rootGraph = app.rootGraph || app.graph;
+        if (!rootGraph) {
+            throw graphPatchScopeError("scoped_graph_unavailable", "The root graph is unavailable.");
+        }
+        const graph = this._resolveGraphPatchScopeExact(rootGraph, scope.scope_path);
+        if (String(graph?.id ?? "") !== scope.definition_id) {
+            throw graphPatchScopeError(
+                "scoped_definition_mismatch",
+                "The native Subgraph ID differs from the scoped authority.",
+            );
+        }
+        const runtime = Object.freeze({
+            graph,
+            rootGraph,
+            pin,
+            inputRuntimeId: descriptor.input_runtime_id,
+            outputRuntimeId: descriptor.output_runtime_id,
+            inputNodeType: descriptor.input_node_type,
+            outputNodeType: descriptor.output_node_type,
+            inputSchemaHash: descriptor.input_schema_hash,
+            outputSchemaHash: descriptor.output_schema_hash,
+        });
+        return {
+            captureDefinition: () => this._captureGraphPatchScopeDefinition(runtime),
+            captureWorkflow: () => this._captureGraphPatchScopeProjection(runtime),
+            getNode: nodeId => this._getGraphPatchScopeNode(runtime, nodeId),
+            listConnections: () => this._listGraphPatchScopeConnections(runtime),
+            createNode: planned => this._createGraphPatchScopeNode(runtime, planned),
+            setNodeValuesExact: (nodeId, values) => (
+                this._setGraphPatchScopeValuesExact(runtime, nodeId, values)
+            ),
+            setNodeMetadata: (nodeId, propertyName, value) => (
+                this._setGraphPatchScopeNodeProperty(runtime, nodeId, propertyName, value)
+            ),
+            setNodeLayoutExact: (nodeId, layout) => (
+                this._setGraphPatchScopeRect(runtime, nodeId, layout)
+            ),
+            convertWidgetToInput: (nodeId, expected) => (
+                this._convertGraphPatchScopeWidget(runtime, nodeId, expected)
+            ),
+            disconnectConnection: expected => (
+                this._disconnectGraphPatchScopeConnection(runtime, expected)
+            ),
+            connectNodes: (sourceId, targetId, connection) => (
+                this._connectGraphPatchScopeNodes(runtime, sourceId, targetId, connection)
+            ),
+            removeNodes: nodeIds => this._removeGraphPatchScopeNodes(runtime, nodeIds),
+        };
+    }
+
+    _resolveGraphPatchScopeExact(rootGraph, scopePath) {
+        let graph = rootGraph;
+        const rootSnapshot = structuredClone(rootGraph.serialize());
+        let serializedGraph = rootSnapshot;
+        for (const [index, step] of scopePath.entries()) {
+            const container = this._resolveSerializedNodeProjection(
+                graph,
+                serializedGraph,
+                step.container_node_id,
+                {
+                    missingCode: "scoped_path_not_found",
+                    ambiguousCode: "scoped_path_ambiguous",
+                    label: `scope_path[${index}]`,
+                },
+            ).node;
+            if (
+                !container.subgraph
+                || (
+                    typeof container.isSubgraphNode === "function"
+                    && !container.isSubgraphNode()
+                )
+                || container.type !== step.subgraph_id
+                || String(container.subgraph.id ?? "") !== step.subgraph_id
+            ) {
+                throw graphPatchScopeError(
+                    "scoped_path_definition_mismatch",
+                    `scope_path[${index}] is not the attested subgraph container.`,
+                );
+            }
+            const registered = typeof rootGraph.subgraphs?.get === "function"
+                ? rootGraph.subgraphs.get(step.subgraph_id)
+                : null;
+            if (registered && registered !== container.subgraph) {
+                throw graphPatchScopeError(
+                    "scoped_path_ambiguous",
+                    `scope_path[${index}] conflicts with the root definition registry.`,
+                );
+            }
+            const definitions = this._serializedSubgraphDefinitions(rootSnapshot)
+                .filter(definition => String(definition?.id ?? "") === step.subgraph_id);
+            if (definitions.length !== 1) {
+                throw graphPatchScopeError(
+                    definitions.length === 0
+                        ? "scoped_path_not_found"
+                        : "scoped_path_ambiguous",
+                    `scope_path[${index}] does not resolve to one serialized definition.`,
+                );
+            }
+            graph = container.subgraph;
+            serializedGraph = definitions[0];
+        }
+        return graph;
+    }
+
+    _assertGraphPatchScopeRuntime(runtime) {
+        if (runtime.pin) this.assertActiveWorkflow(runtime.pin);
+        if ((app.rootGraph || app.graph) !== runtime.rootGraph) {
+            throw graphPatchScopeError(
+                "scoped_root_identity_changed",
+                "The native root graph changed during scoped mutation.",
+            );
+        }
+        return runtime.graph;
+    }
+
+    _scopeGraphLinkValues(graph) {
+        const links = graph?.links;
+        if (!links) return [];
+        if (typeof links.values === "function") return Array.from(links.values());
+        return Object.values(links);
+    }
+
+    _scopeGraphNode(runtime, nodeId) {
+        if ([runtime.inputRuntimeId, runtime.outputRuntimeId].some(id => typedValuesEqual(id, nodeId))) {
+            return null;
+        }
+        const definition = this._captureGraphPatchScopeDefinition(runtime);
+        return this._resolveSerializedNodeProjection(
+            runtime.graph,
+            definition,
+            nodeId,
+            {
+                allowMissing: true,
+                missingCode: "scoped_node_not_found",
+                ambiguousCode: "ambiguous_scoped_node_identity",
+                label: "Scoped workflow",
+            },
+        )?.node || null;
+    }
+
+    _captureGraphPatchScopeDefinition(runtime) {
+        const graph = this._assertGraphPatchScopeRuntime(runtime);
+        if (typeof graph.asSerialisable !== "function") {
+            throw graphPatchScopeError(
+                "scoped_serialization_unavailable",
+                "The native Subgraph cannot provide its exact definition serialization.",
+            );
+        }
+        return structuredClone(graph.asSerialisable());
+    }
+
+    _scopeVirtualNode(runtime, kind) {
+        const input = kind === "input";
+        const graph = runtime.graph;
+        const slots = input ? graph.inputs : graph.outputs;
+        const bounding = input ? graph.inputNode?.boundingRect : graph.outputNode?.boundingRect;
+        const inputs = input ? [] : slots.map(slot => ({
+            name: slot.name,
+            type: slot.type,
+            link: slot.linkIds?.[0] ?? null,
+        }));
+        const outputs = input ? slots.map(slot => ({
+            name: slot.name,
+            type: slot.type,
+            links: structuredClone(slot.linkIds || []),
+        })) : [];
+        return {
+            id: input ? runtime.inputRuntimeId : runtime.outputRuntimeId,
+            type: input ? runtime.inputNodeType : runtime.outputNodeType,
+            schema_hash: input ? runtime.inputSchemaHash : runtime.outputSchemaHash,
+            inputs,
+            outputs,
+            widgets_values: [],
+            properties: {},
+            pos: [bounding?.[0] ?? 0, bounding?.[1] ?? 0],
+            size: [bounding?.[2] ?? 75, bounding?.[3] ?? 100],
+            flags: {},
+            mode: 0,
+        };
+    }
+
+    _captureGraphPatchScopeProjection(runtime) {
+        const definition = this._captureGraphPatchScopeDefinition(runtime);
+        return {
+            version: definition.version,
+            state: structuredClone(definition.state || {}),
+            nodes: [
+                this._scopeVirtualNode(runtime, "input"),
+                ...structuredClone(definition.nodes || []),
+                this._scopeVirtualNode(runtime, "output"),
+            ],
+            links: structuredClone(definition.links || []),
+        };
+    }
+
+    _scopeRerouteManifests(runtime, node, inputs, outputs) {
+        if (
+            (node.comfyClass || node.type) !== "Reroute"
+            || inputs.length !== 1
+            || outputs.length !== 1
+            || inputs[0].name !== ""
+            || outputs[0].name !== ""
+            || inputs[0].type !== "*"
+        ) return { inputs, outputs };
+        const types = new Set(
+            this._scopeGraphLinkValues(runtime.graph)
+                .filter(link => (
+                    typedValuesEqual(link.origin_id, node.id)
+                    || typedValuesEqual(link.target_id, node.id)
+                ))
+                .map(link => link.type)
+                .filter(type => typeof type === "string" && type && type !== "*"),
+        );
+        if (types.size !== 1) {
+            throw graphPatchScopeError(
+                "scoped_reroute_type_ambiguous",
+                `Reroute ${String(node.id)} does not have one exact resolved physical type.`,
+            );
+        }
+        const [type] = types;
+        return {
+            inputs: [{ ...inputs[0], name: "__fl_mcp_reroute_input_0__", type }],
+            outputs: [{ ...outputs[0], name: "__fl_mcp_reroute_output_0__", type }],
+        };
+    }
+
+    _scopeNodeFacts(runtime, node) {
+        const definition = this._captureGraphPatchScopeDefinition(runtime);
+        const projection = this._projectRuntimeNode(
+            runtime.graph,
+            definition,
+            node,
+            {
+                missingCode: "scoped_node_not_found",
+                ambiguousCode: "ambiguous_scoped_node_identity",
+                label: "Scoped workflow",
+            },
+        );
+        const serializedNode = projection.serializedNode
+            || this._serializeRuntimeNode(node);
+        const rawInputs = (node.inputs || []).map((input, socketIndex) => ({
+            socket_index: socketIndex,
+            name: input.name,
+            type: input.type,
+            link: input.link ?? null,
+        }));
+        const rawOutputs = (node.outputs || []).map((output, index) => ({
+            index,
+            name: output.name,
+            type: output.type,
+            links: structuredClone(output.links || []),
+        }));
+        const manifests = this._scopeRerouteManifests(runtime, node, rawInputs, rawOutputs);
+        const values = Object.fromEntries(
+            (node.widgets || [])
+                .filter(widget => widget.name && widget.value !== undefined)
+                .map(widget => [widget.name, structuredClone(widget.value)]),
+        );
+        return {
+            id: projection.serializedId,
+            node_id: projection.serializedId,
+            node_type: node.comfyClass || node.type,
+            type: node.comfyClass || node.type,
+            title: node.title,
+            values,
+            properties: structuredClone(node.properties || {}),
+            position: { x: node.pos[0], y: node.pos[1] },
+            size: { width: node.size[0], height: node.size[1] },
+            outputs: manifests.outputs,
+            live_inputs: manifests.inputs,
+            widgets: (node.widgets || []).map((widget, widgetIndex) => ({
+                widget_index: widgetIndex,
+                name: widget.name,
+                type: widget.type,
+                input_type: widget.options?.input_type ?? widget.options?.type ?? null,
+                value: structuredClone(widget.value),
+            })),
+            serialized_node: serializedNode,
+        };
+    }
+
+    _getGraphPatchScopeNode(runtime, nodeId) {
+        this._assertGraphPatchScopeRuntime(runtime);
+        if (typedValuesEqual(nodeId, runtime.inputRuntimeId)) {
+            const node = this._scopeVirtualNode(runtime, "input");
+            return {
+                ...node,
+                node_id: node.id,
+                node_type: node.type,
+                position: { x: node.pos[0], y: node.pos[1] },
+                size: { width: node.size[0], height: node.size[1] },
+                live_inputs: structuredClone(node.inputs),
+                serialized_node: structuredClone(node),
+            };
+        }
+        if (typedValuesEqual(nodeId, runtime.outputRuntimeId)) {
+            const node = this._scopeVirtualNode(runtime, "output");
+            return {
+                ...node,
+                node_id: node.id,
+                node_type: node.type,
+                position: { x: node.pos[0], y: node.pos[1] },
+                size: { width: node.size[0], height: node.size[1] },
+                live_inputs: structuredClone(node.inputs),
+                serialized_node: structuredClone(node),
+            };
+        }
+        const node = this._scopeGraphNode(runtime, nodeId);
+        return node ? this._scopeNodeFacts(runtime, node) : null;
+    }
+
+    _scopeSlotName(runtime, nodeId, slotIndex, outputSide) {
+        if (typedValuesEqual(nodeId, runtime.inputRuntimeId)) {
+            return runtime.graph.inputs?.[slotIndex]?.name ?? null;
+        }
+        if (typedValuesEqual(nodeId, runtime.outputRuntimeId)) {
+            return runtime.graph.outputs?.[slotIndex]?.name ?? null;
+        }
+        const node = this._scopeGraphNode(runtime, nodeId);
+        if (!node) return null;
+        const facts = this._scopeNodeFacts(runtime, node);
+        const manifest = outputSide ? facts.outputs : facts.live_inputs;
+        const item = outputSide
+            ? manifest.find(slot => slot.index === slotIndex)
+            : manifest.find(slot => slot.socket_index === slotIndex);
+        return item?.name ?? null;
+    }
+
+    _scopeSerializedEndpointId(runtime, endpointId) {
+        if (
+            typedValuesEqual(endpointId, runtime.inputRuntimeId)
+            || typedValuesEqual(endpointId, runtime.graph.inputNode?.id)
+        ) return runtime.inputRuntimeId;
+        if (
+            typedValuesEqual(endpointId, runtime.outputRuntimeId)
+            || typedValuesEqual(endpointId, runtime.graph.outputNode?.id)
+        ) return runtime.outputRuntimeId;
+        const node = this._findRuntimeEndpointNode(runtime.graph, endpointId, {
+            ambiguousCode: "ambiguous_scoped_node_identity",
+            label: "Scoped workflow",
+            serializedGraph: this._captureGraphPatchScopeDefinition(runtime),
+        });
+        if (!node) {
+            throw graphPatchScopeError(
+                "scoped_node_not_found",
+                `Scoped connection endpoint ${String(endpointId)} is missing.`,
+            );
+        }
+        return this._projectRuntimeNode(
+            runtime.graph,
+            this._captureGraphPatchScopeDefinition(runtime),
+            node,
+            {
+                missingCode: "scoped_node_not_found",
+                ambiguousCode: "ambiguous_scoped_node_identity",
+                label: "Scoped workflow",
+            },
+        ).serializedId;
+    }
+
+    _scopeRuntimeEndpointId(runtime, serializedId) {
+        if (typedValuesEqual(serializedId, runtime.inputRuntimeId)) {
+            return runtime.graph.inputNode?.id ?? runtime.inputRuntimeId;
+        }
+        if (typedValuesEqual(serializedId, runtime.outputRuntimeId)) {
+            return runtime.graph.outputNode?.id ?? runtime.outputRuntimeId;
+        }
+        const node = this._scopeGraphNode(runtime, serializedId);
+        if (!node) {
+            throw graphPatchScopeError(
+                "scoped_node_not_found",
+                `Scoped node ${String(serializedId)} is missing.`,
+            );
+        }
+        return node.id;
+    }
+
+    _listGraphPatchScopeConnections(runtime) {
+        const graph = this._assertGraphPatchScopeRuntime(runtime);
+        return this._scopeGraphLinkValues(graph).filter(Boolean).map(link => {
+            const sourceId = this._scopeSerializedEndpointId(runtime, link.origin_id);
+            const targetId = this._scopeSerializedEndpointId(runtime, link.target_id);
+            return {
+                source_node_id: sourceId,
+                source_output_index: link.origin_slot,
+                source_output: this._scopeSlotName(runtime, sourceId, link.origin_slot, true),
+                target_node_id: targetId,
+                target_input_index: link.target_slot,
+                target_input: this._scopeSlotName(runtime, targetId, link.target_slot, false),
+                type: link.type ?? null,
+            };
+        });
+    }
+
+    _createGraphPatchScopeNode(runtime, planned) {
+        const graph = this._assertGraphPatchScopeRuntime(runtime);
+        const node = LiteGraph.createNode(planned.node_type);
+        if (!node) throw new Error(`Node type not found: ${planned.node_type}`);
+        const occupied = this._graphNodes(graph).map(existing => ({
+            x: existing.pos[0],
+            y: existing.pos[1],
+            width: existing.size[0],
+            height: existing.size[1],
+        }));
+        const origin = getGraphInsertionOrigin(occupied);
+        node.pos = [
+            planned.layout_hint?.x ?? origin.x,
+            planned.layout_hint?.y ?? origin.y,
+        ];
+        graph.add(node);
+        if (!planned.layout_hint) {
+            const adjusted = findNonOverlappingPosition({
+                x: node.pos[0],
+                y: node.pos[1],
+                width: node.size[0],
+                height: node.size[1],
+            }, occupied);
+            node.pos = [adjusted.x, adjusted.y];
+        }
+        this._markGraphChanged();
+        const projection = this._projectRuntimeNode(
+            graph,
+            this._captureGraphPatchScopeDefinition(runtime),
+            node,
+            {
+                missingCode: "scoped_node_not_found",
+                ambiguousCode: "ambiguous_scoped_node_identity",
+                label: "Created scoped workflow",
+            },
+        );
+        return {
+            id: projection.serializedId,
+            node_id: projection.serializedId,
+            type: node.comfyClass || node.type,
+        };
+    }
+
+    async _setGraphPatchScopeValuesExact(runtime, nodeId, values) {
+        const node = this._scopeGraphNode(runtime, nodeId);
+        if (!node) throw new Error(`Scoped node not found: ${String(nodeId)}`);
+        const pending = new Map(Object.entries(values || {}));
+        const applied = [];
+        let stalledRounds = 0;
+        while (pending.size > 0 && stalledRounds < 5) {
+            let progress = false;
+            for (const [name, value] of [...pending.entries()]) {
+                const matches = (node.widgets || []).filter(widget => widget.name === name);
+                if (matches.length > 1) {
+                    throw new Error(
+                        `Expected one live widget named ${name} on scoped node ${String(node.id)}; found ${matches.length}.`,
+                    );
+                }
+                if (matches.length === 0) continue;
+                this._setWidgetValueExact(node, matches[0], structuredClone(value));
+                await Promise.resolve();
+                const observed = (node.widgets || []).filter(widget => widget.name === name);
+                if (
+                    observed.length !== 1
+                    || JSON.stringify(observed[0].value) !== JSON.stringify(value)
+                ) throw new Error(`Widget ${name} did not retain its exact requested value.`);
+                pending.delete(name);
+                applied.push(name);
+                progress = true;
+            }
+            if (progress) stalledRounds = 0;
+            else {
+                stalledRounds += 1;
+                await new Promise(resolve => {
+                    if (typeof globalThis.requestAnimationFrame === "function") {
+                        globalThis.requestAnimationFrame(() => resolve());
+                    } else setTimeout(resolve, 0);
+                });
+            }
+        }
+        if (applied.length > 0) this._markGraphChanged();
+        return { applied };
+    }
+
+    _setGraphPatchScopeNodeProperty(runtime, nodeId, propertyName, value) {
+        const node = this._scopeGraphNode(runtime, nodeId);
+        if (!node) throw new Error(`Scoped node not found: ${String(nodeId)}`);
+        node.properties = node.properties || {};
+        node.properties[propertyName] = structuredClone(value);
+        this._markGraphChanged();
+        return value;
+    }
+
+    _setGraphPatchScopeRect(runtime, nodeId, rect) {
+        const node = this._scopeGraphNode(runtime, nodeId);
+        if (!node) throw new Error(`Scoped node not found: ${String(nodeId)}`);
+        if (typeof rect.x === "number") node.pos[0] = rect.x;
+        if (typeof rect.y === "number") node.pos[1] = rect.y;
+        if (typeof rect.width === "number") node.size[0] = rect.width;
+        if (typeof rect.height === "number") node.size[1] = rect.height;
+        this._markGraphChanged();
+        return { x: node.pos[0], y: node.pos[1], width: node.size[0], height: node.size[1] };
+    }
+
+    async _convertGraphPatchScopeWidget(runtime, nodeId, expected) {
+        const node = this._scopeGraphNode(runtime, nodeId);
+        if (!node) throw new Error(`Scoped node not found: ${String(nodeId)}`);
+        const existing = (node.inputs || [])
+            .map((input, socketIndex) => ({ input, socketIndex }))
+            .filter(item => item.input.name === expected.input && item.input.type === expected.type);
+        if (existing[expected.occurrence_index]) {
+            return { socket_index: existing[expected.occurrence_index].socketIndex };
+        }
+        const widgets = (node.widgets || []).filter(widget => widget.name === expected.input);
+        const widget = widgets[expected.occurrence_index];
+        if (!widget) throw new Error(`Scoped widget ${expected.input} is unavailable.`);
+        const beforeInputs = new Set(node.inputs || []);
+        const converted = typeof convertComfyWidgetToInput === "function"
+            ? await convertComfyWidgetToInput(node, widget)
+            : typeof node.convertWidgetToInput === "function"
+                ? await node.convertWidgetToInput(widget)
+                : false;
+        if (converted === false) throw new Error(`Scoped node ${String(node.id)} refused widget conversion.`);
+        let selected = null;
+        for (let attempt = 0; attempt < 6 && !selected; attempt += 1) {
+            await Promise.resolve();
+            const exact = (node.inputs || [])
+                .map((input, socketIndex) => ({ input, socketIndex }))
+                .filter(item => (
+                    !beforeInputs.has(item.input)
+                    && item.input.name === expected.input
+                    && item.input.type === expected.type
+                ));
+            selected = exact.length === 1 ? exact[0] : null;
+            if (!selected && typeof globalThis.requestAnimationFrame === "function") {
+                await new Promise(resolve => globalThis.requestAnimationFrame(() => resolve()));
+            }
+        }
+        if (!selected) throw new Error(`Scoped widget ${expected.input} did not create one exact socket.`);
+        this._markGraphChanged();
+        return { socket_index: selected.socketIndex };
+    }
+
+    _disconnectGraphPatchScopeConnection(runtime, expected) {
+        const graph = this._assertGraphPatchScopeRuntime(runtime);
+        if (
+            typedValuesEqual(expected.source_node_id, runtime.inputRuntimeId)
+            && typedValuesEqual(expected.target_node_id, runtime.outputRuntimeId)
+        ) {
+            throw graphPatchScopeError(
+                "direct_scope_boundary_edge_unsupported",
+                "Direct input-to-output boundary links have no supported native mutation primitive.",
+            );
+        }
+        const matches = this._scopeGraphLinkValues(graph).filter(link => (
+            typedValuesEqual(
+                this._scopeSerializedEndpointId(runtime, link.origin_id),
+                expected.source_node_id,
+            )
+            && link.origin_slot === expected.source_output_index
+            && typedValuesEqual(
+                this._scopeSerializedEndpointId(runtime, link.target_id),
+                expected.target_node_id,
+            )
+            && link.target_slot === expected.target_input_index
+        ));
+        if (matches.length !== 1) {
+            throw new Error(`Expected one exact scoped connection to disconnect; found ${matches.length}.`);
+        }
+        if (typedValuesEqual(expected.source_node_id, runtime.inputRuntimeId)) {
+            const target = this._scopeGraphNode(runtime, expected.target_node_id);
+            if (!target?.disconnectInput?.(expected.target_input_index)) {
+                throw new Error("The scoped input boundary connection could not be disconnected.");
+            }
+        } else if (typedValuesEqual(expected.target_node_id, runtime.outputRuntimeId)) {
+            const slot = graph.outputs?.[expected.target_input_index];
+            if (!slot || typeof slot.disconnect !== "function") {
+                throw new Error("The scoped output boundary connection cannot be disconnected.");
+            }
+            slot.disconnect();
+        } else {
+            const target = this._scopeGraphNode(runtime, expected.target_node_id);
+            if (!target?.disconnectInput?.(expected.target_input_index)) {
+                throw new Error("The scoped internal connection could not be disconnected.");
+            }
+        }
+        const remaining = this._scopeGraphLinkValues(graph).filter(link => (
+            typedValuesEqual(
+                this._scopeSerializedEndpointId(runtime, link.origin_id),
+                expected.source_node_id,
+            )
+            && link.origin_slot === expected.source_output_index
+            && typedValuesEqual(
+                this._scopeSerializedEndpointId(runtime, link.target_id),
+                expected.target_node_id,
+            )
+            && link.target_slot === expected.target_input_index
+        ));
+        if (remaining.length !== 0) throw new Error("The exact scoped connection persisted after disconnect.");
+        this._markGraphChanged();
+        return { disconnected: true, ...expected };
+    }
+
+    _connectGraphPatchScopeNodes(runtime, sourceId, targetId, connection) {
+        const graph = this._assertGraphPatchScopeRuntime(runtime);
+        const sourceSlot = connection?.source_output_index;
+        const targetSlot = connection?.target_input_index;
+        if (!Number.isInteger(sourceSlot) || sourceSlot < 0 || !Number.isInteger(targetSlot) || targetSlot < 0) {
+            throw new Error("Exact scoped connection indices are required.");
+        }
+        if (
+            typedValuesEqual(sourceId, runtime.inputRuntimeId)
+            && typedValuesEqual(targetId, runtime.outputRuntimeId)
+        ) {
+            throw graphPatchScopeError(
+                "direct_scope_boundary_edge_unsupported",
+                "Direct input-to-output boundary links are not supported by the native Subgraph API.",
+            );
+        }
+        let link;
+        if (typedValuesEqual(sourceId, runtime.inputRuntimeId)) {
+            const boundary = graph.inputNode?.slots?.[sourceSlot];
+            const target = this._scopeGraphNode(runtime, targetId);
+            const input = target?.inputs?.[targetSlot];
+            if (!boundary || !target || !input || input.link != null) {
+                throw new Error("The exact scoped input-boundary target is unavailable.");
+            }
+            link = boundary.connect(input, target);
+        } else if (typedValuesEqual(targetId, runtime.outputRuntimeId)) {
+            const boundary = graph.outputNode?.slots?.[targetSlot];
+            const source = this._scopeGraphNode(runtime, sourceId);
+            const output = source?.outputs?.[sourceSlot];
+            if (!boundary || !source || !output || boundary.linkIds?.length) {
+                throw new Error("The exact scoped output-boundary source is unavailable.");
+            }
+            link = boundary.connect(output, source);
+        } else {
+            const source = this._scopeGraphNode(runtime, sourceId);
+            const target = this._scopeGraphNode(runtime, targetId);
+            if (!source || !target || target.inputs?.[targetSlot]?.link != null) {
+                throw new Error("The exact scoped internal endpoints are unavailable.");
+            }
+            link = source.connect(sourceSlot, target, targetSlot);
+        }
+        if (
+            !link
+            || !typedValuesEqual(
+                this._scopeSerializedEndpointId(runtime, link.origin_id),
+                sourceId,
+            )
+            || link.origin_slot !== sourceSlot
+            || !typedValuesEqual(
+                this._scopeSerializedEndpointId(runtime, link.target_id),
+                targetId,
+            )
+            || link.target_slot !== targetSlot
+        ) {
+            throw new Error("ComfyUI rejected or redirected the exact scoped connection.");
+        }
+        this._markGraphChanged();
+        return {
+            id: link.id ?? null,
+            source_node_id: sourceId,
+            source_output_index: link.origin_slot,
+            source_output: this._scopeSlotName(runtime, sourceId, link.origin_slot, true),
+            target_node_id: targetId,
+            target_input_index: link.target_slot,
+            target_input: this._scopeSlotName(runtime, targetId, link.target_slot, false),
+            type: link.type ?? null,
+        };
+    }
+
+    _removeGraphPatchScopeNodes(runtime, nodeIds) {
+        const graph = this._assertGraphPatchScopeRuntime(runtime);
+        let removed = 0;
+        for (const nodeId of nodeIds) {
+            const node = this._scopeGraphNode(runtime, nodeId);
+            if (!node) continue;
+            graph.remove(node);
+            removed += 1;
+        }
+        if (removed > 0) this._markGraphChanged();
+        return { removed };
+    }
+
     /** Fetch one fresh browser-visible /object_info generation for touched node types. */
     async getNodeDefinitions(nodeTypes = []) {
         const response = await api.fetchApi("/object_info", { cache: "no-store" });
@@ -491,11 +1270,18 @@ export class FL_API {
     /** Remove exactly one expected link; never delegate target replacement to LiteGraph. */
     disconnectWorkflowConnection(expected, pin = null) {
         if (pin) this.assertActiveWorkflow(pin);
+        const source = this._workflowNodeFromSerializedId(expected.source_node_id, pin);
+        const target = this._workflowNodeFromSerializedId(expected.target_node_id, pin);
+        const authority = structuredClone(app.graph.serialize());
         const matches = this._workflowLinkEntries().filter(([, link]) => (
             link
-            && nodeIdsEqual(link.origin_id, expected.source_node_id)
+            && this._findRuntimeEndpointNode(app.graph, link.origin_id, {
+                serializedGraph: authority,
+            }) === source
             && link.origin_slot === expected.source_output_index
-            && nodeIdsEqual(link.target_id, expected.target_node_id)
+            && this._findRuntimeEndpointNode(app.graph, link.target_id, {
+                serializedGraph: authority,
+            }) === target
             && link.target_slot === expected.target_input_index
         ));
         if (matches.length !== 1) {
@@ -508,7 +1294,6 @@ export class FL_API {
         if (typeof app.graph?.removeLink === "function") {
             app.graph.removeLink(linkId);
         } else {
-            const target = this._findNode(link.target_id);
             if (!target || typeof target.disconnectInput !== "function") {
                 throw new Error("The current ComfyUI graph cannot disconnect an exact link.");
             }
@@ -588,6 +1373,15 @@ export class FL_API {
             console.error("[FL_API] remove error:", error);
             throw error;
         }
+    }
+
+    /** Remove nodes addressed only by canonical serialized workflow IDs. */
+    removeWorkflowNodesExact(nodeIds, pin = null) {
+        if (!Array.isArray(nodeIds)) throw new Error("Exact workflow node IDs are required.");
+        const nodes = nodeIds.map(nodeId => this._workflowNodeFromSerializedId(nodeId, pin));
+        for (const node of nodes) app.graph.remove(node);
+        if (nodes.length > 0) this._markGraphChanged();
+        return { removed: nodes.length };
     }
 
     /**
@@ -723,6 +1517,219 @@ export class FL_API {
             return { selected: nodes.length };
         } catch (error) {
             console.error("[FL_API] selectNodes error:", error);
+            throw error;
+        }
+    }
+
+    /**
+     * Select and reveal one backend-resolved workflow branch without ever
+     * resolving titles, node types, or partial scope paths in the browser.
+     * All fallible request, workflow, scope, and node checks happen before the
+     * first canvas effect.
+     */
+    async navigateWorkflowBranchExact(request) {
+        const branchId = request?.branch_id;
+        const expectedWorkflowIdentity = request?.expected_workflow_identity;
+        const expectedGraphHash = request?.expected_graph_hash;
+        const rawScopePath = request?.scope_path;
+        const requestedNodeIds = request?.node_ids;
+        if (typeof branchId !== "string" || !branchId || branchId.length > 512) {
+            throw branchNavigationError(
+                "invalid_branch_navigation",
+                "A canonical branch ID is required for branch navigation.",
+            );
+        }
+        if (
+            typeof expectedWorkflowIdentity !== "string"
+            || !expectedWorkflowIdentity
+            || !SHA256_PATTERN.test(String(expectedGraphHash || ""))
+            || !Array.isArray(rawScopePath)
+            || !Array.isArray(requestedNodeIds)
+            || requestedNodeIds.length === 0
+        ) {
+            throw branchNavigationError(
+                "invalid_branch_navigation",
+                "Exact workflow identity, graph hash, scope path, and node IDs are required.",
+            );
+        }
+
+        const scopePath = rawScopePath.map((segment, index) => {
+            const containerNodeId = segment?.container_node_id;
+            const subgraphId = segment?.subgraph_id;
+            const validContainerId = (
+                (typeof containerNodeId === "number" && Number.isInteger(containerNodeId))
+                || (typeof containerNodeId === "string" && containerNodeId.length > 0)
+            );
+            if (
+                !segment
+                || typeof segment !== "object"
+                || Array.isArray(segment)
+                || !validContainerId
+                || typeof subgraphId !== "string"
+                || !subgraphId
+            ) {
+                throw branchNavigationError(
+                    "invalid_branch_navigation",
+                    `scope_path[${index}] is not an exact subgraph scope segment.`,
+                );
+            }
+            return {
+                container_node_id: containerNodeId,
+                subgraph_id: subgraphId,
+            };
+        });
+
+        const requestedKeys = new Set();
+        for (const [index, nodeId] of requestedNodeIds.entries()) {
+            const validNodeId = (
+                (typeof nodeId === "number" && Number.isInteger(nodeId))
+                || (typeof nodeId === "string" && nodeId.length > 0)
+            );
+            if (!validNodeId) {
+                throw branchNavigationError(
+                    "invalid_branch_navigation",
+                    `node_ids[${index}] is not an exact node ID.`,
+                );
+            }
+            const key = `${typeof nodeId}:${String(nodeId)}`;
+            if (requestedKeys.has(key)) {
+                throw branchNavigationError(
+                    "branch_node_ambiguous",
+                    `Branch navigation repeats node ID ${String(nodeId)}.`,
+                    { node_id: nodeId },
+                );
+            }
+            requestedKeys.add(key);
+        }
+
+        const pin = this.pinActiveWorkflow(expectedWorkflowIdentity);
+        const initialRootState = await this._verifyBranchRootHash(
+            pin,
+            expectedGraphHash,
+        );
+        const rootGraph = initialRootState.rootGraph;
+        const targetScope = this._resolveBranchGraphScope(
+            rootGraph,
+            scopePath,
+            initialRootState.snapshot,
+        );
+        const targetGraph = targetScope.graph;
+        const nodes = requestedNodeIds.map(nodeId => (
+            this._findExactNodeInGraph(
+                targetGraph,
+                nodeId,
+                "branch",
+                targetScope.serializedGraph,
+            )
+        ));
+
+        const canvas = app.canvas;
+        if (
+            !canvas
+            || (canvas.graph !== targetGraph && typeof canvas.setGraph !== "function")
+            || (
+                typeof canvas.selectItems !== "function"
+                && typeof canvas.selectNodes !== "function"
+            )
+        ) {
+            throw branchNavigationError(
+                "branch_navigation_unavailable",
+                "The current ComfyUI canvas cannot navigate to an exact branch.",
+            );
+        }
+
+        // Hash once more after every async validation step. Scope/node
+        // resolution above is synchronous, so no stale branch can slip between
+        // this check and the first canvas effect.
+        const preEffectRootState = await this._verifyBranchRootHash(
+            pin,
+            expectedGraphHash,
+            rootGraph,
+        );
+        this._assertBranchRootState(pin, preEffectRootState);
+        const previousCanvasState = this._captureCanvasNavigationState(canvas);
+        let canvasEffectStarted = false;
+        try {
+            canvasEffectStarted = true;
+            if (canvas.graph !== targetGraph) canvas.setGraph(targetGraph);
+            if (canvas.graph !== targetGraph) {
+                throw branchNavigationError(
+                    "branch_navigation_verification_failed",
+                    "ComfyUI did not activate the exact branch scope.",
+                );
+            }
+
+            if (typeof canvas.selectItems === "function") {
+                canvas.selectItems(nodes, false);
+            } else {
+                canvas.selectNodes(nodes, false);
+            }
+            const fitMethod = await this._fitExactCanvasSelection(nodes);
+            this.assertActiveWorkflow(pin);
+
+            this._assertExactBranchCanvasState(canvas, targetGraph, nodes);
+            const finalRootState = await this._verifyBranchRootHash(
+                pin,
+                expectedGraphHash,
+                rootGraph,
+            );
+            // The final digest is asynchronous too. Close both remaining race
+            // windows synchronously before returning success: the root graph,
+            // resolved scope, active canvas graph, and exact selection must all
+            // still be the attested objects.
+            this._assertBranchRootState(pin, finalRootState);
+            const finalScope = this._resolveBranchGraphScope(
+                rootGraph,
+                scopePath,
+                finalRootState.snapshot,
+            );
+            if (finalScope.graph !== targetGraph) {
+                throw branchNavigationError(
+                    "branch_navigation_verification_failed",
+                    "The resolved branch scope changed during navigation.",
+                );
+            }
+            this._assertExactBranchCanvasState(canvas, targetGraph, nodes);
+            this._markCanvasDirty();
+            return {
+                branch_id: branchId,
+                workflow_identity: expectedWorkflowIdentity,
+                graph_hash: finalRootState.graphHash,
+                scope_path: structuredClone(scopePath),
+                scope_graph_id: targetGraph.id ?? null,
+                selected_node_ids: structuredClone(requestedNodeIds),
+                selected_count: nodes.length,
+                fitted_count: nodes.length,
+                fit_method: fitMethod,
+                queued: false,
+            };
+        } catch (error) {
+            if (canvasEffectStarted) {
+                const restore = this._restoreCanvasNavigationState(
+                    canvas,
+                    previousCanvasState,
+                );
+                if (!restore.valid && error && typeof error === "object") {
+                    let originalDetails = null;
+                    if (error.details !== undefined) {
+                        try {
+                            originalDetails = structuredClone(error.details);
+                        } catch (_) {
+                            originalDetails = String(error.details);
+                        }
+                    }
+                    error.details = {
+                        code: "branch_navigation_restore_failed",
+                        message: "The prior canvas graph, selection, or viewport could not be restored exactly.",
+                        issues: restore.issues,
+                        cause: {
+                            code: error.code || "branch_navigation_failed",
+                            message: String(error.message || error),
+                            details: originalDetails,
+                        },
+                    };
+                }
+            }
             throw error;
         }
     }
@@ -1056,9 +2063,8 @@ export class FL_API {
     }
 
     /** Apply every requested widget exactly or fail for transactional rollback. */
-    async setValuesExact(nodeId, values) {
-        const node = this._findNode(nodeId);
-        if (!node) throw new Error(`Node not found: ${nodeId}`);
+    async setValuesExact(nodeId, values, pin = null) {
+        const node = this._workflowNodeFromSerializedId(nodeId, pin);
         const pending = new Map(Object.entries(values || {}));
         const applied = [];
         let stalledRounds = 0;
@@ -1108,9 +2114,8 @@ export class FL_API {
     }
 
     /** Promote one exact primitive widget to a live input socket. */
-    async convertWidgetToInputExact(nodeId, expected) {
-        const node = this._findNode(nodeId);
-        if (!node) throw new Error(`Node not found: ${nodeId}`);
+    async convertWidgetToInputExact(nodeId, expected, pin = null) {
+        const node = this._workflowNodeFromSerializedId(nodeId, pin);
         const existingInputs = (node.inputs || [])
             .map((input, socketIndex) => ({ input, socketIndex }))
             .filter(item => item.input.name === expected.input && item.input.type === expected.type);
@@ -1163,9 +2168,8 @@ export class FL_API {
     }
 
     /** Assign one already-validated Comfy image reference to an exact widget. */
-    assignAttachmentExact(nodeId, attachment) {
-        const node = this._findNode(nodeId);
-        if (!node) throw new Error(`Node not found: ${nodeId}`);
+    assignAttachmentExact(nodeId, attachment, pin = null) {
+        const node = this._workflowNodeFromSerializedId(nodeId, pin);
         const widgets = (node.widgets || []).filter(widget => widget.name === attachment.input);
         if (widgets.length !== 1) {
             throw new Error(
@@ -1191,9 +2195,10 @@ export class FL_API {
         return { assigned: true, value };
     }
 
-    verifyAttachmentExact(nodeId, attachment) {
-        const node = this._findNode(nodeId);
-        if (!node) return false;
+    verifyAttachmentExact(nodeId, attachment, pin = null) {
+        const projection = this._workflowNodeProjection(nodeId, pin, true);
+        if (!projection) return false;
+        const node = projection.node;
         const widgets = (node.widgets || []).filter(widget => widget.name === attachment.input);
         if (widgets.length !== 1) return false;
         const observed = parseImageWidgetRef(widgets[0].value);
@@ -1818,11 +2823,8 @@ export class FL_API {
      */
     connectWorkflowNodesExact(sourceId, targetId, connection, pin = null) {
         if (pin) this.assertActiveWorkflow(pin);
-        const sourceNode = this._findNode(sourceId);
-        const targetNode = this._findNode(targetId);
-        if (!sourceNode || !targetNode) {
-            throw new Error("Source or target node not found for exact workflow connection.");
-        }
+        const sourceNode = this._workflowNodeFromSerializedId(sourceId, pin);
+        const targetNode = this._workflowNodeFromSerializedId(targetId, pin);
 
         const sourceSlot = connection?.source_output_index;
         const targetSlot = connection?.target_input_index;
@@ -1849,10 +2851,15 @@ export class FL_API {
                 + `${targetNode.id}[${targetSlot}].`,
             );
         }
+        const authority = structuredClone(app.graph.serialize());
         const endpointsMatch = (
-            nodeIdsEqual(link.origin_id, sourceNode.id)
+            this._findRuntimeEndpointNode(app.graph, link.origin_id, {
+                serializedGraph: authority,
+            }) === sourceNode
             && link.origin_slot === sourceSlot
-            && nodeIdsEqual(link.target_id, targetNode.id)
+            && this._findRuntimeEndpointNode(app.graph, link.target_id, {
+                serializedGraph: authority,
+            }) === targetNode
             && link.target_slot === targetSlot
         );
         if (!endpointsMatch) {
@@ -1865,10 +2872,10 @@ export class FL_API {
         this._markGraphChanged();
         return {
             id: link.id ?? null,
-            source_node_id: link.origin_id,
+            source_node_id: sourceId,
             source_output_index: link.origin_slot,
             source_output: sourceNode.outputs[sourceSlot]?.name ?? null,
-            target_node_id: link.target_id,
+            target_node_id: targetId,
             target_input_index: link.target_slot,
             target_input: targetNode.inputs[targetSlot]?.name ?? null,
             type: link.type ?? null,
@@ -2255,6 +3262,22 @@ export class FL_API {
             console.error("[FL_API] setRect error:", error);
             throw error;
         }
+    }
+
+    /** Set a node rectangle through one canonical serialized workflow ID. */
+    setWorkflowNodeRectExact(nodeId, rect, pin = null) {
+        const node = this._workflowNodeFromSerializedId(nodeId, pin);
+        if (typeof rect.x === "number") node.pos[0] = rect.x;
+        if (typeof rect.y === "number") node.pos[1] = rect.y;
+        if (typeof rect.width === "number") node.size[0] = rect.width;
+        if (typeof rect.height === "number") node.size[1] = rect.height;
+        this._markGraphChanged();
+        return {
+            x: node.pos[0],
+            y: node.pos[1],
+            width: node.size[0],
+            height: node.size[1],
+        };
     }
 
     /**
@@ -2939,6 +3962,538 @@ export class FL_API {
     }
 
     // ==================== INTERNAL HELPERS ====================
+
+    _captureBranchRootState(pin) {
+        this.assertActiveWorkflow(pin);
+        const rootGraphBefore = app.rootGraph || app.graph;
+        if (!rootGraphBefore) {
+            throw branchNavigationError(
+                "branch_scope_not_found",
+                "The active root graph is unavailable.",
+            );
+        }
+        const snapshot = this.captureWorkflowSnapshot(pin);
+        const rootGraphAfter = app.rootGraph || app.graph;
+        this.assertActiveWorkflow(pin);
+        if (rootGraphAfter !== rootGraphBefore) {
+            throw branchNavigationError(
+                "branch_navigation_precondition_failed",
+                "The active root graph changed while the branch was being verified.",
+                { reason: "root_graph_identity_changed" },
+            );
+        }
+        return {
+            rootGraph: rootGraphAfter,
+            snapshot,
+            token: canonicalWorkflowJSON(snapshot),
+        };
+    }
+
+    async _verifyBranchRootHash(pin, expectedGraphHash, expectedRootGraph = null) {
+        const before = this._captureBranchRootState(pin);
+        if (expectedRootGraph && before.rootGraph !== expectedRootGraph) {
+            throw branchNavigationError(
+                "branch_navigation_precondition_failed",
+                "The active root graph instance no longer matches the discovered branch.",
+                { reason: "root_graph_identity_changed" },
+            );
+        }
+        const actualGraphHash = await workflowGraphHash(before.snapshot);
+        const after = this._captureBranchRootState(pin);
+        if (
+            after.rootGraph !== before.rootGraph
+            || (expectedRootGraph && after.rootGraph !== expectedRootGraph)
+            || after.token !== before.token
+        ) {
+            throw branchNavigationError(
+                "branch_navigation_precondition_failed",
+                "The active graph changed while its branch hash was being verified.",
+                {
+                    reason: "graph_changed_during_hash",
+                    expected_graph_hash: expectedGraphHash,
+                    verified_graph_hash: actualGraphHash,
+                },
+            );
+        }
+        if (actualGraphHash !== expectedGraphHash) {
+            throw branchNavigationError(
+                "branch_navigation_precondition_failed",
+                "The active graph no longer matches the discovered branch.",
+                {
+                    reason: "graph_hash_mismatch",
+                    expected_graph_hash: expectedGraphHash,
+                    actual_graph_hash: actualGraphHash,
+                },
+            );
+        }
+        return { ...after, graphHash: actualGraphHash };
+    }
+
+    _assertBranchRootState(pin, expected) {
+        const observed = this._captureBranchRootState(pin);
+        if (
+            observed.rootGraph !== expected.rootGraph
+            || observed.token !== expected.token
+        ) {
+            throw branchNavigationError(
+                "branch_navigation_precondition_failed",
+                "The active graph changed after branch verification.",
+                {
+                    reason: "graph_changed_after_hash",
+                    verified_graph_hash: expected.graphHash,
+                },
+            );
+        }
+        return observed;
+    }
+
+    _assertExactBranchCanvasState(canvas, targetGraph, nodes) {
+        const selectedItems = this._canvasSelectionItems(canvas);
+        if (
+            canvas.graph !== targetGraph
+            || selectedItems.length !== nodes.length
+            || nodes.some(node => !selectedItems.includes(node))
+        ) {
+            throw branchNavigationError(
+                "branch_navigation_verification_failed",
+                "The canvas did not retain the exact branch scope and selection.",
+            );
+        }
+    }
+
+    _graphNodes(graph) {
+        if (Array.isArray(graph?._nodes)) return graph._nodes;
+        if (Array.isArray(graph?.nodes)) return graph.nodes;
+        return [];
+    }
+
+    _serializedGraphNodes(serializedGraph) {
+        return Array.isArray(serializedGraph?.nodes) ? serializedGraph.nodes : [];
+    }
+
+    _serializeRuntimeNode(node) {
+        if (!node || typeof node.serialize !== "function") return null;
+        const serialized = node.serialize();
+        return serialized && typeof serialized === "object" && !Array.isArray(serialized)
+            ? structuredClone(serialized)
+            : null;
+    }
+
+    _nodeProjectionError(code, message, nodeId, matchCount = null) {
+        const error = new Error(message);
+        error.code = code;
+        error.details = {
+            node_id: nodeId,
+            ...(matchCount === null ? {} : { match_count: matchCount }),
+        };
+        return error;
+    }
+
+    /**
+     * Resolve a serialized workflow ID to one live node. Modern ComfyUI keeps
+     * runtime NodeIds as strings while node.serialize().id canonicalizes
+     * numeric IDs. The serialized record is the wire authority; String()-based
+     * lookup is deliberately forbidden because 1 and "1" can coexist live.
+     */
+    _resolveSerializedNodeProjection(graph, serializedGraph, nodeId, options = {}) {
+        const missingCode = options.missingCode || "workflow_node_projection_missing";
+        const ambiguousCode = options.ambiguousCode || "workflow_node_projection_ambiguous";
+        const label = options.label || "Workflow";
+        const runtimeNodes = this._graphNodes(graph);
+        const authorityMatches = this._serializedGraphNodes(serializedGraph).filter(node => (
+            typedValuesEqual(node?.id, nodeId)
+        ));
+        const projectedMatches = runtimeNodes
+            .map(node => ({ node, serializedNode: this._serializeRuntimeNode(node) }))
+            .filter(item => typedValuesEqual(item.serializedNode?.id, nodeId));
+
+        if (projectedMatches.length > 1 || authorityMatches.length > 1) {
+            throw this._nodeProjectionError(
+                ambiguousCode,
+                `${label} node ${String(nodeId)} has an ambiguous serialized projection.`,
+                nodeId,
+                Math.max(projectedMatches.length, authorityMatches.length),
+            );
+        }
+        if (projectedMatches.length === 1) {
+            if (authorityMatches.length !== 1) {
+                throw this._nodeProjectionError(
+                    missingCode,
+                    `${label} node ${String(nodeId)} is absent from serialized authority.`,
+                    nodeId,
+                );
+            }
+            const projected = projectedMatches[0];
+            const authority = authorityMatches[0];
+            const liveType = projected.node.comfyClass || projected.node.type;
+            const projectedType = projected.serializedNode.type ?? liveType;
+            const authorityType = authority.type ?? projectedType;
+            if (
+                (liveType != null && projectedType != null && liveType !== projectedType)
+                || (
+                    projectedType != null
+                    && authorityType != null
+                    && projectedType !== authorityType
+                )
+            ) {
+                throw this._nodeProjectionError(
+                    ambiguousCode,
+                    `${label} node ${String(nodeId)} conflicts with serialized node type authority.`,
+                    nodeId,
+                    1,
+                );
+            }
+            return {
+                node: projected.node,
+                serializedNode: structuredClone(authority),
+                serializedId: authority.id,
+            };
+        }
+
+        // Compatibility for older/custom graph objects that do not expose a
+        // node serializer. Exact typed identity remains safe; coercion does not.
+        const exactRuntimeMatches = runtimeNodes.filter(node => (
+            typedValuesEqual(node?.id, nodeId)
+        ));
+        if (exactRuntimeMatches.length > 1) {
+            throw this._nodeProjectionError(
+                ambiguousCode,
+                `${label} node ${String(nodeId)} is ambiguous.`,
+                nodeId,
+                exactRuntimeMatches.length,
+            );
+        }
+        if (exactRuntimeMatches.length === 1) {
+            const exactNode = exactRuntimeMatches[0];
+            if (this._serializeRuntimeNode(exactNode)) {
+                throw this._nodeProjectionError(
+                    missingCode,
+                    `${label} node ${String(nodeId)} is not a serialized workflow ID.`,
+                    nodeId,
+                );
+            }
+            const authority = authorityMatches[0] || null;
+            const liveType = exactNode.comfyClass || exactNode.type;
+            if (authority?.type != null && liveType != null && authority.type !== liveType) {
+                throw this._nodeProjectionError(
+                    ambiguousCode,
+                    `${label} node ${String(nodeId)} conflicts with serialized node type authority.`,
+                    nodeId,
+                    1,
+                );
+            }
+            return {
+                node: exactNode,
+                serializedNode: authority ? structuredClone(authority) : null,
+                serializedId: authority?.id ?? nodeId,
+            };
+        }
+        if (options.allowMissing) return null;
+        throw this._nodeProjectionError(
+            missingCode,
+            `${label} node ${String(nodeId)} is missing.`,
+            nodeId,
+        );
+    }
+
+    _projectRuntimeNode(graph, serializedGraph, node, options = {}) {
+        const serialized = this._serializeRuntimeNode(node);
+        const serializedId = serialized?.id ?? node?.id;
+        const projected = this._resolveSerializedNodeProjection(
+            graph,
+            serializedGraph,
+            serializedId,
+            options,
+        );
+        if (projected.node !== node) {
+            throw this._nodeProjectionError(
+                options.ambiguousCode || "workflow_node_projection_ambiguous",
+                `${options.label || "Workflow"} node ${String(serializedId)} projects to a different live node.`,
+                serializedId,
+                2,
+            );
+        }
+        return projected;
+    }
+
+    _findRuntimeEndpointNode(graph, endpointId, options = {}) {
+        const matches = this._graphNodes(graph).filter(node => (
+            typedValuesEqual(node?.id, endpointId)
+        ));
+        if (matches.length === 1) return matches[0];
+        if (matches.length > 1) {
+            throw this._nodeProjectionError(
+                options.ambiguousCode || "workflow_node_projection_ambiguous",
+                `${options.label || "Workflow"} runtime endpoint ${String(endpointId)} is ambiguous.`,
+                endpointId,
+                matches.length,
+            );
+        }
+        if (options.serializedGraph) {
+            return this._resolveSerializedNodeProjection(
+                graph,
+                options.serializedGraph,
+                endpointId,
+                {
+                    allowMissing: true,
+                    missingCode: options.missingCode,
+                    ambiguousCode: options.ambiguousCode,
+                    label: options.label,
+                },
+            )?.node || null;
+        }
+        return null;
+    }
+
+    _workflowNodeProjection(nodeId, pin = null, allowMissing = false) {
+        if (pin) this.assertActiveWorkflow(pin);
+        const graph = app.graph;
+        const authority = structuredClone(graph.serialize());
+        const projection = this._resolveSerializedNodeProjection(
+            graph,
+            authority,
+            nodeId,
+            { allowMissing },
+        );
+        if (pin) this.assertActiveWorkflow(pin);
+        return projection;
+    }
+
+    _workflowNodeFromSerializedId(nodeId, pin = null) {
+        return this._workflowNodeProjection(nodeId, pin, false).node;
+    }
+
+    _findExactNodeInGraph(graph, nodeId, label = "scope", serializedGraph = null) {
+        return this._resolveSerializedNodeProjection(graph, serializedGraph, nodeId, {
+            missingCode: label === "branch" ? "branch_node_missing" : "branch_scope_not_found",
+            ambiguousCode: label === "branch" ? "branch_node_ambiguous" : "branch_scope_ambiguous",
+            label: label === "branch" ? "Branch" : "Scope",
+        }).node;
+    }
+
+    _serializedSubgraphDefinitions(rootSnapshot) {
+        const definitions = rootSnapshot?.definitions?.subgraphs;
+        if (Array.isArray(definitions)) return definitions;
+        if (definitions && typeof definitions === "object") {
+            return Object.values(definitions);
+        }
+        return [];
+    }
+
+    _resolveBranchGraphScope(rootGraph, scopePath, rootSnapshot) {
+        let graph = rootGraph;
+        let serializedGraph = rootSnapshot;
+        const resolvedContainers = [];
+        for (const [index, segment] of scopePath.entries()) {
+            const exactNode = this._findExactNodeInGraph(
+                graph,
+                segment.container_node_id,
+                "scope",
+                serializedGraph,
+            );
+            if (
+                (typeof exactNode.isSubgraphNode === "function" && !exactNode.isSubgraphNode())
+                || !exactNode.subgraph
+            ) {
+                throw branchNavigationError(
+                    "branch_scope_not_found",
+                    `scope_path[${index}] is not a subgraph container.`,
+                    { container_node_id: segment.container_node_id },
+                );
+            }
+            if (String(exactNode.subgraph.id ?? "") !== segment.subgraph_id) {
+                throw branchNavigationError(
+                    "branch_scope_not_found",
+                    `scope_path[${index}] resolves to a different subgraph.`,
+                    {
+                        container_node_id: segment.container_node_id,
+                        expected_subgraph_id: segment.subgraph_id,
+                        actual_subgraph_id: exactNode.subgraph.id ?? null,
+                    },
+                );
+            }
+            const registeredSubgraph = typeof rootGraph.subgraphs?.get === "function"
+                ? rootGraph.subgraphs.get(segment.subgraph_id)
+                : null;
+            if (registeredSubgraph && registeredSubgraph !== exactNode.subgraph) {
+                throw branchNavigationError(
+                    "branch_scope_ambiguous",
+                    `scope_path[${index}] conflicts with the registered subgraph definition.`,
+                );
+            }
+            const serializedDefinitions = this._serializedSubgraphDefinitions(rootSnapshot)
+                .filter(definition => String(definition?.id ?? "") === segment.subgraph_id);
+            if (
+                serializedDefinitions.length !== 1
+                && !(serializedDefinitions.length === 0 && !this._serializeRuntimeNode(exactNode))
+            ) {
+                throw branchNavigationError(
+                    serializedDefinitions.length === 0
+                        ? "branch_scope_not_found"
+                        : "branch_scope_ambiguous",
+                    `scope_path[${index}] does not resolve to one serialized subgraph definition.`,
+                    {
+                        subgraph_id: segment.subgraph_id,
+                        match_count: serializedDefinitions.length,
+                    },
+                );
+            }
+            resolvedContainers.push(exactNode);
+            graph = exactNode.subgraph;
+            serializedGraph = serializedDefinitions[0] || null;
+        }
+
+        if (scopePath.length > 0 && typeof rootGraph.resolveSubgraphIdPath === "function") {
+            try {
+                const nativeNodes = rootGraph.resolveSubgraphIdPath(
+                    resolvedContainers.map(node => node.id),
+                );
+                if (
+                    !Array.isArray(nativeNodes)
+                    || nativeNodes.length !== resolvedContainers.length
+                    || nativeNodes.some((node, index) => node !== resolvedContainers[index])
+                ) {
+                    throw branchNavigationError(
+                        "branch_scope_ambiguous",
+                        "The native subgraph resolver disagrees with serialized scope authority.",
+                    );
+                }
+            } catch (error) {
+                if (error?.code === "branch_scope_ambiguous") throw error;
+                // Older/custom builds may not expose a usable native resolver;
+                // the exact serialized projection above remains authoritative.
+            }
+        }
+        return { graph, serializedGraph };
+    }
+
+    _canvasSelectionItems(canvas) {
+        if (canvas?.selectedItems && typeof canvas.selectedItems.values === "function") {
+            return Array.from(canvas.selectedItems.values());
+        }
+        return Object.values(canvas?.selected_nodes || {});
+    }
+
+    _captureCanvasNavigationState(canvas) {
+        const offset = canvas?.ds?.offset;
+        return {
+            graph: canvas?.graph || null,
+            selectedItems: this._canvasSelectionItems(canvas),
+            viewport: {
+                scale: Number.isFinite(canvas?.ds?.scale) ? canvas.ds.scale : null,
+                offset: Array.isArray(offset) && offset.length >= 2
+                    ? [offset[0], offset[1]]
+                    : null,
+            },
+        };
+    }
+
+    _restoreCanvasNavigationState(canvas, state) {
+        const issues = [];
+        try {
+            if (state.graph && canvas.graph !== state.graph) canvas.setGraph(state.graph);
+        } catch (error) {
+            issues.push({
+                field: "graph",
+                reason: "restore_threw",
+                message: String(error?.message || error),
+            });
+        }
+        try {
+            if (typeof canvas.selectItems === "function") {
+                canvas.selectItems(state.selectedItems, false);
+            } else if (typeof canvas.selectNodes === "function") {
+                canvas.selectNodes(state.selectedItems, false);
+            }
+        } catch (error) {
+            issues.push({
+                field: "selection",
+                reason: "restore_threw",
+                message: String(error?.message || error),
+            });
+        }
+        try {
+            if (state.viewport.scale !== null && canvas?.ds) {
+                canvas.ds.scale = state.viewport.scale;
+            }
+            if (state.viewport.offset && Array.isArray(canvas?.ds?.offset)) {
+                canvas.ds.offset[0] = state.viewport.offset[0];
+                canvas.ds.offset[1] = state.viewport.offset[1];
+            }
+            canvas?.setDirty?.(true, true);
+        } catch (error) {
+            issues.push({
+                field: "viewport",
+                reason: "restore_threw",
+                message: String(error?.message || error),
+            });
+        }
+
+        if (canvas.graph !== state.graph) {
+            issues.push({
+                field: "graph",
+                reason: "identity_mismatch",
+                expected_graph_id: state.graph?.id ?? null,
+                actual_graph_id: canvas.graph?.id ?? null,
+            });
+        }
+        const selectedItems = this._canvasSelectionItems(canvas);
+        if (
+            selectedItems.length !== state.selectedItems.length
+            || state.selectedItems.some(item => !selectedItems.includes(item))
+        ) {
+            issues.push({
+                field: "selection",
+                reason: "identity_mismatch",
+                expected_node_ids: state.selectedItems.map(item => item?.id ?? null),
+                actual_node_ids: selectedItems.map(item => item?.id ?? null),
+            });
+        }
+        if (
+            state.viewport.scale !== null
+            && canvas?.ds?.scale !== state.viewport.scale
+        ) {
+            issues.push({
+                field: "viewport.scale",
+                reason: "value_mismatch",
+                expected: state.viewport.scale,
+                actual: canvas?.ds?.scale ?? null,
+            });
+        }
+        if (
+            state.viewport.offset
+            && (
+                !Array.isArray(canvas?.ds?.offset)
+                || canvas.ds.offset[0] !== state.viewport.offset[0]
+                || canvas.ds.offset[1] !== state.viewport.offset[1]
+            )
+        ) {
+            issues.push({
+                field: "viewport.offset",
+                reason: "value_mismatch",
+                expected: structuredClone(state.viewport.offset),
+                actual: Array.isArray(canvas?.ds?.offset)
+                    ? [canvas.ds.offset[0], canvas.ds.offset[1]]
+                    : null,
+            });
+        }
+        return { valid: issues.length === 0, issues };
+    }
+
+    async _fitExactCanvasSelection(nodes) {
+        const canvas = app.canvas;
+        if (typeof canvas?.fitViewToSelectionAnimated === "function") {
+            await canvas.fitViewToSelectionAnimated();
+            return "native_selection";
+        }
+        const commandBridge = this._getCommandBridge();
+        if (typeof commandBridge?.execute === "function") {
+            await commandBridge.execute("Comfy.Canvas.FitView");
+            return "native_command";
+        }
+        this._fitNodesFallback(nodes);
+        return "fallback";
+    }
 
     _unwrap(value) {
         if (value && typeof value === "object" && "value" in value) {

@@ -12,6 +12,9 @@ This skill is workflow-first. It borrows the old Ren Agent's operating disciplin
 ## Core Loop
 
 1. Compile the whole requested graph change once.
+   - For a whole-branch request such as find, jump, compare, clone, replace, or remove, call `workflow_branches_discover` first. Use exact returned workflow, graph, catalog, scope, branch, node, slot, and boundary-edge facts; never authorize a branch from its label or fingerprint.
+   - Resolve comparison operands to two exact branch IDs under the same pinned catalog. One bounded listing may identify both uniquely; otherwise perform separate pinned discovery resolutions. Never guess two branches from one ambiguous text query.
+   - For whole-branch clone, replace, or remove, pass the exact discovery pins and mappings to `compile_workflow_branch_operation`. Root operations return GraphPatch v2; supported nested operations return scoped GraphPatch v3.
    - For a new workflow, an added branch, a rewire, an existing value/layout change, a removal, or an attachment, call `compile_workflow_refinement_spec` first.
    - Include every requested role or exact class, value, edge, update/removal, attachment, and layout hint in one semantic request.
    - Describe the desired endpoints rather than guessing intermediary classes or dynamic dotted paths. The compiler prefers direct compatibility, then may infer a unique bounded supported local converter route. Partner/API/heavy/output nodes require explicit intent.
@@ -20,11 +23,12 @@ This skill is workflow-first. It borrows the old Ren Agent's operating disciplin
    - Do not precede the compiler with workflow JSON, overview, selection, node search/details, slots, values, or layout reads. It reads the active graph (including an empty canvas) and refreshed local native, partner, and custom schemas internally.
 2. Respect deterministic outcomes.
    - If `valid=true`, pass the returned `apply_request` unchanged to `apply_workflow_graph_patch`.
+   - After a successful whole-branch apply, call `resolve_workflow_branch_successor` with the unchanged apply envelope, compiler `pending_successor_locator`, and the apply result's exact aliases, workflow identity, and final graph hash. Treat its per-scope successor list as authoritative; zero or multiple successors are valid outcomes when explicitly attested.
    - If `needs_choice=true`, show the ranked node, endpoint, or route candidates and wait for the user. Never accept an alphabetical tie-break.
    - If a schema is classified unsupported, stop and report it. Use lower-level schema tools only in a focused diagnostic follow-up, never to bypass the failed atomic route in the same run.
 3. Apply one atomic GraphPatch.
    - Keep the same application ID for retries so the idempotency ledger cannot duplicate work.
-   - GraphPatch may create, update, connect, disconnect, remove, attach, and lay out arbitrary acyclic branches with fan-in, fan-out, multiple sinks, dynamic inputs, and explicit widget-to-input conversion.
+   - Root GraphPatch v2 and scoped GraphPatch v3 may create, update, connect, disconnect, remove, attach, and lay out arbitrary acyclic branches with fan-in, fan-out, multiple sinks, dynamic inputs, and explicit widget-to-input conversion.
    - It pins workflow, graph, catalog, and schemas; preserves unrelated state; visibly applies mutations in deterministic order; verifies the exact final graph; fully rolls back on failure; and never queues.
    - Do not fall back to `create_nodes`, `set_node_values`, `connect_nodes_batch`, `remove_nodes`, or legacy workflow planners after a GraphPatch validation/application failure.
 4. Trust exact verification.
@@ -55,10 +59,15 @@ Always wrap tool input as required by the active MCP client. In many FL-MCP clie
 Common patterns:
 
 - Any normal graph change: `compile_workflow_refinement_spec`, then pass its valid `apply_request` unchanged to `apply_workflow_graph_patch`.
+- Find/list a branch: `workflow_branches_discover`; stop on ambiguity.
+- Jump/focus a branch: discover it, then pass its exact pins and `branch_id` to `workflow_branch_navigate`.
+- Compare branches: resolve two exact IDs under the same catalog pins, then call `workflow_branch_compare`.
+- Clone/replace/remove a whole branch: discover, call `compile_workflow_branch_operation`, apply its unchanged GraphPatch envelope, then call `resolve_workflow_branch_successor` with the exact successful result facts.
+- Nested mutation: unique definitions may be edited directly; reused definitions require explicit `shared_definition` acknowledgement of every affected instance. Instance-only copy-on-write detach remains unsupported and must fail closed.
 - New empty-canvas workflow: use the same two tools; no preliminary inspection is necessary.
 - Selected/deictic edit: declare an existing selector with `selected=true`; do not separately read selection.
 - Parameter or layout change: express an existing-node update in the semantic request; GraphPatch applies it atomically with structural changes.
-- Add/rewire/remove arbitrary branches: describe all desired edges and removals in one request; GraphPatch preserves every undeclared sibling edge.
+- Add or rewire part of a graph: describe all desired edges in one semantic refinement request. Whole-branch clone/replace/remove uses the branch-specific flow above. Both routes preserve every undeclared sibling edge.
 - Attach a chat image: include the trusted attachment binding in the compiler request; never separately place the image.
 - Diagnose a classified unsupported schema: in a later focused request, use local node details/schema tools. Do not mutate through low-level tools in that failed run.
 - Read-only explanation with no requested change: `workflow_overview`, `workflow_diagram`, `workflow_get_current_json`, selection, values, or slots remain appropriate.
@@ -75,6 +84,7 @@ Common patterns:
 - Never use stale node knowledge, Registry metadata, or web results as build authority. Only the refreshed local `/object_info` catalog can authorize a node class/schema.
 - Verified exact-schema lessons may rank a route internally, but they never authorize a stale class, port, value, or connection.
 - Never replay a reconstructed or edited apply envelope. Pass the exact compiler result unchanged.
+- Never reuse a branch ID after a mutation without the attested successor result or fresh discovery.
 - Never place multiple new nodes at the same coordinates. Prefer automatic placement, or calculate manual positions from measured width and height plus a visible gap.
 - Never assume requested creation coordinates were retained. Collision avoidance may adjust them; use the final bounds returned by `create_nodes`.
 - Never set a ComfyUI KSampler seed to a negative value.

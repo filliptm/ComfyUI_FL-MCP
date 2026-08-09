@@ -14,9 +14,10 @@ import json
 import math
 import re
 from collections import deque
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import PurePosixPath, PureWindowsPath
 from typing import Annotated, Any, Literal, TypeAlias
+from uuid import UUID
 
 from node_library import node_schema_hash
 from pydantic import (
@@ -26,6 +27,7 @@ from pydantic import (
     StrictFloat,
     StrictInt,
     StrictStr,
+    TypeAdapter,
     model_validator,
 )
 from workflow_planner import (
@@ -35,7 +37,11 @@ from workflow_planner import (
     _is_connectable,
     _validate_widget_value,
 )
-from workflow_refinement import NormalizedGraphEdge, NormalizedGraphSnapshot
+from workflow_refinement import (
+    NormalizedGraphEdge,
+    NormalizedGraphSnapshot,
+    normalize_workflow_graph,
+)
 from workflow_schema_capabilities import (
     InputCapability,
     MaterializedInput,
@@ -46,9 +52,24 @@ from workflow_schema_capabilities import (
     materialize_inputs,
     normalize_node_schema,
 )
+from workflow_scope import (
+    SCOPE_INPUT_NODE_ID,
+    SCOPE_INPUT_NODE_TYPE,
+    SCOPE_OUTPUT_NODE_ID,
+    SCOPE_OUTPUT_NODE_TYPE,
+    WorkflowBoundaryPortFact,
+    WorkflowScopeEditPolicy,
+    WorkflowScopeError,
+    WorkflowScopeProjection,
+    WorkflowScopeStep,
+    project_workflow_scope,
+    resolve_workflow_scope_edit,
+)
 
 GRAPH_PATCH_SCHEMA = "fl-mcp.workflow-graph-patch.v2"
 GRAPH_PATCH_HASH_SCHEMA = "fl-mcp.workflow-graph-patch-hash.v2"
+SCOPED_GRAPH_PATCH_SCHEMA = "fl-mcp.workflow-graph-patch.v3"
+SCOPED_GRAPH_PATCH_HASH_SCHEMA = "fl-mcp.workflow-graph-patch-hash.v3"
 
 _ALIAS_PATTERN = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _APPLICATION_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$")
@@ -59,6 +80,10 @@ MAX_GRAPH_PATCH_ATTACHMENTS = 8
 NodeId: TypeAlias = StrictInt | StrictStr
 SlotIndex: TypeAlias = Annotated[StrictInt, Field(ge=0)]
 Coordinate: TypeAlias = StrictInt | StrictFloat
+WorkflowScopePath: TypeAlias = Annotated[
+    list[WorkflowScopeStep],
+    Field(min_length=1, max_length=32),
+]
 
 
 def _canonical_hash(value: Any) -> str:
@@ -426,6 +451,270 @@ class PlanGraphPatchRequest(BaseModel):
 GraphPatchRequest = PlanGraphPatchRequest
 
 
+def _scope_step_key(step: WorkflowScopeStep) -> tuple[str, str, str]:
+    node_kind, node_value = _id_key(step.container_node_id)
+    return node_kind, node_value, step.subgraph_id
+
+
+def _scope_path_key(path: Sequence[WorkflowScopeStep]) -> tuple[tuple[str, str, str], ...]:
+    return tuple(_scope_step_key(step) for step in path)
+
+
+class GraphPatchScopeAuthority(BaseModel):
+    """Exact root-pinned authority for editing one serialized subgraph definition."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["subgraph_definition"] = "subgraph_definition"
+    scope_path: WorkflowScopePath
+    definition_id: str = Field(..., min_length=1, max_length=256)
+    definition_hash: str = Field(..., pattern=r"^[0-9a-f]{64}$")
+    edit_mode: Literal["instance", "shared_definition"] = "instance"
+    affected_scope_paths: list[WorkflowScopePath] = Field(
+        ...,
+        min_length=1,
+        max_length=8_192,
+    )
+
+    @model_validator(mode="after")
+    def validate_scope_authority(self) -> GraphPatchScopeAuthority:
+        if self.scope_path[-1].subgraph_id != self.definition_id:
+            raise ValueError("definition_id must equal the terminal scope_path subgraph_id")
+        keys = [_scope_path_key(path) for path in self.affected_scope_paths]
+        if len(keys) != len(set(keys)):
+            raise ValueError("affected_scope_paths must be duplicate-free")
+        self.affected_scope_paths = [
+            path
+            for _, path in sorted(
+                zip(keys, self.affected_scope_paths, strict=True),
+                key=lambda item: (len(item[0]), item[0]),
+            )
+        ]
+        return self
+
+
+class GraphPatchScopeBoundaryIdentity(BaseModel):
+    """Immutable public identity of one subgraph boundary port."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    slot_id: str = Field(..., min_length=36, max_length=36)
+    slot_index: SlotIndex
+    name: str = Field(..., min_length=1, max_length=256)
+    type: str = Field(..., min_length=1, max_length=256)
+
+    @model_validator(mode="after")
+    def validate_slot_id(self) -> GraphPatchScopeBoundaryIdentity:
+        try:
+            canonical = str(UUID(self.slot_id))
+        except (TypeError, ValueError, AttributeError) as exc:
+            raise ValueError("scope boundary slot_id must be a canonical UUID") from exc
+        if canonical != self.slot_id:
+            raise ValueError("scope boundary slot_id must use canonical lowercase UUID spelling")
+        return self
+
+
+class GraphPatchScopeInputRef(BaseModel):
+    """Public source-only reference to a subgraph input boundary."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    scope_input: GraphPatchScopeBoundaryIdentity
+
+
+class GraphPatchScopeOutputRef(BaseModel):
+    """Public target-only reference to a subgraph output boundary."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    scope_output: GraphPatchScopeBoundaryIdentity
+
+
+ScopedGraphPatchSourceRef: TypeAlias = (
+    ExistingNodeRef | NewNodeRef | GraphPatchScopeInputRef
+)
+ScopedGraphPatchTargetRef: TypeAlias = (
+    ExistingNodeRef | NewNodeRef | GraphPatchScopeOutputRef
+)
+
+
+class ScopedGraphPatchSourceEndpoint(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    ref: ScopedGraphPatchSourceRef
+    output_index: SlotIndex
+    output: str = Field(..., min_length=1, max_length=256)
+    type: str = Field(..., min_length=1, max_length=256)
+
+    @model_validator(mode="after")
+    def validate_boundary_fact(self) -> ScopedGraphPatchSourceEndpoint:
+        if isinstance(self.ref, GraphPatchScopeInputRef):
+            fact = self.ref.scope_input
+            if (
+                self.output_index != fact.slot_index
+                or self.output != fact.name
+                or self.type != fact.type
+            ):
+                raise ValueError(
+                    "scope_input endpoint index, name, and type must equal its immutable boundary fact"
+                )
+        return self
+
+
+class ScopedGraphPatchTargetEndpoint(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    ref: ScopedGraphPatchTargetRef
+    input_index: SlotIndex
+    occurrence_index: SlotIndex = 0
+    socket_index: SlotIndex | None
+    input: str = Field(..., min_length=1, max_length=256)
+    type: str = Field(..., min_length=1, max_length=256)
+    mode: Literal["slot", "convert_widget"] = "slot"
+
+    @model_validator(mode="after")
+    def validate_index_domains(self) -> ScopedGraphPatchTargetEndpoint:
+        if self.mode == "slot" and self.socket_index is None:
+            raise ValueError("slot targets require an exact socket_index")
+        if self.mode == "convert_widget" and self.socket_index is not None:
+            raise ValueError("convert_widget targets require socket_index=null")
+        if isinstance(self.ref, GraphPatchScopeOutputRef):
+            fact = self.ref.scope_output
+            if (
+                self.mode != "slot"
+                or self.input_index != fact.slot_index
+                or self.occurrence_index != 0
+                or self.socket_index != fact.slot_index
+                or self.input != fact.name
+                or self.type != fact.type
+            ):
+                raise ValueError(
+                    "scope_output endpoint must be an exact physical slot matching its immutable boundary fact"
+                )
+        return self
+
+
+class ScopedGraphPatchEdge(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    source: ScopedGraphPatchSourceEndpoint
+    target: ScopedGraphPatchTargetEndpoint
+
+
+class ScopedGraphPatchAssertions(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    nodes: list[GraphPatchNodeAssertion] = Field(default_factory=list, max_length=500)
+    edges: list[ScopedGraphPatchEdge] = Field(default_factory=list, max_length=2_000)
+
+
+class ScopedGraphPatchRemoveNode(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    ref: ExistingNodeRef
+    node_type: str = Field(..., min_length=1, max_length=256)
+    schema_hash: str = Field(..., pattern=r"^[0-9a-f]{64}$")
+    expected_incident_edges: list[ScopedGraphPatchEdge] = Field(
+        default_factory=list,
+        max_length=2_000,
+    )
+
+
+class ScopedGraphPatchPlan(BaseModel):
+    """Canonical GraphPatch v3 plan for one serialized subgraph definition."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    operation: Literal["scoped_patch"] = "scoped_patch"
+    expected_workflow_identity: str = Field(..., min_length=8, max_length=256)
+    expected_graph_hash: str = Field(..., pattern=r"^[0-9a-f]{64}$")
+    scope: GraphPatchScopeAuthority
+    assertions: ScopedGraphPatchAssertions
+    create_nodes: list[GraphPatchCreateNode] = Field(default_factory=list, max_length=100)
+    update_nodes: list[GraphPatchUpdateNode] = Field(default_factory=list, max_length=100)
+    remove_edges: list[ScopedGraphPatchEdge] = Field(default_factory=list, max_length=2_000)
+    add_edges: list[ScopedGraphPatchEdge] = Field(default_factory=list, max_length=2_000)
+    remove_nodes: list[ScopedGraphPatchRemoveNode] = Field(default_factory=list, max_length=100)
+    attachments: list[GraphPatchAttachment] = Field(default_factory=list, max_length=0)
+    expected_delta: GraphPatchExpectedDelta
+
+
+def scoped_graph_patch_hash(
+    plan: ScopedGraphPatchPlan,
+    expected_catalog_hash: str,
+) -> str:
+    return _canonical_hash(
+        {
+            "hash_schema": SCOPED_GRAPH_PATCH_HASH_SCHEMA,
+            "expected_catalog_hash": expected_catalog_hash,
+            "plan": plan.model_dump(mode="json"),
+        }
+    )
+
+
+class ApplyScopedGraphPatchRequest(BaseModel):
+    """Idempotent canonical v3 envelope consumed by the scoped frontend executor."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    application_id: str = Field(..., min_length=8, max_length=128)
+    expected_catalog_hash: str = Field(..., pattern=r"^[0-9a-f]{64}$")
+    patch_hash: str = Field(..., pattern=r"^[0-9a-f]{64}$")
+    plan: ScopedGraphPatchPlan
+
+    @model_validator(mode="after")
+    def validate_identity_and_hash(self) -> ApplyScopedGraphPatchRequest:
+        if not _APPLICATION_ID_PATTERN.fullmatch(self.application_id):
+            raise ValueError("application_id has an invalid format")
+        expected = scoped_graph_patch_hash(self.plan, self.expected_catalog_hash)
+        if self.patch_hash != expected:
+            raise ValueError("patch_hash does not match the canonical scoped plan")
+        return self
+
+
+class PlanScopedGraphPatchRequest(BaseModel):
+    """Dry-run input for compiling one canonical GraphPatch v3 envelope."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    application_id: str = Field(..., min_length=8, max_length=128)
+    expected_workflow_identity: str = Field(..., min_length=8, max_length=256)
+    expected_graph_hash: str = Field(..., pattern=r"^[0-9a-f]{64}$")
+    expected_catalog_hash: str = Field(..., pattern=r"^[0-9a-f]{64}$")
+    scope: GraphPatchScopeAuthority
+    assertions: ScopedGraphPatchAssertions = Field(default_factory=ScopedGraphPatchAssertions)
+    create_nodes: list[GraphPatchCreateNode] = Field(default_factory=list, max_length=100)
+    update_nodes: list[GraphPatchUpdateNode] = Field(default_factory=list, max_length=100)
+    remove_edges: list[ScopedGraphPatchEdge] = Field(default_factory=list, max_length=2_000)
+    add_edges: list[ScopedGraphPatchEdge] = Field(default_factory=list, max_length=2_000)
+    remove_nodes: list[ScopedGraphPatchRemoveNode] = Field(default_factory=list, max_length=100)
+    attachments: list[GraphPatchAttachment] = Field(default_factory=list, max_length=0)
+
+    @model_validator(mode="after")
+    def validate_request(self) -> PlanScopedGraphPatchRequest:
+        if not _APPLICATION_ID_PATTERN.fullmatch(self.application_id):
+            raise ValueError("application_id has an invalid format")
+        if not any(
+            (
+                self.create_nodes,
+                self.update_nodes,
+                self.remove_edges,
+                self.add_edges,
+                self.remove_nodes,
+            )
+        ):
+            raise ValueError("scoped graph patch must contain at least one operation")
+        payload = self.model_dump(mode="json", exclude_none=True)
+        if len(json.dumps(payload, ensure_ascii=False).encode("utf-8")) > 2_097_152:
+            raise ValueError("scoped graph patch request must not exceed 2 MiB")
+        return self
+
+
+WorkflowGraphPatchApplyRequest: TypeAlias = (
+    ApplyGraphPatchRequest | ApplyScopedGraphPatchRequest
+)
+
+
 def graph_patch_request_from_apply(
     envelope: ApplyGraphPatchRequest | Mapping[str, Any],
     graph: NormalizedGraphSnapshot | Mapping[str, Any],
@@ -730,6 +1019,110 @@ def _opaque_baseline_edge(edge: NormalizedGraphEdge) -> GraphPatchEdge:
             "type": edge.type,
             "mode": "slot",
         },
+    )
+
+
+def graph_patch_assertions_for_existing_region(
+    graph: NormalizedGraphSnapshot,
+    catalog: Mapping[str, Any],
+    node_ids: Sequence[NodeId],
+) -> tuple[GraphPatchAssertions, list[dict[str, str]]]:
+    """Build exact node and incident-edge assertions for an existing region.
+
+    This read-only helper supports higher-level compilers that preserve an
+    existing region while creating a sibling copy.  Every selected node and
+    every endpoint of an incident edge is schema-pinned.  Dynamic targets keep
+    their observed live socket while pinning exact declaration/occurrence
+    facts, matching the canonical baseline compiler.
+    """
+
+    selected = {_id_key(node_id) for node_id in node_ids}
+    graph_nodes = {_id_key(node.node_id): node for node in graph.nodes}
+    incident = [
+        edge
+        for edge in graph.edges
+        if _id_key(edge.source_node_id) in selected
+        or _id_key(edge.target_node_id) in selected
+    ]
+    asserted_node_keys = set(selected)
+    for edge in incident:
+        asserted_node_keys.add(_id_key(edge.source_node_id))
+        asserted_node_keys.add(_id_key(edge.target_node_id))
+
+    issues: list[dict[str, str]] = []
+    assertions: list[GraphPatchNodeAssertion] = []
+    for key in sorted(asserted_node_keys):
+        node = graph_nodes.get(key)
+        if node is None:
+            issues.append(
+                _issue(
+                    "assertion_region_node_missing",
+                    "graph.nodes",
+                    f"Assertion-region node {key[1]!r} is absent from the graph.",
+                )
+            )
+            continue
+        raw_info = catalog.get(node.node_type)
+        if not isinstance(raw_info, Mapping):
+            issues.append(
+                _issue(
+                    "assertion_region_schema_unavailable",
+                    "catalog",
+                    f"Assertion-region node type {node.node_type!r} is not loaded.",
+                )
+            )
+            continue
+        assertions.append(
+            GraphPatchNodeAssertion(
+                ref=ExistingNodeRef(node_id=node.node_id),
+                node_type=node.node_type,
+                schema_hash=node_schema_hash(node.node_type, raw_info),
+            )
+        )
+
+    connected_inputs: dict[tuple[str, str], set[str]] = {}
+    for edge in graph.edges:
+        connected_inputs.setdefault(_id_key(edge.target_node_id), set()).add(
+            edge.target_input
+        )
+    canonical_edges: list[GraphPatchEdge] = []
+    for index, edge in enumerate(incident):
+        target = graph_nodes.get(_id_key(edge.target_node_id))
+        raw_target = catalog.get(target.node_type) if target is not None else None
+        if target is None or not isinstance(raw_target, Mapping):
+            issues.append(
+                _issue(
+                    "assertion_region_target_schema_unavailable",
+                    f"graph.edges[{index}].target_node_id",
+                    "An incident edge target lacks an exact loaded schema.",
+                )
+            )
+            canonical_edges.append(_opaque_baseline_edge(edge))
+            continue
+        edge_issues: list[dict[str, str]] = []
+        canonical_edges.append(
+            _baseline_edge(
+                edge,
+                target_capabilities=normalize_node_schema(
+                    target.node_type,
+                    raw_target,
+                ),
+                target_widget_values=target.widget_values,
+                connected_inputs=connected_inputs.get(
+                    _id_key(edge.target_node_id), set()
+                ),
+                path=f"graph.edges[{index}].target_input_index",
+                issues=edge_issues,
+            )
+        )
+        issues.extend(edge_issues)
+
+    return (
+        GraphPatchAssertions(
+            nodes=sorted(assertions, key=lambda item: _id_key(item.ref.node_id)),
+            edges=sorted(canonical_edges, key=_edge_sort_key),
+        ),
+        issues,
     )
 
 
@@ -2077,6 +2470,1450 @@ def compile_graph_patch(
     }
 
 
+class _ScopedGraphPatchError(ValueError):
+    def __init__(self, code: str, path: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.path = path
+        self.message = message
+
+    def as_issue(self) -> dict[str, str]:
+        return _issue(self.code, self.path, self.message)
+
+
+def _scope_boundary_private_name(
+    kind: Literal["scope_input", "scope_output"],
+    fact: WorkflowBoundaryPortFact,
+) -> str:
+    return f"__fl_mcp_{kind}_{fact.slot_index}_{fact.slot_id.replace('-', '')}"
+
+
+def _scope_boundary_identity(
+    fact: WorkflowBoundaryPortFact,
+) -> GraphPatchScopeBoundaryIdentity:
+    return GraphPatchScopeBoundaryIdentity(
+        slot_id=fact.slot_id,
+        slot_index=fact.slot_index,
+        name=fact.name,
+        type=fact.type,
+    )
+
+
+def _boundary_fact_key(
+    identity: GraphPatchScopeBoundaryIdentity,
+) -> tuple[str, int, str, str]:
+    return identity.slot_id, identity.slot_index, identity.name, identity.type
+
+
+def _scope_fact_map(
+    facts: Sequence[WorkflowBoundaryPortFact],
+) -> dict[tuple[str, int, str, str], WorkflowBoundaryPortFact]:
+    return {
+        (fact.slot_id, fact.slot_index, fact.name, fact.type): fact
+        for fact in facts
+    }
+
+
+def _resolve_public_boundary_fact(
+    identity: GraphPatchScopeBoundaryIdentity,
+    *,
+    facts: Sequence[WorkflowBoundaryPortFact],
+    path: str,
+    kind: Literal["scope_input", "scope_output"],
+) -> WorkflowBoundaryPortFact:
+    fact = _scope_fact_map(facts).get(_boundary_fact_key(identity))
+    if fact is None:
+        raise _ScopedGraphPatchError(
+            "scope_boundary_fact_mismatch",
+            path,
+            f"The {kind} UUID, index, name, or type differs from the pinned definition.",
+        )
+    return fact
+
+
+def _private_scope_catalog(
+    catalog: Mapping[str, Any],
+    projection: WorkflowScopeProjection,
+) -> dict[str, Any]:
+    collisions = sorted(
+        node_type
+        for node_type in (SCOPE_INPUT_NODE_TYPE, SCOPE_OUTPUT_NODE_TYPE)
+        if node_type in catalog
+    )
+    if collisions:
+        raise _ScopedGraphPatchError(
+            "scope_boundary_node_type_collision",
+            "catalog",
+            "The loaded catalog contains a class name reserved for private scoped "
+            f"boundary projection: {', '.join(collisions)}.",
+        )
+    reserved_types = {SCOPE_INPUT_NODE_TYPE, SCOPE_OUTPUT_NODE_TYPE}
+    leaked_nodes = [
+        node
+        for node in projection.graph.nodes
+        if node.node_id not in {SCOPE_INPUT_NODE_ID, SCOPE_OUTPUT_NODE_ID}
+        and node.node_type in reserved_types
+    ]
+    if leaked_nodes:
+        raise _ScopedGraphPatchError(
+            "scope_boundary_node_type_reserved",
+            "scope.definition.nodes",
+            "A real scoped node uses a node type reserved for private boundary projection.",
+        )
+    result = dict(catalog)
+    result[SCOPE_INPUT_NODE_TYPE] = {
+        "input": {"required": {}},
+        "output": [item.type for item in projection.resolution.boundary_inputs],
+        "output_name": [
+            _scope_boundary_private_name("scope_input", item)
+            for item in projection.resolution.boundary_inputs
+        ],
+        "python_module": "fl_mcp.workflow_scope",
+    }
+    result[SCOPE_OUTPUT_NODE_TYPE] = {
+        "input": {
+            "required": {
+                _scope_boundary_private_name("scope_output", item): [
+                    item.type,
+                    {"forceInput": True},
+                ]
+                for item in projection.resolution.boundary_outputs
+            }
+        },
+        "output": [],
+        "output_name": [],
+        "python_module": "fl_mcp.workflow_scope",
+    }
+    return result
+
+
+def _private_scope_graph(
+    projection: WorkflowScopeProjection,
+) -> NormalizedGraphSnapshot:
+    input_names = {
+        item.slot_index: _scope_boundary_private_name("scope_input", item)
+        for item in projection.resolution.boundary_inputs
+    }
+    output_names = {
+        item.slot_index: _scope_boundary_private_name("scope_output", item)
+        for item in projection.resolution.boundary_outputs
+    }
+    outputs = []
+    for output in projection.graph.outputs:
+        payload = output.model_dump(mode="json")
+        if _id_key(output.node_id) == _id_key(SCOPE_INPUT_NODE_ID):
+            private_name = input_names.get(output.output_index)
+            if private_name is None:
+                raise _ScopedGraphPatchError(
+                    "scope_boundary_projection_mismatch",
+                    "scope.boundary_inputs",
+                    "The projected scope input output index is absent from its boundary facts.",
+                )
+            payload["output"] = private_name
+        outputs.append(payload)
+    edges = []
+    for edge in projection.graph.edges:
+        payload = edge.model_dump(mode="json")
+        if _id_key(edge.source_node_id) == _id_key(SCOPE_INPUT_NODE_ID):
+            private_name = input_names.get(edge.source_output_index)
+            if private_name is None:
+                raise _ScopedGraphPatchError(
+                    "scope_boundary_projection_mismatch",
+                    "scope.boundary_inputs",
+                    "A projected edge references an unknown scope input index.",
+                )
+            payload["source_output"] = private_name
+        if _id_key(edge.target_node_id) == _id_key(SCOPE_OUTPUT_NODE_ID):
+            private_name = output_names.get(edge.target_input_index)
+            if private_name is None:
+                raise _ScopedGraphPatchError(
+                    "scope_boundary_projection_mismatch",
+                    "scope.boundary_outputs",
+                    "A projected edge references an unknown scope output index.",
+                )
+            payload["target_input"] = private_name
+        edges.append(payload)
+    return NormalizedGraphSnapshot(
+        complete=True,
+        nodes=projection.graph.nodes,
+        outputs=outputs,
+        edges=edges,
+    )
+
+
+def _private_source_endpoint(
+    endpoint: ScopedGraphPatchSourceEndpoint,
+    projection: WorkflowScopeProjection,
+    *,
+    path: str,
+) -> GraphPatchSourceEndpoint:
+    if isinstance(endpoint.ref, GraphPatchScopeInputRef):
+        fact = _resolve_public_boundary_fact(
+            endpoint.ref.scope_input,
+            facts=projection.resolution.boundary_inputs,
+            path=f"{path}.ref.scope_input",
+            kind="scope_input",
+        )
+        return GraphPatchSourceEndpoint(
+            ref=ExistingNodeRef(node_id=SCOPE_INPUT_NODE_ID),
+            output_index=fact.slot_index,
+            output=_scope_boundary_private_name("scope_input", fact),
+            type=fact.type,
+        )
+    if isinstance(endpoint.ref, ExistingNodeRef) and endpoint.ref.node_id in {
+        SCOPE_INPUT_NODE_ID,
+        SCOPE_OUTPUT_NODE_ID,
+    }:
+        raise _ScopedGraphPatchError(
+            "private_virtual_ref_forbidden",
+            f"{path}.ref.node_id",
+            "Scoped GraphPatch endpoints must use immutable public boundary references.",
+        )
+    return GraphPatchSourceEndpoint.model_validate(endpoint.model_dump(mode="json"))
+
+
+def _private_target_endpoint(
+    endpoint: ScopedGraphPatchTargetEndpoint,
+    projection: WorkflowScopeProjection,
+    *,
+    path: str,
+) -> GraphPatchTargetEndpoint:
+    if isinstance(endpoint.ref, GraphPatchScopeOutputRef):
+        fact = _resolve_public_boundary_fact(
+            endpoint.ref.scope_output,
+            facts=projection.resolution.boundary_outputs,
+            path=f"{path}.ref.scope_output",
+            kind="scope_output",
+        )
+        return GraphPatchTargetEndpoint(
+            ref=ExistingNodeRef(node_id=SCOPE_OUTPUT_NODE_ID),
+            input_index=fact.slot_index,
+            occurrence_index=0,
+            socket_index=fact.slot_index,
+            input=_scope_boundary_private_name("scope_output", fact),
+            type=fact.type,
+            mode="slot",
+        )
+    if isinstance(endpoint.ref, ExistingNodeRef) and endpoint.ref.node_id in {
+        SCOPE_INPUT_NODE_ID,
+        SCOPE_OUTPUT_NODE_ID,
+    }:
+        raise _ScopedGraphPatchError(
+            "private_virtual_ref_forbidden",
+            f"{path}.ref.node_id",
+            "Scoped GraphPatch endpoints must use immutable public boundary references.",
+        )
+    return GraphPatchTargetEndpoint.model_validate(endpoint.model_dump(mode="json"))
+
+
+def _private_edge(
+    edge: ScopedGraphPatchEdge,
+    projection: WorkflowScopeProjection,
+    *,
+    path: str,
+) -> GraphPatchEdge:
+    return GraphPatchEdge(
+        source=_private_source_endpoint(edge.source, projection, path=f"{path}.source"),
+        target=_private_target_endpoint(edge.target, projection, path=f"{path}.target"),
+    )
+
+
+def _scope_ref_is_private(ref: ExistingNodeRef | NewNodeRef) -> bool:
+    return isinstance(ref, ExistingNodeRef) and ref.node_id in {
+        SCOPE_INPUT_NODE_ID,
+        SCOPE_OUTPUT_NODE_ID,
+    }
+
+
+def _public_source_endpoint(
+    endpoint: GraphPatchSourceEndpoint,
+    projection: WorkflowScopeProjection,
+) -> ScopedGraphPatchSourceEndpoint:
+    if isinstance(endpoint.ref, ExistingNodeRef) and endpoint.ref.node_id == SCOPE_INPUT_NODE_ID:
+        matches = [
+            fact
+            for fact in projection.resolution.boundary_inputs
+            if fact.slot_index == endpoint.output_index
+            and endpoint.output
+            in {_scope_boundary_private_name("scope_input", fact), fact.name}
+            and fact.type == endpoint.type
+        ]
+        if len(matches) != 1:
+            raise _ScopedGraphPatchError(
+                "scope_boundary_projection_mismatch",
+                "plan.edges.source",
+                "The canonical private input boundary cannot be mapped back to one public port.",
+            )
+        fact = matches[0]
+        return ScopedGraphPatchSourceEndpoint(
+            ref=GraphPatchScopeInputRef(scope_input=_scope_boundary_identity(fact)),
+            output_index=fact.slot_index,
+            output=fact.name,
+            type=fact.type,
+        )
+    if isinstance(endpoint.ref, ExistingNodeRef) and endpoint.ref.node_id == SCOPE_OUTPUT_NODE_ID:
+        raise _ScopedGraphPatchError(
+            "invalid_boundary_edge_direction",
+            "plan.edges.source",
+            "A subgraph output boundary cannot be an edge source.",
+        )
+    return ScopedGraphPatchSourceEndpoint.model_validate(endpoint.model_dump(mode="json"))
+
+
+def _public_target_endpoint(
+    endpoint: GraphPatchTargetEndpoint,
+    projection: WorkflowScopeProjection,
+) -> ScopedGraphPatchTargetEndpoint:
+    if isinstance(endpoint.ref, ExistingNodeRef) and endpoint.ref.node_id == SCOPE_OUTPUT_NODE_ID:
+        matches = [
+            fact
+            for fact in projection.resolution.boundary_outputs
+            if fact.slot_index == endpoint.input_index
+            and endpoint.input
+            in {_scope_boundary_private_name("scope_output", fact), fact.name}
+            and fact.type == endpoint.type
+        ]
+        if len(matches) != 1:
+            raise _ScopedGraphPatchError(
+                "scope_boundary_projection_mismatch",
+                "plan.edges.target",
+                "The canonical private output boundary cannot be mapped back to one public port.",
+            )
+        fact = matches[0]
+        return ScopedGraphPatchTargetEndpoint(
+            ref=GraphPatchScopeOutputRef(scope_output=_scope_boundary_identity(fact)),
+            input_index=fact.slot_index,
+            occurrence_index=0,
+            socket_index=fact.slot_index,
+            input=fact.name,
+            type=fact.type,
+            mode="slot",
+        )
+    if isinstance(endpoint.ref, ExistingNodeRef) and endpoint.ref.node_id == SCOPE_INPUT_NODE_ID:
+        raise _ScopedGraphPatchError(
+            "invalid_boundary_edge_direction",
+            "plan.edges.target",
+            "A subgraph input boundary cannot be an edge target.",
+        )
+    return ScopedGraphPatchTargetEndpoint.model_validate(endpoint.model_dump(mode="json"))
+
+
+def _public_edge(
+    edge: GraphPatchEdge,
+    projection: WorkflowScopeProjection,
+) -> ScopedGraphPatchEdge:
+    return ScopedGraphPatchEdge(
+        source=_public_source_endpoint(edge.source, projection),
+        target=_public_target_endpoint(edge.target, projection),
+    )
+
+
+def _private_scope_assertions(
+    request: PlanScopedGraphPatchRequest,
+    projection: WorkflowScopeProjection,
+    private_catalog: Mapping[str, Any],
+) -> GraphPatchAssertions:
+    private_edges = [
+        _private_edge(edge, projection, path=f"assertions.edges[{index}]")
+        for index, edge in enumerate(request.assertions.edges)
+    ]
+    boundary_ids: set[int] = set()
+    edge_collections: Sequence[Sequence[ScopedGraphPatchEdge]] = (
+        request.assertions.edges,
+        request.remove_edges,
+        request.add_edges,
+        *[item.expected_incident_edges for item in request.remove_nodes],
+    )
+    for collection in edge_collections:
+        for edge in collection:
+            if isinstance(edge.source.ref, GraphPatchScopeInputRef):
+                boundary_ids.add(SCOPE_INPUT_NODE_ID)
+            if isinstance(edge.target.ref, GraphPatchScopeOutputRef):
+                boundary_ids.add(SCOPE_OUTPUT_NODE_ID)
+    nodes = list(request.assertions.nodes)
+    for boundary_id in sorted(boundary_ids):
+        node_type = (
+            SCOPE_INPUT_NODE_TYPE
+            if boundary_id == SCOPE_INPUT_NODE_ID
+            else SCOPE_OUTPUT_NODE_TYPE
+        )
+        raw_info = private_catalog[node_type]
+        nodes.append(
+            GraphPatchNodeAssertion(
+                ref=ExistingNodeRef(node_id=boundary_id),
+                node_type=node_type,
+                schema_hash=node_schema_hash(node_type, raw_info),
+            )
+        )
+    return GraphPatchAssertions(nodes=nodes, edges=private_edges)
+
+
+def _private_scope_request(
+    request: PlanScopedGraphPatchRequest,
+    projection: WorkflowScopeProjection,
+    private_graph: NormalizedGraphSnapshot,
+    private_catalog: Mapping[str, Any],
+) -> PlanGraphPatchRequest:
+    reserved_types = {SCOPE_INPUT_NODE_TYPE, SCOPE_OUTPUT_NODE_TYPE}
+    public_type_facts = [
+        *(('assertions.nodes', index, item.node_type) for index, item in enumerate(request.assertions.nodes)),
+        *(('create_nodes', index, item.node_type) for index, item in enumerate(request.create_nodes)),
+        *(('update_nodes', index, item.node_type) for index, item in enumerate(request.update_nodes)),
+        *(('remove_nodes', index, item.node_type) for index, item in enumerate(request.remove_nodes)),
+    ]
+    for collection, index, node_type in public_type_facts:
+        if node_type in reserved_types:
+            raise _ScopedGraphPatchError(
+                "scope_boundary_node_type_reserved",
+                f"{collection}[{index}].node_type",
+                "Public scoped operations cannot name compiler-only boundary node types.",
+            )
+    for index, assertion in enumerate(request.assertions.nodes):
+        if assertion.ref.node_id in {SCOPE_INPUT_NODE_ID, SCOPE_OUTPUT_NODE_ID}:
+            raise _ScopedGraphPatchError(
+                "private_virtual_ref_forbidden",
+                f"assertions.nodes[{index}].ref.node_id",
+                "Virtual scope nodes cannot be asserted on the public v3 wire.",
+            )
+    for collection_name, collection in (
+        ("update_nodes", request.update_nodes),
+        ("remove_nodes", request.remove_nodes),
+    ):
+        for index, item in enumerate(collection):
+            if item.ref.node_id in {SCOPE_INPUT_NODE_ID, SCOPE_OUTPUT_NODE_ID}:
+                raise _ScopedGraphPatchError(
+                    "private_virtual_ref_forbidden",
+                    f"{collection_name}[{index}].ref.node_id",
+                    "Virtual scope nodes cannot be updated or removed on the public v3 wire.",
+                )
+    return PlanGraphPatchRequest(
+        application_id=request.application_id,
+        expected_workflow_identity=request.expected_workflow_identity,
+        expected_graph_hash=request.expected_graph_hash,
+        expected_catalog_hash=request.expected_catalog_hash,
+        graph=private_graph,
+        assertions=_private_scope_assertions(request, projection, private_catalog),
+        create_nodes=request.create_nodes,
+        update_nodes=request.update_nodes,
+        remove_edges=[
+            _private_edge(edge, projection, path=f"remove_edges[{index}]")
+            for index, edge in enumerate(request.remove_edges)
+        ],
+        add_edges=[
+            _private_edge(edge, projection, path=f"add_edges[{index}]")
+            for index, edge in enumerate(request.add_edges)
+        ],
+        remove_nodes=[
+            GraphPatchRemoveNode(
+                ref=item.ref,
+                node_type=item.node_type,
+                schema_hash=item.schema_hash,
+                expected_incident_edges=[
+                    _private_edge(
+                        edge,
+                        projection,
+                        path=f"remove_nodes[{index}].expected_incident_edges[{edge_index}]",
+                    )
+                    for edge_index, edge in enumerate(item.expected_incident_edges)
+                ],
+            )
+            for index, item in enumerate(request.remove_nodes)
+        ],
+        attachments=[],
+    )
+
+
+def _scoped_plan_from_private(
+    plan: GraphPatchPlan,
+    *,
+    scope: GraphPatchScopeAuthority,
+    projection: WorkflowScopeProjection,
+) -> ScopedGraphPatchPlan:
+    public_assertions = ScopedGraphPatchAssertions(
+        nodes=[
+            item
+            for item in plan.assertions.nodes
+            if not _scope_ref_is_private(item.ref)
+        ],
+        edges=[_public_edge(item, projection) for item in plan.assertions.edges],
+    )
+    public_removals = [
+        ScopedGraphPatchRemoveNode(
+            ref=item.ref,
+            node_type=item.node_type,
+            schema_hash=item.schema_hash,
+            expected_incident_edges=[
+                _public_edge(edge, projection) for edge in item.expected_incident_edges
+            ],
+        )
+        for item in plan.remove_nodes
+    ]
+    if plan.expected_delta.final_node_count < 2:
+        raise _ScopedGraphPatchError(
+            "scope_projection_count_mismatch",
+            "expected_delta.final_node_count",
+            "The private projection lost one or both immutable boundary nodes.",
+        )
+    return ScopedGraphPatchPlan(
+        expected_workflow_identity=plan.expected_workflow_identity,
+        expected_graph_hash=plan.expected_graph_hash,
+        scope=scope,
+        assertions=public_assertions,
+        create_nodes=plan.create_nodes,
+        update_nodes=plan.update_nodes,
+        remove_edges=[_public_edge(item, projection) for item in plan.remove_edges],
+        add_edges=[_public_edge(item, projection) for item in plan.add_edges],
+        remove_nodes=public_removals,
+        attachments=[],
+        expected_delta=GraphPatchExpectedDelta(
+            created_node_count=plan.expected_delta.created_node_count,
+            updated_node_count=plan.expected_delta.updated_node_count,
+            removed_node_count=plan.expected_delta.removed_node_count,
+            added_edge_count=plan.expected_delta.added_edge_count,
+            removed_edge_count=plan.expected_delta.removed_edge_count,
+            final_node_count=plan.expected_delta.final_node_count - 2,
+            final_edge_count=plan.expected_delta.final_edge_count,
+        ),
+    )
+
+
+def _public_scope_expected_final(
+    expected_final: Mapping[str, Any],
+    projection: WorkflowScopeProjection,
+) -> dict[str, Any]:
+    public_nodes: list[dict[str, Any]] = []
+    for raw in expected_final.get("nodes", []):
+        ref = ExistingNodeRef.model_validate(raw) if "node_id" in raw else NewNodeRef.model_validate(raw)
+        if _scope_ref_is_private(ref):
+            continue
+        public_nodes.append(ref.model_dump(mode="json"))
+    public_edges = [
+        _public_edge(GraphPatchEdge.model_validate(raw), projection).model_dump(mode="json")
+        for raw in expected_final.get("edges", [])
+    ]
+    return {"nodes": public_nodes, "edges": public_edges}
+
+
+def _public_scope_issue(issue: Mapping[str, Any]) -> dict[str, Any]:
+    def cleanse(value: Any) -> Any:
+        if isinstance(value, str):
+            return value.replace(str(SCOPE_INPUT_NODE_ID), "scope_input").replace(
+                str(SCOPE_OUTPUT_NODE_ID), "scope_output"
+            )
+        if isinstance(value, Mapping):
+            return {key: cleanse(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [cleanse(item) for item in value]
+        return value
+
+    return cleanse(dict(issue))
+
+
+def _scoped_invalid_result(
+    *,
+    catalog_hash: str,
+    source: str,
+    catalog_count: int,
+    issues: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    public_issues = [_public_scope_issue(item) for item in issues]
+    return {
+        "valid": False,
+        "schema": SCOPED_GRAPH_PATCH_SCHEMA,
+        "patch_hash": None,
+        "patch_hash_schema": SCOPED_GRAPH_PATCH_HASH_SCHEMA,
+        "plan": None,
+        "apply_request": None,
+        "expected_final": None,
+        "catalog": {
+            "state": "changed"
+            if any(item.get("code") == "catalog_changed" for item in public_issues)
+            else "pinned",
+            "source": source,
+            "catalog_hash": catalog_hash,
+            "node_count": catalog_count,
+        },
+        "issues": public_issues,
+        "error_count": sum(item.get("severity") == "error" for item in public_issues),
+    }
+
+
+def _canonical_scope_authority(
+    request: PlanScopedGraphPatchRequest,
+    policy: WorkflowScopeEditPolicy,
+) -> GraphPatchScopeAuthority:
+    return GraphPatchScopeAuthority(
+        scope_path=policy.selected.scope_path,
+        definition_id=policy.selected.definition_id,
+        definition_hash=policy.selected.definition_hash,
+        edit_mode=request.scope.edit_mode,
+        affected_scope_paths=policy.affected_scope_paths,
+    )
+
+
+def compile_scoped_graph_patch(
+    request: PlanScopedGraphPatchRequest | Mapping[str, Any],
+    workflow: Mapping[str, Any],
+    *,
+    workflow_identity: str,
+    graph_hash: str,
+    catalog: Mapping[str, Any],
+    catalog_hash: str,
+    source: str,
+) -> dict[str, Any]:
+    """Compile one exact subgraph-definition edit through the v2 graph kernel."""
+
+    validated = (
+        request
+        if isinstance(request, PlanScopedGraphPatchRequest)
+        else PlanScopedGraphPatchRequest.model_validate(request)
+    )
+    issues: list[dict[str, Any]] = []
+    if validated.expected_workflow_identity != workflow_identity:
+        issues.append(
+            _issue(
+                "workflow_identity_changed",
+                "expected_workflow_identity",
+                "The active workflow identity changed after scoped planning.",
+            )
+        )
+    if validated.expected_graph_hash != graph_hash:
+        issues.append(
+            _issue(
+                "graph_changed",
+                "expected_graph_hash",
+                "The full root workflow graph changed after scoped planning.",
+            )
+        )
+    if validated.expected_catalog_hash != catalog_hash:
+        issues.append(
+            _issue(
+                "catalog_changed",
+                "expected_catalog_hash",
+                "The loaded-node catalog changed after scoped planning.",
+            )
+        )
+    if validated.attachments:
+        issues.append(
+            _issue(
+                "scoped_attachments_not_supported",
+                "attachments",
+                "Scoped attachments are disabled until definition-scoped upload assignment is attested.",
+            )
+        )
+    for field, edges in (
+        ("remove_edges", validated.remove_edges),
+        ("add_edges", validated.add_edges),
+    ):
+        for index, edge in enumerate(edges):
+            if isinstance(edge.source.ref, GraphPatchScopeInputRef) and isinstance(
+                edge.target.ref,
+                GraphPatchScopeOutputRef,
+            ):
+                issues.append(
+                    _issue(
+                        "direct_scope_boundary_edge_unsupported",
+                        f"{field}[{index}]",
+                        "ComfyUI cannot safely mutate a direct subgraph-input to "
+                        "subgraph-output link; retain or add one real intermediary node.",
+                    )
+                )
+    if issues:
+        return _scoped_invalid_result(
+            catalog_hash=catalog_hash,
+            source=source,
+            catalog_count=len(catalog),
+            issues=issues,
+        )
+    try:
+        policy = resolve_workflow_scope_edit(
+            workflow,
+            validated.scope.scope_path,
+            requested_mode=validated.scope.edit_mode,
+            acknowledged_scope_paths=validated.scope.affected_scope_paths,
+            expected_definition_hash=validated.scope.definition_hash,
+        )
+        if not policy.allowed:
+            return _scoped_invalid_result(
+                catalog_hash=catalog_hash,
+                source=source,
+                catalog_count=len(catalog),
+                issues=[
+                    _issue(
+                        "instance_detach_not_supported",
+                        "scope.edit_mode",
+                        "This definition is reused; instance-only detachment is not supported. "
+                        "Choose shared_definition and acknowledge every affected scope path.",
+                    )
+                ],
+            )
+        projection = project_workflow_scope(
+            workflow,
+            validated.scope.scope_path,
+            expected_definition_hash=validated.scope.definition_hash,
+        )
+        canonical_scope = _canonical_scope_authority(validated, policy)
+        if canonical_scope != validated.scope:
+            return _scoped_invalid_result(
+                catalog_hash=catalog_hash,
+                source=source,
+                catalog_count=len(catalog),
+                issues=[
+                    _issue(
+                        "scope_authority_mismatch",
+                        "scope",
+                        "The supplied scope authority differs from the current complete edit policy.",
+                    )
+                ],
+            )
+        private_catalog = _private_scope_catalog(catalog, projection)
+        private_graph = _private_scope_graph(projection)
+        private_request = _private_scope_request(
+            validated,
+            projection,
+            private_graph,
+            private_catalog,
+        )
+        compiled = compile_graph_patch(
+            private_request,
+            private_catalog,
+            catalog_hash=catalog_hash,
+            source=source,
+        )
+        if not compiled.get("valid"):
+            return _scoped_invalid_result(
+                catalog_hash=catalog_hash,
+                source=source,
+                catalog_count=len(catalog),
+                issues=compiled.get("issues", []),
+            )
+        private_plan = GraphPatchPlan.model_validate(compiled["plan"])
+        public_plan = _scoped_plan_from_private(
+            private_plan,
+            scope=canonical_scope,
+            projection=projection,
+        )
+        patch_hash = scoped_graph_patch_hash(public_plan, catalog_hash)
+        apply_request = ApplyScopedGraphPatchRequest(
+            application_id=validated.application_id,
+            expected_catalog_hash=catalog_hash,
+            patch_hash=patch_hash,
+            plan=public_plan,
+        )
+        return {
+            "valid": True,
+            "schema": SCOPED_GRAPH_PATCH_SCHEMA,
+            "patch_hash": patch_hash,
+            "patch_hash_schema": SCOPED_GRAPH_PATCH_HASH_SCHEMA,
+            "plan": public_plan.model_dump(mode="json"),
+            "apply_request": apply_request.model_dump(mode="json"),
+            "expected_final": _public_scope_expected_final(
+                compiled["expected_final"], projection
+            ),
+            "catalog": {
+                "state": "pinned",
+                "source": source,
+                "catalog_hash": catalog_hash,
+                "node_count": len(catalog),
+            },
+            "issues": [],
+            "error_count": 0,
+        }
+    except WorkflowScopeError as exc:
+        return _scoped_invalid_result(
+            catalog_hash=catalog_hash,
+            source=source,
+            catalog_count=len(catalog),
+            issues=[exc.as_issue()],
+        )
+    except _ScopedGraphPatchError as exc:
+        return _scoped_invalid_result(
+            catalog_hash=catalog_hash,
+            source=source,
+            catalog_count=len(catalog),
+            issues=[exc.as_issue()],
+        )
+
+
+def scoped_graph_patch_request_from_apply(
+    envelope: ApplyScopedGraphPatchRequest | Mapping[str, Any],
+) -> PlanScopedGraphPatchRequest:
+    """Reconstruct the only v3 planner request represented by an apply envelope."""
+
+    validated = (
+        envelope
+        if isinstance(envelope, ApplyScopedGraphPatchRequest)
+        else ApplyScopedGraphPatchRequest.model_validate(envelope)
+    )
+    plan = validated.plan
+    return PlanScopedGraphPatchRequest(
+        application_id=validated.application_id,
+        expected_workflow_identity=plan.expected_workflow_identity,
+        expected_graph_hash=plan.expected_graph_hash,
+        expected_catalog_hash=validated.expected_catalog_hash,
+        scope=plan.scope,
+        assertions=plan.assertions,
+        create_nodes=plan.create_nodes,
+        update_nodes=plan.update_nodes,
+        remove_edges=plan.remove_edges,
+        add_edges=plan.add_edges,
+        remove_nodes=plan.remove_nodes,
+        attachments=plan.attachments,
+    )
+
+
+def verify_completed_graph_patch_state(
+    envelope: ApplyGraphPatchRequest | ApplyScopedGraphPatchRequest | Mapping[str, Any],
+    workflow: Mapping[str, Any],
+    catalog: Mapping[str, Any],
+    aliases: Mapping[str, NodeId],
+    *,
+    result_definition_hash: str | None = None,
+) -> list[dict[str, str]]:
+    """Prove a ledger-claimed application from the current serialized graph.
+
+    The persisted ledger is deliberately excluded from the workflow content
+    hash, so its own aliases and result hash are never sufficient authority.
+    This verifier independently checks the exact plan-shaped postconditions
+    against the current root graph or scoped definition without mutating it.
+    """
+
+    request = (
+        envelope
+        if isinstance(envelope, (ApplyGraphPatchRequest, ApplyScopedGraphPatchRequest))
+        else TypeAdapter(WorkflowGraphPatchApplyRequest).validate_python(envelope)
+    )
+    issues: list[dict[str, str]] = []
+    if not isinstance(workflow, Mapping):
+        return [_issue("completed_patch_workflow_invalid", "workflow", "The current workflow is not an editable JSON object.")]
+
+    try:
+        if isinstance(request, ApplyScopedGraphPatchRequest):
+            projection = project_workflow_scope(workflow, request.plan.scope.scope_path)
+            if projection.resolution.definition_id != request.plan.scope.definition_id:
+                return [
+                    _issue(
+                        "completed_patch_scope_changed",
+                        "plan.scope.definition_id",
+                        "The current scope path resolves to a different definition.",
+                    )
+                ]
+            if result_definition_hash != projection.resolution.definition_hash:
+                return [
+                    _issue(
+                        "completed_patch_definition_hash_mismatch",
+                        "ledger.result_definition_hash",
+                        "The ledger does not attest the exact current scoped definition.",
+                    )
+                ]
+            graph = _private_scope_graph(projection)
+            verification_catalog = _private_scope_catalog(catalog, projection)
+            compiler_workflow: Mapping[str, Any] = projection.compiler_workflow
+            add_edges = [
+                _private_edge(edge, projection, path=f"add_edges[{index}]")
+                for index, edge in enumerate(request.plan.add_edges)
+            ]
+            remove_edges = [
+                _private_edge(edge, projection, path=f"remove_edges[{index}]")
+                for index, edge in enumerate(request.plan.remove_edges)
+            ]
+            assertion_edges = [
+                _private_edge(edge, projection, path=f"assertions.edges[{index}]")
+                for index, edge in enumerate(request.plan.assertions.edges)
+            ]
+            private_node_adjustment = 2
+        else:
+            if result_definition_hash is not None:
+                return [
+                    _issue(
+                        "completed_patch_definition_hash_unexpected",
+                        "ledger.result_definition_hash",
+                        "A root GraphPatch ledger entry cannot claim a scoped definition hash.",
+                    )
+                ]
+            graph = normalize_workflow_graph(workflow)
+            verification_catalog = catalog
+            compiler_workflow = workflow
+            add_edges = list(request.plan.add_edges)
+            remove_edges = list(request.plan.remove_edges)
+            assertion_edges = list(request.plan.assertions.edges)
+            private_node_adjustment = 0
+    except (TypeError, ValueError, WorkflowScopeError, _ScopedGraphPatchError) as exc:
+        return [
+            _issue(
+                "completed_patch_graph_invalid",
+                "workflow",
+                f"The current workflow cannot prove the completed patch: {exc}",
+            )
+        ]
+
+    expected_aliases = {item.alias for item in request.plan.create_nodes}
+    if set(aliases) != expected_aliases:
+        return [
+            _issue(
+                "completed_patch_alias_mismatch",
+                "ledger.aliases",
+                "The ledger aliases do not exactly match the plan's created nodes.",
+            )
+        ]
+    if any(type(value) not in {int, str} for value in aliases.values()):
+        return [
+            _issue(
+                "completed_patch_alias_mismatch",
+                "ledger.aliases",
+                "The ledger contains an invalid exact node ID.",
+            )
+        ]
+
+    graph_nodes = {_id_key(item.node_id): item for item in graph.nodes}
+    if len(graph_nodes) != len(graph.nodes):
+        issues.append(_issue("completed_patch_duplicate_node", "workflow.nodes", "The current graph repeats an exact node ID."))
+
+    def resolved_id(ref: GraphPatchNodeRef) -> NodeId | None:
+        if isinstance(ref, ExistingNodeRef):
+            return ref.node_id
+        return aliases.get(ref.alias)
+
+    pinned_node_schemas: dict[tuple[str, str], tuple[str, str]] = {}
+
+    def pin_node_schema(
+        ref: GraphPatchNodeRef,
+        node_type: str,
+        schema_hash: str,
+    ) -> None:
+        node_id = resolved_id(ref)
+        if node_id is not None:
+            pinned_node_schemas[_id_key(node_id)] = (node_type, schema_hash)
+
+    for assertion in request.plan.assertions.nodes:
+        pin_node_schema(assertion.ref, assertion.node_type, assertion.schema_hash)
+    for create in request.plan.create_nodes:
+        pin_node_schema(
+            NewNodeRef(alias=create.alias),
+            create.node_type,
+            create.schema_hash,
+        )
+    for update in request.plan.update_nodes:
+        pin_node_schema(update.ref, update.node_type, update.schema_hash)
+    if isinstance(request, ApplyScopedGraphPatchRequest):
+        for boundary_id, node_type in (
+            (SCOPE_INPUT_NODE_ID, SCOPE_INPUT_NODE_TYPE),
+            (SCOPE_OUTPUT_NODE_ID, SCOPE_OUTPUT_NODE_TYPE),
+        ):
+            node_info = verification_catalog[node_type]
+            pin_node_schema(
+                ExistingNodeRef(node_id=boundary_id),
+                node_type,
+                node_schema_hash(node_type, node_info),
+            )
+
+    def attest_node(
+        node_id: NodeId | None,
+        node_type: str,
+        schema_hash: str,
+        path: str,
+    ) -> None:
+        if node_id is None:
+            issues.append(_issue("completed_patch_node_missing", path, "A planned node alias has no exact current ID."))
+            return
+        node = graph_nodes.get(_id_key(node_id))
+        if node is None or node.node_type != node_type:
+            issues.append(_issue("completed_patch_node_mismatch", path, "The current node ID/type does not match the completed plan."))
+            return
+        node_info = verification_catalog.get(node_type)
+        if not isinstance(node_info, Mapping) or node_schema_hash(node_type, node_info) != schema_hash:
+            issues.append(_issue("completed_patch_schema_mismatch", path, "The current loaded schema differs from the completed plan."))
+
+    removed_keys = {
+        _id_key(item.ref.node_id) for item in request.plan.remove_nodes
+    }
+    for index, assertion in enumerate(request.plan.assertions.nodes):
+        if _id_key(assertion.ref.node_id) in removed_keys:
+            continue
+        attest_node(
+            assertion.ref.node_id,
+            assertion.node_type,
+            assertion.schema_hash,
+            f"assertions.nodes[{index}]",
+        )
+    for index, create in enumerate(request.plan.create_nodes):
+        attest_node(
+            aliases.get(create.alias),
+            create.node_type,
+            create.schema_hash,
+            f"create_nodes[{index}]",
+        )
+    for index, update in enumerate(request.plan.update_nodes):
+        attest_node(
+            update.ref.node_id,
+            update.node_type,
+            update.schema_hash,
+            f"update_nodes[{index}]",
+        )
+    for index, removal in enumerate(request.plan.remove_nodes):
+        if _id_key(removal.ref.node_id) in graph_nodes:
+            issues.append(
+                _issue(
+                    "completed_patch_removed_node_present",
+                    f"remove_nodes[{index}].ref.node_id",
+                    "A node declared removed is still present in the current graph.",
+                )
+            )
+
+    raw_nodes_value = compiler_workflow.get("nodes", [])
+    if isinstance(raw_nodes_value, Mapping):
+        raw_node_items = list(raw_nodes_value.items())
+    elif isinstance(raw_nodes_value, list):
+        raw_node_items = [(None, item) for item in raw_nodes_value]
+    else:
+        raw_node_items = []
+    raw_nodes: dict[tuple[str, str], Mapping[str, Any]] = {}
+    for mapping_id, raw_node in raw_node_items:
+        if not isinstance(raw_node, Mapping):
+            continue
+        node_id = raw_node.get("id", mapping_id)
+        if type(node_id) in {int, str}:
+            raw_nodes[_id_key(node_id)] = raw_node
+
+    connected_by_node: dict[tuple[str, str], set[str]] = {}
+    for edge in graph.edges:
+        connected_by_node.setdefault(_id_key(edge.target_node_id), set()).add(
+            edge.target_input
+        )
+
+    def current_values(node_id: NodeId, node_type: str, path: str) -> dict[str, Any] | None:
+        raw_node = raw_nodes.get(_id_key(node_id))
+        node_info = verification_catalog.get(node_type)
+        widgets = raw_node.get("widgets_values", []) if raw_node is not None else None
+        if not isinstance(raw_node, Mapping) or not isinstance(node_info, Mapping) or not isinstance(widgets, list):
+            issues.append(_issue("completed_patch_values_unavailable", path, "Exact current widget values are unavailable."))
+            return None
+        try:
+            capabilities = normalize_node_schema(node_type, node_info)
+            connected = connected_by_node.get(_id_key(node_id), set())
+            selectors = infer_dynamic_selector_values(
+                capabilities,
+                widgets,
+                connected_inputs=connected,
+            )
+            materialized = materialize_inputs(
+                capabilities,
+                values=selectors,
+                connected_inputs=connected,
+            )
+            active_widgets = [
+                item.capability
+                for item in materialized
+                if item.capability.widget
+                and not item.capability.hidden
+            ]
+        except (TypeError, ValueError) as exc:
+            issues.append(_issue("completed_patch_values_unavailable", path, f"Current widget values could not be materialized: {exc}"))
+            return None
+        if len(active_widgets) != len(widgets):
+            issues.append(_issue("completed_patch_values_unavailable", path, "The current positional widgets do not map to one exact active schema branch."))
+            return None
+        return {
+            capability.path: value
+            for capability, value in zip(active_widgets, widgets, strict=True)
+        }
+
+    def attest_values(
+        node_id: NodeId | None,
+        node_type: str,
+        expected: Mapping[str, Any],
+        path: str,
+    ) -> None:
+        if node_id is None or not expected:
+            return
+        actual = current_values(node_id, node_type, path)
+        if actual is None:
+            return
+        for name, expected_value in expected.items():
+            if name not in actual or _canonical_hash(actual[name]) != _canonical_hash(expected_value):
+                issues.append(_issue("completed_patch_value_mismatch", f"{path}.{name}", "The current widget value does not match the completed plan."))
+
+    def attest_layout(
+        node_id: NodeId | None,
+        hint: GraphPatchLayoutHint | None,
+        path: str,
+    ) -> None:
+        if node_id is None or hint is None:
+            return
+        raw_node = raw_nodes.get(_id_key(node_id))
+        pos = raw_node.get("pos") if raw_node is not None else None
+        size = raw_node.get("size") if raw_node is not None else None
+        expected_pos = [hint.x, hint.y]
+        if (
+            not isinstance(pos, Sequence)
+            or isinstance(pos, (str, bytes))
+            or len(pos) < 2
+            or _canonical_hash(list(pos[:2])) != _canonical_hash(expected_pos)
+        ):
+            issues.append(_issue("completed_patch_layout_mismatch", path, "The current node position differs from the completed plan."))
+            return
+        if hint.width is None and hint.height is None:
+            return
+        if not isinstance(size, Sequence) or isinstance(size, (str, bytes)) or len(size) < 2:
+            issues.append(_issue("completed_patch_layout_mismatch", path, "The current node size is unavailable."))
+            return
+        expected_size = [
+            hint.width if hint.width is not None else size[0],
+            hint.height if hint.height is not None else size[1],
+        ]
+        if _canonical_hash(list(size[:2])) != _canonical_hash(expected_size):
+            issues.append(_issue("completed_patch_layout_mismatch", path, "The current node size differs from the completed plan."))
+
+    for index, create in enumerate(request.plan.create_nodes):
+        node_id = aliases.get(create.alias)
+        attest_values(
+            node_id,
+            create.node_type,
+            create.values,
+            f"create_nodes[{index}].values",
+        )
+        attest_layout(node_id, create.layout_hint, f"create_nodes[{index}].layout_hint")
+    for index, update in enumerate(request.plan.update_nodes):
+        attest_values(
+            update.ref.node_id,
+            update.node_type,
+            update.set_values,
+            f"update_nodes[{index}].set_values",
+        )
+        attest_layout(
+            update.ref.node_id,
+            update.layout_hint,
+            f"update_nodes[{index}].layout_hint",
+        )
+    for index, attachment in enumerate(request.plan.attachments):
+        attachment_id = resolved_id(attachment.ref)
+        if attachment_id is None:
+            issues.append(_issue("completed_patch_attachment_mismatch", f"attachments[{index}].ref", "The attachment target alias has no exact current ID."))
+            continue
+        node = graph_nodes.get(_id_key(attachment_id))
+        if node is None:
+            issues.append(_issue("completed_patch_attachment_mismatch", f"attachments[{index}].ref", "The attachment target node is absent."))
+            continue
+        actual = current_values(attachment_id, node.node_type, f"attachments[{index}]")
+        expected_value = f"{attachment.subfolder}/{attachment.filename} [{attachment.file_type}]"
+        if actual is not None and actual.get(attachment.input) != expected_value:
+            issues.append(_issue("completed_patch_attachment_mismatch", f"attachments[{index}]", "The current attachment reference differs from the completed plan."))
+
+    def declared_target_uses_dynamic_projection(
+        expected: GraphPatchEdge,
+        target_id: NodeId,
+    ) -> bool | None:
+        target_key = _id_key(target_id)
+        target_node = graph_nodes.get(target_key)
+        pinned = pinned_node_schemas.get(target_key)
+        if target_node is None or pinned is None:
+            return None
+        node_type, schema_hash = pinned
+        node_info = verification_catalog.get(node_type)
+        if (
+            target_node.node_type != node_type
+            or not isinstance(node_info, Mapping)
+            or node_schema_hash(node_type, node_info) != schema_hash
+        ):
+            return None
+        try:
+            capabilities = normalize_node_schema(node_type, node_info)
+        except (TypeError, ValueError):
+            return None
+        exact = [
+            capability
+            for capability in capabilities.inputs
+            if not capability.hidden
+            and capability.path == expected.target.input
+            and capability.declaration_index == expected.target.input_index
+            and capability.occurrence_index == expected.target.occurrence_index
+            and _type_is_allowed(
+                capability.accepted_types,
+                expected.target.type,
+            )
+        ]
+        if not exact:
+            return None
+        return any(
+            _uses_dynamic_socket_projection(capabilities, capability)
+            for capability in exact
+        )
+
+    def exact_active_target_capability(
+        expected: GraphPatchEdge,
+        target_id: NodeId,
+    ) -> tuple[NodeSchemaCapabilities, InputCapability, int] | None:
+        target_key = _id_key(target_id)
+        target_node = graph_nodes.get(target_key)
+        pinned = pinned_node_schemas.get(target_key)
+        raw_node = raw_nodes.get(target_key)
+        if target_node is None or pinned is None or raw_node is None:
+            return None
+        node_type, schema_hash = pinned
+        node_info = verification_catalog.get(node_type)
+        widgets = raw_node.get("widgets_values")
+        raw_inputs = raw_node.get("inputs")
+        if (
+            target_node.node_type != node_type
+            or not isinstance(node_info, Mapping)
+            or node_schema_hash(node_type, node_info) != schema_hash
+            or not isinstance(widgets, list)
+            or not isinstance(raw_inputs, list)
+        ):
+            return None
+        live_matches = [
+            index
+            for index, item in enumerate(raw_inputs)
+            if isinstance(item, Mapping)
+            and item.get("name") == expected.target.input
+            and item.get("type") == expected.target.type
+        ]
+        if len(live_matches) != 1:
+            return None
+        try:
+            capabilities = normalize_node_schema(node_type, node_info)
+            connected = connected_by_node.get(target_key, set())
+            selectors = infer_dynamic_selector_values(
+                capabilities,
+                widgets,
+                connected_inputs=connected,
+            )
+            active_matches: list[tuple[InputCapability, MaterializedInput]] = []
+            for capability in capabilities.inputs:
+                if (
+                    capability.hidden
+                    or capability.path != expected.target.input
+                    or not _type_is_allowed(
+                        capability.accepted_types,
+                        expected.target.type,
+                    )
+                ):
+                    continue
+                materialized = _materialize_capability(
+                    capabilities,
+                    capability,
+                    values=selectors,
+                    connected_inputs=set(connected),
+                )
+                if materialized is not None:
+                    active_matches.append((capability, materialized))
+        except (TypeError, ValueError):
+            return None
+        exact = [
+            capability
+            for capability, _materialized in active_matches
+            if capability.declaration_index == expected.target.input_index
+            and capability.occurrence_index == expected.target.occurrence_index
+        ]
+        # A live serialized link exposes only name/type/socket.  If multiple
+        # active declarations share that identity, an occurrence cannot be
+        # re-attested from the current graph and the retry must fail closed.
+        if len(active_matches) != 1 or len(exact) != 1:
+            return None
+        return capabilities, exact[0], live_matches[0]
+
+    def target_socket_matches(
+        expected: GraphPatchEdge,
+        observed: NormalizedGraphEdge,
+        target_id: NodeId,
+    ) -> bool:
+        dynamic_projection = declared_target_uses_dynamic_projection(
+            expected,
+            target_id,
+        )
+        requires_active_schema_proof = bool(
+            dynamic_projection or expected.target.mode == "convert_widget"
+        )
+        if requires_active_schema_proof:
+            exact = exact_active_target_capability(expected, target_id)
+            if exact is None:
+                return False
+            capabilities, capability, live_socket_index = exact
+            if observed.target_input_index != live_socket_index:
+                return False
+            if expected.target.mode == "convert_widget":
+                return capability.widget_convertible
+            return bool(
+                capability.connectable
+                and _uses_dynamic_socket_projection(capabilities, capability)
+            )
+        return bool(
+            dynamic_projection is False
+            and observed.target_input_index == expected.target.socket_index
+        )
+
+    def edge_matches(expected: GraphPatchEdge, observed: NormalizedGraphEdge) -> bool:
+        source_id = resolved_id(expected.source.ref)
+        target_id = resolved_id(expected.target.ref)
+        return bool(
+            source_id is not None
+            and target_id is not None
+            and _id_key(observed.source_node_id) == _id_key(source_id)
+            and observed.source_output_index == expected.source.output_index
+            and observed.source_output == expected.source.output
+            and _id_key(observed.target_node_id) == _id_key(target_id)
+            and observed.target_input == expected.target.input
+            and observed.type == expected.source.type == expected.target.type
+            and target_socket_matches(expected, observed, target_id)
+        )
+
+    for index, edge in enumerate(add_edges):
+        if not any(edge_matches(edge, observed) for observed in graph.edges):
+            issues.append(_issue("completed_patch_added_edge_missing", f"add_edges[{index}]", "An edge declared added is absent from the current graph."))
+    removed_edge_keys = {_edge_key(edge) for edge in remove_edges}
+    for index, edge in enumerate(assertion_edges):
+        if _edge_key(edge) in removed_edge_keys:
+            continue
+        if not any(edge_matches(edge, observed) for observed in graph.edges):
+            issues.append(
+                _issue(
+                    "completed_patch_asserted_edge_missing",
+                    f"assertions.edges[{index}]",
+                    "A retained edge asserted by the plan is absent from the current graph.",
+                )
+            )
+    for index, edge in enumerate(remove_edges):
+        if any(edge_matches(edge, observed) for observed in graph.edges):
+            issues.append(_issue("completed_patch_removed_edge_present", f"remove_edges[{index}]", "An edge declared removed is still present in the current graph."))
+    for index, create in enumerate(request.plan.create_nodes):
+        created_id = aliases.get(create.alias)
+        if created_id is None:
+            continue
+        created_key = _id_key(created_id)
+        planned_incident = [
+            edge
+            for edge in add_edges
+            if any(
+                endpoint_id is not None and _id_key(endpoint_id) == created_key
+                for endpoint_id in (
+                    resolved_id(edge.source.ref),
+                    resolved_id(edge.target.ref),
+                )
+            )
+        ]
+        observed_incident = [
+            edge
+            for edge in graph.edges
+            if created_key
+            in {
+                _id_key(edge.source_node_id),
+                _id_key(edge.target_node_id),
+            }
+        ]
+        if len(planned_incident) != len(observed_incident) or any(
+            not any(edge_matches(planned, observed) for planned in planned_incident)
+            for observed in observed_incident
+        ):
+            issues.append(
+                _issue(
+                    "completed_patch_created_node_incident_edge_mismatch",
+                    f"create_nodes[{index}]",
+                    "A created node's complete current incident-edge set differs from the plan.",
+                )
+            )
+
+    actual_node_count = len(graph.nodes) - private_node_adjustment
+    if actual_node_count != request.plan.expected_delta.final_node_count:
+        issues.append(_issue("completed_patch_node_count_mismatch", "expected_delta.final_node_count", "The current node count differs from the completed plan."))
+    if len(graph.edges) != request.plan.expected_delta.final_edge_count:
+        issues.append(_issue("completed_patch_edge_count_mismatch", "expected_delta.final_edge_count", "The current edge count differs from the completed plan."))
+    seen_edges: set[tuple[Any, ...]] = set()
+    occupied_inputs: set[tuple[tuple[str, str], int]] = set()
+    for index, edge in enumerate(graph.edges):
+        edge_key = (
+            _id_key(edge.source_node_id),
+            edge.source_output_index,
+            edge.source_output,
+            _id_key(edge.target_node_id),
+            edge.target_input_index,
+            edge.target_input,
+            edge.type,
+        )
+        if edge_key in seen_edges:
+            issues.append(
+                _issue(
+                    "completed_patch_duplicate_edge",
+                    f"workflow.links[{index}]",
+                    "The current completed graph repeats an exact edge.",
+                )
+            )
+        seen_edges.add(edge_key)
+        target_key = (_id_key(edge.target_node_id), edge.target_input_index)
+        if target_key in occupied_inputs:
+            issues.append(
+                _issue(
+                    "completed_patch_input_occupied_multiple_times",
+                    f"workflow.links[{index}]",
+                    "The current completed graph connects one live input socket more than once.",
+                )
+            )
+        occupied_inputs.add(target_key)
+    indegree = dict.fromkeys(graph_nodes, 0)
+    outgoing: dict[tuple[str, str], list[tuple[str, str]]] = {
+        key: [] for key in graph_nodes
+    }
+    for edge in graph.edges:
+        source_key = _id_key(edge.source_node_id)
+        target_key = _id_key(edge.target_node_id)
+        if source_key not in outgoing or target_key not in indegree:
+            issues.append(_issue("completed_patch_edge_endpoint_missing", "workflow.links", "The current graph contains an edge with a missing endpoint."))
+            continue
+        outgoing[source_key].append(target_key)
+        indegree[target_key] += 1
+    ready = deque(sorted(key for key, degree in indegree.items() if degree == 0))
+    visited = 0
+    while ready:
+        source_key = ready.popleft()
+        visited += 1
+        for target_key in sorted(outgoing[source_key]):
+            indegree[target_key] -= 1
+            if indegree[target_key] == 0:
+                ready.append(target_key)
+    if visited != len(graph_nodes):
+        issues.append(_issue("completed_patch_cycle_detected", "workflow.links", "The current completed graph contains a directed cycle."))
+    return issues
+
+
+def scoped_graph_patch_request_from_private_plan(
+    envelope: ApplyGraphPatchRequest | Mapping[str, Any],
+    *,
+    scope: GraphPatchScopeAuthority,
+    projection: WorkflowScopeProjection,
+) -> PlanScopedGraphPatchRequest:
+    """Translate a compiler-only projected v2 plan into one public v3 request.
+
+    This is used by higher-level semantic compilers, such as branch operations,
+    after they plan against a scope projection.  The returned request must still
+    be passed through :func:`compile_scoped_graph_patch`; this helper is not an
+    apply path and performs no mutation.
+    """
+
+    validated = (
+        envelope
+        if isinstance(envelope, ApplyGraphPatchRequest)
+        else ApplyGraphPatchRequest.model_validate(envelope)
+    )
+    public_plan = _scoped_plan_from_private(
+        validated.plan,
+        scope=scope,
+        projection=projection,
+    )
+    return PlanScopedGraphPatchRequest(
+        application_id=validated.application_id,
+        expected_workflow_identity=public_plan.expected_workflow_identity,
+        expected_graph_hash=public_plan.expected_graph_hash,
+        expected_catalog_hash=validated.expected_catalog_hash,
+        scope=scope,
+        assertions=public_plan.assertions,
+        create_nodes=public_plan.create_nodes,
+        update_nodes=public_plan.update_nodes,
+        remove_edges=public_plan.remove_edges,
+        add_edges=public_plan.add_edges,
+        remove_nodes=public_plan.remove_nodes,
+        attachments=[],
+    )
+
+
 def lower_legacy_append_plan(
     *,
     application_id: str,
@@ -2138,6 +3975,7 @@ def lower_legacy_append_plan(
 
 __all__ = [
     "ApplyGraphPatchRequest",
+    "ApplyScopedGraphPatchRequest",
     "ExistingNodeRef",
     "GRAPH_PATCH_HASH_SCHEMA",
     "GRAPH_PATCH_SCHEMA",
@@ -2152,6 +3990,10 @@ __all__ = [
     "GraphPatchPlan",
     "GraphPatchRemoveNode",
     "GraphPatchRequest",
+    "GraphPatchScopeAuthority",
+    "GraphPatchScopeBoundaryIdentity",
+    "GraphPatchScopeInputRef",
+    "GraphPatchScopeOutputRef",
     "GraphPatchSourceEndpoint",
     "GraphPatchTargetEndpoint",
     "GraphPatchUpdateNode",
@@ -2159,8 +4001,25 @@ __all__ = [
     "MAX_GRAPH_PATCH_ATTACHMENT_BYTES",
     "NewNodeRef",
     "PlanGraphPatchRequest",
+    "PlanScopedGraphPatchRequest",
+    "SCOPED_GRAPH_PATCH_HASH_SCHEMA",
+    "SCOPED_GRAPH_PATCH_SCHEMA",
+    "ScopedGraphPatchAssertions",
+    "ScopedGraphPatchEdge",
+    "ScopedGraphPatchPlan",
+    "ScopedGraphPatchRemoveNode",
+    "ScopedGraphPatchSourceEndpoint",
+    "ScopedGraphPatchTargetEndpoint",
+    "WorkflowGraphPatchApplyRequest",
+    "WorkflowScopePath",
     "compile_graph_patch",
+    "compile_scoped_graph_patch",
+    "graph_patch_assertions_for_existing_region",
     "graph_patch_request_from_apply",
     "graph_patch_hash",
     "lower_legacy_append_plan",
+    "scoped_graph_patch_hash",
+    "scoped_graph_patch_request_from_apply",
+    "scoped_graph_patch_request_from_private_plan",
+    "verify_completed_graph_patch_state",
 ]

@@ -38,6 +38,7 @@ const CANVAS_MUTATION_TOOL_NAMES = new Set([
     "apply_workflow_plan",
     "apply_workflow_refinement",
     "apply_workflow_graph_patch",
+    "navigate_workflow_branch",
     "remove_nodes",
     "bypass_nodes",
     "unbypass_nodes",
@@ -176,7 +177,7 @@ export class ToolExecutor {
             "apply_workflow_refinement": this._handleApplyWorkflowRefinement.bind(this),
             "apply_workflow_graph_patch": withToolContractRevision(
                 this._handleApplyWorkflowGraphPatch.bind(this),
-                2,
+                3,
             ),
             "remove_nodes": this._handleRemoveNodes.bind(this),
             "bypass_nodes": this._handleBypassNodes.bind(this),
@@ -186,6 +187,7 @@ export class ToolExecutor {
             "select_nodes": this._handleSelectNodes.bind(this),
             "get_selected_nodes": this._handleGetSelectedNodes.bind(this),
             "focus_on_nodes": this._handleFocusOnNodes.bind(this),
+            "navigate_workflow_branch": this._handleNavigateWorkflowBranch.bind(this),
             "take_screenshot": this._handleTakeScreenshot.bind(this),
             
             // Node Manipulation
@@ -669,7 +671,15 @@ export class ToolExecutor {
                     () => this.flApi.listWorkflowConnections(workflowPin),
                 ),
                 createNode: plannedNode => mutationGuarded(() => {
-                    const created = this.flApi.create(plannedNode.node_type, {}, null);
+                    const created = typeof this.flApi.createWorkflowNodeExact === "function"
+                        ? this.flApi.createWorkflowNodeExact(
+                            plannedNode.node_type,
+                            {},
+                            null,
+                            {},
+                            workflowPin,
+                        )
+                        : this.flApi.create(plannedNode.node_type, {}, null);
                     const context = schemaContexts.get(`new:${plannedNode.alias}`);
                     if (!context) {
                         throw new Error(`No schema context exists for ${plannedNode.alias}.`);
@@ -678,26 +688,35 @@ export class ToolExecutor {
                     return created;
                 }),
                 setNodeValuesExact: (nodeId, values) => mutationGuarded(
-                    () => this.flApi.setValuesExact(nodeId, values),
+                    () => this.flApi.setValuesExact(nodeId, values, workflowPin),
                 ),
                 setNodeMetadata: (nodeId, metadata) => mutationGuarded(
-                    () => this.flApi.setNodeProperty(
-                        nodeId,
-                        WORKFLOW_GRAPH_PATCH_PROPERTY,
-                        metadata,
-                    ),
+                    () => typeof this.flApi.setWorkflowNodePropertyExact === "function"
+                        ? this.flApi.setWorkflowNodePropertyExact(
+                            nodeId,
+                            WORKFLOW_GRAPH_PATCH_PROPERTY,
+                            metadata,
+                            workflowPin,
+                        )
+                        : this.flApi.setNodeProperty(
+                            nodeId,
+                            WORKFLOW_GRAPH_PATCH_PROPERTY,
+                            metadata,
+                        ),
                 ),
                 setNodeLayoutExact: (nodeId, layout) => mutationGuarded(
-                    () => this.flApi.setRect(nodeId, layout),
+                    () => typeof this.flApi.setWorkflowNodeRectExact === "function"
+                        ? this.flApi.setWorkflowNodeRectExact(nodeId, layout, workflowPin)
+                        : this.flApi.setRect(nodeId, layout),
                 ),
                 assignAttachmentExact: (nodeId, attachment) => mutationGuarded(
-                    () => this.flApi.assignAttachmentExact(nodeId, attachment),
+                    () => this.flApi.assignAttachmentExact(nodeId, attachment, workflowPin),
                 ),
                 verifyAttachmentExact: (nodeId, attachment) => readGuarded(
-                    () => this.flApi.verifyAttachmentExact(nodeId, attachment),
+                    () => this.flApi.verifyAttachmentExact(nodeId, attachment, workflowPin),
                 ),
                 convertWidgetToInput: (nodeId, expected) => mutationGuarded(
-                    () => this.flApi.convertWidgetToInputExact(nodeId, expected),
+                    () => this.flApi.convertWidgetToInputExact(nodeId, expected, workflowPin),
                 ),
                 disconnectConnection: edge => mutationGuarded(
                     () => this.flApi.disconnectWorkflowConnection(edge, workflowPin),
@@ -710,10 +729,80 @@ export class ToolExecutor {
                         workflowPin,
                     ),
                 ),
-                removeNodes: nodeIds => mutationGuarded(() => this.flApi.remove(nodeIds)),
+                removeNodes: nodeIds => mutationGuarded(
+                    () => typeof this.flApi.removeWorkflowNodesExact === "function"
+                        ? this.flApi.removeWorkflowNodesExact(nodeIds, workflowPin)
+                        : this.flApi.remove(nodeIds),
+                ),
                 setWorkflowExtra: (key, value) => mutationGuarded(
                     () => this.flApi.setWorkflowExtra(key, value, workflowPin),
                 ),
+                resolveScopedGraph: async descriptor => {
+                    const runtime = await readGuarded(
+                        () => this.flApi.createWorkflowGraphPatchScopeRuntime(
+                            descriptor,
+                            workflowPin,
+                        ),
+                    );
+                    return {
+                        withReadGuard: operation => readGuarded(operation),
+                        captureDefinition: () => readGuarded(
+                            () => runtime.captureDefinition(),
+                        ),
+                        captureWorkflow: () => readGuarded(
+                            () => runtime.captureWorkflow(),
+                        ),
+                        getNode: nodeId => readGuarded(() => {
+                            const observed = runtime.getNode(nodeId);
+                            return enrichGraphPatchNode(observed, contextForId(nodeId));
+                        }),
+                        listConnections: () => readGuarded(
+                            () => runtime.listConnections(),
+                        ),
+                        createNode: plannedNode => mutationGuarded(() => {
+                            const created = runtime.createNode(plannedNode);
+                            const context = schemaContexts.get(`new:${plannedNode.alias}`);
+                            if (!context) {
+                                throw new Error(`No schema context exists for ${plannedNode.alias}.`);
+                            }
+                            createdContextsById.set(String(created.id), context);
+                            return created;
+                        }),
+                        setNodeValuesExact: (nodeId, values) => mutationGuarded(
+                            () => runtime.setNodeValuesExact(nodeId, values),
+                        ),
+                        setNodeMetadata: (nodeId, metadata) => mutationGuarded(
+                            () => runtime.setNodeMetadata(
+                                nodeId,
+                                WORKFLOW_GRAPH_PATCH_PROPERTY,
+                                metadata,
+                            ),
+                        ),
+                        setNodeLayoutExact: (nodeId, layout) => mutationGuarded(
+                            () => runtime.setNodeLayoutExact(nodeId, layout),
+                        ),
+                        convertWidgetToInput: (nodeId, expected) => mutationGuarded(
+                            () => runtime.convertWidgetToInput(nodeId, expected),
+                        ),
+                        disconnectConnection: edge => mutationGuarded(
+                            () => runtime.disconnectConnection(edge),
+                        ),
+                        connectNodes: (sourceId, targetId, connection) => mutationGuarded(
+                            () => runtime.connectNodes(sourceId, targetId, connection),
+                        ),
+                        removeNodes: nodeIds => mutationGuarded(
+                            () => runtime.removeNodes(nodeIds),
+                        ),
+                        afterMutationStep: async step => {
+                            await this.flApi.assertWorkflowMutationGuard(mutationGuard);
+                            await new Promise(resolve => setTimeout(
+                                resolve,
+                                Number.isInteger(step?.delay_ms) ? step.delay_ms : 160,
+                            ));
+                            await this.flApi.assertWorkflowMutationGuard(mutationGuard);
+                        },
+                    };
+                },
                 afterMutationStep: async step => {
                     await this.flApi.assertWorkflowMutationGuard(mutationGuard);
                     await new Promise(resolve => setTimeout(
@@ -796,18 +885,33 @@ export class ToolExecutor {
                 getNode: nodeId => this.flApi.getWorkflowNode(nodeId, workflowPin),
                 listConnections: () => this.flApi.listWorkflowConnections(workflowPin),
                 createNode: plannedNode => mutationGuarded(() => {
-                    const created = this.flApi.create(plannedNode.node_type, {}, null);
+                    const created = typeof this.flApi.createWorkflowNodeExact === "function"
+                        ? this.flApi.createWorkflowNodeExact(
+                            plannedNode.node_type,
+                            {},
+                            null,
+                            {},
+                            workflowPin,
+                        )
+                        : this.flApi.create(plannedNode.node_type, {}, null);
                     if (Object.keys(plannedNode.values || {}).length > 0) {
                         this.flApi.setValues(created.id, plannedNode.values);
                     }
                     return created;
                 }),
                 setNodeMetadata: (nodeId, metadata) => mutationGuarded(
-                    () => this.flApi.setNodeProperty(
-                        nodeId,
-                        WORKFLOW_REFINEMENT_PROPERTY,
-                        metadata,
-                    ),
+                    () => typeof this.flApi.setWorkflowNodePropertyExact === "function"
+                        ? this.flApi.setWorkflowNodePropertyExact(
+                            nodeId,
+                            WORKFLOW_REFINEMENT_PROPERTY,
+                            metadata,
+                            workflowPin,
+                        )
+                        : this.flApi.setNodeProperty(
+                            nodeId,
+                            WORKFLOW_REFINEMENT_PROPERTY,
+                            metadata,
+                        ),
                 ),
                 disconnectConnection: edge => mutationGuarded(
                     () => this.flApi.disconnectWorkflowConnection(edge, workflowPin),
@@ -820,7 +924,11 @@ export class ToolExecutor {
                         workflowPin,
                     ),
                 ),
-                removeNodes: nodeIds => mutationGuarded(() => this.flApi.remove(nodeIds)),
+                removeNodes: nodeIds => mutationGuarded(
+                    () => typeof this.flApi.removeWorkflowNodesExact === "function"
+                        ? this.flApi.removeWorkflowNodesExact(nodeIds, workflowPin)
+                        : this.flApi.remove(nodeIds),
+                ),
                 setWorkflowExtra: (key, value) => mutationGuarded(
                     () => this.flApi.setWorkflowExtra(key, value, workflowPin),
                 ),
@@ -884,6 +992,10 @@ export class ToolExecutor {
     async _handleGetSelectedNodes(params) {
         const nodes = this.flApi.getSelectedNodes();
         return { nodes };
+    }
+
+    async _handleNavigateWorkflowBranch(params) {
+        return await this.flApi.navigateWorkflowBranchExact(params);
     }
 
     /**

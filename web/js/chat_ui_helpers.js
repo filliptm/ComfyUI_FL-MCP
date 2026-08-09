@@ -236,6 +236,11 @@ export function summarizeToolStep(step, config = {}) {
             compile_workflow_spec: "Couldn’t compile workflow",
             compile_workflow_refinement_spec: "Couldn’t plan workflow",
             apply_workflow_graph_patch: "Couldn’t build workflow",
+            workflow_branches_discover: "Couldn’t discover workflow branches",
+            workflow_branch_compare: "Couldn’t compare workflow branches",
+            workflow_branch_navigate: "Couldn’t focus workflow branch",
+            compile_workflow_branch_operation: "Couldn’t plan branch change",
+            resolve_workflow_branch_successor: "Couldn’t resolve branch lineage",
             plan_workflow: "Couldn’t validate workflow plan",
             registry_search_packages: "Couldn’t search official Comfy Registry",
             registry_get_package: "Couldn’t inspect Registry package",
@@ -431,6 +436,58 @@ export function summarizeToolStep(step, config = {}) {
         return parts.length > 0
             ? `Built workflow · ${parts.join(" · ")}`
             : "Built workflow";
+    }
+    if (name === "workflow_branches_discover") {
+        const resolution = result?.resolution || {};
+        if (resolution.status === "needs_choice") return "Branch match needs your choice";
+        if (["stale", "invalid_catalog"].includes(resolution.status)) {
+            return "Branch discovery stopped safely";
+        }
+        if (resolution.status === "not_found") return "No matching workflow branch";
+        if (resolution.status === "resolved") {
+            const count = Number(result?.selected_branch?.selectable_node_ids?.length ?? 0);
+            return `Found workflow branch · ${plural(count, "node")}`;
+        }
+        const count = Number(resolution.candidate_count ?? result?.summary?.branch_count ?? 0);
+        return `Listed ${plural(count, "workflow branch", "workflow branches")}`;
+    }
+    if (name === "workflow_branch_compare") {
+        if (result?.status !== "compared") return "Branch comparison stopped safely";
+        const structure = result?.structurally_equal === true
+            ? "same structure"
+            : result?.structurally_equal === false
+                ? "different structure"
+                : "structure unavailable";
+        const values = result?.value_equal === true
+            ? "same values"
+            : result?.value_equal === false
+                ? "different values"
+                : "values protected";
+        return `Compared workflow branches · ${structure} · ${values}`;
+    }
+    if (name === "workflow_branch_navigate") {
+        if (result?.success === false) return "Branch navigation stopped safely";
+        const count = Number(result?.selected_count ?? result?.selected_node_ids?.length ?? 0);
+        return `Focused workflow branch · ${plural(count, "node")}`;
+    }
+    if (name === "compile_workflow_branch_operation") {
+        if (result?.valid === false) {
+            if (result?.needs_choice) return "Branch change needs your choice";
+            return `Branch change needs fixes · ${plural(Number(result?.error_count || 0), "error")}`;
+        }
+        const operation = String(result?.operation || "change");
+        const parts = workflowDeltaParts(result?.plan?.expected_delta || {});
+        return parts.length > 0
+            ? `Planned branch ${operation} · ${parts.join(" · ")}`
+            : `Planned branch ${operation}`;
+    }
+    if (name === "resolve_workflow_branch_successor") {
+        if (result?.valid !== true) return "Branch lineage stopped safely";
+        const count = Array.isArray(result?.successor_branch_ids)
+            ? result.successor_branch_ids.length
+            : 0;
+        if (count === 0) return "Confirmed branch removal · no successor branches";
+        return `Resolved ${plural(count, "successor branch", "successor branches")}`;
     }
     if (name === "compile_workflow_spec") {
         const nodeCount = Array.isArray(result?.plan?.nodes)

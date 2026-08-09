@@ -7,7 +7,11 @@ import {
     applyWorkflowGraphPatchAtomic,
     WORKFLOW_GRAPH_PATCH_PROPERTY,
 } from "../../web/js/workflow_graph_patch_apply.js";
-import { workflowGraphHash } from "../../web/js/graph_precondition.js";
+import {
+    canonicalWorkflowJSON,
+    workflowGraphHash,
+    workflowGraphHashExcludingExtra,
+} from "../../web/js/graph_precondition.js";
 import { enrichGraphPatchNode } from "../../web/js/node_schema_contract.js";
 
 
@@ -116,6 +120,7 @@ async function loadFlApi(harness, globals = {}) {
         api: harness.browserApi,
         LiteGraph: { createNode() { return null; } },
         GRAPH_PRECONDITION_SCHEMA: "test.graph.v1",
+        canonicalWorkflowJSON: workflow => JSON.stringify(workflow),
         workflowGraphHash: async workflow => `hash:${workflow.marker || "graph"}`,
         workflowGraphHashExcludingExtra: async workflow => `content-hash:${workflow.marker || "graph"}`,
         nodeIdsEqual: (left, right) => (
@@ -148,6 +153,846 @@ async function loadFlApi(harness, globals = {}) {
 }
 
 
+const NAVIGATION_GRAPH_HASH = "a".repeat(64);
+const STALE_NAVIGATION_GRAPH_HASH = "b".repeat(64);
+
+
+async function branchNavigationFixture(options = {}) {
+    const harness = flApiHarness();
+    const effects = [];
+    const scopeReads = [];
+    const mutationCalls = {
+        graphChange: 0,
+        graphChangedEvent: 0,
+        queue: 0,
+    };
+    const rootNode = { id: 1, title: "Root duplicate" };
+    const priorSelection = { id: 99, title: "Prior selection" };
+    const leafNode = { id: 1, title: "Leaf duplicate" };
+    const secondLeafNode = { id: 2, title: "Leaf second" };
+    const leafGraph = {
+        id: "subgraph-leaf",
+        _nodes: [leafNode, secondLeafNode],
+        links: new Map(),
+    };
+    const leafContainer = {
+        id: 8,
+        title: "Leaf container",
+        subgraph: leafGraph,
+        isSubgraphNode: () => true,
+    };
+    const middleNode = { id: 1, title: "Middle duplicate" };
+    const middleGraph = {
+        id: "subgraph-middle",
+        _nodes: [middleNode, leafContainer],
+        links: new Map(),
+    };
+    const middleContainer = {
+        id: 7,
+        title: "Middle container",
+        subgraph: middleGraph,
+        isSubgraphNode: () => true,
+    };
+    const rootGraph = harness.graph;
+    rootGraph.id = "workflow-root";
+    rootGraph._nodes = [rootNode, priorSelection, middleContainer];
+    rootGraph.change = () => { mutationCalls.graphChange += 1; };
+    rootGraph.subgraphs = new Map([
+        [middleGraph.id, middleGraph],
+        [leafGraph.id, leafGraph],
+    ]);
+    rootGraph.resolveSubgraphIdPath = nodeIds => {
+        scopeReads.push(nodeIds.join("/"));
+        let graph = rootGraph;
+        return nodeIds.map(nodeId => {
+            const node = graph._nodes.find(item => String(item.id) === String(nodeId));
+            if (!node?.subgraph) throw new Error("invalid scope");
+            graph = node.subgraph;
+            return node;
+        });
+    };
+    for (const graph of [rootGraph, middleGraph, leafGraph]) {
+        for (const node of graph._nodes) node.graph = graph;
+    }
+
+    if (options.serializedRuntimeIdProjection) {
+        const graphs = [rootGraph, middleGraph, leafGraph];
+        for (const graph of graphs) {
+            for (const node of graph._nodes) {
+                node.id = String(node.id);
+                node.serialize = () => ({
+                    id: Number(node.id),
+                    type: node.subgraph?.id || node.type || "Pass",
+                    title: node.title,
+                    pos: [0, 0],
+                    size: [220, 120],
+                    flags: {},
+                    mode: 0,
+                    inputs: [],
+                    outputs: [],
+                    properties: {},
+                    widgets_values: [],
+                });
+            }
+        }
+        const definitionFor = graph => ({
+            id: graph.id,
+            nodes: graph._nodes.map(node => node.serialize()),
+            links: [],
+            inputs: [],
+            outputs: [],
+            groups: [],
+            reroutes: [],
+            extra: {},
+        });
+        rootGraph.serialize = () => ({
+            version: 0.4,
+            last_node_id: 99,
+            last_link_id: 0,
+            nodes: rootGraph._nodes.map(node => node.serialize()),
+            links: [],
+            groups: [],
+            config: {},
+            extra: {},
+            definitions: {
+                subgraphs: [definitionFor(middleGraph), definitionFor(leafGraph)],
+            },
+        });
+    }
+
+    const canvas = harness.canvas;
+    canvas.graph = rootGraph;
+    canvas.ds = { scale: 1.25, offset: [17, 23] };
+    canvas.selectedItems = new Set([priorSelection]);
+    canvas.selected_nodes = { [priorSelection.id]: priorSelection };
+    canvas.setGraph = graph => {
+        effects.push(`set-graph:${graph.id}`);
+        canvas.graph = graph;
+        canvas.selectedItems = new Set();
+        canvas.selected_nodes = {};
+    };
+    canvas.selectItems = items => {
+        effects.push(`select:${items.map(item => item.title).join("|")}`);
+        canvas.selectedItems = new Set(items);
+        canvas.selected_nodes = Object.fromEntries(items.map(item => [item.id, item]));
+    };
+    canvas.fitViewToSelectionAnimated = async () => {
+        effects.push("fit");
+        canvas.ds.scale = 2;
+        canvas.ds.offset[0] = 100;
+        canvas.ds.offset[1] = 200;
+    };
+
+    harness.app.rootGraph = rootGraph;
+    harness.app.queuePrompt = () => { mutationCalls.queue += 1; };
+    harness.browserApi.dispatchCustomEvent = eventName => {
+        if (eventName === "graphChanged") mutationCalls.graphChangedEvent += 1;
+    };
+    const { Class: FL_API } = await loadFlApi(harness, {
+        nodeIdsEqual: (left, right) => String(left) === String(right),
+        canonicalWorkflowJSON: workflow => {
+            options.onCanonicalWorkflowJSON?.({ harness, workflow });
+            return JSON.stringify(workflow);
+        },
+        workflowGraphHash: options.workflowGraphHash
+            || (async () => NAVIGATION_GRAPH_HASH),
+    });
+    const flApi = new FL_API();
+    return {
+        harness,
+        flApi,
+        effects,
+        scopeReads,
+        mutationCalls,
+        rootGraph,
+        rootNode,
+        priorSelection,
+        middleGraph,
+        leafGraph,
+        leafNode,
+        secondLeafNode,
+        workflowIdentity: flApi.getActiveWorkflowIdentity(),
+    };
+}
+
+
+function branchNavigationRequest(fixture, overrides = {}) {
+    return {
+        branch_id: "branch:test:upscale",
+        expected_workflow_identity: fixture.workflowIdentity,
+        expected_graph_hash: NAVIGATION_GRAPH_HASH,
+        scope_path: [],
+        node_ids: [1],
+        ...overrides,
+    };
+}
+
+
+function assertNavigationUiUnchanged(fixture) {
+    assert.equal(fixture.harness.canvas.graph, fixture.rootGraph);
+    assert.deepEqual(
+        Array.from(fixture.harness.canvas.selectedItems),
+        [fixture.priorSelection],
+    );
+    assert.equal(fixture.harness.canvas.ds.scale, 1.25);
+    assert.deepEqual(fixture.harness.canvas.ds.offset, [17, 23]);
+    assert.deepEqual(fixture.effects, []);
+}
+
+
+function serializedNavigationRoot(fixture) {
+    return JSON.stringify(fixture.rootGraph.serialize());
+}
+
+
+function assertNoNavigationMutationCalls(fixture) {
+    assert.deepEqual(fixture.mutationCalls, {
+        graphChange: 0,
+        graphChangedEvent: 0,
+        queue: 0,
+    });
+}
+
+
+function assertNoPrivateNavigationDiagnostics(value, sentinelSecret) {
+    const serialized = JSON.stringify(value);
+    assert.equal(serialized.includes(sentinelSecret), false);
+    assert.equal(serialized.includes("expected_root_token"), false);
+    assert.equal(serialized.includes("actual_root_token"), false);
+    assert.ok(serialized.length < 4096, "branch navigation diagnostics must stay bounded");
+}
+
+
+test("exact branch navigation selects and natively fits a root branch", async () => {
+    const fixture = await branchNavigationFixture();
+    const beforeRoot = serializedNavigationRoot(fixture);
+    const result = await fixture.flApi.navigateWorkflowBranchExact(
+        branchNavigationRequest(fixture),
+    );
+
+    assert.equal(fixture.harness.canvas.graph, fixture.rootGraph);
+    assert.deepEqual(Array.from(fixture.harness.canvas.selectedItems), [fixture.rootNode]);
+    assert.deepEqual(fixture.effects, ["select:Root duplicate", "fit"]);
+    assert.deepEqual(JSON.parse(JSON.stringify(result)), {
+        branch_id: "branch:test:upscale",
+        workflow_identity: fixture.workflowIdentity,
+        graph_hash: NAVIGATION_GRAPH_HASH,
+        scope_path: [],
+        scope_graph_id: "workflow-root",
+        selected_node_ids: [1],
+        selected_count: 1,
+        fitted_count: 1,
+        fit_method: "native_selection",
+        queued: false,
+    });
+    assert.equal(serializedNavigationRoot(fixture), beforeRoot);
+    assertNoNavigationMutationCalls(fixture);
+});
+
+
+test("stale branch workflow identity or graph hash has no canvas effects", async t => {
+    await t.test("workflow identity", async () => {
+        const fixture = await branchNavigationFixture();
+        const beforeRoot = serializedNavigationRoot(fixture);
+        await assert.rejects(
+            () => fixture.flApi.navigateWorkflowBranchExact(branchNavigationRequest(
+                fixture,
+                { expected_workflow_identity: "fl-mcp-workflow:stale:99" },
+            )),
+            error => error?.code === "workflow_identity_precondition_failed",
+        );
+        assertNavigationUiUnchanged(fixture);
+        assert.equal(serializedNavigationRoot(fixture), beforeRoot);
+        assertNoNavigationMutationCalls(fixture);
+    });
+
+    await t.test("graph hash", async () => {
+        const fixture = await branchNavigationFixture();
+        const beforeRoot = serializedNavigationRoot(fixture);
+        await assert.rejects(
+            () => fixture.flApi.navigateWorkflowBranchExact(branchNavigationRequest(
+                fixture,
+                { expected_graph_hash: STALE_NAVIGATION_GRAPH_HASH },
+            )),
+            error => error?.code === "branch_navigation_precondition_failed",
+        );
+        assertNavigationUiUnchanged(fixture);
+        assert.equal(serializedNavigationRoot(fixture), beforeRoot);
+        assertNoNavigationMutationCalls(fixture);
+    });
+});
+
+
+test("branch navigation closes async graph-hash race windows", async t => {
+    await t.test("a graph edit during the pre-effect hash has no transient canvas effect", async () => {
+        const sentinelSecret = "SENTINEL_PRIVATE_BRANCH_PROMPT_DURING_HASH";
+        let hashCalls = 0;
+        let releaseHash;
+        let markHashStarted;
+        const hashGate = new Promise(resolve => { releaseHash = resolve; });
+        const hashStarted = new Promise(resolve => { markHashStarted = resolve; });
+        const fixture = await branchNavigationFixture({
+            workflowGraphHash: async () => {
+                hashCalls += 1;
+                if (hashCalls === 2) {
+                    markHashStarted();
+                    await hashGate;
+                }
+                return NAVIGATION_GRAPH_HASH;
+            },
+        });
+
+        const navigation = fixture.flApi.navigateWorkflowBranchExact(
+            branchNavigationRequest(fixture),
+        );
+        await hashStarted;
+        fixture.harness.graphState = {
+            ...fixture.harness.graphState,
+            marker: sentinelSecret,
+        };
+        releaseHash();
+        let observedError = null;
+        await assert.rejects(
+            navigation,
+            error => {
+                observedError = error;
+                return (
+                    error?.code === "branch_navigation_precondition_failed"
+                    && error?.details?.reason === "graph_changed_during_hash"
+                );
+            },
+        );
+
+        assertNoPrivateNavigationDiagnostics({
+            error: observedError.message,
+            error_code: observedError.code,
+            error_details: observedError.details,
+        }, sentinelSecret);
+        assertNavigationUiUnchanged(fixture);
+        assertNoNavigationMutationCalls(fixture);
+    });
+
+    await t.test("a graph edit immediately after a verified hash emits no canonical token", async () => {
+        const sentinelSecret = "SENTINEL_PRIVATE_BRANCH_PROMPT_AFTER_HASH";
+        let canonicalCalls = 0;
+        const fixture = await branchNavigationFixture({
+            onCanonicalWorkflowJSON: ({ harness }) => {
+                canonicalCalls += 1;
+                if (canonicalCalls === 4) {
+                    harness.graphState = {
+                        ...harness.graphState,
+                        marker: sentinelSecret,
+                    };
+                }
+            },
+        });
+
+        let observedError = null;
+        await assert.rejects(
+            () => fixture.flApi.navigateWorkflowBranchExact(
+                branchNavigationRequest(fixture),
+            ),
+            error => {
+                observedError = error;
+                return (
+                    error?.code === "branch_navigation_precondition_failed"
+                    && error?.details?.reason === "graph_changed_after_hash"
+                );
+            },
+        );
+
+        assertNoPrivateNavigationDiagnostics({
+            error: observedError.message,
+            error_code: observedError.code,
+            error_details: observedError.details,
+        }, sentinelSecret);
+        assertNavigationUiUnchanged(fixture);
+        assertNoNavigationMutationCalls(fixture);
+    });
+
+    await t.test("a graph edit during the final hash fails and restores the prior UI", async () => {
+        let hashCalls = 0;
+        let releaseHash;
+        let markHashStarted;
+        const hashGate = new Promise(resolve => { releaseHash = resolve; });
+        const hashStarted = new Promise(resolve => { markHashStarted = resolve; });
+        const fixture = await branchNavigationFixture({
+            workflowGraphHash: async () => {
+                hashCalls += 1;
+                if (hashCalls === 3) {
+                    markHashStarted();
+                    await hashGate;
+                }
+                return NAVIGATION_GRAPH_HASH;
+            },
+        });
+
+        const navigation = fixture.flApi.navigateWorkflowBranchExact(
+            branchNavigationRequest(fixture),
+        );
+        await hashStarted;
+        fixture.harness.graphState = {
+            ...fixture.harness.graphState,
+            marker: "edited-during-final-hash",
+        };
+        const editedRoot = serializedNavigationRoot(fixture);
+        releaseHash();
+        await assert.rejects(
+            navigation,
+            error => (
+                error?.code === "branch_navigation_precondition_failed"
+                && error?.details?.reason === "graph_changed_during_hash"
+            ),
+        );
+
+        assert.equal(fixture.harness.canvas.graph, fixture.rootGraph);
+        assert.deepEqual(
+            Array.from(fixture.harness.canvas.selectedItems),
+            [fixture.priorSelection],
+        );
+        assert.equal(fixture.harness.canvas.ds.scale, 1.25);
+        assert.deepEqual(fixture.harness.canvas.ds.offset, [17, 23]);
+        assert.deepEqual(fixture.effects, [
+            "select:Root duplicate",
+            "fit",
+            "select:Prior selection",
+        ]);
+        assert.equal(serializedNavigationRoot(fixture), editedRoot);
+        assertNoNavigationMutationCalls(fixture);
+    });
+
+    await t.test("a scope and selection change during the final hash cannot report success", async () => {
+        let hashCalls = 0;
+        let releaseHash;
+        let markHashStarted;
+        const hashGate = new Promise(resolve => { releaseHash = resolve; });
+        const hashStarted = new Promise(resolve => { markHashStarted = resolve; });
+        const fixture = await branchNavigationFixture({
+            workflowGraphHash: async () => {
+                hashCalls += 1;
+                if (hashCalls === 3) {
+                    markHashStarted();
+                    await hashGate;
+                }
+                return NAVIGATION_GRAPH_HASH;
+            },
+        });
+        const beforeRoot = serializedNavigationRoot(fixture);
+
+        const navigation = fixture.flApi.navigateWorkflowBranchExact(
+            branchNavigationRequest(fixture),
+        );
+        await hashStarted;
+        fixture.harness.canvas.graph = fixture.middleGraph;
+        fixture.harness.canvas.selectedItems = new Set([
+            fixture.middleGraph._nodes[0],
+        ]);
+        fixture.harness.canvas.selected_nodes = {
+            1: fixture.middleGraph._nodes[0],
+        };
+        releaseHash();
+        await assert.rejects(
+            navigation,
+            error => error?.code === "branch_navigation_verification_failed",
+        );
+
+        assert.equal(fixture.harness.canvas.graph, fixture.rootGraph);
+        assert.deepEqual(
+            Array.from(fixture.harness.canvas.selectedItems),
+            [fixture.priorSelection],
+        );
+        assert.equal(fixture.harness.canvas.ds.scale, 1.25);
+        assert.deepEqual(fixture.harness.canvas.ds.offset, [17, 23]);
+        assert.equal(serializedNavigationRoot(fixture), beforeRoot);
+        assertNoNavigationMutationCalls(fixture);
+    });
+});
+
+
+test("invalid branch scope and node identities fail before selection or navigation", async t => {
+    const cases = [
+        {
+            name: "malformed scope",
+            overrides: { scope_path: [{ container_node_id: 7 }] },
+            code: "invalid_branch_navigation",
+        },
+        {
+            name: "ordinary node used as a scope container",
+            overrides: {
+                scope_path: [{ container_node_id: 1, subgraph_id: "subgraph-middle" }],
+            },
+            code: "branch_scope_not_found",
+        },
+        {
+            name: "wrong subgraph identity",
+            overrides: {
+                scope_path: [{ container_node_id: 7, subgraph_id: "subgraph-wrong" }],
+            },
+            code: "branch_scope_not_found",
+        },
+        {
+            name: "missing local node",
+            overrides: { node_ids: [404] },
+            code: "branch_node_missing",
+        },
+        {
+            name: "repeated requested node",
+            overrides: { node_ids: [1, 1] },
+            code: "branch_node_ambiguous",
+        },
+    ];
+    for (const item of cases) {
+        await t.test(item.name, async () => {
+            const fixture = await branchNavigationFixture();
+            await assert.rejects(
+                () => fixture.flApi.navigateWorkflowBranchExact(
+                    branchNavigationRequest(fixture, item.overrides),
+                ),
+                error => error?.code === item.code,
+            );
+            assertNavigationUiUnchanged(fixture);
+        });
+    }
+
+    await t.test("duplicate exact local node identity", async () => {
+        const fixture = await branchNavigationFixture();
+        fixture.rootGraph._nodes.push({ id: 1, title: "Colliding root ID" });
+        await assert.rejects(
+            () => fixture.flApi.navigateWorkflowBranchExact(
+                branchNavigationRequest(fixture),
+            ),
+            error => error?.code === "branch_node_ambiguous",
+        );
+        assertNavigationUiUnchanged(fixture);
+    });
+});
+
+
+test("root branch navigation preserves exact numeric and string node IDs", async () => {
+    const fixture = await branchNavigationFixture();
+    const stringNode = { id: "1", title: "String root ID", graph: fixture.rootGraph };
+    fixture.rootGraph._nodes.push(stringNode);
+    const beforeRoot = serializedNavigationRoot(fixture);
+
+    const result = await fixture.flApi.navigateWorkflowBranchExact(
+        branchNavigationRequest(fixture, { node_ids: [1, "1"] }),
+    );
+
+    assert.deepEqual(
+        Array.from(fixture.harness.canvas.selectedItems),
+        [fixture.rootNode, stringNode],
+    );
+    assert.deepEqual(result.selected_node_ids, [1, "1"]);
+    assert.equal(serializedNavigationRoot(fixture), beforeRoot);
+    assertNoNavigationMutationCalls(fixture);
+});
+
+
+test("root branch navigation projects an attested serialized integer ID to its live string node", async () => {
+    const fixture = await branchNavigationFixture({ serializedRuntimeIdProjection: true });
+    const beforeRoot = serializedNavigationRoot(fixture);
+
+    const result = await fixture.flApi.navigateWorkflowBranchExact(
+        branchNavigationRequest(fixture, { node_ids: [1] }),
+    );
+
+    assert.equal(fixture.rootNode.id, "1");
+    assert.deepEqual(Array.from(fixture.harness.canvas.selectedItems), [fixture.rootNode]);
+    assert.deepEqual(result.selected_node_ids, [1]);
+    assert.equal(serializedNavigationRoot(fixture), beforeRoot);
+    assertNoNavigationMutationCalls(fixture);
+});
+
+
+test("branch navigation rejects an ambiguous serialized projection without coercing live IDs", async () => {
+    const fixture = await branchNavigationFixture({ serializedRuntimeIdProjection: true });
+    const collision = {
+        id: 1,
+        title: "Genuine numeric collision",
+        graph: fixture.rootGraph,
+        serialize: () => ({
+            id: 1,
+            type: "Pass",
+            title: "Genuine numeric collision",
+            pos: [0, 0],
+            size: [220, 120],
+            flags: {},
+            mode: 0,
+            inputs: [],
+            outputs: [],
+            properties: {},
+            widgets_values: [],
+        }),
+    };
+    fixture.rootGraph._nodes.push(collision);
+
+    await assert.rejects(
+        () => fixture.flApi.navigateWorkflowBranchExact(
+            branchNavigationRequest(fixture, { node_ids: [1] }),
+        ),
+        error => error?.code === "branch_node_ambiguous",
+    );
+
+    assertNavigationUiUnchanged(fixture);
+    assertNoNavigationMutationCalls(fixture);
+});
+
+
+test("nested branch navigation uses the exact recursive scope despite duplicate local IDs", async () => {
+    const fixture = await branchNavigationFixture();
+    const beforeRoot = serializedNavigationRoot(fixture);
+    const scopePath = [
+        { container_node_id: 7, subgraph_id: "subgraph-middle" },
+        { container_node_id: 8, subgraph_id: "subgraph-leaf" },
+    ];
+    const result = await fixture.flApi.navigateWorkflowBranchExact(
+        branchNavigationRequest(fixture, {
+            scope_path: scopePath,
+            node_ids: [1, 2],
+        }),
+    );
+
+    assert.equal(fixture.harness.canvas.graph, fixture.leafGraph);
+    assert.deepEqual(
+        Array.from(fixture.harness.canvas.selectedItems),
+        [fixture.leafNode, fixture.secondLeafNode],
+    );
+    assert.deepEqual(fixture.effects, [
+        "set-graph:subgraph-leaf",
+        "select:Leaf duplicate|Leaf second",
+        "fit",
+    ]);
+    assert.deepEqual(fixture.scopeReads, ["7/8", "7/8"]);
+    assert.deepEqual(result.scope_path, scopePath);
+    assert.deepEqual(result.selected_node_ids, [1, 2]);
+    assert.equal(result.scope_graph_id, "subgraph-leaf");
+    assert.equal(result.queued, false);
+    assert.equal(serializedNavigationRoot(fixture), beforeRoot);
+    assertNoNavigationMutationCalls(fixture);
+});
+
+
+test("nested branch navigation projects serialized scope and node IDs to live strings", async () => {
+    const fixture = await branchNavigationFixture({ serializedRuntimeIdProjection: true });
+    const beforeRoot = serializedNavigationRoot(fixture);
+    const scopePath = [
+        { container_node_id: 7, subgraph_id: "subgraph-middle" },
+        { container_node_id: 8, subgraph_id: "subgraph-leaf" },
+    ];
+
+    const result = await fixture.flApi.navigateWorkflowBranchExact(
+        branchNavigationRequest(fixture, {
+            scope_path: scopePath,
+            node_ids: [1, 2],
+        }),
+    );
+
+    assert.equal(fixture.leafNode.id, "1");
+    assert.equal(fixture.secondLeafNode.id, "2");
+    assert.equal(fixture.harness.canvas.graph, fixture.leafGraph);
+    assert.deepEqual(
+        Array.from(fixture.harness.canvas.selectedItems),
+        [fixture.leafNode, fixture.secondLeafNode],
+    );
+    assert.deepEqual(result.scope_path, scopePath);
+    assert.deepEqual(result.selected_node_ids, [1, 2]);
+    assert.equal(serializedNavigationRoot(fixture), beforeRoot);
+    assertNoNavigationMutationCalls(fixture);
+});
+
+
+test("nested branch navigation preserves exact numeric and string local IDs", async () => {
+    const fixture = await branchNavigationFixture();
+    const stringLeafNode = { id: "1", title: "String leaf ID", graph: fixture.leafGraph };
+    fixture.leafGraph._nodes.push(stringLeafNode);
+    const beforeRoot = serializedNavigationRoot(fixture);
+    const scopePath = [
+        { container_node_id: 7, subgraph_id: "subgraph-middle" },
+        { container_node_id: 8, subgraph_id: "subgraph-leaf" },
+    ];
+
+    const result = await fixture.flApi.navigateWorkflowBranchExact(
+        branchNavigationRequest(fixture, {
+            scope_path: scopePath,
+            node_ids: [1, "1"],
+        }),
+    );
+
+    assert.equal(fixture.harness.canvas.graph, fixture.leafGraph);
+    assert.deepEqual(
+        Array.from(fixture.harness.canvas.selectedItems),
+        [fixture.leafNode, stringLeafNode],
+    );
+    assert.deepEqual(result.selected_node_ids, [1, "1"]);
+    assert.equal(serializedNavigationRoot(fixture), beforeRoot);
+    assertNoNavigationMutationCalls(fixture);
+});
+
+
+test("failed branch navigation restores and verifies graph, selection, and viewport exactly", async t => {
+    const cases = [
+        { name: "successful exact restoration", field: null, behavior: null },
+        { name: "silent graph restoration", field: "setGraph", behavior: "silent" },
+        { name: "throwing graph restoration", field: "setGraph", behavior: "throw" },
+        { name: "silent selection restoration", field: "selectItems", behavior: "silent" },
+        { name: "throwing selection restoration", field: "selectItems", behavior: "throw" },
+    ];
+    for (const item of cases) {
+        await t.test(item.name, async () => {
+            const fixture = await branchNavigationFixture();
+            const canvas = fixture.harness.canvas;
+            const beforeRoot = serializedNavigationRoot(fixture);
+            const originalSetGraph = canvas.setGraph.bind(canvas);
+            const originalSelectItems = canvas.selectItems.bind(canvas);
+            let setGraphCalls = 0;
+            let selectCalls = 0;
+            canvas.setGraph = graph => {
+                setGraphCalls += 1;
+                if (item.field === "setGraph" && setGraphCalls === 2) {
+                    fixture.effects.push(`restore-set-graph:${item.behavior}`);
+                    if (item.behavior === "throw") throw new Error("setGraph restore failed");
+                    return;
+                }
+                originalSetGraph(graph);
+            };
+            canvas.selectItems = items => {
+                selectCalls += 1;
+                if (item.field === "selectItems" && selectCalls === 2) {
+                    fixture.effects.push(`restore-selection:${item.behavior}`);
+                    if (item.behavior === "throw") throw new Error("selection restore failed");
+                    return;
+                }
+                originalSelectItems(items);
+            };
+            canvas.fitViewToSelectionAnimated = async () => {
+                fixture.effects.push("fit-failure");
+                canvas.ds.scale = 4;
+                canvas.ds.offset[0] = 400;
+                canvas.ds.offset[1] = 500;
+                throw new Error("forced navigation fit failure");
+            };
+
+            const scopePath = [
+                { container_node_id: 7, subgraph_id: "subgraph-middle" },
+                { container_node_id: 8, subgraph_id: "subgraph-leaf" },
+            ];
+            let observedError = null;
+            await assert.rejects(
+                () => fixture.flApi.navigateWorkflowBranchExact(
+                    branchNavigationRequest(fixture, {
+                        scope_path: scopePath,
+                        node_ids: [1, 2],
+                    }),
+                ),
+                error => {
+                    observedError = error;
+                    return error?.message === "forced navigation fit failure";
+                },
+            );
+
+            assert.equal(observedError.message, "forced navigation fit failure");
+            assert.equal(serializedNavigationRoot(fixture), beforeRoot);
+            assertNoNavigationMutationCalls(fixture);
+            assert.equal(canvas.ds.scale, 1.25);
+            assert.deepEqual(canvas.ds.offset, [17, 23]);
+            if (item.field === null) {
+                assert.equal(canvas.graph, fixture.rootGraph);
+                assert.deepEqual(Array.from(canvas.selectedItems), [fixture.priorSelection]);
+                assert.equal(observedError.details, undefined);
+                return;
+            }
+
+            assert.equal(observedError.details?.code, "branch_navigation_restore_failed");
+            assert.equal(
+                observedError.details?.cause?.message,
+                "forced navigation fit failure",
+            );
+            assert.equal(observedError.details?.cause?.details, null);
+            assert.ok(observedError.details?.issues?.some(issue => (
+                issue.field === (item.field === "setGraph" ? "graph" : "selection")
+            )));
+        });
+    }
+});
+
+
+test("ToolExecutor never serializes private branch workflow tokens on its wire", async () => {
+    const sentinelSecret = "SENTINEL_PRIVATE_BRANCH_PROMPT_TOOL_WIRE";
+    let hashCalls = 0;
+    let releaseHash;
+    let markHashStarted;
+    const hashGate = new Promise(resolve => { releaseHash = resolve; });
+    const hashStarted = new Promise(resolve => { markHashStarted = resolve; });
+    const fixture = await branchNavigationFixture({
+        workflowGraphHash: async () => {
+            hashCalls += 1;
+            if (hashCalls === 3) {
+                markHashStarted();
+                await hashGate;
+            }
+            return NAVIGATION_GRAPH_HASH;
+        },
+    });
+    const canvas = fixture.harness.canvas;
+    const originalSelectItems = canvas.selectItems.bind(canvas);
+    let selectionCalls = 0;
+    canvas.selectItems = items => {
+        selectionCalls += 1;
+        if (selectionCalls === 2) return;
+        originalSelectItems(items);
+    };
+
+    const { Class: ToolExecutor } = await loadBrowserClass(
+        "web/js/tool_executor.js",
+        "ToolExecutor",
+        {
+            FL_API: class {},
+            QueryExecutor: class {},
+            performance: { now: () => 1 },
+        },
+    );
+    const sentMessages = [];
+    const executor = Object.create(ToolExecutor.prototype);
+    executor.flApi = fixture.flApi;
+    executor.queryExecutor = {};
+    executor.wsClient = { send: async message => { sentMessages.push(message); } };
+    executor.executionLog = [];
+    executor.maxLogEntries = 10;
+    executor.toolHandlers = executor._registerHandlers();
+
+    const execution = executor.executeToolRequest({
+        request_id: "private-branch-wire",
+        tool_name: "navigate_workflow_branch",
+        parameters: branchNavigationRequest(fixture),
+    });
+    await hashStarted;
+    fixture.harness.graphState = {
+        ...fixture.harness.graphState,
+        marker: sentinelSecret,
+    };
+    releaseHash();
+    await execution;
+
+    assert.equal(sentMessages.length, 1);
+    assert.equal(sentMessages[0].success, false);
+    assert.equal(
+        sentMessages[0].error_code,
+        "branch_navigation_precondition_failed",
+    );
+    assert.equal(
+        sentMessages[0].error_details?.code,
+        "branch_navigation_restore_failed",
+    );
+    assert.equal(
+        sentMessages[0].error_details?.cause?.details?.reason,
+        "graph_changed_during_hash",
+    );
+    assertNoPrivateNavigationDiagnostics(sentMessages[0], sentinelSecret);
+    assertNoPrivateNavigationDiagnostics(executor.executionLog, sentinelSecret);
+    assertNoNavigationMutationCalls(fixture);
+});
+
+
 test("ToolExecutor derives its advertised tools from the registered handler map", async () => {
     const { Class: ToolExecutor } = await loadBrowserClass(
         "web/js/tool_executor.js",
@@ -171,7 +1016,9 @@ test("ToolExecutor derives its advertised tools from the registered handler map"
         Object.keys(executor.toolHandlers).sort(),
     );
     assert.ok(supportedTools.includes("apply_workflow_graph_patch"));
-    assert.equal(contractRevisions.apply_workflow_graph_patch, 2);
+    assert.ok(supportedTools.includes("navigate_workflow_branch"));
+    assert.equal(contractRevisions.apply_workflow_graph_patch, 3);
+    assert.equal(contractRevisions.navigate_workflow_branch, 1);
     assert.equal(contractRevisions.find_node, 1);
     assert.deepEqual(Array.from(supportedTools), [...supportedTools].sort());
 });
@@ -845,6 +1692,348 @@ test("tool executor registers and routes GraphPatch through the guarded real ada
 });
 
 
+test("root GraphPatch keeps serialized integer IDs across live string-node create and retry", async () => {
+    const schemaHash = "7".repeat(64);
+    class ProjectedNode {
+        constructor(id = null) {
+            this.id = id === null ? null : String(id);
+            this.type = "ProjectedSource";
+            this.comfyClass = "ProjectedSource";
+            this.title = "Projected source";
+            this.pos = [0, 0];
+            this.size = [220, 120];
+            this.inputs = [{ name: "image", type: "IMAGE", link: null }];
+            this.outputs = [{ name: "image", type: "IMAGE", links: [] }];
+            this.widgets = [];
+            this.widgets_values = [];
+            this.properties = {};
+            this.flags = {};
+            this.mode = 0;
+        }
+
+        serialize() {
+            return {
+                id: Number(this.id),
+                type: this.type,
+                pos: structuredClone(this.pos),
+                size: structuredClone(this.size),
+                flags: structuredClone(this.flags),
+                mode: this.mode,
+                inputs: structuredClone(this.inputs),
+                outputs: structuredClone(this.outputs),
+                widgets_values: [],
+                properties: structuredClone(this.properties),
+            };
+        }
+
+        connect(sourceSlot, target, targetSlot) {
+            const link = this.graph.addLink(this, sourceSlot, target, targetSlot);
+            this.outputs[sourceSlot].links.push(link.id);
+            target.inputs[targetSlot].link = link.id;
+            return link;
+        }
+    }
+    class ProjectedGraph {
+        constructor() {
+            this._nodes = [new ProjectedNode(1), new ProjectedNode(2)];
+            for (const node of this._nodes) node.graph = this;
+            this.links = new Map();
+            this.extra = {};
+            this.lastNodeId = 2;
+            this.lastLinkId = 0;
+            this._nodes[0].connect(0, this._nodes[1], 0);
+        }
+
+        add(node) {
+            this.lastNodeId += 1;
+            node.id = String(this.lastNodeId);
+            node.graph = this;
+            this._nodes.push(node);
+        }
+
+        remove(node) {
+            for (const link of [...this.links.values()]) {
+                if (link.origin_id === node.id || link.target_id === node.id) {
+                    this.removeLink(link.id);
+                }
+            }
+            this._nodes = this._nodes.filter(item => item !== node);
+        }
+
+        removeLink(linkId) {
+            const link = this.links.get(linkId);
+            if (!link) return;
+            const source = this._nodes.find(node => node.id === link.origin_id);
+            const target = this._nodes.find(node => node.id === link.target_id);
+            if (source) {
+                source.outputs[link.origin_slot].links = source.outputs[link.origin_slot].links
+                    .filter(id => id !== link.id);
+            }
+            if (target) target.inputs[link.target_slot].link = null;
+            this.links.delete(linkId);
+        }
+
+        addLink(source, sourceSlot, target, targetSlot) {
+            this.lastLinkId += 1;
+            const link = {
+                id: this.lastLinkId,
+                origin_id: source.id,
+                origin_slot: sourceSlot,
+                target_id: target.id,
+                target_slot: targetSlot,
+                type: "IMAGE",
+            };
+            this.links.set(link.id, link);
+            return link;
+        }
+
+        serialize() {
+            return {
+                version: 0.4,
+                last_node_id: this.lastNodeId,
+                last_link_id: this.lastLinkId,
+                nodes: this._nodes.map(node => node.serialize()),
+                links: [...this.links.values()].map(link => [
+                    link.id,
+                    Number(link.origin_id),
+                    link.origin_slot,
+                    Number(link.target_id),
+                    link.target_slot,
+                    link.type,
+                ]),
+                groups: [],
+                config: {},
+                extra: structuredClone(this.extra),
+            };
+        }
+
+        change() {}
+        setDirtyCanvas() {}
+    }
+
+    const graph = new ProjectedGraph();
+    const workflow = { key: "projected-root-workflow", changeTracker: { changeCount: 0 } };
+    const app = {
+        graph,
+        rootGraph: graph,
+        canvas: {
+            read_only: false,
+            emitBeforeChange() {},
+            emitAfterChange() {},
+            setDirty() {},
+        },
+        extensionManager: { workflow: { activeWorkflow: workflow } },
+    };
+    const { Class: FL_API } = await loadBrowserClass("web/js/fl_api.js", "FL_API", {
+        app,
+        api: { dispatchCustomEvent() {} },
+        LiteGraph: { createNode: nodeType => (
+            nodeType === "ProjectedSource" ? new ProjectedNode() : null
+        ) },
+        GRAPH_PRECONDITION_SCHEMA: "fl-mcp.graph-precondition.v1",
+        canonicalWorkflowJSON,
+        workflowGraphHash,
+        workflowGraphHashExcludingExtra,
+        nodeIdsEqual: (left, right) => String(left) === String(right),
+        findNonOverlappingPosition: value => ({ x: value.x, y: value.y }),
+        getGraphInsertionOrigin: () => ({ x: 300, y: 0 }),
+        convertComfyWidgetToInput: async () => false,
+        formatImageWidgetRef: value => String(value),
+        nestedImageRefForNode: () => null,
+        normalizeMaskRegion: value => value,
+        parseImageWidgetRef: () => null,
+        summarizeMaskPixels: () => ({}),
+    });
+    const flApi = new FL_API();
+    flApi.pauseAutoQueue = () => ({ mode: "disabled" });
+    flApi.restoreAutoQueue = () => {};
+    flApi.getNodeDefinitions = async () => ({ ProjectedSource: {} });
+    const workflowIdentity = flApi.getActiveWorkflowIdentity();
+    const originalEdge = {
+        source: {
+            ref: { node_id: 1 },
+            output_index: 0,
+            output: "image",
+            type: "IMAGE",
+        },
+        target: {
+            ref: { node_id: 2 },
+            input_index: 0,
+            occurrence_index: 0,
+            socket_index: 0,
+            input: "image",
+            type: "IMAGE",
+            mode: "slot",
+        },
+    };
+    const request = {
+        application_id: "projected-root-clone-retry-test",
+        expected_catalog_hash: "c".repeat(64),
+        patch_hash: "d".repeat(64),
+        schema_contracts: {
+            ProjectedSource: { schema_hash: schemaHash, schema: {} },
+        },
+        plan: {
+            operation: "patch",
+            expected_workflow_identity: workflowIdentity,
+            expected_graph_hash: await workflowGraphHash(graph.serialize()),
+            assertions: {
+                nodes: [1, 2].map(nodeId => ({
+                    ref: { node_id: nodeId },
+                    node_type: "ProjectedSource",
+                    schema_hash: schemaHash,
+                })),
+                edges: [structuredClone(originalEdge)],
+            },
+            create_nodes: [{
+                alias: "clone",
+                node_type: "ProjectedSource",
+                schema_hash: schemaHash,
+                values: {},
+            }],
+            update_nodes: [{
+                ref: { node_id: 1 },
+                node_type: "ProjectedSource",
+                schema_hash: schemaHash,
+                expected_values: {},
+                set_values: {},
+                layout_hint: { x: 10, y: 20, width: 230, height: 130 },
+            }],
+            remove_edges: [structuredClone(originalEdge)],
+            add_edges: [{
+                source: {
+                    ref: { node_id: 1 },
+                    output_index: 0,
+                    output: "image",
+                    type: "IMAGE",
+                },
+                target: {
+                    ref: { alias: "clone" },
+                    input_index: 0,
+                    occurrence_index: 0,
+                    socket_index: 0,
+                    input: "image",
+                    type: "IMAGE",
+                    mode: "slot",
+                },
+            }],
+            remove_nodes: [{
+                ref: { node_id: 2 },
+                node_type: "ProjectedSource",
+                schema_hash: schemaHash,
+                expected_incident_edges: [structuredClone(originalEdge)],
+            }],
+            attachments: [],
+            expected_delta: {
+                created_node_count: 1,
+                updated_node_count: 1,
+                removed_node_count: 1,
+                added_edge_count: 1,
+                removed_edge_count: 1,
+                final_node_count: 2,
+                final_edge_count: 1,
+            },
+        },
+    };
+    const contexts = new Map([
+        ["existing:1", {
+            key: "existing:1",
+            node_type: "ProjectedSource",
+            schema_hash: schemaHash,
+            schema_inputs: [{
+                index: 0,
+                occurrence_index: 0,
+                name: "image",
+                type: "IMAGE",
+                kind: "socket",
+                socket_index: 0,
+            }],
+            schema_outputs: [{ index: 0, name: "image", type: "IMAGE" }],
+            dynamic_selector_names: [],
+            dynamic_input_roots: [],
+        }],
+        ["existing:2", {
+            key: "existing:2",
+            node_type: "ProjectedSource",
+            schema_hash: schemaHash,
+            schema_inputs: [{
+                index: 0,
+                occurrence_index: 0,
+                name: "image",
+                type: "IMAGE",
+                kind: "socket",
+                socket_index: 0,
+            }],
+            schema_outputs: [{ index: 0, name: "image", type: "IMAGE" }],
+            dynamic_selector_names: [],
+            dynamic_input_roots: [],
+        }],
+        ["new:clone", {
+            key: "new:clone",
+            node_type: "ProjectedSource",
+            schema_hash: schemaHash,
+            schema_inputs: [{
+                index: 0,
+                occurrence_index: 0,
+                name: "image",
+                type: "IMAGE",
+                kind: "socket",
+                socket_index: 0,
+            }],
+            schema_outputs: [{ index: 0, name: "image", type: "IMAGE" }],
+            dynamic_selector_names: [],
+            dynamic_input_roots: [],
+        }],
+    ]);
+    const { Class: ToolExecutor } = await loadBrowserClass(
+        "web/js/tool_executor.js",
+        "ToolExecutor",
+        {
+            FL_API: class {},
+            QueryExecutor: class {},
+            WORKFLOW_APPLICATION_PROPERTY: "application",
+            WORKFLOW_REFINEMENT_PROPERTY: "refinement",
+            WORKFLOW_GRAPH_PATCH_PROPERTY,
+            applyWorkflowPlanAtomic: async () => ({}),
+            applyWorkflowRefinementAtomic: async () => ({}),
+            applyWorkflowGraphPatchAtomic,
+            buildGraphPatchSchemaContexts: async () => contexts,
+            enrichGraphPatchNode,
+            setTimeout: callback => { callback(); return 1; },
+        },
+    );
+    const executor = Object.create(ToolExecutor.prototype);
+    executor.flApi = flApi;
+    executor.queryExecutor = {};
+    executor.toolHandlers = executor._registerHandlers();
+
+    const first = await executor.toolHandlers.apply_workflow_graph_patch(request);
+    const retry = await executor.toolHandlers.apply_workflow_graph_patch(request);
+
+    assert.equal(first.success, true, JSON.stringify(first.error));
+    assert.deepEqual(first.aliases, { clone: 3 });
+    assert.deepEqual(first.created_node_ids, [3]);
+    assert.deepEqual(first.removed_node_ids, [2]);
+    assert.deepEqual(graph._nodes.map(node => node.id), ["1", "3"]);
+    assert.deepEqual(graph.serialize().nodes.map(node => node.id), [1, 3]);
+    assert.deepEqual(graph.serialize().links.map(link => [link[1], link[3]]), [[1, 3]]);
+    assert.deepEqual(graph._nodes[0].pos, [10, 20]);
+    assert.deepEqual(graph._nodes[0].size, [230, 130]);
+    assert.equal(retry.success, true, JSON.stringify(retry.error));
+    assert.equal(retry.already_applied, true);
+    assert.equal(graph._nodes.length, 2);
+
+    const collidingRuntimeNode = new ProjectedNode(1);
+    collidingRuntimeNode.id = 1;
+    collidingRuntimeNode.graph = graph;
+    graph._nodes.push(collidingRuntimeNode);
+    assert.throws(
+        () => flApi.getWorkflowNode(1),
+        error => error?.code === "workflow_node_projection_ambiguous",
+    );
+});
+
+
 test("the guarded ToolExecutor adapter lets an edge unlock a deferred dynamic-slot value", async () => {
     const workflowIdentity = "fl-mcp-workflow:dynamic-slot-adapter:1";
     const catalogHash = "c".repeat(64);
@@ -1318,6 +2507,58 @@ test("concurrent refinement fails busy immediately and the lock releases after f
     assert.equal(thirdResult.success, true);
     assert.ok(events.indexOf("restore-auto:first") < events.indexOf("pin:third:identity-third"));
     assert.ok(events.indexOf("pin:third:identity-third") < events.indexOf("start:third"));
+});
+
+
+test("registered branch navigation is serialized by the shared canvas lock", async () => {
+    const calls = [];
+    let releaseFirst;
+    let markFirstStarted;
+    const firstGate = new Promise(resolve => { releaseFirst = resolve; });
+    const firstStarted = new Promise(resolve => { markFirstStarted = resolve; });
+    const { Class: ToolExecutor } = await loadBrowserClass(
+        "web/js/tool_executor.js",
+        "ToolExecutor",
+        {
+            FL_API: class {},
+            QueryExecutor: class {},
+        },
+    );
+    const executor = Object.create(ToolExecutor.prototype);
+    executor.flApi = {
+        async navigateWorkflowBranchExact(params) {
+            calls.push(`start:${params.branch_id}`);
+            if (params.branch_id === "first") {
+                markFirstStarted();
+                await firstGate;
+            }
+            calls.push(`finish:${params.branch_id}`);
+            return { branch_id: params.branch_id, queued: false };
+        },
+    };
+    executor.queryExecutor = {};
+    executor.toolHandlers = executor._registerHandlers();
+
+    const first = executor.toolHandlers.navigate_workflow_branch({ branch_id: "first" });
+    await firstStarted;
+    await assert.rejects(
+        () => executor.toolHandlers.navigate_workflow_branch({ branch_id: "second" }),
+        error => error?.code === "canvas_mutation_busy" && error?.details?.retryable === true,
+    );
+    assert.deepEqual(calls, ["start:first"]);
+
+    releaseFirst();
+    assert.deepEqual(await first, { branch_id: "first", queued: false });
+    assert.deepEqual(
+        await executor.toolHandlers.navigate_workflow_branch({ branch_id: "third" }),
+        { branch_id: "third", queued: false },
+    );
+    assert.deepEqual(calls, [
+        "start:first",
+        "finish:first",
+        "start:third",
+        "finish:third",
+    ]);
 });
 
 

@@ -32,7 +32,7 @@ test("browser bridge advertises its instantiated ToolExecutor before connecting"
     assert.ok(manifestIndex < extension.indexOf("wsClient.connect()", manifestIndex));
     assert.match(executor, /getSupportedTools\(\)\s*\{\s*return Object\.keys\(this\.toolHandlers\)\.sort\(\)/s);
     assert.match(executor, /getToolContractRevisions\(\)/);
-    assert.match(executor, /"apply_workflow_graph_patch": withToolContractRevision\([\s\S]*?,\s*2,/);
+    assert.match(executor, /"apply_workflow_graph_patch": withToolContractRevision\([\s\S]*?,\s*3,/);
     assert.doesNotMatch(extension, /supportedTools:\s*\[/);
 });
 
@@ -510,6 +510,12 @@ test("deterministic workflow planning has clear human tool activity", async () =
     assert.match(tools, /"apply_workflow_graph_patch"\s*:\s*\{/);
     assert.match(tools, /label:\s*"Build Workflow"/);
     assert.match(tools, /apply_workflow_graph_patch:\s*"Building workflow graph"/);
+    assert.match(tools, /"workflow_branches_discover"\s*:\s*\{/);
+    assert.match(tools, /label:\s*"Find Branches"/);
+    assert.match(tools, /workflow_branches_discover:\s*"Discovering workflow branches"/);
+    assert.match(tools, /"workflow_branch_compare"\s*:\s*\{/);
+    assert.match(tools, /"workflow_branch_navigate"\s*:\s*\{/);
+    assert.match(tools, /"compile_workflow_branch_operation"\s*:\s*\{/);
 });
 
 

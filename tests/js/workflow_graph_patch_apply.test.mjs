@@ -2231,6 +2231,80 @@ test("an existing-node attachment is applied and verified as an intentional valu
 });
 
 
+test("a forged v2 ledger cannot hide an attachment postcondition mismatch", async () => {
+    const attached = createdNodeTemplate("AttachmentNode", 1);
+    const workflow = {
+        version: 0.4,
+        last_node_id: 1,
+        last_link_id: 0,
+        nodes: [attached],
+        links: [],
+        groups: [],
+        config: {},
+        extra: {},
+    };
+    const adapter = new FakeGraphPatchAdapter(workflow);
+    const request = {
+        application_id: "forged-attachment-retry-test",
+        expected_catalog_hash: CATALOG_HASH,
+        patch_hash: "a".repeat(64),
+        plan: {
+            operation: "patch",
+            expected_workflow_identity: WORKFLOW_IDENTITY,
+            expected_graph_hash: await workflowGraphHash(workflow),
+            assertions: {
+                nodes: [assertion(1, "AttachmentNode", SCHEMAS.AttachmentNode)],
+                edges: [],
+            },
+            create_nodes: [],
+            update_nodes: [],
+            remove_edges: [],
+            add_edges: [],
+            remove_nodes: [],
+            attachments: [{
+                ref: existingRef(1),
+                input_index: 0,
+                input: "image",
+                type: "STRING",
+                filename: "subject.png",
+                subfolder: "ren-chat",
+                file_type: "input",
+                size_bytes: 123,
+                sha256: ATTACHMENT_SHA256,
+            }],
+            expected_delta: {
+                created_node_count: 0,
+                updated_node_count: 0,
+                removed_node_count: 0,
+                added_edge_count: 0,
+                removed_edge_count: 0,
+                final_node_count: 1,
+                final_edge_count: 0,
+            },
+        },
+    };
+    assert.equal((await applyWorkflowGraphPatchAtomic(request, adapter)).success, true);
+    const wrong = { filename: "wrong.png", subfolder: "ren-chat", type: "input" };
+    adapter.workflow.nodes[0].values.image = structuredClone(wrong);
+    adapter.workflow.nodes[0].widgets.find(item => item.name === "image").value = structuredClone(wrong);
+    adapter.workflow.nodes[0].widgets_values = Object.values(
+        structuredClone(adapter.workflow.nodes[0].values),
+    );
+    const content = adapter.captureWorkflow();
+    delete content.extra[GRAPH_PATCH_LEDGER_KEY];
+    adapter.workflow.extra[GRAPH_PATCH_LEDGER_KEY]
+        .entries[request.application_id].result_content_hash = await workflowGraphHash(content);
+
+    const retry = await applyWorkflowGraphPatchAtomic(request, adapter);
+
+    assert.equal(retry.success, false);
+    assert.equal(retry.error.code, "graph_patch_idempotency_conflict");
+    assert.ok(retry.error.details.issues.some(issue => (
+        issue.code === "graph_patch_attachment_mismatch"
+    )));
+});
+
+
 test("attachment normalization rejects non-attested and non-Ren image references", async () => {
     const variants = [
         { filename: "nested/subject.png" },
@@ -2778,4 +2852,411 @@ test("retrying the identical patch is idempotent without duplicate DAG nodes or 
     assert.equal(adapter.workflow.nodes.length, nodesAfterFirst);
     assert.equal(adapter.workflow.links.length, edgesAfterFirst);
     assert.equal(adapter.createCalls, createCalls);
+});
+
+
+test("a forged retry ledger cannot bind a converted widget edge to the wrong duplicate occurrence", async () => {
+    const adapter = new FakeGraphPatchAdapter();
+    const request = await productionPatch(adapter);
+    assert.equal((await applyWorkflowGraphPatchAtomic(request, adapter)).success, true);
+
+    const ledger = adapter.workflow.extra[GRAPH_PATCH_LEDGER_KEY];
+    const entry = ledger.entries[request.application_id];
+    const combineId = entry.aliases.video_combine;
+    const combine = adapter.workflow.nodes.find(node => sameId(node.id, combineId));
+    const converted = combine.inputs.find(inputValue => inputValue.name === "frame_rate");
+    const convertedEdge = adapter.workflow.links.find(edgeValue => (
+        sameId(edgeValue.target_node_id, combineId)
+        && edgeValue.target_input === "frame_rate"
+    ));
+    assert.ok(converted);
+    assert.ok(convertedEdge);
+
+    converted.occurrence_index = 0;
+    const wrongOccurrence = {
+        ...structuredClone(converted),
+        socket_index: combine.inputs.length,
+        occurrence_index: 1,
+        link: null,
+    };
+    combine.inputs.push(wrongOccurrence);
+    convertedEdge.target_input_index = wrongOccurrence.socket_index;
+
+    const content = adapter.captureWorkflow();
+    delete content.extra[GRAPH_PATCH_LEDGER_KEY];
+    entry.result_content_hash = await workflowGraphHash(content);
+
+    const retry = await applyWorkflowGraphPatchAtomic(request, adapter);
+
+    assert.equal(retry.success, false);
+    assert.equal(retry.error.code, "graph_patch_idempotency_conflict");
+    assert.ok(retry.error.details.issues.some(issue => (
+        issue.code === "graph_patch_edge_mismatch"
+    )));
+});
+
+
+test("a converted retry accepts one unlabelled target but rejects an unlabelled duplicate", async () => {
+    const adapter = new FakeGraphPatchAdapter();
+    const request = await productionPatch(adapter);
+    assert.equal((await applyWorkflowGraphPatchAtomic(request, adapter)).success, true);
+
+    const ledger = adapter.workflow.extra[GRAPH_PATCH_LEDGER_KEY];
+    const entry = ledger.entries[request.application_id];
+    const combineId = entry.aliases.video_combine;
+    const combine = adapter.workflow.nodes.find(node => sameId(node.id, combineId));
+    const converted = combine.inputs.find(inputValue => inputValue.name === "frame_rate");
+    assert.ok(converted);
+    delete converted.schema_index;
+    delete converted.input_index;
+    delete converted.occurrence_index;
+
+    let content = adapter.captureWorkflow();
+    delete content.extra[GRAPH_PATCH_LEDGER_KEY];
+    entry.result_content_hash = await workflowGraphHash(content);
+    const uniqueRetry = await applyWorkflowGraphPatchAtomic(request, adapter);
+    assert.equal(uniqueRetry.success, true);
+    assert.equal(uniqueRetry.already_applied, true);
+
+    combine.inputs.push({
+        name: converted.name,
+        type: converted.type,
+        socket_index: combine.inputs.length,
+        link: null,
+    });
+    content = adapter.captureWorkflow();
+    delete content.extra[GRAPH_PATCH_LEDGER_KEY];
+    entry.result_content_hash = await workflowGraphHash(content);
+
+    const ambiguousRetry = await applyWorkflowGraphPatchAtomic(request, adapter);
+
+    assert.equal(ambiguousRetry.success, false);
+    assert.equal(ambiguousRetry.error.code, "graph_patch_idempotency_conflict");
+    assert.ok(ambiguousRetry.error.details.issues.some(issue => (
+        issue.code === "graph_patch_edge_mismatch"
+    )));
+});
+
+
+test("a forged root retry ledger cannot hide retained asserted node or edge substitution", async () => {
+    const workflow = existingEdgeWorkflow({ withUnrelated: true });
+    workflow.last_link_id = 1;
+    workflow.links = [link(1, 1, 0, "IMAGE", 2, 0, "image_1", "IMAGE")];
+    const original = new FakeGraphPatchAdapter(workflow);
+    const request = {
+        application_id: "retained-assertion-retry-test",
+        expected_catalog_hash: CATALOG_HASH,
+        patch_hash: "4".repeat(64),
+        plan: {
+            operation: "patch",
+            expected_workflow_identity: WORKFLOW_IDENTITY,
+            expected_graph_hash: await workflowGraphHash(workflow),
+            assertions: {
+                nodes: [
+                    assertion(1, "Source", SCHEMAS.Source),
+                    assertion(2, "DynamicTarget", SCHEMAS.DynamicTarget),
+                    assertion(3, "Source", SCHEMAS.Source),
+                ],
+                edges: [edge(
+                    source(existingRef(1), 0, "IMAGE", "IMAGE"),
+                    target(existingRef(2), 0, 0, "image_1", "IMAGE"),
+                )],
+            },
+            create_nodes: [{
+                alias: "isolated_source",
+                node_type: "Source",
+                schema_hash: SCHEMAS.Source,
+                values: {},
+            }],
+            update_nodes: [],
+            remove_edges: [],
+            add_edges: [],
+            remove_nodes: [],
+            attachments: [],
+            expected_delta: {
+                created_node_count: 1,
+                updated_node_count: 0,
+                removed_node_count: 0,
+                added_edge_count: 0,
+                removed_edge_count: 0,
+                final_node_count: 4,
+                final_edge_count: 1,
+            },
+        },
+    };
+    assert.equal((await applyWorkflowGraphPatchAtomic(request, original)).success, true);
+    const baseline = original.captureWorkflow();
+    const corruptions = [
+        {
+            code: "graph_patch_asserted_node_mismatch",
+            apply(adapter) {
+                adapter.workflow.nodes.find(node => sameId(node.id, 3)).schema_hash = "f".repeat(64);
+            },
+        },
+        {
+            code: "graph_patch_asserted_edge_mismatch",
+            apply(adapter) {
+                adapter.workflow.links[0].source_node_id = 3;
+            },
+        },
+    ];
+
+    for (const corruption of corruptions) {
+        const adapter = new FakeGraphPatchAdapter(baseline);
+        corruption.apply(adapter);
+        const ledger = adapter.workflow.extra[GRAPH_PATCH_LEDGER_KEY];
+        const content = adapter.captureWorkflow();
+        delete content.extra[GRAPH_PATCH_LEDGER_KEY];
+        ledger.entries[request.application_id].result_content_hash = await workflowGraphHash(content);
+
+        const retry = await applyWorkflowGraphPatchAtomic(request, adapter);
+
+        assert.equal(retry.success, false);
+        assert.equal(retry.error.code, "graph_patch_idempotency_conflict");
+        assert.ok(retry.error.details.issues.some(issue => issue.code === corruption.code));
+    }
+});
+
+
+test("a forged root retry ledger cannot attach an undeclared edge to a created node", async () => {
+    const adapter = new FakeGraphPatchAdapter();
+    const request = await productionPatch(adapter);
+    assert.equal((await applyWorkflowGraphPatchAtomic(request, adapter)).success, true);
+
+    const ledger = adapter.workflow.extra[GRAPH_PATCH_LEDGER_KEY];
+    const componentsId = ledger.entries[request.application_id].aliases.video_components;
+    const displaced = adapter.workflow.links.find(edgeValue => edgeValue.id === 45);
+    assert.ok(displaced);
+    displaced.source_node_id = componentsId;
+    displaced.source_output_index = 0;
+    displaced.source_output = "images";
+    const content = adapter.captureWorkflow();
+    delete content.extra[GRAPH_PATCH_LEDGER_KEY];
+    ledger.entries[request.application_id].result_content_hash = await workflowGraphHash(content);
+
+    const retry = await applyWorkflowGraphPatchAtomic(request, adapter);
+
+    assert.equal(retry.success, false);
+    assert.equal(retry.error.code, "graph_patch_idempotency_conflict");
+    assert.ok(retry.error.details.issues.some(issue => (
+        issue.code === "graph_patch_created_incident_edge_mismatch"
+        && issue.alias === "video_components"
+    )));
+});
+
+
+test("created-node retry edge proof preserves exact typed endpoint IDs", async () => {
+    const adapter = new FakeGraphPatchAdapter();
+    const request = await productionPatch(adapter);
+    assert.equal((await applyWorkflowGraphPatchAtomic(request, adapter)).success, true);
+
+    const ledger = adapter.workflow.extra[GRAPH_PATCH_LEDGER_KEY];
+    const entry = ledger.entries[request.application_id];
+    const componentsId = entry.aliases.video_components;
+    const combineId = entry.aliases.video_combine;
+    const typedEdge = adapter.workflow.links.find(edgeValue => (
+        sameId(edgeValue.source_node_id, componentsId)
+        && sameId(edgeValue.target_node_id, combineId)
+        && edgeValue.target_input === "images"
+    ));
+    assert.ok(typedEdge);
+    typedEdge.source_node_id = String(componentsId);
+    assert.notEqual(typeof typedEdge.source_node_id, typeof componentsId);
+    const content = adapter.captureWorkflow();
+    delete content.extra[GRAPH_PATCH_LEDGER_KEY];
+    entry.result_content_hash = await workflowGraphHash(content);
+
+    const retry = await applyWorkflowGraphPatchAtomic(request, adapter);
+
+    assert.equal(retry.success, false);
+    assert.equal(retry.error.code, "graph_patch_idempotency_conflict");
+    assert.ok(retry.error.details.issues.some(issue => (
+        issue.code === "graph_patch_edge_mismatch"
+    )));
+});
+
+
+test("root retry rejects a string node and edge substituted for numeric plan IDs", async () => {
+    const adapter = new FakeGraphPatchAdapter(existingEdgeWorkflow());
+    const request = await existingEdgePatch(adapter, {
+        applicationId: "typed-root-substitution-retry-test",
+    });
+    assert.equal((await applyWorkflowGraphPatchAtomic(request, adapter)).success, true);
+
+    const numericNode = adapter.workflow.nodes.find(node => (
+        typeof node.id === "number" && node.id === 1
+    ));
+    const numericEdge = adapter.workflow.links[0];
+    numericNode.id = "1";
+    numericEdge.source_node_id = "1";
+    const ledger = adapter.workflow.extra[GRAPH_PATCH_LEDGER_KEY];
+    const content = adapter.captureWorkflow();
+    delete content.extra[GRAPH_PATCH_LEDGER_KEY];
+    ledger.entries[request.application_id].result_content_hash = await workflowGraphHash(content);
+
+    const retry = await applyWorkflowGraphPatchAtomic(request, adapter);
+
+    assert.equal(retry.success, false);
+    assert.equal(retry.error.code, "graph_patch_idempotency_conflict");
+    assert.ok(retry.error.details.issues.some(issue => (
+        issue.code === "graph_patch_asserted_node_mismatch"
+    )));
+    assert.ok(retry.error.details.issues.some(issue => (
+        issue.code === "graph_patch_edge_mismatch"
+    )));
+});
+
+
+test("a substantive root ledger-only import cannot claim an unchanged pre-patch graph", async () => {
+    const workflow = existingEdgeWorkflow();
+    const authority = new FakeGraphPatchAdapter(workflow);
+    const request = await existingEdgePatch(authority, {
+        applicationId: "unchanged-root-ledger-test",
+    });
+    assert.equal((await applyWorkflowGraphPatchAtomic(request, authority)).success, true);
+    const forged = new FakeGraphPatchAdapter(workflow);
+    forged.workflow.extra[GRAPH_PATCH_LEDGER_KEY] = structuredClone(
+        authority.workflow.extra[GRAPH_PATCH_LEDGER_KEY],
+    );
+    forged.workflow.extra[GRAPH_PATCH_LEDGER_KEY]
+        .entries[request.application_id].result_content_hash = request.plan.expected_graph_hash;
+
+    const retry = await applyWorkflowGraphPatchAtomic(request, forged);
+
+    assert.equal(retry.success, false);
+    assert.equal(retry.error.code, "graph_patch_idempotency_conflict");
+    assert.ok(retry.error.details.issues.some(issue => (
+        issue.code === "graph_patch_delta_mismatch"
+        || issue.code === "graph_patch_edge_mismatch"
+    )));
+    assert.equal(forged.createCalls, 0);
+    assert.equal(forged.connectCalls, 0);
+});
+
+
+test("a same-value and same-layout root update retries idempotently", async () => {
+    const workflow = productionWorkflow();
+    const adapter = new FakeGraphPatchAdapter(workflow);
+    const request = {
+        application_id: "root-no-op-update-retry-test",
+        expected_catalog_hash: CATALOG_HASH,
+        patch_hash: "5".repeat(64),
+        plan: {
+            operation: "patch",
+            expected_workflow_identity: WORKFLOW_IDENTITY,
+            expected_graph_hash: await workflowGraphHash(workflow),
+            assertions: {
+                nodes: [assertion(60, "WaveletColorFix", SCHEMAS.WaveletColorFix)],
+                edges: [],
+            },
+            create_nodes: [],
+            update_nodes: [{
+                ref: existingRef(60),
+                node_type: "WaveletColorFix",
+                schema_hash: SCHEMAS.WaveletColorFix,
+                expected_values: { align_method: "wavelet" },
+                set_values: { align_method: "wavelet" },
+                layout_hint: { x: 1800, y: 0, width: 240, height: 140 },
+            }],
+            remove_edges: [],
+            add_edges: [],
+            remove_nodes: [],
+            attachments: [],
+            expected_delta: {
+                created_node_count: 0,
+                updated_node_count: 1,
+                removed_node_count: 0,
+                added_edge_count: 0,
+                removed_edge_count: 0,
+                final_node_count: 9,
+                final_edge_count: 13,
+            },
+        },
+    };
+
+    const first = await applyWorkflowGraphPatchAtomic(request, adapter);
+    assert.equal(first.success, true, JSON.stringify(first.error));
+    const entry = adapter.workflow.extra[GRAPH_PATCH_LEDGER_KEY].entries[request.application_id];
+    const second = await applyWorkflowGraphPatchAtomic(request, adapter);
+
+    assert.equal(entry.result_content_hash, request.plan.expected_graph_hash);
+    assert.equal(second.success, true, JSON.stringify(second.error));
+    assert.equal(second.already_applied, true);
+});
+
+
+test("retry assertion proof preserves a trusted dynamic socket relocation", async () => {
+    const dynamicInput = "model.reference_images.image_1";
+    const workflow = {
+        version: 0.4,
+        last_node_id: 2,
+        last_link_id: 1,
+        nodes: [
+            graphNode({
+                id: 1,
+                type: "Source",
+                schemaHash: SCHEMAS.Source,
+                outputs: [output("IMAGE", "IMAGE", 0)],
+            }),
+            graphNode({
+                id: 2,
+                type: "ByteDance2ReferenceNode",
+                schemaHash: SCHEMAS.ByteDance2ReferenceNode,
+                inputs: [input(dynamicInput, "IMAGE", 6, 5)],
+                schemaInputs: [schemaInput(dynamicInput, "IMAGE", 6)],
+                dynamicInputRoots: ["model"],
+            }),
+        ],
+        links: [link(1, 1, 0, "IMAGE", 2, 5, dynamicInput, "IMAGE")],
+        groups: [],
+        config: {},
+        extra: {},
+    };
+    const adapter = new FakeGraphPatchAdapter(workflow);
+    const request = {
+        application_id: "dynamic-assertion-retry-test",
+        expected_catalog_hash: CATALOG_HASH,
+        patch_hash: "6".repeat(64),
+        plan: {
+            operation: "patch",
+            expected_workflow_identity: WORKFLOW_IDENTITY,
+            expected_graph_hash: await workflowGraphHash(workflow),
+            assertions: {
+                nodes: [
+                    assertion(1, "Source", SCHEMAS.Source),
+                    assertion(2, "ByteDance2ReferenceNode", SCHEMAS.ByteDance2ReferenceNode),
+                ],
+                edges: [edge(
+                    source(existingRef(1), 0, "IMAGE", "IMAGE"),
+                    target(existingRef(2), 6, 0, dynamicInput, "IMAGE"),
+                )],
+            },
+            create_nodes: [{
+                alias: "isolated_source",
+                node_type: "Source",
+                schema_hash: SCHEMAS.Source,
+                values: {},
+            }],
+            update_nodes: [],
+            remove_edges: [],
+            add_edges: [],
+            remove_nodes: [],
+            attachments: [],
+            expected_delta: {
+                created_node_count: 1,
+                updated_node_count: 0,
+                removed_node_count: 0,
+                added_edge_count: 0,
+                removed_edge_count: 0,
+                final_node_count: 3,
+                final_edge_count: 1,
+            },
+        },
+    };
+    assert.equal((await applyWorkflowGraphPatchAtomic(request, adapter)).success, true);
+
+    const retry = await applyWorkflowGraphPatchAtomic(request, adapter);
+
+    assert.equal(retry.success, true, JSON.stringify(retry.error));
+    assert.equal(retry.already_applied, true);
 });
