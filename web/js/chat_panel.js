@@ -34,6 +34,7 @@ const MAX_CHAT_ATTACHMENTS = 8;
 const MAX_CHAT_ATTACHMENT_BYTES = 32 * 1024 * 1024;
 const CHAT_IMAGE_TYPES = new Set(["image/png", "image/jpeg", "image/webp", "image/gif"]);
 const WORKFLOW_CONVERSATIONS_KEY = "fl_mcp_workflow_conversations_v1";
+const STREAM_RENDER_INTERVAL_MS = 50;
 
 export class AssistantPanel {
     constructor(container, sessionManager, options = {}) {
@@ -2562,6 +2563,8 @@ export class AssistantPanel {
         message.activeSource = "";
         message.pendingText = "";
         message.textRenderFrame = null;
+        message.textRenderTimer = null;
+        message.lastTextRenderAt = 0;
         if (message.activeBody) message.activeBody.classList.add("streaming-active");
         message.tools = new Map();
         if (context) context.assistant = message;
@@ -2571,11 +2574,21 @@ export class AssistantPanel {
 
     appendAssistantDelta(message, delta) {
         message.pendingText += delta;
-        if (message.textRenderFrame !== null) return;
-        message.textRenderFrame = requestAnimationFrame(() => {
-            message.textRenderFrame = null;
-            this.flushAssistantText(message);
-        });
+        if (message.textRenderFrame !== null || message.textRenderTimer !== null) return;
+        const render = () => {
+            message.textRenderTimer = null;
+            message.textRenderFrame = requestAnimationFrame(() => {
+                message.textRenderFrame = null;
+                message.lastTextRenderAt = Date.now();
+                this.flushAssistantText(message);
+            });
+        };
+        const delay = Math.max(
+            0,
+            STREAM_RENDER_INTERVAL_MS - (Date.now() - message.lastTextRenderAt),
+        );
+        if (delay) message.textRenderTimer = setTimeout(render, delay);
+        else render();
     }
 
     flushAssistantText(message) {
@@ -2596,6 +2609,10 @@ export class AssistantPanel {
         if (message?.textRenderFrame !== null && message?.textRenderFrame !== undefined) {
             cancelAnimationFrame(message.textRenderFrame);
             message.textRenderFrame = null;
+        }
+        if (message?.textRenderTimer !== null && message?.textRenderTimer !== undefined) {
+            clearTimeout(message.textRenderTimer);
+            message.textRenderTimer = null;
         }
         this.flushAssistantText(message);
         if (discardEmpty && message.activeBody && !message.activeSource) {
@@ -3095,6 +3112,15 @@ export class AssistantPanel {
             this.renderApproval(event.value, context);
         } else if (event.type === "CUSTOM" && event.name === "approval_resolved") {
             this.resolveApprovalCard(event.value);
+        } else if (event.type === "CUSTOM" && event.name === "run_phase") {
+            if (!context || context === this.currentRunContext) {
+                const phase = event.value?.phase;
+                const label = {
+                    connecting_tools: "Preparing toolsâ€¦",
+                    waiting_for_model: "Waiting for modelâ€¦",
+                }[phase];
+                if (label) this.setRunStatus(label);
+            }
         } else if (event.type === "RUN_ERROR") {
             const interrupted = event.code === "steered";
             this.settleOpenTools(
