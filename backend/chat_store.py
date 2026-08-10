@@ -490,6 +490,101 @@ class ChatStore:
             for row in rows
         ]
 
+    def list_model_messages(
+        self,
+        conversation_id: str,
+        limit: int = 500,
+    ) -> List[Dict[str, Any]]:
+        """Read the active branch without loading serialized runs or full tool results."""
+        with self._lock, self._connect() as connection:
+            conversation = connection.execute(
+                "SELECT active_leaf_message_id FROM conversations WHERE id = ?",
+                (conversation_id,),
+            ).fetchone()
+            if not conversation or not conversation["active_leaf_message_id"]:
+                return []
+            path_rows = connection.execute(
+                """
+                WITH RECURSIVE active_path AS (
+                    SELECT id, parent_message_id, 0 AS path_depth
+                    FROM messages WHERE id = ? AND conversation_id = ?
+                    UNION ALL
+                    SELECT parent.id, parent.parent_message_id, active_path.path_depth + 1
+                    FROM messages AS parent
+                    JOIN active_path ON active_path.parent_message_id = parent.id
+                )
+                SELECT id FROM active_path
+                ORDER BY path_depth DESC LIMIT ?
+                """,
+                (
+                    conversation["active_leaf_message_id"],
+                    conversation_id,
+                    max(1, min(int(limit), 2000)),
+                ),
+            ).fetchall()
+            message_ids = [str(row["id"]) for row in path_rows]
+            if not message_ids:
+                return []
+            placeholders = ",".join("?" for _ in message_ids)
+            rows = connection.execute(
+                f"""
+                SELECT
+                    messages.id,
+                    messages.conversation_id,
+                    messages.role,
+                    messages.content,
+                    messages.status,
+                    messages.provider,
+                    messages.model,
+                    messages.created_at,
+                    messages.parent_message_id,
+                    json_extract(messages.metadata_json, '$.usage') AS usage_json,
+                    json_extract(messages.metadata_json, '$.attachments') AS attachments_json,
+                    json_extract(messages.metadata_json, '$.claudeSessionId') AS claude_session_id,
+                    json_extract(messages.metadata_json, '$.codexThreadId') AS codex_thread_id,
+                    (
+                        SELECT json_group_array(json_object(
+                            'name', json_extract(tool.value, '$.name'),
+                            'status', json_extract(tool.value, '$.status')
+                        ))
+                        FROM json_each(messages.metadata_json, '$.toolSteps') AS tool
+                    ) AS tool_steps_json
+                FROM messages
+                WHERE messages.id IN ({placeholders})
+                """,
+                message_ids,
+            ).fetchall()
+        by_id = {str(row["id"]): row for row in rows}
+        messages = []
+        for message_id in message_ids:
+            row = by_id[message_id]
+            metadata = {}
+            for key, column in (
+                ("usage", "usage_json"),
+                ("attachments", "attachments_json"),
+                ("toolSteps", "tool_steps_json"),
+            ):
+                value = _loads(row[column], None)
+                if value:
+                    metadata[key] = value
+            if row["claude_session_id"]:
+                metadata["claudeSessionId"] = row["claude_session_id"]
+            if row["codex_thread_id"]:
+                metadata["codexThreadId"] = row["codex_thread_id"]
+            messages.append({
+                "id": row["id"],
+                "conversationId": row["conversation_id"],
+                "role": row["role"],
+                "content": row["content"],
+                "status": row["status"],
+                "provider": row["provider"],
+                "model": row["model"],
+                "createdAt": row["created_at"],
+                "metadata": metadata,
+                "parentMessageId": row["parent_message_id"],
+            })
+        return messages
+
     def list_messages_page(
         self,
         conversation_id: str,
@@ -660,11 +755,29 @@ class ChatStore:
         return self.list_messages(conversation_id)
 
     def serialized_history(self, conversation_id: str) -> Optional[bytes]:
-        message_ids = [item["id"] for item in self.list_messages(conversation_id)]
-        if not message_ids:
-            return None
-        placeholders = ",".join("?" for _ in message_ids)
         with self._lock, self._connect() as connection:
+            conversation = connection.execute(
+                "SELECT active_leaf_message_id FROM conversations WHERE id = ?",
+                (conversation_id,),
+            ).fetchone()
+            if not conversation or not conversation["active_leaf_message_id"]:
+                return None
+            path_rows = connection.execute(
+                """
+                WITH RECURSIVE active_path AS (
+                    SELECT id, parent_message_id
+                    FROM messages WHERE id = ? AND conversation_id = ?
+                    UNION ALL
+                    SELECT parent.id, parent.parent_message_id
+                    FROM messages AS parent
+                    JOIN active_path ON active_path.parent_message_id = parent.id
+                )
+                SELECT id FROM active_path
+                """,
+                (conversation["active_leaf_message_id"], conversation_id),
+            ).fetchall()
+            message_ids = [str(row["id"]) for row in path_rows]
+            placeholders = ",".join("?" for _ in message_ids)
             row = connection.execute(
                 f"""
                 SELECT serialized_json FROM messages

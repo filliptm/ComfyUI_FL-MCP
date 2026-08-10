@@ -400,72 +400,188 @@ class MCPWebSocketClient:
 
 _WS_CLIENT = None  # module-level singleton
 
+BROWSER_BRIDGE_TOOLS = {
+    "query_workflow",
+    "workflow_overview",
+    "workflow_diagram",
+    "frontend_list_commands",
+    "frontend_execute_command",
+    "frontend_list_keybindings",
+    "workflow_get_current_json",
+    "workflow_load_json",
+    "workflow_get_tabs",
+    "workflow_list_files",
+    "workflow_read_file",
+    "workflow_save_current",
+    "workflow_rename_file",
+    "workflow_delete_file",
+    "workflow_close_current",
+    "workflow_duplicate_current",
+    "find_node",
+    "create_nodes",
+    "remove_nodes",
+    "bypass_nodes",
+    "unbypass_nodes",
+    "pin_nodes",
+    "unpin_nodes",
+    "select_nodes",
+    "focus_on_nodes",
+    "take_screenshot",
+    "get_current_node_selection",
+    "get_node_values",
+    "view_node_mask",
+    "edit_node_mask",
+    "confirm_mask_review",
+    "set_node_values",
+    "connect_nodes",
+    "get_node_slots",
+    "connect_nodes_batch",
+    "auto_connect_workflow",
+    "get_layout",
+    "modify_layout",
+    "queue_workflow",
+    "cancel_workflow",
+    "enable_auto_queue",
+    "disable_auto_queue",
+    "set_batch_count",
+    "get_queue_status",
+    "generate_seed",
+    "generate_float",
+    "generate_int",
+    "random_choice",
+    "plan_workflow_refinement",
+    "apply_workflow_refinement",
+    "workflow_branches_discover",
+    "workflow_branch_compare",
+    "workflow_branch_navigate",
+    "compile_workflow_branch_operation",
+    "resolve_workflow_branch_successor",
+    "compile_workflow_refinement_spec",
+    "apply_workflow_graph_patch",
+    "apply_workflow_plan",
+    "place_chat_image_in_node",
+}
+
+NODE_CATALOG_TOOLS = {
+    "node_library_status",
+    "node_knowledge_search",
+    "node_library_search",
+    "node_library_get_details",
+    "node_library_find_compatible",
+    "plan_workflow_refinement",
+    "apply_workflow_refinement",
+    "workflow_branch_compare",
+    "compile_workflow_branch_operation",
+    "resolve_workflow_branch_successor",
+    "compile_workflow_refinement_spec",
+    "apply_workflow_graph_patch",
+    "plan_workflow",
+    "compile_workflow_spec",
+    "resolve_workflow_spec",
+    "apply_workflow_plan",
+}
+
+
+def _embedded_allowed_tools() -> set[str] | None:
+    if os.getenv("FL_MCP_MODE") != "subprocess":
+        return None
+    raw = os.getenv("FL_MCP_ALLOWED_TOOLS")
+    if raw is None:
+        return None
+    return {name.strip() for name in raw.split(",") if name.strip()}
+
 @asynccontextmanager
 async def mcp_lifespan(server: FastMCP) -> AsyncIterator[Any]:
     """Manage MCP server lifespan and persistent WebSocket connection."""
     global _WS_CLIENT
 
-    # Check if ComfyUI Manager is installed and initialize client
+    allowed_tools = _embedded_allowed_tools()
+    all_tools = allowed_tools is None
+    needs_manager = all_tools or any(
+        name.startswith(("manager_", "registry_"))
+        or name == "mcp_capability_audit"
+        for name in allowed_tools
+    )
+    needs_node_catalog = all_tools or bool(allowed_tools & NODE_CATALOG_TOOLS)
+    needs_web = all_tools or bool(allowed_tools & {"web_search", "web_fetch_page"})
+    needs_registry = all_tools or any(name.startswith("registry_") for name in allowed_tools)
+    needs_browser_bridge = all_tools or bool(allowed_tools & BROWSER_BRIDGE_TOOLS)
+
     manager_client = None
     manager_available = False
     
     logger.info(f"FL_MCP_MODE: {os.getenv('FL_MCP_MODE')}")
     
-    try:
-        manager_client = get_comfy_manager_client(
-            server_url=settings.comfyui_server_url,
-            timeout=settings.comfyui_api_timeout
-        )
-        version_info = await manager_client.check_installed()
-        
-        if version_info.installed:
-            logger.info(f"[MCP] ComfyUI Manager detected (v{version_info.version})")
-            manager_available = True
-        else:
-            logger.warning("[MCP] ComfyUI Manager not installed - manager tools will return errors")
-    except Exception as e:
-        logger.warning(f"[MCP] Could not check Manager status: {e}")
+    if needs_manager:
+        try:
+            manager_client = get_comfy_manager_client(
+                server_url=settings.comfyui_server_url,
+                timeout=settings.comfyui_api_timeout
+            )
+            version_info = await manager_client.check_installed()
+
+            if version_info.installed:
+                logger.info(f"[MCP] ComfyUI Manager detected (v{version_info.version})")
+                manager_available = True
+            else:
+                logger.warning("[MCP] ComfyUI Manager not installed - manager tools will return errors")
+        except Exception as e:
+            logger.warning(f"[MCP] Could not check Manager status: {e}")
 
     node_catalog_store: NodeCatalogStore | None = None
-    node_library_client = get_node_library_client(
-        server_url=settings.comfyui_server_url,
-        timeout=settings.comfyui_api_timeout,
-    )
-    try:
-        node_catalog_store = NodeCatalogStore(DATA_DIR / "node_catalog.sqlite3")
-        node_library_client.bind_persistence(node_catalog_store)
-    except Exception as exc:
-        logger.warning("[MCP] Persistent node knowledge is unavailable: %s", exc)
-        if node_catalog_store is not None:
-            node_catalog_store.close()
-        node_catalog_store = None
+    node_library_client = None
+    if needs_node_catalog:
+        node_library_client = get_node_library_client(
+            server_url=settings.comfyui_server_url,
+            timeout=settings.comfyui_api_timeout,
+        )
+        try:
+            node_catalog_store = NodeCatalogStore(DATA_DIR / "node_catalog.sqlite3")
+            node_library_client.bind_persistence(node_catalog_store)
+        except Exception as exc:
+            logger.warning("[MCP] Persistent node knowledge is unavailable: %s", exc)
+            if node_catalog_store is not None:
+                node_catalog_store.close()
+            node_catalog_store = None
 
-    web_cache = WebCache(DATA_DIR / "web_cache.sqlite3")
-    web_fetcher = AsyncWebFetcher()
-    web_pages = WebPageService(fetcher=web_fetcher, cache=web_cache)
-    web_search = WebSearchService(
-        mode=os.getenv("FL_MCP_WEB_SEARCH_MODE", "free"),
-        tavily_api_key=(
-            os.getenv("FL_MCP_TAVILY_API_KEY")
-            or os.getenv("TAVILY_API_KEY")
-        ),
+    web_cache = WebCache(DATA_DIR / "web_cache.sqlite3") if needs_web else None
+    web_fetcher = AsyncWebFetcher() if needs_web else None
+    web_pages = (
+        WebPageService(fetcher=web_fetcher, cache=web_cache)
+        if web_fetcher is not None and web_cache is not None
+        else None
+    )
+    web_search = (
+        WebSearchService(
+            mode=os.getenv("FL_MCP_WEB_SEARCH_MODE", "free"),
+            tavily_api_key=(
+                os.getenv("FL_MCP_TAVILY_API_KEY")
+                or os.getenv("TAVILY_API_KEY")
+            ),
+        )
+        if needs_web
+        else None
     )
     web_images_allowed = (
         os.getenv("FL_MCP_MODE") != "subprocess"
         or os.getenv("FL_MCP_WEB_IMAGES_ALLOWED", "").strip().lower()
         in {"1", "true", "yes", "on"}
     )
-    registry_client = ComfyRegistryClient()
+    registry_client = ComfyRegistryClient() if needs_registry else None
 
     async def close_web_resources() -> None:
-        await web_search.aclose()
-        await web_fetcher.aclose()
-        web_cache.close()
+        if web_search is not None:
+            await web_search.aclose()
+        if web_fetcher is not None:
+            await web_fetcher.aclose()
+        if web_cache is not None:
+            web_cache.close()
 
     def close_node_knowledge() -> None:
         if node_catalog_store is None:
             return
-        node_library_client.unbind_persistence(node_catalog_store)
+        if node_library_client is not None:
+            node_library_client.unbind_persistence(node_catalog_store)
         node_catalog_store.close()
 
     if os.getenv('FL_MCP_MODE') == 'subprocess':
@@ -479,20 +595,21 @@ async def mcp_lifespan(server: FastMCP) -> AsyncIterator[Any]:
         
         logger.info(f"[MCP] Starting in subprocess mode for session: {session_id}")
 
-        try:
-            if _WS_CLIENT is None:
-                _WS_CLIENT = MCPWebSocketClient(session_id, ws_url)
-            await _WS_CLIENT.connect()
-            logger.info("[MCP] WebSocket client connected (persistent)")
-        except Exception as e:
-            logger.error(f"MCP Initialization Failed: {str(e)}")
-            await close_web_resources()
-            close_node_knowledge()
-            raise
+        if needs_browser_bridge:
+            try:
+                if _WS_CLIENT is None:
+                    _WS_CLIENT = MCPWebSocketClient(session_id, ws_url)
+                await _WS_CLIENT.connect()
+                logger.info("[MCP] WebSocket client connected (persistent)")
+            except Exception as e:
+                logger.error(f"MCP Initialization Failed: {str(e)}")
+                await close_web_resources()
+                close_node_knowledge()
+                raise
 
         try:
             yield {
-                "client": _WS_CLIENT,
+                "client": _WS_CLIENT if needs_browser_bridge else None,
                 "manager_client": manager_client,
                 "manager_available": manager_available,
                 "web_search": web_search,

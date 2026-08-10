@@ -41,6 +41,44 @@ def test_conversation_crud_and_serialized_history(tmp_path):
     assert store.get_conversation(conversation["id"]) is None
 
 
+def test_model_history_omits_serialized_runs_and_large_tool_results(tmp_path):
+    store = ChatStore(tmp_path / "chat.db", tmp_path / "missing.db")
+    conversation = store.create_conversation(provider="openrouter", model="model")
+    store.append_message(
+        conversation["id"],
+        "user",
+        "inspect it",
+        metadata={"attachments": [{"filename": "reference.png"}]},
+    )
+    store.append_message(
+        conversation["id"],
+        "assistant",
+        "done",
+        serialized=[{"content": "S" * 100_000}],
+        metadata={
+            "usage": {"inputTokens": 12},
+            "codexThreadId": "thread-1",
+            "toolSteps": [{
+                "name": "workflow_overview",
+                "status": "done",
+                "result": "R" * 100_000,
+            }],
+        },
+    )
+
+    messages = store.list_model_messages(conversation["id"])
+
+    assert messages[0]["metadata"]["attachments"][0]["filename"] == "reference.png"
+    assert messages[1]["metadata"]["usage"]["inputTokens"] == 12
+    assert messages[1]["metadata"]["codexThreadId"] == "thread-1"
+    assert messages[1]["metadata"]["toolSteps"] == [{
+        "name": "workflow_overview",
+        "status": "done",
+    }]
+    assert "serialized" not in messages[1]
+    assert "result" not in messages[1]["metadata"]["toolSteps"][0]
+
+
 def test_conversation_list_rejects_unknown_view(tmp_path):
     store = ChatStore(tmp_path / "chat.db", tmp_path / "missing.db")
 

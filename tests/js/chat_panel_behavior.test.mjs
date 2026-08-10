@@ -7,7 +7,7 @@ import vm from "node:vm";
 const root = new URL("../../", import.meta.url);
 
 
-async function loadAssistantPanel() {
+async function loadAssistantPanel(globals = {}) {
     const source = await readFile(new URL("web/js/chat_panel.js", root), "utf8");
     const classStart = source.indexOf("export class AssistantPanel");
     assert.notEqual(classStart, -1, "AssistantPanel class was not found");
@@ -15,9 +15,10 @@ async function loadAssistantPanel() {
     const classSource = source
         .slice(classStart)
         .replace("export class AssistantPanel", "class AssistantPanel");
-    const context = vm.createContext({});
+    const context = vm.createContext(globals);
     vm.runInContext(
-        `${classSource}\nglobalThis.AssistantPanel = AssistantPanel;`,
+        `const STREAM_RENDER_INTERVAL_MS = 50;\n${classSource}\n` +
+            "globalThis.AssistantPanel = AssistantPanel;",
         context,
     );
     return context.AssistantPanel;
@@ -390,6 +391,58 @@ test("plain-text assistant replies finish without tool history", async () => {
     assert.doesNotThrow(() => panel.finishAssistantMessage(message));
     assert.equal(textFinished, true);
     assert.equal(streamingRemoved, true);
+});
+
+
+test("streaming text throttles Markdown work and flushes the final delta", async () => {
+    const frames = [];
+    const timers = new Map();
+    let clock = 100;
+    const AssistantPanel = await loadAssistantPanel({
+        Date: { now: () => clock },
+        requestAnimationFrame(callback) {
+            frames.push(callback);
+            return frames.length;
+        },
+        cancelAnimationFrame() {},
+        setTimeout(callback) {
+            const id = timers.size + 1;
+            timers.set(id, callback);
+            return id;
+        },
+        clearTimeout(id) {
+            timers.delete(id);
+        },
+    });
+    const panel = Object.create(AssistantPanel.prototype);
+    let renders = 0;
+    panel.flushAssistantText = message => {
+        message.activeSource += message.pendingText;
+        message.pendingText = "";
+        renders += 1;
+    };
+    const message = {
+        activeSource: "",
+        pendingText: "",
+        textRenderFrame: null,
+        textRenderTimer: null,
+        lastTextRenderAt: 0,
+    };
+
+    panel.appendAssistantDelta(message, "one");
+    panel.appendAssistantDelta(message, " two");
+    assert.equal(frames.length, 1);
+    frames.shift()();
+    assert.equal(renders, 1);
+    assert.equal(message.activeSource, "one two");
+
+    clock = 110;
+    panel.appendAssistantDelta(message, " three");
+    assert.equal(timers.size, 1);
+    panel.finishActiveTextSegment(message);
+    assert.equal(timers.size, 0);
+    assert.equal(renders, 2);
+    assert.equal(message.activeSource, "");
 });
 
 
