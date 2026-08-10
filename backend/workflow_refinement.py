@@ -34,6 +34,9 @@ _ALIAS_PATTERN = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _APPLICATION_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$")
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 
+_REROUTE_INPUT_NAME = "__fl_mcp_reroute_input_0__"
+_REROUTE_OUTPUT_NAME = "__fl_mcp_reroute_output_0__"
+
 NodeId: TypeAlias = StrictInt | StrictStr
 SlotIndex: TypeAlias = Annotated[StrictInt, Field(ge=0)]
 
@@ -599,6 +602,58 @@ def _slot_sequence(value: Any, *, label: str) -> list[Mapping[str, Any]]:
     return list(slots)
 
 
+def _is_concrete_reroute_link_type(value: Any) -> bool:
+    return isinstance(value, str) and bool(value) and value != "*" and len(value) <= 256
+
+
+def _reroute_slot_declaration(
+    raw_node: Mapping[str, Any],
+    *,
+    node_id: NodeId,
+    allow_private_slots: bool,
+) -> tuple[str, str, bool]:
+    """Validate the one native ComfyUI Reroute shape we can normalize safely."""
+
+    inputs = _slot_sequence(
+        raw_node.get("inputs", []),
+        label=f"Reroute node {node_id!r} inputs",
+    )
+    outputs = _slot_sequence(
+        raw_node.get("outputs", []),
+        label=f"Reroute node {node_id!r} outputs",
+    )
+    if len(inputs) != 1 or len(outputs) != 1:
+        raise ValueError(
+            f"workflow Reroute node {node_id!r} must expose exactly one input and one output"
+        )
+    input_name = inputs[0].get("name")
+    output_name = outputs[0].get("name")
+    input_type = inputs[0].get("type")
+    output_type = outputs[0].get("type")
+    is_native = input_name == "" and output_name == "" and input_type == "*"
+    is_private_resolved = (
+        allow_private_slots
+        and input_name == _REROUTE_INPUT_NAME
+        and output_name == _REROUTE_OUTPUT_NAME
+        and _is_concrete_reroute_link_type(input_type)
+        and input_type == output_type
+    )
+    if not is_native and not is_private_resolved:
+        raise ValueError(
+            f"workflow Reroute node {node_id!r} is not the exact ComfyUI "
+            "blank-name, wildcard-input shape"
+        )
+    if (
+        not isinstance(output_type, str)
+        or not output_type
+        or len(output_type) > 256
+    ):
+        raise ValueError(
+            f"workflow Reroute node {node_id!r} has no exact output type declaration"
+        )
+    return input_type, output_type, is_private_resolved
+
+
 def _link_parts(raw: Any) -> tuple[NodeId, int, NodeId, int, Any]:
     if isinstance(raw, (list, tuple)):
         if len(raw) < 6:
@@ -630,13 +685,19 @@ def _link_parts(raw: Any) -> tuple[NodeId, int, NodeId, int, Any]:
     return source_id, source_slot, target_id, target_slot, link_type
 
 
-def normalize_workflow_graph(workflow: Mapping[str, Any]) -> NormalizedGraphSnapshot:
+def normalize_workflow_graph(
+    workflow: Mapping[str, Any],
+    *,
+    allow_private_reroute_slots: bool = False,
+) -> NormalizedGraphSnapshot:
     """Normalize editable Comfy workflow JSON or fail if any edge is incomplete.
 
     Both the classic six-item link arrays and mapping-shaped LiteGraph links are
     accepted. Slot names and types always come from the serialized endpoint nodes;
     a caller never gets a misleading ``complete=true`` snapshot with unresolved
-    endpoints.
+    endpoints. ``allow_private_reroute_slots`` exists only for compiler-owned
+    scope projections that have already replaced an attested native Reroute's
+    blank slots with the private stable names used by GraphPatch.
     """
 
     if not isinstance(workflow, Mapping):
@@ -652,6 +713,7 @@ def normalize_workflow_graph(workflow: Mapping[str, Any]) -> NormalizedGraphSnap
     normalized_nodes: list[NormalizedGraphNode] = []
     normalized_outputs: list[NormalizedGraphOutput] = []
     node_slots: dict[tuple[str, str], tuple[list[Mapping[str, Any]], list[Mapping[str, Any]]]] = {}
+    reroutes: dict[tuple[str, str], tuple[NodeId, str, str, bool]] = {}
     for index, (mapping_key, raw_node) in enumerate(node_items):
         if not isinstance(raw_node, Mapping):
             raise ValueError(f"workflow node {index} is malformed")
@@ -666,29 +728,47 @@ def normalize_workflow_graph(workflow: Mapping[str, Any]) -> NormalizedGraphSnap
         key = _id_key(node_id)
         if key in node_slots:
             raise ValueError(f"workflow contains duplicate node ID {node_id!r}")
-        inputs = _slot_sequence(raw_node.get("inputs", []), label=f"node {node_id!r} inputs")
-        outputs = _slot_sequence(
-            raw_node.get("outputs", []),
-            label=f"node {node_id!r} outputs",
-        )
-        for output_index, output in enumerate(outputs):
-            output_name = output.get("name")
-            output_type = output.get("type")
-            if not all(
-                isinstance(item, str) and item
-                for item in (output_name, output_type)
-            ):
-                raise ValueError(
-                    f"workflow node {node_id!r} output {output_index} is unnamed or untyped"
-                )
-            normalized_outputs.append(
-                NormalizedGraphOutput(
-                    node_id=node_id,
-                    output=output_name,
-                    output_index=output_index,
-                    type=output_type,
-                )
+        if node_type == "Reroute":
+            input_type, output_type, is_private_resolved = _reroute_slot_declaration(
+                raw_node,
+                node_id=node_id,
+                allow_private_slots=allow_private_reroute_slots,
             )
+            inputs = [{"name": _REROUTE_INPUT_NAME, "type": input_type}]
+            outputs = [{"name": _REROUTE_OUTPUT_NAME, "type": output_type}]
+            reroutes[key] = (
+                node_id,
+                input_type,
+                output_type,
+                is_private_resolved,
+            )
+        else:
+            inputs = _slot_sequence(
+                raw_node.get("inputs", []),
+                label=f"node {node_id!r} inputs",
+            )
+            outputs = _slot_sequence(
+                raw_node.get("outputs", []),
+                label=f"node {node_id!r} outputs",
+            )
+            for output_index, output in enumerate(outputs):
+                output_name = output.get("name")
+                output_type = output.get("type")
+                if not all(
+                    isinstance(item, str) and item
+                    for item in (output_name, output_type)
+                ):
+                    raise ValueError(
+                        f"workflow node {node_id!r} output {output_index} is unnamed or untyped"
+                    )
+                normalized_outputs.append(
+                    NormalizedGraphOutput(
+                        node_id=node_id,
+                        output=output_name,
+                        output_index=output_index,
+                        type=output_type,
+                    )
+                )
         node_slots[key] = (inputs, outputs)
         raw_widget_values = raw_node.get("widgets_values", [])
         widget_values = list(raw_widget_values) if isinstance(raw_widget_values, list) else []
@@ -708,8 +788,12 @@ def normalize_workflow_graph(workflow: Mapping[str, Any]) -> NormalizedGraphSnap
     else:
         raise ValueError("workflow links must be an array or mapping")
 
-    normalized_edges: list[NormalizedGraphEdge] = []
-    seen_edges: set[tuple[Any, ...]] = set()
+    parsed_links: list[tuple[int, NodeId, int, NodeId, int, Any]] = []
+    reroute_incident_counts = dict.fromkeys(reroutes, 0)
+    reroute_incident_types: dict[tuple[str, str], set[str]] = {
+        key: set() for key in reroutes
+    }
+    reroute_has_untyped_incident = dict.fromkeys(reroutes, False)
     for index, raw_link in enumerate(link_items):
         try:
             source_id, source_index, target_id, target_index, link_type = _link_parts(raw_link)
@@ -723,6 +807,62 @@ def normalize_workflow_graph(workflow: Mapping[str, Any]) -> NormalizedGraphSnap
         inputs = target_slots[0]
         if source_index >= len(outputs) or target_index >= len(inputs):
             raise ValueError(f"workflow link {index} references a missing endpoint slot")
+        parsed_links.append(
+            (index, source_id, source_index, target_id, target_index, link_type)
+        )
+        source_key = _id_key(source_id)
+        target_key = _id_key(target_id)
+        for reroute_key in {source_key, target_key}.intersection(reroutes):
+            reroute_incident_counts[reroute_key] += 1
+            if not _is_concrete_reroute_link_type(link_type):
+                reroute_has_untyped_incident[reroute_key] = True
+            else:
+                reroute_incident_types[reroute_key].add(link_type)
+
+    for reroute_key in sorted(reroutes):
+        node_id, input_type, output_type, is_private_resolved = reroutes[reroute_key]
+        incident_types = reroute_incident_types[reroute_key]
+        if (
+            reroute_incident_counts[reroute_key] == 0
+            or reroute_has_untyped_incident[reroute_key]
+        ):
+            raise ValueError(
+                f"workflow Reroute node {node_id!r} requires every physical link "
+                "to attest one concrete type"
+            )
+        if len(incident_types) != 1:
+            raise ValueError(
+                f"workflow Reroute node {node_id!r} must resolve to exactly one "
+                "concrete physical link type"
+            )
+        resolved_type = next(iter(incident_types))
+        declaration_matches = (
+            input_type == output_type == resolved_type
+            if is_private_resolved
+            else input_type == "*" and output_type in {"*", resolved_type}
+        )
+        if not declaration_matches:
+            raise ValueError(
+                f"workflow Reroute node {node_id!r} declaration disagrees with its "
+                "physical link type"
+            )
+        resolved_inputs = [{"name": _REROUTE_INPUT_NAME, "type": resolved_type}]
+        resolved_outputs = [{"name": _REROUTE_OUTPUT_NAME, "type": resolved_type}]
+        node_slots[reroute_key] = (resolved_inputs, resolved_outputs)
+        normalized_outputs.append(
+            NormalizedGraphOutput(
+                node_id=node_id,
+                output=_REROUTE_OUTPUT_NAME,
+                output_index=0,
+                type=resolved_type,
+            )
+        )
+
+    normalized_edges: list[NormalizedGraphEdge] = []
+    seen_edges: set[tuple[Any, ...]] = set()
+    for index, source_id, source_index, target_id, target_index, link_type in parsed_links:
+        outputs = node_slots[_id_key(source_id)][1]
+        inputs = node_slots[_id_key(target_id)][0]
         output = outputs[source_index]
         target_input = inputs[target_index]
         output_name = output.get("name")

@@ -1653,7 +1653,10 @@ def _validate_scope_graph(
         "links": compiler_links,
     }
     try:
-        graph = normalize_workflow_graph(compiler_workflow)
+        graph = normalize_workflow_graph(
+            compiler_workflow,
+            allow_private_reroute_slots=True,
+        )
     except (TypeError, ValueError) as exc:
         raise WorkflowScopeError(
             "scope_graph_invalid",

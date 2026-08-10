@@ -755,6 +755,9 @@ def test_whole_branch_intents_use_only_the_pinned_pr35_routes():
     assert "resolve_workflow_branch_successor" in prompt
     assert "pending locator" in prompt
     assert "never navigate from a label or fingerprint" in prompt
+    assert "opaque bridge-issued security tokens" in prompt
+    assert "never compare them with a serialized workflow `id`" in prompt
+    assert "expected_workflow_identity" in prompt
 
 
 def test_exact_registry_request_gets_tools_and_source_guardrails():

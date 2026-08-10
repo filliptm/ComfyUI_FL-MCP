@@ -1,16 +1,15 @@
 import copy
 
 import pytest
-from pydantic import ValidationError
-
 from node_library import catalog_contract_hash, node_schema_hash
+from pydantic import ValidationError
 from workflow_refinement import (
-    ApplyWorkflowRefinementRequest,
     GRAPH_PRECONDITION_HASH_SCHEMA,
     NORMALIZED_GRAPH_SCHEMA,
+    WORKFLOW_REFINEMENT_SCHEMA,
+    ApplyWorkflowRefinementRequest,
     NormalizedGraphEdge,
     NormalizedGraphOutput,
-    WORKFLOW_REFINEMENT_SCHEMA,
     PlanWorkflowRefinementRequest,
     WorkflowRefinementExistingOutput,
     WorkflowRefinementNode,
@@ -110,6 +109,41 @@ def _workflow(*, with_middle=True, sibling=True, middle_output="IMAGE"):
         nodes.append(_node(4, "Preview", input_type="IMAGE"))
         links.append([next_link, 1, 0, 4, 0, "IMAGE"])
     return {"nodes": nodes, "links": links}
+
+
+def _current_shaped_reroute_workflow():
+    return {
+        "nodes": [
+            {
+                "id": 47,
+                "type": "ImageSource",
+                "inputs": [],
+                "outputs": [{"name": "image", "type": "IMAGE", "links": [71]}],
+                "widgets_values": [],
+            },
+            {
+                "id": 58,
+                "type": "Reroute",
+                "inputs": [{"name": "", "type": "*", "link": 71}],
+                "outputs": [{"name": "", "type": "IMAGE", "links": [49]}],
+                "widgets_values": [],
+                "properties": {"horizontal": False, "showOutputText": False},
+            },
+            {
+                "id": 44,
+                "type": "PreviewImage",
+                "inputs": [{"name": "images", "type": "IMAGE", "link": 49}],
+                "outputs": [],
+                "widgets_values": [],
+            },
+        ],
+        # This is the same outgoing-before-incoming physical link order used by
+        # the loaded Rebuilder root that exposed the one-pass normalization bug.
+        "links": [
+            [49, 58, 0, 44, 0, "IMAGE"],
+            [71, 47, 0, 58, 0, "IMAGE"],
+        ],
+    }
 
 
 def _request(
@@ -325,6 +359,103 @@ def test_normalizer_resolves_array_and_mapping_links_with_exact_slot_facts():
         }
     }
     assert normalize_workflow_graph(mapped) == graph
+
+
+def test_normalizer_resolves_current_shaped_native_reroute_without_mutation():
+    workflow = _current_shaped_reroute_workflow()
+    original = copy.deepcopy(workflow)
+
+    graph = normalize_workflow_graph(workflow)
+
+    assert workflow == original
+    reroute_output = next(output for output in graph.outputs if output.node_id == 58)
+    assert reroute_output.model_dump() == {
+        "node_id": 58,
+        "output": "__fl_mcp_reroute_output_0__",
+        "output_index": 0,
+        "type": "IMAGE",
+    }
+    incoming = next(edge for edge in graph.edges if edge.target_node_id == 58)
+    outgoing = next(edge for edge in graph.edges if edge.source_node_id == 58)
+    assert incoming.target_input == "__fl_mcp_reroute_input_0__"
+    assert outgoing.source_output == "__fl_mcp_reroute_output_0__"
+    assert incoming.type == outgoing.type == "IMAGE"
+
+    reordered = copy.deepcopy(workflow)
+    reordered["nodes"].reverse()
+    reordered["links"].reverse()
+    assert normalize_workflow_graph(reordered) == graph
+
+
+def test_private_resolved_reroute_slots_require_internal_opt_in():
+    workflow = _current_shaped_reroute_workflow()
+    reroute = next(node for node in workflow["nodes"] if node["id"] == 58)
+    reroute["inputs"][0] = {
+        "name": "__fl_mcp_reroute_input_0__",
+        "type": "IMAGE",
+        "link": 71,
+    }
+    reroute["outputs"][0] = {
+        "name": "__fl_mcp_reroute_output_0__",
+        "type": "IMAGE",
+        "links": [49],
+    }
+
+    with pytest.raises(ValueError, match="exact ComfyUI blank-name"):
+        normalize_workflow_graph(workflow)
+
+    graph = normalize_workflow_graph(
+        workflow,
+        allow_private_reroute_slots=True,
+    )
+    reroute_output = next(output for output in graph.outputs if output.node_id == 58)
+    assert reroute_output.output == "__fl_mcp_reroute_output_0__"
+    assert reroute_output.type == "IMAGE"
+
+
+@pytest.mark.parametrize(
+    "case,match",
+    [
+        ("wrong_shape", "exactly one input and one output"),
+        ("nonblank_name", "exact ComfyUI blank-name"),
+        ("missing_output_type", "no exact output type declaration"),
+        ("missing_incident", "every physical link"),
+        ("untyped_incident", "every physical link"),
+        ("wildcard_incident", "every physical link"),
+        ("mixed_incident", "exactly one concrete physical link type"),
+        ("declared_type_mismatch", "declaration disagrees"),
+    ],
+)
+def test_normalizer_rejects_ambiguous_or_malformed_native_reroutes(case, match):
+    workflow = _current_shaped_reroute_workflow()
+    reroute = next(node for node in workflow["nodes"] if node["id"] == 58)
+    if case == "wrong_shape":
+        reroute["inputs"].append({"name": "", "type": "*", "link": None})
+    elif case == "nonblank_name":
+        reroute["outputs"][0]["name"] = "image"
+    elif case == "missing_output_type":
+        reroute["outputs"][0].pop("type")
+    elif case == "missing_incident":
+        workflow["links"] = []
+    elif case == "untyped_incident":
+        workflow["links"][0][5] = None
+    elif case == "wildcard_incident":
+        workflow["links"][1][5] = "*"
+    elif case == "mixed_incident":
+        workflow["links"][0][5] = "MASK"
+    elif case == "declared_type_mismatch":
+        reroute["outputs"][0]["type"] = "MASK"
+
+    with pytest.raises(ValueError, match=match):
+        normalize_workflow_graph(workflow)
+
+
+def test_normalizer_does_not_generalize_reroute_rules_to_other_blank_slots():
+    workflow = _workflow(with_middle=False, sibling=False)
+    workflow["nodes"][0]["outputs"][0]["name"] = ""
+
+    with pytest.raises(ValueError, match="unnamed or untyped"):
+        normalize_workflow_graph(workflow)
 
 
 def test_named_slot_mappings_use_canonical_key_order_not_insertion_order():

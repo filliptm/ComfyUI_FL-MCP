@@ -570,6 +570,31 @@ def _terminal_split(
     }
 
 
+def _terminal_split_with_current_shaped_reroute() -> dict[str, Any]:
+    workflow = _terminal_split()
+    sibling = next(node for node in workflow["nodes"] if node["id"] == 3)
+    sibling["inputs"][0]["link"] = 49
+    workflow["nodes"].append(
+        {
+            "id": 58,
+            "type": "Reroute",
+            "inputs": [{"name": "", "type": "*", "link": 71}],
+            "outputs": [{"name": "", "type": "IMAGE", "links": [49]}],
+            "widgets_values": [],
+            "properties": {"horizontal": False, "showOutputText": False},
+            "pos": [300, 200],
+            "size": [75, 26],
+        }
+    )
+    workflow["links"] = [
+        link for link in workflow["links"] if link[0] != 3
+    ] + [
+        _link(49, 58, 0, 3, 0),
+        _link(71, 1, 0, 58, 0),
+    ]
+    return workflow
+
+
 def _dynamic_live_inputs(link_id: int | None) -> list[dict[str, Any]]:
     return [
         {"name": f"runtime_prefix_{index}", "type": "IMAGE", "link": None}
@@ -1296,6 +1321,17 @@ def test_safe_terminal_clone_copies_named_values_offsets_layout_and_shares_sourc
     assert ApplyGraphPatchRequest.model_validate(result["apply_request"]).model_dump(
         mode="json"
     ) == result["apply_request"]
+
+
+def test_root_branch_operation_compiles_with_current_shaped_native_reroute() -> None:
+    workflow = _terminal_split_with_current_shaped_reroute()
+    branch = _arm_to(workflow, 2)
+
+    result = _compile({**_pins(workflow, branch), "operation": "clone"}, workflow)
+
+    assert result["valid"], result["issues"]
+    assert result["queued"] is False
+    assert "workflow_graph_invalid" not in {item["code"] for item in result["issues"]}
 
 
 def test_safe_terminal_segment_clone_includes_its_private_sink_boundary() -> None:

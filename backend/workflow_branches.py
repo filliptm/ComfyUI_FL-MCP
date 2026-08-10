@@ -35,6 +35,9 @@ WORKFLOW_BRANCH_FINGERPRINT_SCHEMA = "fl-mcp.workflow-branch-fingerprint.v1"
 WORKFLOW_BRANCH_EDGE_ID_SCHEMA = "fl-mcp.workflow-branch-edge-id.v1"
 WORKFLOW_BRANCH_SCOPE_ID_SCHEMA = "fl-mcp.workflow-branch-scope-id.v1"
 
+_REROUTE_INPUT_NAME = "__fl_mcp_reroute_input_0__"
+_REROUTE_OUTPUT_NAME = "__fl_mcp_reroute_output_0__"
+
 NodeId: TypeAlias = StrictInt | StrictStr
 
 
@@ -421,6 +424,62 @@ def _slot_sequence(value: Any, *, path: str) -> tuple[_Slot, ...]:
     return tuple(result)
 
 
+def _reroute_slot_declaration(
+    raw: Mapping[str, Any],
+    *,
+    path: str,
+) -> tuple[str, str]:
+    def entries(value: Any, *, slot_path: str) -> list[Mapping[str, Any]]:
+        if value is None:
+            values: list[Any] = []
+        elif isinstance(value, Mapping):
+            values = list(value.values())
+        elif isinstance(value, Sequence) and not isinstance(
+            value,
+            (str, bytes, bytearray),
+        ):
+            values = list(value)
+        else:
+            raise _DiscoveryFailure(
+                "invalid_reroute_shape",
+                slot_path,
+                "A serialized Reroute slot manifest must be an array or mapping.",
+            )
+        if any(not isinstance(item, Mapping) for item in values):
+            raise _DiscoveryFailure(
+                "invalid_reroute_shape",
+                slot_path,
+                "Every serialized Reroute slot must be an object.",
+            )
+        return values
+
+    inputs = entries(raw.get("inputs", []), slot_path=f"{path}.inputs")
+    outputs = entries(raw.get("outputs", []), slot_path=f"{path}.outputs")
+    if len(inputs) != 1 or len(outputs) != 1:
+        raise _DiscoveryFailure(
+            "invalid_reroute_shape",
+            path,
+            "A serialized Reroute must expose exactly one input and one output.",
+        )
+    input_name = inputs[0].get("name")
+    output_name = outputs[0].get("name")
+    input_type = inputs[0].get("type")
+    output_type = outputs[0].get("type")
+    if input_name != "" or output_name != "" or input_type != "*":
+        raise _DiscoveryFailure(
+            "invalid_reroute_shape",
+            path,
+            "Only the exact ComfyUI blank-name, wildcard-input Reroute shape is supported.",
+        )
+    return input_type, _exact_text(
+        output_type,
+        path=f"{path}.outputs[0].type",
+        code="invalid_reroute_shape",
+        label="Reroute output type",
+        max_length=256,
+    )
+
+
 def _node_items(value: Any, *, path: str) -> list[tuple[Any, Mapping[str, Any]]]:
     if isinstance(value, list):
         items = [(None, item) for item in value]
@@ -505,6 +564,10 @@ def _build_scope_graph(
     path: str,
 ) -> _ScopeGraph:
     nodes: dict[tuple[str, str], _Node] = {}
+    reroutes: dict[
+        tuple[str, str],
+        tuple[int | str, str, str, str],
+    ] = {}
     for index, (mapping_id, raw) in enumerate(_node_items(payload.get("nodes", []), path=f"{path}.nodes")):
         node_id = raw.get("id", mapping_id)
         node_type = raw.get("type") or raw.get("comfyClass") or raw.get("class_type")
@@ -527,11 +590,23 @@ def _build_scope_graph(
                 f"{path}.nodes[{index}].id",
                 f"Scope repeats local node ID {node_id!r}.",
             )
+        node_path = f"{path}.nodes[{index}]"
+        if node_type == "Reroute":
+            input_type, output_type = _reroute_slot_declaration(
+                raw,
+                path=node_path,
+            )
+            inputs = (_Slot(name=_REROUTE_INPUT_NAME, type=input_type),)
+            outputs = (_Slot(name=_REROUTE_OUTPUT_NAME, type=output_type),)
+            reroutes[key] = (node_id, input_type, output_type, node_path)
+        else:
+            inputs = _slot_sequence(raw.get("inputs", []), path=f"{node_path}.inputs")
+            outputs = _slot_sequence(raw.get("outputs", []), path=f"{node_path}.outputs")
         nodes[key] = _Node(
             node_id=node_id,
             node_type=node_type,
-            inputs=_slot_sequence(raw.get("inputs", []), path=f"{path}.nodes[{index}].inputs"),
-            outputs=_slot_sequence(raw.get("outputs", []), path=f"{path}.nodes[{index}].outputs"),
+            inputs=inputs,
+            outputs=outputs,
         )
 
     if definition:
@@ -577,8 +652,14 @@ def _build_scope_graph(
                 boundary_kind=boundary_kind,
             )
 
-    edges: list[_Edge] = []
-    seen: set[tuple[Any, ...]] = set()
+    parsed_links: list[
+        tuple[int, int | str, int, int | str, int, str | None]
+    ] = []
+    reroute_incident_counts = dict.fromkeys(reroutes, 0)
+    reroute_incident_types: dict[tuple[str, str], set[str]] = {
+        key: set() for key in reroutes
+    }
+    reroute_has_untyped_incident = dict.fromkeys(reroutes, False)
     for index, raw_link in enumerate(_link_items(payload.get("links", []), path=f"{path}.links")):
         source_id, source_index, target_id, target_index, link_type = _link_parts(
             raw_link,
@@ -600,6 +681,55 @@ def _build_scope_graph(
                 f"{path}.links[{index}]",
                 "Link references a slot absent from its endpoint node.",
             )
+        parsed_links.append(
+            (index, source_id, source_index, target_id, target_index, link_type)
+        )
+        for reroute_key in {source_key, target_key}.intersection(reroutes):
+            reroute_incident_counts[reroute_key] += 1
+            if link_type is None or link_type == "*":
+                reroute_has_untyped_incident[reroute_key] = True
+            else:
+                reroute_incident_types[reroute_key].add(link_type)
+
+    for reroute_key in sorted(reroutes, key=_node_sort_key):
+        node_id, input_type, output_type, node_path = reroutes[reroute_key]
+        incident_types = reroute_incident_types[reroute_key]
+        if (
+            reroute_incident_counts[reroute_key] == 0
+            or reroute_has_untyped_incident[reroute_key]
+        ):
+            raise _DiscoveryFailure(
+                "unresolved_reroute_type",
+                node_path,
+                "Every physical Reroute link must attest one concrete type.",
+            )
+        if len(incident_types) != 1:
+            raise _DiscoveryFailure(
+                "reroute_type_mismatch",
+                node_path,
+                "A Reroute must resolve to exactly one concrete physical link type.",
+            )
+        resolved_type = next(iter(incident_types))
+        if input_type != "*" or output_type not in {"*", resolved_type}:
+            raise _DiscoveryFailure(
+                "reroute_type_mismatch",
+                node_path,
+                "The Reroute declaration disagrees with its physical link type.",
+            )
+        nodes[reroute_key] = _Node(
+            node_id=node_id,
+            node_type="Reroute",
+            inputs=(_Slot(name=_REROUTE_INPUT_NAME, type=resolved_type),),
+            outputs=(_Slot(name=_REROUTE_OUTPUT_NAME, type=resolved_type),),
+        )
+
+    edges: list[_Edge] = []
+    seen: set[tuple[Any, ...]] = set()
+    for index, source_id, source_index, target_id, target_index, link_type in parsed_links:
+        source_key = _id_key(source_id)
+        target_key = _id_key(target_id)
+        source_node = nodes[source_key]
+        target_node = nodes[target_key]
         output = source_node.outputs[source_index]
         target_input = target_node.inputs[target_index]
         effective_type = link_type or output.type

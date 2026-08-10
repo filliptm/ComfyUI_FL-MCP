@@ -149,6 +149,38 @@ def _diamond_workflow() -> dict[str, Any]:
     )
 
 
+def _real_reroute_node(
+    node_id: int | str = 14,
+    *,
+    output_type: str = "*",
+) -> dict[str, Any]:
+    return {
+        "id": node_id,
+        "type": "Reroute",
+        "inputs": [{"name": "", "type": "*", "link": 1}],
+        "outputs": [{"name": "", "type": output_type, "links": [2]}],
+    }
+
+
+def _reroute_workflow(
+    *,
+    output_type: str = "*",
+    incoming_type: str | None = "VAE",
+    outgoing_type: str | None = "VAE",
+) -> dict[str, Any]:
+    return _workflow(
+        [
+            _node(13, "Source", outputs=(("vae", "VAE"),)),
+            _real_reroute_node(output_type=output_type),
+            _node(15, "Sink", inputs=(("vae", "VAE"),)),
+        ],
+        [
+            _link(1, 13, 0, 14, 0, incoming_type),
+            _link(2, 14, 0, 15, 0, outgoing_type),
+        ],
+    )
+
+
 def _subgraph_definition(
     subgraph_id: str,
     *,
@@ -190,6 +222,121 @@ def test_linear_graph_is_one_maximal_segment_with_exact_boundary_facts() -> None
     assert segment.entry_edges[0].source.output == "image"
     assert segment.exit_edges[0].target.input == "images"
     assert _primitive_edge_counts(scope) == Counter(dict.fromkeys(segment.edge_ids, 1))
+
+
+def test_exact_real_reroute_is_normalized_by_incident_type_stably() -> None:
+    workflow = _reroute_workflow()
+    forward = _catalog(workflow)
+    reversed_workflow = deepcopy(workflow)
+    reversed_workflow["nodes"].reverse()
+    reversed_workflow["links"].reverse()
+    reversed_catalog = _catalog(reversed_workflow)
+
+    assert forward.valid
+    assert reversed_catalog.valid
+    assert reversed_catalog.branch_catalog_hash == forward.branch_catalog_hash
+    [segment] = _branches(_root(forward), "segment")
+    assert segment.owned_node_ids == [14]
+    [entry] = segment.entry_edges
+    [exit_edge] = segment.exit_edges
+    assert entry.target.input == "__fl_mcp_reroute_input_0__"
+    assert entry.target.type == "VAE"
+    assert exit_edge.source.output == "__fl_mcp_reroute_output_0__"
+    assert exit_edge.source.type == "VAE"
+    assert entry.link_type == exit_edge.link_type == "VAE"
+    assert workflow["nodes"][1]["inputs"][0]["name"] == ""
+
+
+def test_exact_real_reroute_is_normalized_inside_a_subgraph_instance() -> None:
+    definition = _subgraph_definition(
+        "reroute-definition",
+        nodes=[_real_reroute_node(295, output_type="VAE")],
+        links=[
+            _link(1, -10, 0, 295, 0, "VAE"),
+            _link(2, 295, 0, -20, 0, "VAE"),
+        ],
+    )
+    definition["inputs"][0]["type"] = "VAE"
+    definition["outputs"][0]["type"] = "VAE"
+    workflow = _workflow(
+        [
+            _node(
+                9,
+                "reroute-definition",
+                inputs=(("vae", "VAE"),),
+                outputs=(("vae", "VAE"),),
+            )
+        ],
+        [],
+        subgraphs=[definition],
+    )
+
+    catalog = _catalog(workflow)
+
+    assert catalog.valid
+    nested = next(
+        scope for scope in catalog.scopes if scope.scope.kind == "subgraph_instance"
+    )
+    reroute_edges = [
+        edge
+        for branch in nested.branches
+        for edge in branch.entry_edges + branch.exit_edges + branch.internal_edges
+        if edge.source.node_id == 295 or edge.target.node_id == 295
+    ]
+    assert reroute_edges
+    assert {
+        endpoint
+        for edge in reroute_edges
+        for endpoint in (edge.source.output, edge.target.input)
+        if "reroute" in endpoint
+    } == {"__fl_mcp_reroute_input_0__", "__fl_mcp_reroute_output_0__"}
+    assert {edge.link_type for edge in reroute_edges} == {"VAE"}
+
+
+@pytest.mark.parametrize(
+    ("case", "expected_code"),
+    [
+        ("wrong_shape", "invalid_reroute_shape"),
+        ("missing_incident", "unresolved_reroute_type"),
+        ("untyped_incident", "unresolved_reroute_type"),
+        ("wildcard_incident", "unresolved_reroute_type"),
+        ("mixed_incident", "reroute_type_mismatch"),
+        ("declared_type_mismatch", "reroute_type_mismatch"),
+    ],
+)
+def test_reroute_normalization_fails_closed(
+    case: str,
+    expected_code: str,
+) -> None:
+    workflow = _reroute_workflow()
+    if case == "wrong_shape":
+        workflow["nodes"][1]["inputs"].append({"name": "", "type": "*"})
+    elif case == "missing_incident":
+        workflow = _workflow([_real_reroute_node()], [])
+    elif case == "untyped_incident":
+        workflow["links"][0][5] = None
+    elif case == "wildcard_incident":
+        workflow["links"][1][5] = "*"
+    elif case == "mixed_incident":
+        workflow["links"][1][5] = "MODEL"
+    elif case == "declared_type_mismatch":
+        workflow["nodes"][1]["outputs"][0]["type"] = "MODEL"
+
+    catalog = _catalog(workflow)
+
+    assert not catalog.valid
+    assert expected_code in {issue.code for issue in catalog.issues}
+    assert all(not scope.writable for scope in catalog.scopes)
+
+
+def test_arbitrary_blank_slot_node_still_fails_closed() -> None:
+    workflow = _linear_workflow()
+    workflow["nodes"][1]["inputs"][0]["name"] = ""
+
+    catalog = _catalog(workflow)
+
+    assert not catalog.valid
+    assert "unresolved_slot_fact" in {issue.code for issue in catalog.issues}
 
 
 def test_diamond_exposes_segments_and_exclusive_split_arms_until_join() -> None:
