@@ -11,13 +11,11 @@ from chat_runtime import (
     BRANCH_MUTATION_TOOLS,
     BRANCH_NAVIGATION_TOOLS,
     CONTEXT_MAX_CHARS,
-    MAX_PERSISTED_TOOL_STEPS_CHARS,
     REFINEMENT_COMPILER_TOOLS,
     ActiveRun,
     ChatRuntime,
     PendingApproval,
     approval_fingerprint,
-    bounded_tool_steps_for_storage,
     bridge_settings,
     claude_tool_name,
     codex_tool_name,
@@ -31,7 +29,6 @@ from chat_runtime import (
     normalize_approval_decision,
     normalize_assistant_timeline,
     normalize_chat_attachments,
-    provider_usage_metadata,
     registry_discovery_instructions,
     ren_instructions,
     should_request_approval,
@@ -150,18 +147,6 @@ def test_provider_usage_rolls_native_thread_into_bounded_prompt():
     assert "provider thread was rolled over" in prompt
     assert prompt.endswith("Continue with the selected nodes")
     assert len(prompt) <= CONTEXT_MAX_CHARS
-
-
-def test_pydantic_run_usage_is_saved_as_plain_metadata():
-    from pydantic_ai.usage import RunUsage
-
-    metadata = provider_usage_metadata(SimpleNamespace(
-        usage=lambda: RunUsage(input_tokens=10, output_tokens=4, requests=2),
-    ))
-
-    assert metadata["input_tokens"] == 10
-    assert metadata["output_tokens"] == 4
-    assert metadata["requests"] == 2
 
 
 @pytest.mark.asyncio
@@ -295,48 +280,6 @@ async def test_duplicate_run_started_events_are_suppressed(tmp_path):
     await runtime.publish(state, event)
 
     assert [_payload(raw) for raw in state.events] == [event]
-
-
-@pytest.mark.asyncio
-async def test_conversation_run_skips_mcp_and_records_local_performance(tmp_path):
-    from pydantic_ai.models.test import TestModel
-
-    store = ChatStore(tmp_path / "chat.db", tmp_path / "missing.db")
-    conversation = store.create_conversation(provider="ollama", model="test")
-    user = store.append_message(
-        conversation["id"],
-        "user",
-        "Hello, explain diffusion sampling",
-    )
-    store.create_run("run-1", conversation["id"])
-    runtime = ChatRuntime(store)
-    runtime.model_factory = lambda _settings: TestModel(
-        custom_output_text="Sampling explained.",
-    )
-    state = ActiveRun(
-        "run-1",
-        conversation["id"],
-        "session-1",
-        settings={
-            "provider": "ollama",
-            "model": "test",
-            "temperature": 0.2,
-            "reasoning_effort": "default",
-            "search_mode": "free",
-        },
-        user_message_id=user["id"],
-    )
-
-    await runtime._execute(state, user["id"])
-
-    assistant = store.list_messages(conversation["id"])[-1]
-    performance = assistant["metadata"]["performance"]
-    assert assistant["content"] == "Sampling explained."
-    assert performance["allowedToolCount"] == 0
-    assert performance["localPreparationMs"] >= 0
-    assert performance["firstTextMs"] >= performance["localPreparationMs"]
-    assert performance["totalMs"] >= performance["firstTextMs"]
-    assert assistant["metadata"]["usage"]["requests"] == 1
 
 
 @pytest.mark.asyncio
@@ -519,29 +462,34 @@ async def test_global_bypass_does_not_release_mandatory_mask_review(tmp_path):
     assert "mask-review-1" in runtime.approvals
 
 
-def test_intent_tool_filter_uses_small_capability_groups():
-    assert tools_for_message("Hello, explain diffusion sampling") == set()
-
+def test_intent_tool_filter_keeps_core_and_adds_narrow_groups():
     basic = tools_for_message("Inspect the open graph")
-    assert basic == {
-        "workflow_overview",
-        "workflow_get_current_json",
-        "find_node",
-        "get_current_node_selection",
-        "get_node_values",
-        "get_node_slots",
-        "get_layout",
-        "take_screenshot",
-    }
-
-    ambiguous = tools_for_message("Help me with this workflow")
-    assert "compile_workflow_spec" in ambiguous
-    assert "registry_search_packages" in ambiguous
+    assert "workflow_overview" in basic
+    assert "view_output_image" in basic
+    assert "view_chat_image" in basic
+    assert "place_chat_image_in_node" in basic
+    assert "view_node_mask" in basic
+    assert "edit_node_mask" in basic
+    assert "confirm_mask_review" in basic
+    assert "get_execution_history" in basic
+    assert "node_library_search" in basic
+    assert "node_library_get_details" in basic
+    assert "node_library_status" in basic
+    assert "node_knowledge_search" in basic
+    assert "compile_workflow_spec" in basic
+    assert "resolve_workflow_spec" in basic
+    assert "plan_workflow" in basic
+    assert "apply_workflow_plan" in basic
+    assert "registry_search_packages" in basic
+    assert "registry_get_package" in basic
+    assert "node_library_find_compatible" not in basic
+    assert "web_search" not in basic
+    assert "web_fetch_page" not in basic
+    assert "manager_queue_action" not in basic
 
     free_web = tools_for_message("Research current ComfyUI nodes", "free")
     assert "web_search" in free_web
     assert "web_fetch_page" in free_web
-    assert "web_search" not in tools_for_message("Explain ComfyUI nodes", "free")
 
     manager = tools_for_message("Install a missing custom node with Manager")
     assert "manager_search_nodes" in manager
@@ -554,27 +502,6 @@ def test_intent_tool_filter_uses_small_capability_groups():
     review = tools_for_message("Review the final output image for distortion")
     assert "view_output_image" in review
     assert "get_execution_details" in review
-
-
-def test_persisted_tool_history_is_bounded_without_changing_live_steps():
-    tool_steps = [
-        {
-            "id": f"tool-{index}",
-            "name": "workflow_get_current_json",
-            "status": "done",
-            "arguments": "A" * 10_000,
-            "result": "R" * 20_000,
-        }
-        for index in range(12)
-    ]
-
-    persisted = bounded_tool_steps_for_storage(tool_steps)
-
-    assert tool_steps[0]["result"] == "R" * 20_000
-    assert len(json.dumps(persisted, ensure_ascii=False, separators=(",", ":"))) <= (
-        MAX_PERSISTED_TOOL_STEPS_CHARS
-    )
-    assert any(step.get("resultTruncated") for step in persisted)
 
 
 def test_complete_new_workflow_uses_only_compiler_application_route():
@@ -762,12 +689,8 @@ def test_existing_chain_edit_uses_only_atomic_refinement_route():
         "get_queue_status",
     } <= run_tools
 
-    # Image review does not start unrelated execution diagnostics.
-    assert tools_for_message("Please show me this image.") == {
-        "view_output_image",
-        "view_chat_image",
-        "place_chat_image_in_node",
-    }
+    # Outside refinement intent, image review keeps the richer diagnostic surface.
+    assert "comfy_get_logs" in tools_for_message("Please show me this image.")
 
     instructions = registry_discovery_instructions()
     assert "compile_workflow_refinement_spec" in instructions
@@ -1198,7 +1121,7 @@ async def test_claude_subscription_streams_tools_approvals_and_persists_session(
             options.mcp_servers["ren"]["env"]["FL_MCP_ALLOWED_TOOLS"].split(",")
         )
         assert "view_chat_image" in allowed_tool_names
-        assert "view_node_mask" not in allowed_tool_names
+        assert "view_node_mask" in allowed_tool_names
         assert callable(options.stderr)
         assert options.max_buffer_size == 8 * 1024 * 1024
 

@@ -8,11 +8,10 @@ import logging
 import os
 import re
 import sys
-import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from concurrent.futures import CancelledError as FutureCancelledError
-from dataclasses import asdict, dataclass, field, is_dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
@@ -29,6 +28,8 @@ from claude_subscription import claude_subscription
 from config import (
     MAX_GENERATION_COMPLETION_TIMEOUT_SECONDS,
     MCP_TOOL_TIMEOUT_BUFFER_SECONDS,
+)
+from config import (
     settings as bridge_settings,
 )
 
@@ -37,13 +38,10 @@ PROMPT_PATH = Path(__file__).with_name("chat_prompt.md")
 MANDATORY_REVIEW_TOOLS = {"confirm_mask_review"}
 MAX_CHAT_ATTACHMENTS = 8
 MAX_CHAT_ATTACHMENT_BYTES = 32 * 1024 * 1024
-CONTEXT_MAX_CHARS = 64_000
-CONTEXT_RECENT_CHARS = 40_000
-CONTEXT_CHECKPOINT_CHARS = 12_000
+CONTEXT_MAX_CHARS = 96_000
+CONTEXT_RECENT_CHARS = 64_000
+CONTEXT_CHECKPOINT_CHARS = 24_000
 CONTEXT_ROLLOVER_TOKENS = 64_000
-MAX_PERSISTED_TOOL_RESULT_CHARS = 8_000
-MAX_PERSISTED_TOOL_ARGUMENT_CHARS = 4_000
-MAX_PERSISTED_TOOL_STEPS_CHARS = 64_000
 CLAUDE_STDERR_MAX_LINES = 40
 CLAUDE_STDERR_MAX_LINE_CHARS = 1_000
 CLAUDE_MAX_MESSAGE_BYTES = 8 * 1024 * 1024
@@ -243,45 +241,6 @@ def _graph_compiler_optional_tools(message: str) -> set[str]:
         selected.add("view_chat_image")
     return selected
 
-WORKFLOW_INSPECT_TOOLS = {
-    "workflow_overview",
-    "workflow_get_current_json",
-    "find_node",
-    "get_current_node_selection",
-    "get_node_values",
-    "get_node_slots",
-    "get_layout",
-    "take_screenshot",
-}
-
-WORKFLOW_EXECUTION_TOOLS = {
-    "queue_workflow",
-    "wait",
-    "get_execution_history",
-    "get_execution_details",
-    "get_queue_status",
-    "get_queue_status_details",
-    "view_output_image",
-}
-
-IMAGE_TOOLS = {
-    "view_output_image",
-    "view_chat_image",
-    "place_chat_image_in_node",
-}
-
-MASK_TOOLS = {
-    "view_node_mask",
-    "edit_node_mask",
-    "confirm_mask_review",
-}
-
-NODE_LIBRARY_TOOLS = {
-    "node_library_search",
-    "node_library_get_details",
-    "node_library_status",
-    "node_knowledge_search",
-}
 
 def compiler_first_workflow_requested(message: str) -> bool:
     """Detect bounded new-workflow requests that the one-pass compiler owns."""
@@ -510,11 +469,6 @@ def explicit_web_research_requested(message: str) -> bool:
         or re.search(
             r"\b(?:exact|current|latest)\b.{0,40}\b(?:pricing|price|cost|policy|"
             r"privacy|terms)\b",
-            visible,
-        )
-        or re.search(
-            r"\b(?:research|find|check|what(?:'s| is))\b.{0,40}"
-            r"\b(?:current|latest|newest|recent)\b",
             visible,
         )
     )
@@ -1030,81 +984,29 @@ async def wait_for_codex_mcp_status(
 
 
 def tools_for_message(message: str, search_mode: str = "off") -> set[str]:
-    text = message.casefold()
+    text = message.lower()
     branch_intent = workflow_branch_intent(message)
     graph_change_requested = workflow_graph_change_requested(message)
-    if branch_intent is not None:
-        selected = set({
-            "discover": BRANCH_DISCOVERY_TOOLS,
-            "navigate": BRANCH_NAVIGATION_TOOLS,
-            "compare": BRANCH_COMPARISON_TOOLS,
-            "clone": BRANCH_MUTATION_TOOLS,
-            "replace": BRANCH_MUTATION_TOOLS,
-            "remove": BRANCH_MUTATION_TOOLS,
-        }[branch_intent])
-        if branch_intent in {"clone", "replace", "remove"}:
-            selected.update(_graph_compiler_optional_tools(message))
-        return selected
-
-    if graph_change_requested:
-        selected = set(REFINEMENT_COMPILER_TOOLS)
-        selected.update(_graph_compiler_optional_tools(message))
-        if explicit_node_knowledge_requested(message):
-            selected.add("node_knowledge_search")
-        if explicit_web_research_requested(message) and search_mode != "off":
-            selected.update({"web_search", "web_fetch_page"})
-        return selected
-
-    selected: set[str] = set()
-    workflow_signal = re.search(
-        r"\b(?:workflow|graph|canvas|nodes?|ksampler|sampler|seed|widget|"
-        r"socket|connection|selected)\b",
-        text,
+    selected = set(CORE_CHAT_TOOLS)
+    debug_requested = any(
+        word in text
+        for word in (
+            "error", "broken", "debug", "failed", "queue", "output", "result",
+            "review", "validate", "distortion", "artifact",
+        )
     )
-    inspect_signal = re.search(
-        r"\b(?:inspect|show|check|look at|read|current|selected|overview|"
-        r"what(?:'s| is)|values?|settings?|layout)\b",
-        text,
-    )
-    execution_signal = re.search(
-        r"\b(?:run|queue|execute|render|progress|history|failed|failure|"
-        r"error|debug|broken|output|result)\b",
-        text,
-    )
-    ambiguous_canvas_signal = re.search(
-        r"\b(?:this|current|open|my|selected)\b.{0,30}"
-        r"\b(?:workflow|graph|canvas|node|ksampler|sampler)\b",
-        text,
-    )
-    if workflow_signal:
-        if inspect_signal or execution_signal:
-            selected.update(WORKFLOW_INSPECT_TOOLS)
-        elif ambiguous_canvas_signal:
-            selected.update(CORE_CHAT_TOOLS)
-    if execution_signal:
-        selected.update(WORKFLOW_EXECUTION_TOOLS)
-
-    if re.search(
-        r"\b(?:image|photo|picture|visual|attached|attachment)\b",
-        text,
-    ):
-        selected.update(IMAGE_TOOLS)
-    if re.search(r"\b(?:mask|masked|inpaint)\b", text):
-        selected.update(MASK_TOOLS)
-    if re.search(
-        r"\b(?:node library|node catalog|node knowledge|connection lesson|"
-        r"compatible node)\b",
-        text,
-    ):
-        selected.update(NODE_LIBRARY_TOOLS)
-    if re.search(r"\b(?:registry|uninstalled package|new node pack)\b", text):
-        selected.update({"registry_search_packages", "registry_get_package"})
+    # A refinement request commonly says which image output should feed a new
+    # node. That noun alone is not an execution-debug request, and enabling the
+    # full diagnostics group only adds irrelevant tool choices. Visual, mask,
+    # and attachment tools remain in CORE_CHAT_TOOLS.
+    if debug_requested or ("image" in text and not graph_change_requested):
+        selected.update(INTENT_TOOL_GROUPS["debug"])
     if any(
         word in text
         for word in ("install", "manager", "missing node", "custom node", "update node")
     ):
         selected.update(INTENT_TOOL_GROUPS["manager"])
-    if any(word in text for word in ("checkpoint", "lora", "vae", "model file", "asset")):
+    if any(word in text for word in ("model", "checkpoint", "lora", "vae", "asset")):
         selected.update(INTENT_TOOL_GROUPS["models"])
     if any(word in text for word in ("code", "python", "javascript", "custom node pack")):
         selected.update(INTENT_TOOL_GROUPS["coding"])
@@ -1113,8 +1015,32 @@ def tools_for_message(message: str, search_mode: str = "off") -> set[str]:
         for word in ("save workflow", "load workflow", "workflow file", "delete workflow")
     ):
         selected.update(INTENT_TOOL_GROUPS["files"])
-    if search_mode != "off" and explicit_web_research_requested(message):
+    if search_mode != "off":
         selected.update({"web_search", "web_fetch_page"})
+    if branch_intent is not None:
+        branch_tools = {
+            "discover": BRANCH_DISCOVERY_TOOLS,
+            "navigate": BRANCH_NAVIGATION_TOOLS,
+            "compare": BRANCH_COMPARISON_TOOLS,
+            "clone": BRANCH_MUTATION_TOOLS,
+            "replace": BRANCH_MUTATION_TOOLS,
+            "remove": BRANCH_MUTATION_TOOLS,
+        }[branch_intent]
+        selected = set(branch_tools)
+        if branch_intent in {"clone", "replace", "remove"}:
+            selected.update(_graph_compiler_optional_tools(message))
+        return selected
+    if graph_change_requested:
+        # Empty-canvas builds and existing-graph edits use the same arbitrary-DAG
+        # compiler, schema guards, transaction, rollback, and two-call surface.
+        selected.intersection_update(REFINEMENT_COMPILER_TOOLS)
+        selected.update(_graph_compiler_optional_tools(message))
+        if explicit_node_knowledge_requested(message):
+            selected.add("node_knowledge_search")
+        if explicit_web_research_requested(message) and search_mode != "off":
+            selected.update({"web_search", "web_fetch_page"})
+        else:
+            selected.difference_update({"web_search", "web_fetch_page"})
     return selected
 
 
@@ -1409,86 +1335,6 @@ def normalize_assistant_timeline(
     return content, normalized_steps
 
 
-def bounded_tool_steps_for_storage(
-    tool_steps: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    """Keep live tool output intact while bounding the history copy."""
-    persisted: list[dict[str, Any]] = []
-    used = 2
-    omitted = 0
-    for index, step in enumerate(tool_steps):
-        candidate = dict(step)
-        if "arguments" in candidate:
-            original_arguments = tool_result_content(candidate["arguments"])
-            arguments = _bounded_context_text(
-                original_arguments,
-                MAX_PERSISTED_TOOL_ARGUMENT_CHARS,
-            )
-            if arguments != original_arguments:
-                candidate["argumentsTruncated"] = True
-            candidate["arguments"] = arguments
-        if "result" in candidate:
-            result = tool_result_content(candidate["result"])
-            bounded_result = _bounded_context_text(
-                result,
-                MAX_PERSISTED_TOOL_RESULT_CHARS,
-            )
-            if bounded_result != result:
-                candidate["resultTruncated"] = True
-            candidate["result"] = bounded_result
-
-        encoded_size = len(json.dumps(candidate, ensure_ascii=False, separators=(",", ":")))
-        if used + encoded_size + 1 > MAX_PERSISTED_TOOL_STEPS_CHARS:
-            candidate.pop("result", None)
-            candidate["resultTruncated"] = True
-            candidate["resultSummary"] = "Tool result omitted from persisted history."
-            encoded_size = len(json.dumps(candidate, ensure_ascii=False, separators=(",", ":")))
-        if used + encoded_size + 1 > MAX_PERSISTED_TOOL_STEPS_CHARS:
-            candidate.pop("arguments", None)
-            candidate["argumentsTruncated"] = True
-            encoded_size = len(json.dumps(candidate, ensure_ascii=False, separators=(",", ":")))
-        if used + encoded_size + 1 > MAX_PERSISTED_TOOL_STEPS_CHARS:
-            omitted = len(tool_steps) - index
-            break
-        persisted.append(candidate)
-        used += encoded_size + 1
-
-    if omitted:
-        summary = {
-            "name": "tool_history",
-            "status": "truncated",
-            "resultSummary": f"{omitted} additional tool call(s) omitted from persisted history.",
-            "resultTruncated": True,
-        }
-        while persisted:
-            encoded = json.dumps(
-                persisted + [summary],
-                ensure_ascii=False,
-                separators=(",", ":"),
-            )
-            if len(encoded) <= MAX_PERSISTED_TOOL_STEPS_CHARS:
-                break
-            persisted.pop()
-            omitted += 1
-            summary["resultSummary"] = (
-                f"{omitted} additional tool call(s) omitted from persisted history."
-            )
-        persisted.append(summary)
-    return persisted
-
-
-def provider_usage_metadata(result: Any) -> dict[str, Any]:
-    usage_method = getattr(result, "usage", None)
-    if not callable(usage_method):
-        return {}
-    usage = usage_method()
-    if hasattr(usage, "model_dump"):
-        return usage.model_dump(mode="json", by_alias=True)
-    if is_dataclass(usage):
-        return asdict(usage)
-    return usage if isinstance(usage, dict) else {}
-
-
 @dataclass
 class ActiveRun:
     run_id: str
@@ -1510,8 +1356,6 @@ class ActiveRun:
     provider_metadata: dict[str, Any] = field(default_factory=dict)
     provider_stderr: list[str] = field(default_factory=list)
     cancel_callback: Callable[[], Awaitable[Any]] | None = None
-    started_at: float = field(default_factory=time.perf_counter, repr=False)
-    performance: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -1562,7 +1406,6 @@ class ChatRuntime:
         attachments: Any = None,
         workflow: dict[str, Any] | None = None,
     ) -> ActiveRun:
-        started_at = time.perf_counter()
         text = message.strip()
         normalized_attachments: list[dict[str, Any]] | None = None
         if attachments is not None or not edit_message_id:
@@ -1660,7 +1503,6 @@ class ChatRuntime:
                 workflow=workflow,
                 settings=settings,
                 user_message_id=user_message["id"],
-                started_at=started_at,
             )
             self.runs[run_id] = state
             self._prune_completed_runs()
@@ -1677,21 +1519,6 @@ class ChatRuntime:
                 name=f"fl-mcp-chat-{run_id}",
             )
             return state
-
-    @staticmethod
-    def _elapsed_ms(state: ActiveRun) -> float:
-        return round((time.perf_counter() - state.started_at) * 1000, 1)
-
-    async def _publish_phase(self, state: ActiveRun, phase: str) -> None:
-        await self.publish(state, {
-            "type": "CUSTOM",
-            "name": "run_phase",
-            "value": {"phase": phase},
-        })
-
-    def _finish_performance(self, state: ActiveRun) -> None:
-        state.performance["totalMs"] = self._elapsed_ms(state)
-        state.provider_metadata["performance"] = dict(state.performance)
 
     async def subscribe(self, run_id: str) -> AsyncIterator[str]:
         state = self.runs.get(run_id)
@@ -1731,7 +1558,6 @@ class ChatRuntime:
             if event_type == "RUN_ERROR":
                 state.error_emitted = True
             if event_type == "TEXT_MESSAGE_CONTENT":
-                state.performance.setdefault("firstTextMs", self._elapsed_ms(state))
                 state.assistant_text += str(payload.get("delta") or "")
             elif event_type == "TOOL_CALL_START":
                 tool_name = str(payload.get("toolCallName") or "")
@@ -1837,7 +1663,6 @@ class ChatRuntime:
         )
         if not assistant_content and not persisted_tool_steps:
             return
-        self._finish_performance(state)
         self.store.append_message(
             state.conversation_id,
             "assistant",
@@ -1846,7 +1671,7 @@ class ChatRuntime:
             provider=(state.settings or {}).get("provider"),
             model=(state.settings or {}).get("model"),
             metadata={
-                "toolSteps": bounded_tool_steps_for_storage(persisted_tool_steps),
+                "toolSteps": persisted_tool_steps,
                 "runId": state.run_id,
                 "interrupted": True,
                 "interruptionReason": state.interruption_reason,
@@ -1953,17 +1778,21 @@ class ChatRuntime:
 
             from pydantic_ai import Agent
             from pydantic_ai.ag_ui import RunAgentInput, run_ag_ui
+            from pydantic_ai.mcp import MCPServerStdio
 
             model = (
                 self.model_factory(settings)
                 if self.model_factory is not None
                 else self._build_model(settings)
             )
-            stored_messages = self.store.list_model_messages(state.conversation_id)
+            prompt = (
+                ren_instructions(str(settings.get("search_mode") or "off"))
+                + workflow_context_instructions(state.workflow)
+            )
             latest_user_item = next(
                 (
                     item
-                    for item in reversed(stored_messages)
+                    for item in reversed(self.store.list_messages(state.conversation_id))
                     if item["role"] == "user"
                 ),
                 {},
@@ -1973,15 +1802,6 @@ class ChatRuntime:
                 latest_user_message,
                 str(settings.get("search_mode") or "off"),
             )
-            prompt = (
-                ren_instructions(
-                    str(settings.get("search_mode") or "off")
-                    if "web_search" in allowed_tools
-                    else "off"
-                )
-                + workflow_context_instructions(state.workflow)
-            )
-            state.performance["allowedToolCount"] = len(allowed_tools)
             retry_approval_grants: set[str] = set()
 
             async def prepare_tools(ctx, tool_definitions):
@@ -2060,42 +1880,40 @@ class ChatRuntime:
                     retry_approval_grants.discard(approval_key)
                     return result
 
-            toolsets = []
-            if allowed_tools:
-                from pydantic_ai.mcp import MCPServerStdio
-
-                environment = os.environ.copy()
-                environment.update({
-                    "FL_MCP_MODE": "subprocess",
-                    "FL_MCP_SESSION_ID": state.session_id,
-                    "FL_MCP_WS_URL": self._ws_url(),
-                    "FL_MCP_CLIENT_ID": f"embedded-chat-{state.run_id}",
-                    "FL_MCP_ALLOWED_TOOLS": ",".join(sorted(allowed_tools)),
-                    **workflow_context_environment(state.workflow),
-                    **(
-                        web_search_environment(
-                            settings,
-                            str(latest_user_item.get("content") or ""),
-                        )
-                        if "web_search" in allowed_tools
-                        else {}
-                    ),
-                })
-                toolsets.append(MCPServerStdio(
-                    sys.executable,
-                    [str(PROJECT_ROOT / "backend" / "mcp_server.py")],
-                    cwd=PROJECT_ROOT,
-                    env=environment,
-                    process_tool_call=process_tool_call,
-                    read_timeout=mcp_tool_timeout_seconds(),
-                ))
+            environment = os.environ.copy()
+            environment.update({
+                "FL_MCP_MODE": "subprocess",
+                "FL_MCP_SESSION_ID": state.session_id,
+                "FL_MCP_WS_URL": self._ws_url(),
+                "FL_MCP_CLIENT_ID": f"embedded-chat-{state.run_id}",
+                **workflow_context_environment(state.workflow),
+                **web_search_environment(
+                    settings,
+                    str(latest_user_item.get("content") or ""),
+                ),
+            })
+            mcp_server = MCPServerStdio(
+                sys.executable,
+                [str(PROJECT_ROOT / "backend" / "mcp_server.py")],
+                cwd=PROJECT_ROOT,
+                env=environment,
+                process_tool_call=process_tool_call,
+                read_timeout=mcp_tool_timeout_seconds(),
+            )
+            model_settings: dict[str, Any] = {
+                "temperature": settings["temperature"],
+            }
+            reasoning_effort = settings.get("reasoning_effort", "default")
+            if reasoning_effort != "default":
+                model_settings["openai_reasoning_effort"] = reasoning_effort
             agent = Agent(
                 model,
                 instructions=prompt,
-                toolsets=toolsets,
-                model_settings=model_settings_for_provider(settings),
-                prepare_tools=prepare_tools if toolsets else None,
+                toolsets=[mcp_server],
+                model_settings=model_settings,
+                prepare_tools=prepare_tools,
             )
+            stored_messages = self.store.list_messages(state.conversation_id)
             messages, context_compacted = compact_messages_for_model(stored_messages)
             if context_compacted:
                 state.provider_metadata["contextCompacted"] = True
@@ -2108,31 +1926,18 @@ class ChatRuntime:
                 "context": [],
                 "forwardedProps": {},
             })
-            state.performance["localPreparationMs"] = self._elapsed_ms(state)
-            await self._publish_phase(
-                state,
-                "connecting_tools" if toolsets else "waiting_for_model",
-            )
             completed_result = None
-            provider_event_seen = False
 
             async def on_complete(result):
                 nonlocal completed_result
                 completed_result = result
 
             async for event in run_ag_ui(agent, run_input, on_complete=on_complete):
-                if not provider_event_seen:
-                    payload = event if isinstance(event, dict) else _event_payload(event)
-                    if payload and payload.get("type") != "RUN_STARTED":
-                        provider_event_seen = True
-                        state.performance["firstProviderEventMs"] = self._elapsed_ms(state)
                 await self.publish(state, event)
 
+            serialized = None
             if completed_result is not None:
-                usage = provider_usage_metadata(completed_result)
-                if usage:
-                    state.provider_metadata["usage"] = usage
-            self._finish_performance(state)
+                serialized = json.loads(completed_result.all_messages_json())
             assistant_content, persisted_tool_steps = normalize_assistant_timeline(
                 state.assistant_text,
                 state.tool_steps,
@@ -2143,8 +1948,9 @@ class ChatRuntime:
                 assistant_content,
                 provider=settings["provider"],
                 model=settings["model"],
+                serialized=serialized,
                 metadata={
-                    "toolSteps": bounded_tool_steps_for_storage(persisted_tool_steps),
+                    "toolSteps": persisted_tool_steps,
                     "runId": state.run_id,
                     **state.provider_metadata,
                 },
@@ -2215,7 +2021,23 @@ class ChatRuntime:
                 "Install Claude Code and run `claude auth login`."
             )
 
-        messages = self.store.list_model_messages(state.conversation_id)
+        prompt = (
+            ren_instructions(str(settings.get("search_mode") or "off"))
+            + workflow_context_instructions(state.workflow)
+        )
+        claude_prompt = (
+            f"{prompt}\n\n"
+            "Claude Code integration rules:\n"
+            "- Ren tools are MCP tools whose full names begin with `mcp__ren__`.\n"
+            "- Invoke the actual MCP tools. Never print or simulate "
+            "`<function_calls>`, `<invoke>`, or `<function_response>` markup.\n"
+            "- Attachment references are ComfyUI references, not Claude filesystem "
+            "paths. Call `mcp__ren__view_chat_image` to receive their pixels; never "
+            "try to open `input/ren-chat/...` directly. Use the matching Ren image "
+            "and mask tools for outputs and masks.\n"
+            "- Do not claim a tool succeeded unless its MCP result confirms it."
+        )
+        messages = self.store.list_messages(state.conversation_id)
         latest_user_item = next(
             (
                 item
@@ -2233,27 +2055,6 @@ class ChatRuntime:
             latest_user_message,
             str(settings.get("search_mode") or "off"),
         )
-        prompt = (
-            ren_instructions(
-                str(settings.get("search_mode") or "off")
-                if "web_search" in allowed_tools
-                else "off"
-            )
-            + workflow_context_instructions(state.workflow)
-        )
-        claude_prompt = (
-            f"{prompt}\n\n"
-            "Claude Code integration rules:\n"
-            "- Ren tools are MCP tools whose full names begin with `mcp__ren__`.\n"
-            "- Invoke the actual MCP tools. Never print or simulate "
-            "`<function_calls>`, `<invoke>`, or `<function_response>` markup.\n"
-            "- Attachment references are ComfyUI references, not Claude filesystem "
-            "paths. Call `mcp__ren__view_chat_image` to receive their pixels; never "
-            "try to open `input/ren-chat/...` directly. Use the matching Ren image "
-            "and mask tools for outputs and masks.\n"
-            "- Do not claim a tool succeeded unless its MCP result confirms it."
-        )
-        state.performance["allowedToolCount"] = len(allowed_tools)
         claude_session_id = next(
             (
                 str(item["metadata"]["claudeSessionId"])
@@ -2277,13 +2078,9 @@ class ChatRuntime:
             "FL_MCP_CLIENT_ID": f"embedded-claude-{state.run_id}",
             **workflow_context_environment(state.workflow),
             "FL_MCP_ALLOWED_TOOLS": ",".join(sorted(allowed_tools)),
-            **(
-                web_search_environment(
-                    settings,
-                    str(latest_user_item.get("content") or ""),
-                )
-                if "web_search" in allowed_tools
-                else {}
+            **web_search_environment(
+                settings,
+                str(latest_user_item.get("content") or ""),
             ),
             "CLAUDE_AGENT_SDK_CLIENT_APP": "comfyui-fl-mcp/ren",
             # A configured Anthropic API key otherwise takes precedence over
@@ -2386,7 +2183,7 @@ class ChatRuntime:
                     "args": [str(PROJECT_ROOT / "backend" / "mcp_server.py")],
                     "env": environment,
                 }
-            } if allowed_tools else {},
+            },
             "strict_mcp_config": True,
             "permission_mode": "default",
             "disallowed_tools": sorted(CLAUDE_BUILTIN_TOOLS),
@@ -2436,13 +2233,7 @@ class ChatRuntime:
             "threadId": state.conversation_id,
             "runId": state.run_id,
         })
-        state.performance["localPreparationMs"] = self._elapsed_ms(state)
-        await self._publish_phase(
-            state,
-            "connecting_tools" if allowed_tools else "waiting_for_model",
-        )
         client = None
-        provider_event_seen = False
         if self.claude_query_factory is not None:
             message_stream = self.claude_query_factory(
                 prompt=prompt_stream(),
@@ -2455,8 +2246,7 @@ class ChatRuntime:
             interrupt = getattr(client, "interrupt", None)
             if callable(interrupt):
                 state.cancel_callback = interrupt
-            if allowed_tools:
-                await wait_for_claude_mcp(client)
+            await wait_for_claude_mcp(client)
             session_id = (
                 captured_session_id
                 or (state.run_id if context_compacted else state.conversation_id)
@@ -2466,9 +2256,6 @@ class ChatRuntime:
 
         try:
             async for message in message_stream:
-                if not provider_event_seen:
-                    provider_event_seen = True
-                    state.performance["firstProviderEventMs"] = self._elapsed_ms(state)
                 message_session_id = getattr(message, "session_id", None)
                 if message_session_id:
                     captured_session_id = str(message_session_id)
@@ -2598,9 +2385,8 @@ class ChatRuntime:
             state.assistant_text,
             state.tool_steps,
         )
-        self._finish_performance(state)
         metadata = {
-            "toolSteps": bounded_tool_steps_for_storage(persisted_tool_steps),
+            "toolSteps": persisted_tool_steps,
             "runId": state.run_id,
             "claudeSessionId": captured_session_id,
             "usage": result_message.usage or {},
@@ -2646,7 +2432,20 @@ class ChatRuntime:
             TurnStatus,
         )
 
-        messages = self.store.list_model_messages(state.conversation_id)
+        prompt = (
+            ren_instructions(str(settings.get("search_mode") or "off"))
+            + workflow_context_instructions(state.workflow)
+        )
+        codex_prompt = (
+            f"{prompt}\n\n"
+            "Codex integration rules:\n"
+            "- Use only tools from the `ren` MCP server.\n"
+            "- Invoke the actual Ren MCP tools; never simulate a tool call in text.\n"
+            "- Do not use shell, file-editing, web, app, plugin, subagent, or other "
+            "built-in tools.\n"
+            "- Do not claim a tool succeeded unless its MCP result confirms it."
+        )
+        messages = self.store.list_messages(state.conversation_id)
         latest_user_item = next(
             (
                 item
@@ -2664,24 +2463,6 @@ class ChatRuntime:
             latest_user_message,
             str(settings.get("search_mode") or "off"),
         )
-        prompt = (
-            ren_instructions(
-                str(settings.get("search_mode") or "off")
-                if "web_search" in allowed_tools
-                else "off"
-            )
-            + workflow_context_instructions(state.workflow)
-        )
-        codex_prompt = (
-            f"{prompt}\n\n"
-            "Codex integration rules:\n"
-            "- Use only tools from the `ren` MCP server.\n"
-            "- Invoke the actual Ren MCP tools; never simulate a tool call in text.\n"
-            "- Do not use shell, file-editing, web, app, plugin, subagent, or other "
-            "built-in tools.\n"
-            "- Do not claim a tool succeeded unless its MCP result confirms it."
-        )
-        state.performance["allowedToolCount"] = len(allowed_tools)
         codex_thread_id = next(
             (
                 str(item["metadata"]["codexThreadId"])
@@ -2704,13 +2485,9 @@ class ChatRuntime:
             "FL_MCP_CLIENT_ID": f"embedded-codex-{state.run_id}",
             **workflow_context_environment(state.workflow),
             "FL_MCP_ALLOWED_TOOLS": ",".join(sorted(allowed_tools)),
-            **(
-                web_search_environment(
-                    settings,
-                    str(latest_user_item.get("content") or ""),
-                )
-                if "web_search" in allowed_tools
-                else {}
+            **web_search_environment(
+                settings,
+                str(latest_user_item.get("content") or ""),
             ),
         }
         ren_server = {
@@ -2855,11 +2632,6 @@ class ChatRuntime:
             "threadId": state.conversation_id,
             "runId": state.run_id,
         })
-        state.performance["localPreparationMs"] = self._elapsed_ms(state)
-        await self._publish_phase(
-            state,
-            "connecting_tools" if allowed_tools else "waiting_for_model",
-        )
 
         usage: dict[str, Any] = {}
         seen_tool_ids: set[str] = set()
@@ -2898,8 +2670,7 @@ class ChatRuntime:
                 for name in (effective_config.get("mcp_servers") or {})
                 if name != "ren"
             }
-            if allowed_tools:
-                isolated_mcp_servers["ren"] = ren_server
+            isolated_mcp_servers["ren"] = ren_server
             isolated_plugins = {
                 name: {"enabled": False}
                 for name in (effective_config.get("plugins") or {})
@@ -2951,32 +2722,31 @@ class ChatRuntime:
             if codex_thread_id:
                 state.provider_metadata["codexThreadId"] = codex_thread_id
 
-            if allowed_tools:
-                status_params = ListMcpServerStatusParams(
-                    thread_id=thread.id,
-                    detail="full",
-                ).model_dump(mode="json", by_alias=True, exclude_none=True)
-                server_status = await wait_for_codex_mcp_status(
-                    codex._client,
-                    status_params,
-                    ListMcpServerStatusResponse,
+            status_params = ListMcpServerStatusParams(
+                thread_id=thread.id,
+                detail="full",
+            ).model_dump(mode="json", by_alias=True, exclude_none=True)
+            server_status = await wait_for_codex_mcp_status(
+                codex._client,
+                status_params,
+                ListMcpServerStatusResponse,
+            )
+            unexpected_servers = [
+                item.name
+                for item in server_status.data
+                # First-party UI helpers can remain advertised by the host even
+                # with apps/plugins disabled. Client-side dynamic tool calls are
+                # denied by approval_handler above, so they are not executable.
+                if item.name not in {
+                    "ren",
+                    "sites-design-picker",
+                    "dataAnalyticsWidgets",
+                } and item.tools
+            ]
+            if unexpected_servers:
+                raise RuntimeError(
+                    "Codex tool isolation failed; unexpected MCP servers remained enabled."
                 )
-                unexpected_servers = [
-                    item.name
-                    for item in server_status.data
-                    # First-party UI helpers can remain advertised by the host even
-                    # with apps/plugins disabled. Client-side dynamic tool calls are
-                    # denied by approval_handler above, so they are not executable.
-                    if item.name not in {
-                        "ren",
-                        "sites-design-picker",
-                        "dataAnalyticsWidgets",
-                    } and item.tools
-                ]
-                if unexpected_servers:
-                    raise RuntimeError(
-                        "Codex tool isolation failed; unexpected MCP servers remained enabled."
-                    )
 
             turn = await thread.turn(
                 provider_user_message,
@@ -2989,11 +2759,7 @@ class ChatRuntime:
                 sandbox=None,
             )
             state.cancel_callback = turn.interrupt
-            provider_event_seen = False
             async for event in turn.stream():
-                if not provider_event_seen:
-                    provider_event_seen = True
-                    state.performance["firstProviderEventMs"] = self._elapsed_ms(state)
                 payload = event.payload
                 if isinstance(payload, AgentMessageDeltaNotification):
                     if not text_started:
@@ -3104,7 +2870,6 @@ class ChatRuntime:
             state.assistant_text,
             state.tool_steps,
         )
-        self._finish_performance(state)
         self.store.append_message(
             state.conversation_id,
             "assistant",
@@ -3112,7 +2877,7 @@ class ChatRuntime:
             provider=settings["provider"],
             model=settings["model"],
             metadata={
-                "toolSteps": bounded_tool_steps_for_storage(persisted_tool_steps),
+                "toolSteps": persisted_tool_steps,
                 "runId": state.run_id,
                 "codexThreadId": codex_thread_id,
                 "usage": usage,

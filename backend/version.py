@@ -9,7 +9,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-__version__ = "0.8.1"
+__version__ = "0.8.0"
 
 RUNTIME_PRODUCT = "comfyui-fl-mcp"
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
