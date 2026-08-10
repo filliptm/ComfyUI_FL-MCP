@@ -7,15 +7,34 @@ import {
 import { nodeIdsEqual } from "./node_identity.js";
 
 export const WORKFLOW_GRAPH_PATCH_SCHEMA = "fl-mcp.workflow-graph-patch.v2";
+export const SCOPED_WORKFLOW_GRAPH_PATCH_SCHEMA = "fl-mcp.workflow-graph-patch.v3";
 export const WORKFLOW_GRAPH_PATCH_PROPERTY = "fl_mcp_workflow_graph_patch";
 export const GRAPH_PATCH_LEDGER_KEY = "fl_mcp_graph_patch_ledger";
+
+// These IDs exist only inside the private scoped adapter. They are never
+// accepted on the v3 wire and are mapped to ComfyUI's native Subgraph
+// inputNode/outputNode connection APIs before any mutation.
+export const GRAPH_PATCH_SCOPE_INPUT_RUNTIME_ID = -10;
+export const GRAPH_PATCH_SCOPE_OUTPUT_RUNTIME_ID = -20;
 
 const SHA256_PATTERN = /^[0-9a-f]{64}$/;
 const APPLICATION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$/;
 const ALIAS_PATTERN = /^[a-z][a-z0-9_]{0,63}$/;
 const LEDGER_LIMIT = 64;
+const LEDGER_ENTRY_NODE_ID_LIMIT = 100;
+const LEDGER_NODE_ID_STRING_LIMIT = 4_096;
 const MAX_CHAT_ATTACHMENT_BYTES = 32 * 1024 * 1024;
 const MAX_CHAT_ATTACHMENTS = 8;
+const MAX_SCOPE_DEPTH = 32;
+const MAX_SCOPE_INSTANCES = 8_192;
+const SCOPE_INPUT_NODE_TYPE = "__fl_mcp_scope_input__";
+const SCOPE_OUTPUT_NODE_TYPE = "__fl_mcp_scope_output__";
+const SCOPE_INPUT_SCHEMA_HASH = "0".repeat(64);
+const SCOPE_OUTPUT_SCHEMA_HASH = "f".repeat(64);
+const SCOPE_DEFINITION_HASH_SCHEMA = "fl-mcp.workflow-scope-definition-hash.v2";
+const MAX_SCOPE_DEFINITION_JSON_DEPTH = 64;
+const MAX_SCOPE_DEFINITION_JSON_FACTS = 200_000;
+const MAX_SCOPE_DEFINITION_JSON_BYTES = 8_388_608;
 const WORKFLOW_OWNED_FIELDS = new Set([
     "nodes",
     "links",
@@ -60,6 +79,16 @@ function canonicalValue(value) {
 
 function valuesEqual(left, right) {
     return JSON.stringify(canonicalValue(left)) === JSON.stringify(canonicalValue(right));
+}
+
+
+function typedValuesEqual(left, right) {
+    return typeof left === typeof right && Object.is(left, right);
+}
+
+
+function typedIdKey(value) {
+    return `${typeof value}:${String(value)}`;
 }
 
 
@@ -109,10 +138,14 @@ function failureResult(request, error, extras = {}) {
         success: false,
         applied: false,
         already_applied: false,
-        patch_schema: WORKFLOW_GRAPH_PATCH_SCHEMA,
+        patch_schema: request?.patch_schema || (
+            request?.plan?.operation === "scoped_patch"
+                ? SCOPED_WORKFLOW_GRAPH_PATCH_SCHEMA
+                : WORKFLOW_GRAPH_PATCH_SCHEMA
+        ),
         application_id: request?.application_id ?? null,
         patch_hash: request?.patch_hash ?? null,
-        operation: "patch",
+        operation: request?.operation || request?.plan?.operation || "patch",
         expected_workflow_identity: request?.plan?.expected_workflow_identity ?? null,
         error: {
             code: error?.code || "graph_patch_failed",
@@ -437,6 +470,409 @@ function normalizeExpectedDelta(value) {
 }
 
 
+function normalizeScopeNodeRef(value, label, allowedKinds = new Set(["existing", "new"])) {
+    const ref = normalizeRef(value, label, allowedKinds);
+    if (Object.prototype.hasOwnProperty.call(ref, "node_id")) {
+        if (
+            !(
+                (typeof ref.node_id === "number" && Number.isInteger(ref.node_id))
+                || (typeof ref.node_id === "string" && ref.node_id.length > 0)
+            )
+            || [GRAPH_PATCH_SCOPE_INPUT_RUNTIME_ID, GRAPH_PATCH_SCOPE_OUTPUT_RUNTIME_ID]
+                .includes(ref.node_id)
+        ) {
+            throw graphPatchError(
+                "invalid_scoped_graph_patch",
+                `${label}.node_id must be an exact non-reserved typed node ID.`,
+            );
+        }
+    }
+    return ref;
+}
+
+
+function normalizeScopeStep(value, label) {
+    const containerNodeId = value?.container_node_id;
+    if (
+        !isRecord(value)
+        || !(
+            (typeof containerNodeId === "number" && Number.isInteger(containerNodeId))
+            || (typeof containerNodeId === "string" && containerNodeId.length > 0)
+        )
+        || typeof value.subgraph_id !== "string"
+        || !value.subgraph_id
+        || value.subgraph_id.length > 256
+    ) {
+        throw graphPatchError(
+            "invalid_scoped_graph_patch",
+            `${label} is not an exact scope-path segment.`,
+        );
+    }
+    return {
+        container_node_id: containerNodeId,
+        subgraph_id: value.subgraph_id,
+    };
+}
+
+
+function normalizeScopePath(value, label) {
+    if (!Array.isArray(value) || value.length < 1 || value.length > MAX_SCOPE_DEPTH) {
+        throw graphPatchError(
+            "invalid_scoped_graph_patch",
+            `${label} must contain one to ${MAX_SCOPE_DEPTH} exact scope segments.`,
+        );
+    }
+    return value.map((step, index) => normalizeScopeStep(step, `${label}[${index}]`));
+}
+
+
+function scopePathKey(path) {
+    return path.map(step => (
+        `${typedIdKey(step.container_node_id)}\u0000${step.subgraph_id}`
+    )).join("\u0001");
+}
+
+
+function compareScopePaths(left, right) {
+    if (left.length !== right.length) return left.length - right.length;
+    return scopePathKey(left).localeCompare(scopePathKey(right));
+}
+
+
+function normalizeScopeAuthority(value) {
+    if (
+        !isRecord(value)
+        || typeof value.definition_id !== "string"
+        || !value.definition_id
+        || value.definition_id.length > 256
+        || !SHA256_PATTERN.test(String(value.definition_hash || ""))
+        || !["instance", "shared_definition"].includes(value.edit_mode)
+        || !Array.isArray(value.affected_scope_paths)
+        || value.affected_scope_paths.length < 1
+        || value.affected_scope_paths.length > MAX_SCOPE_INSTANCES
+    ) {
+        throw graphPatchError(
+            "invalid_scoped_graph_patch",
+            "A canonical scoped GraphPatch authority is required.",
+        );
+    }
+    const scopePath = normalizeScopePath(value.scope_path, "scope.scope_path");
+    if (scopePath.at(-1).subgraph_id !== value.definition_id) {
+        throw graphPatchError(
+            "invalid_scoped_graph_patch",
+            "scope.definition_id must equal the terminal scope-path definition.",
+        );
+    }
+    const affected = value.affected_scope_paths.map((path, index) => (
+        normalizeScopePath(path, `scope.affected_scope_paths[${index}]`)
+    ));
+    const keys = affected.map(scopePathKey);
+    if (new Set(keys).size !== keys.length) {
+        throw graphPatchError(
+            "invalid_scoped_graph_patch",
+            "scope.affected_scope_paths must be duplicate-free.",
+        );
+    }
+    affected.sort(compareScopePaths);
+    return {
+        scope_path: scopePath,
+        definition_id: value.definition_id,
+        definition_hash: value.definition_hash,
+        edit_mode: value.edit_mode,
+        affected_scope_paths: affected,
+    };
+}
+
+
+function normalizeBoundaryIdentity(value, label) {
+    if (
+        !isRecord(value)
+        || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(
+            String(value.slot_id || ""),
+        )
+        || !isIndex(value.slot_index)
+        || typeof value.name !== "string"
+        || !value.name
+        || value.name.length > 256
+        || typeof value.type !== "string"
+        || !value.type
+        || value.type.length > 256
+    ) {
+        throw graphPatchError(
+            "invalid_scoped_graph_patch",
+            `${label} is not an immutable public boundary identity.`,
+        );
+    }
+    return {
+        slot_id: value.slot_id,
+        slot_index: value.slot_index,
+        name: value.name,
+        type: value.type,
+    };
+}
+
+
+function normalizeScopedSourceRef(value, label) {
+    if (isRecord(value) && Object.keys(value).length === 1 && value.scope_input !== undefined) {
+        return { scope_input: normalizeBoundaryIdentity(value.scope_input, `${label}.scope_input`) };
+    }
+    if (isRecord(value) && (value.scope_output !== undefined || value.scope_input !== undefined)) {
+        throw graphPatchError(
+            "invalid_scoped_graph_patch",
+            `${label} may use only a source-side scope_input boundary.`,
+        );
+    }
+    return normalizeScopeNodeRef(value, label);
+}
+
+
+function normalizeScopedTargetRef(value, label) {
+    if (isRecord(value) && Object.keys(value).length === 1 && value.scope_output !== undefined) {
+        return { scope_output: normalizeBoundaryIdentity(value.scope_output, `${label}.scope_output`) };
+    }
+    if (isRecord(value) && (value.scope_input !== undefined || value.scope_output !== undefined)) {
+        throw graphPatchError(
+            "invalid_scoped_graph_patch",
+            `${label} may use only a target-side scope_output boundary.`,
+        );
+    }
+    return normalizeScopeNodeRef(value, label);
+}
+
+
+function normalizeScopedSource(value, label) {
+    if (
+        !isRecord(value)
+        || !isIndex(value.output_index)
+        || typeof value.output !== "string"
+        || !value.output
+        || typeof value.type !== "string"
+        || !value.type
+    ) {
+        throw graphPatchError("invalid_scoped_graph_patch", `${label} is not an exact output endpoint.`);
+    }
+    const ref = normalizeScopedSourceRef(value.ref, `${label}.ref`);
+    if (ref.scope_input) {
+        const fact = ref.scope_input;
+        if (
+            value.output_index !== fact.slot_index
+            || value.output !== fact.name
+            || value.type !== fact.type
+        ) {
+            throw graphPatchError(
+                "invalid_scoped_graph_patch",
+                `${label} disagrees with its scope_input boundary fact.`,
+            );
+        }
+    }
+    return { ref, output_index: value.output_index, output: value.output, type: value.type };
+}
+
+
+function normalizeScopedTarget(value, label) {
+    if (
+        !isRecord(value)
+        || !isIndex(value.input_index)
+        || !isIndex(value.occurrence_index)
+        || typeof value.input !== "string"
+        || !value.input
+        || typeof value.type !== "string"
+        || !value.type
+        || !["slot", "convert_widget"].includes(value.mode)
+        || (value.mode === "slot" && !isIndex(value.socket_index))
+        || (value.mode === "convert_widget" && value.socket_index !== null)
+    ) {
+        throw graphPatchError("invalid_scoped_graph_patch", `${label} is not an exact input endpoint.`);
+    }
+    const ref = normalizeScopedTargetRef(value.ref, `${label}.ref`);
+    if (ref.scope_output) {
+        const fact = ref.scope_output;
+        if (
+            value.mode !== "slot"
+            || value.input_index !== fact.slot_index
+            || value.occurrence_index !== 0
+            || value.socket_index !== fact.slot_index
+            || value.input !== fact.name
+            || value.type !== fact.type
+        ) {
+            throw graphPatchError(
+                "invalid_scoped_graph_patch",
+                `${label} disagrees with its scope_output boundary fact.`,
+            );
+        }
+    }
+    return {
+        ref,
+        input_index: value.input_index,
+        occurrence_index: value.occurrence_index,
+        socket_index: value.socket_index,
+        input: value.input,
+        type: value.type,
+        mode: value.mode,
+    };
+}
+
+
+function normalizeScopedEdge(value, label) {
+    if (!isRecord(value)) {
+        throw graphPatchError("invalid_scoped_graph_patch", `${label} must be an exact scoped edge.`);
+    }
+    const source = normalizeScopedSource(value.source, `${label}.source`);
+    const target = normalizeScopedTarget(value.target, `${label}.target`);
+    if (source.ref.scope_input && target.ref.scope_output) {
+        throw graphPatchError(
+            "direct_scope_boundary_edge_unsupported",
+            `${label} cannot bypass a native Subgraph directly from input to output.`,
+        );
+    }
+    return { source, target };
+}
+
+
+function normalizeScopedRemoveNode(value, index) {
+    if (
+        !isRecord(value)
+        || typeof value.node_type !== "string"
+        || !value.node_type
+        || !SHA256_PATTERN.test(String(value.schema_hash || ""))
+        || !Array.isArray(value.expected_incident_edges)
+    ) {
+        throw graphPatchError(
+            "invalid_scoped_graph_patch",
+            `remove_nodes[${index}] is not a canonical scoped node removal.`,
+        );
+    }
+    return {
+        ref: normalizeScopeNodeRef(
+            value.ref,
+            `remove_nodes[${index}].ref`,
+            new Set(["existing"]),
+        ),
+        node_type: value.node_type,
+        schema_hash: value.schema_hash,
+        expected_incident_edges: value.expected_incident_edges.map((edge, edgeIndex) => (
+            normalizeScopedEdge(edge, `remove_nodes[${index}].expected_incident_edges[${edgeIndex}]`)
+        )),
+    };
+}
+
+
+function lowerScopeRef(ref) {
+    if (ref.scope_input) return { node_id: GRAPH_PATCH_SCOPE_INPUT_RUNTIME_ID };
+    if (ref.scope_output) return { node_id: GRAPH_PATCH_SCOPE_OUTPUT_RUNTIME_ID };
+    return clone(ref);
+}
+
+
+function lowerScopedEdge(edge) {
+    return {
+        source: { ...clone(edge.source), ref: lowerScopeRef(edge.source.ref) },
+        target: { ...clone(edge.target), ref: lowerScopeRef(edge.target.ref) },
+    };
+}
+
+
+function normalizeScopedRequest(request) {
+    const plan = request?.plan;
+    if (
+        !isRecord(request)
+        || !APPLICATION_ID_PATTERN.test(String(request.application_id || ""))
+        || !SHA256_PATTERN.test(String(request.expected_catalog_hash || ""))
+        || !SHA256_PATTERN.test(String(request.patch_hash || ""))
+        || !isRecord(plan)
+        || plan.operation !== "scoped_patch"
+        || typeof plan.expected_workflow_identity !== "string"
+        || !plan.expected_workflow_identity
+        || !SHA256_PATTERN.test(String(plan.expected_graph_hash || ""))
+        || !isRecord(plan.assertions)
+        || !Array.isArray(plan.assertions.nodes)
+        || !Array.isArray(plan.assertions.edges)
+        || !Array.isArray(plan.create_nodes)
+        || !Array.isArray(plan.update_nodes)
+        || !Array.isArray(plan.remove_edges)
+        || !Array.isArray(plan.add_edges)
+        || !Array.isArray(plan.remove_nodes)
+        || !Array.isArray(plan.attachments)
+        || plan.attachments.length !== 0
+    ) {
+        throw graphPatchError(
+            "invalid_scoped_graph_patch",
+            "A canonical workflow GraphPatch v3 scoped apply request is required.",
+        );
+    }
+    const scope = normalizeScopeAuthority(plan.scope);
+    const publicPlan = {
+        operation: "scoped_patch",
+        expected_workflow_identity: plan.expected_workflow_identity,
+        expected_graph_hash: plan.expected_graph_hash,
+        scope,
+        assertions: {
+            nodes: plan.assertions.nodes.map(normalizeAssertionNode),
+            edges: plan.assertions.edges.map((edge, index) => (
+                normalizeScopedEdge(edge, `assertions.edges[${index}]`)
+            )),
+        },
+        create_nodes: plan.create_nodes.map(normalizeCreateNode),
+        update_nodes: plan.update_nodes.map(normalizeUpdateNode),
+        remove_edges: plan.remove_edges.map((edge, index) => (
+            normalizeScopedEdge(edge, `remove_edges[${index}]`)
+        )),
+        add_edges: plan.add_edges.map((edge, index) => (
+            normalizeScopedEdge(edge, `add_edges[${index}]`)
+        )),
+        remove_nodes: plan.remove_nodes.map(normalizeScopedRemoveNode),
+        attachments: [],
+        expected_delta: normalizeExpectedDelta(plan.expected_delta),
+    };
+    const lowerEdges = edges => edges.map(lowerScopedEdge);
+    const loweredPlan = {
+        operation: "scoped_patch",
+        expected_workflow_identity: publicPlan.expected_workflow_identity,
+        expected_graph_hash: publicPlan.expected_graph_hash,
+        assertions: {
+            nodes: [
+                ...publicPlan.assertions.nodes,
+                {
+                    ref: { node_id: GRAPH_PATCH_SCOPE_INPUT_RUNTIME_ID },
+                    node_type: SCOPE_INPUT_NODE_TYPE,
+                    schema_hash: SCOPE_INPUT_SCHEMA_HASH,
+                },
+                {
+                    ref: { node_id: GRAPH_PATCH_SCOPE_OUTPUT_RUNTIME_ID },
+                    node_type: SCOPE_OUTPUT_NODE_TYPE,
+                    schema_hash: SCOPE_OUTPUT_SCHEMA_HASH,
+                },
+            ],
+            edges: lowerEdges(publicPlan.assertions.edges),
+        },
+        create_nodes: clone(publicPlan.create_nodes),
+        update_nodes: clone(publicPlan.update_nodes),
+        remove_edges: lowerEdges(publicPlan.remove_edges),
+        add_edges: lowerEdges(publicPlan.add_edges),
+        remove_nodes: publicPlan.remove_nodes.map(item => ({
+            ...clone(item),
+            expected_incident_edges: lowerEdges(item.expected_incident_edges),
+        })),
+        attachments: [],
+        expected_delta: {
+            ...clone(publicPlan.expected_delta),
+            final_node_count: publicPlan.expected_delta.final_node_count + 2,
+        },
+    };
+    validateNormalizedPlan(loweredPlan);
+    return {
+        application_id: request.application_id,
+        expected_catalog_hash: request.expected_catalog_hash,
+        patch_hash: request.patch_hash,
+        patch_schema: SCOPED_WORKFLOW_GRAPH_PATCH_SCHEMA,
+        operation: "scoped_patch",
+        scope,
+        public_plan: publicPlan,
+        plan: loweredPlan,
+    };
+}
+
+
 function normalizeRequest(request) {
     const plan = request?.plan;
     if (
@@ -470,6 +906,8 @@ function normalizeRequest(request) {
         application_id: request.application_id,
         expected_catalog_hash: request.expected_catalog_hash,
         patch_hash: request.patch_hash,
+        patch_schema: WORKFLOW_GRAPH_PATCH_SCHEMA,
+        operation: "patch",
         plan: {
             operation: "patch",
             expected_workflow_identity: plan.expected_workflow_identity,
@@ -495,6 +933,938 @@ function normalizeRequest(request) {
     };
     validateNormalizedPlan(normalized.plan);
     return normalized;
+}
+
+
+function normalizeApplyRequest(request) {
+    return request?.plan?.operation === "scoped_patch"
+        ? normalizeScopedRequest(request)
+        : normalizeRequest(request);
+}
+
+
+function assertUnicodeScalarString(value, path) {
+    for (let index = 0; index < value.length; index += 1) {
+        const code = value.charCodeAt(index);
+        if (code >= 0xd800 && code <= 0xdbff) {
+            const next = value.charCodeAt(index + 1);
+            if (!(next >= 0xdc00 && next <= 0xdfff)) {
+                throw graphPatchError(
+                    "non_json_scoped_definition",
+                    `The scoped definition contains an invalid UTF-8 string at ${path}.`,
+                );
+            }
+            index += 1;
+        } else if (code >= 0xdc00 && code <= 0xdfff) {
+            throw graphPatchError(
+                "non_json_scoped_definition",
+                `The scoped definition contains an invalid UTF-8 string at ${path}.`,
+            );
+        }
+    }
+}
+
+
+function consumeScopeText(value, path, budget) {
+    assertUnicodeScalarString(value, path);
+    const byteLength = new TextEncoder().encode(value).byteLength;
+    budget.textBytes += byteLength;
+    if (budget.textBytes > MAX_SCOPE_DEFINITION_JSON_BYTES) {
+        throw graphPatchError(
+            "scoped_definition_hash_size_exceeded",
+            `The scoped definition exceeds the byte limit at ${path}.`,
+        );
+    }
+}
+
+
+function assertStrictJSON(
+    value,
+    path = "definition",
+    depth = 0,
+    budget = { facts: 0, textBytes: 0, active: new Set() },
+) {
+    if (depth > MAX_SCOPE_DEFINITION_JSON_DEPTH) {
+        throw graphPatchError(
+            "scoped_definition_hash_depth_exceeded",
+            `The scoped definition exceeds the depth limit at ${path}.`,
+        );
+    }
+    budget.facts += 1;
+    if (budget.facts > MAX_SCOPE_DEFINITION_JSON_FACTS) {
+        throw graphPatchError(
+            "scoped_definition_hash_fact_limit_exceeded",
+            `The scoped definition exceeds the fact limit at ${path}.`,
+        );
+    }
+    if (value === null || typeof value === "boolean") return;
+    if (typeof value === "number") {
+        if (!Number.isFinite(value)) {
+            throw graphPatchError(
+                "non_json_scoped_definition",
+                `The scoped definition contains a non-finite number at ${path}.`,
+            );
+        }
+        return;
+    }
+    if (typeof value === "string") {
+        consumeScopeText(value, path, budget);
+        return;
+    }
+    if (Array.isArray(value)) {
+        if (budget.active.has(value)) {
+            throw graphPatchError(
+                "non_json_scoped_definition",
+                `The scoped definition contains a cyclic array at ${path}.`,
+            );
+        }
+        if (budget.facts + value.length > MAX_SCOPE_DEFINITION_JSON_FACTS) {
+            throw graphPatchError(
+                "scoped_definition_hash_fact_limit_exceeded",
+                `The scoped definition exceeds the fact limit at ${path}.`,
+            );
+        }
+        const ownKeys = Object.keys(value);
+        if (
+            ownKeys.length !== value.length
+            || ownKeys.some((key, index) => key !== String(index))
+        ) {
+            throw graphPatchError(
+                "non_json_scoped_definition",
+                `The scoped definition contains a sparse or decorated array at ${path}.`,
+            );
+        }
+        budget.active.add(value);
+        try {
+            for (let index = 0; index < value.length; index += 1) {
+                assertStrictJSON(value[index], `${path}[${index}]`, depth + 1, budget);
+            }
+        } finally {
+            budget.active.delete(value);
+        }
+        return;
+    }
+    if (isRecord(value)) {
+        if (
+            ![Object.prototype, null].includes(Object.getPrototypeOf(value))
+            || Object.getOwnPropertySymbols(value).length > 0
+        ) {
+            throw graphPatchError(
+                "non_json_scoped_definition",
+                `The scoped definition contains a non-JSON object at ${path}.`,
+            );
+        }
+        if (budget.active.has(value)) {
+            throw graphPatchError(
+                "non_json_scoped_definition",
+                `The scoped definition contains a cyclic object at ${path}.`,
+            );
+        }
+        const entries = Object.entries(value);
+        if (budget.facts + (2 * entries.length) > MAX_SCOPE_DEFINITION_JSON_FACTS) {
+            throw graphPatchError(
+                "scoped_definition_hash_fact_limit_exceeded",
+                `The scoped definition exceeds the fact limit at ${path}.`,
+            );
+        }
+        budget.active.add(value);
+        try {
+            for (const [key, item] of entries) {
+                budget.facts += 1;
+                consumeScopeText(key, `${path}.${key}`, budget);
+                assertStrictJSON(item, `${path}.${key}`, depth + 1, budget);
+            }
+        } finally {
+            budget.active.delete(value);
+        }
+        return;
+    }
+    throw graphPatchError(
+        "non_json_scoped_definition",
+        `The scoped definition contains a non-JSON value at ${path}.`,
+    );
+}
+
+
+function projectNativeScopeDefinition(definition) {
+    const active = new Set();
+    const textBudget = { textBytes: 0 };
+    let facts = 0;
+
+    const consumeFact = path => {
+        facts += 1;
+        if (facts > MAX_SCOPE_DEFINITION_JSON_FACTS) {
+            throw graphPatchError(
+                "scoped_definition_hash_fact_limit_exceeded",
+                `The scoped definition exceeds the fact limit at ${path}.`,
+            );
+        }
+    };
+
+    const project = (value, path, depth) => {
+        if (depth > MAX_SCOPE_DEFINITION_JSON_DEPTH) {
+            throw graphPatchError(
+                "scoped_definition_hash_depth_exceeded",
+                `The scoped definition exceeds the depth limit at ${path}.`,
+            );
+        }
+        consumeFact(path);
+        if (typeof value === "string") {
+            consumeScopeText(value, path, textBudget);
+            return value;
+        }
+        if (value === null || typeof value === "boolean") {
+            return value;
+        }
+        if (typeof value === "number") {
+            if (!Number.isFinite(value)) {
+                throw graphPatchError(
+                    "non_json_scoped_definition",
+                    `The scoped definition contains a non-finite number at ${path}.`,
+                );
+            }
+            return value;
+        }
+        if (Array.isArray(value)) {
+            const ownKeys = Object.keys(value);
+            if (
+                Object.getPrototypeOf(value) !== Array.prototype
+                || Object.getOwnPropertySymbols(value).length > 0
+                || ownKeys.length !== value.length
+                || ownKeys.some((key, index) => key !== String(index))
+            ) {
+                throw graphPatchError(
+                    "non_json_scoped_definition",
+                    `The scoped definition contains a sparse, decorated, or non-JSON array at ${path}.`,
+                );
+            }
+            if (facts + value.length > MAX_SCOPE_DEFINITION_JSON_FACTS) {
+                throw graphPatchError(
+                    "scoped_definition_hash_fact_limit_exceeded",
+                    `The scoped definition exceeds the fact limit at ${path}.`,
+                );
+            }
+            if (active.has(value)) {
+                throw graphPatchError(
+                    "non_json_scoped_definition",
+                    `The scoped definition contains a cyclic array at ${path}.`,
+                );
+            }
+            active.add(value);
+            try {
+                return value.map((item, index) => project(item, `${path}[${index}]`, depth + 1));
+            } finally {
+                active.delete(value);
+            }
+        }
+        if (value && typeof value === "object") {
+            const prototype = Object.getPrototypeOf(value);
+            if (
+                ![Object.prototype, null].includes(prototype)
+                || Object.getOwnPropertySymbols(value).length > 0
+            ) {
+                throw graphPatchError(
+                    "non_json_scoped_definition",
+                    `The scoped definition contains a non-JSON object at ${path}.`,
+                );
+            }
+            if (active.has(value)) {
+                throw graphPatchError(
+                    "non_json_scoped_definition",
+                    `The scoped definition contains a cyclic object at ${path}.`,
+                );
+            }
+            const keys = Object.keys(value);
+            if (facts + keys.length > MAX_SCOPE_DEFINITION_JSON_FACTS) {
+                throw graphPatchError(
+                    "scoped_definition_hash_fact_limit_exceeded",
+                    `The scoped definition exceeds the fact limit at ${path}.`,
+                );
+            }
+            active.add(value);
+            try {
+                const result = prototype === null ? Object.create(null) : {};
+                for (const key of keys) {
+                    const item = value[key];
+                    consumeFact(`${path}.${key}`);
+                    consumeScopeText(key, `${path}.${key}`, textBudget);
+                    // Native Comfy serializers intentionally emit optional
+                    // object fields as undefined. JSON workflow transport
+                    // omits those fields, so make that one projection exact.
+                    if (item === undefined) continue;
+                    result[key] = project(item, `${path}.${key}`, depth + 1);
+                }
+                return result;
+            } finally {
+                active.delete(value);
+            }
+        }
+        throw graphPatchError(
+            "non_json_scoped_definition",
+            `The scoped definition contains a non-JSON value at ${path}.`,
+        );
+    };
+
+    const projected = project(definition, "definition", 0);
+    assertStrictJSON(projected);
+    return projected;
+}
+
+
+async function sha256Hex(value) {
+    const bytes = typeof value === "string" ? new TextEncoder().encode(value) : value;
+    if (globalThis.crypto?.subtle) {
+        const digest = await globalThis.crypto.subtle.digest("SHA-256", bytes);
+        return [...new Uint8Array(digest)]
+            .map(byte => byte.toString(16).padStart(2, "0"))
+            .join("");
+    }
+    if (typeof process !== "undefined" && process.versions?.node) {
+        const { createHash } = await import("node:crypto");
+        return createHash("sha256").update(bytes).digest("hex");
+    }
+    throw graphPatchError("sha256_unavailable", "SHA-256 is unavailable in this browser.");
+}
+
+
+function compareUnicodeScalarStrings(left, right) {
+    const leftPoints = Array.from(left, item => item.codePointAt(0));
+    const rightPoints = Array.from(right, item => item.codePointAt(0));
+    const length = Math.min(leftPoints.length, rightPoints.length);
+    for (let index = 0; index < length; index += 1) {
+        if (leftPoints[index] !== rightPoints[index]) return leftPoints[index] - rightPoints[index];
+    }
+    return leftPoints.length - rightPoints.length;
+}
+
+
+function bytesToHex(bytes) {
+    return Array.from(bytes, byte => byte.toString(16).padStart(2, "0")).join("");
+}
+
+
+function canonicalScopeNumber(value) {
+    const normalized = Object.is(value, -0) ? 0 : value;
+    const buffer = new ArrayBuffer(8);
+    new DataView(buffer).setFloat64(0, normalized, false);
+    return `d${bytesToHex(new Uint8Array(buffer))};`;
+}
+
+
+function canonicalScopeString(value) {
+    const encoded = new TextEncoder().encode(value);
+    return `s${encoded.byteLength}:${bytesToHex(encoded)};`;
+}
+
+
+function canonicalScopeValue(value) {
+    if (value === null) return "n;";
+    if (typeof value === "boolean") return value ? "b1;" : "b0;";
+    if (typeof value === "number") return canonicalScopeNumber(value);
+    if (typeof value === "string") return canonicalScopeString(value);
+    if (Array.isArray(value)) {
+        return `a${value.length}:[${value.map(canonicalScopeValue).join("")}];`;
+    }
+    const keys = Object.keys(value).sort(compareUnicodeScalarStrings);
+    return `o${keys.length}:{${keys.map(key => (
+        canonicalScopeString(key) + canonicalScopeValue(value[key])
+    )).join("")}};`;
+}
+
+
+export async function workflowScopeDefinitionHash(definition) {
+    if (!isRecord(definition)) {
+        throw graphPatchError(
+            "invalid_scoped_definition",
+            "A serialized subgraph definition object is required.",
+        );
+    }
+    assertStrictJSON(definition);
+    const canonical = canonicalScopeValue({
+        schema: SCOPE_DEFINITION_HASH_SCHEMA,
+        value: definition,
+    });
+    const payload = new TextEncoder().encode(canonical);
+    if (payload.byteLength > MAX_SCOPE_DEFINITION_JSON_BYTES) {
+        throw graphPatchError(
+            "scoped_definition_hash_size_exceeded",
+            "The canonical scoped definition exceeds the frontend byte limit.",
+        );
+    }
+    return await sha256Hex(payload);
+}
+
+
+function collectionEntries(value, label) {
+    if (Array.isArray(value)) return value.map((item, index) => [index, item]);
+    if (isRecord(value)) return Object.entries(value);
+    throw graphPatchError(
+        "invalid_scoped_workflow",
+        `${label} must be a serialized array or object.`,
+    );
+}
+
+
+function exactNodeId(value, label) {
+    if (
+        (typeof value === "number" && Number.isInteger(value))
+        || (typeof value === "string" && value.length > 0)
+    ) return value;
+    throw graphPatchError("invalid_scoped_workflow", `${label} is not an exact typed ID.`);
+}
+
+
+function definitionInventory(rootSnapshot) {
+    const raw = rootSnapshot?.definitions?.subgraphs ?? [];
+    const result = new Map();
+    for (const [mappingId, definition] of collectionEntries(raw, "workflow.definitions.subgraphs")) {
+        if (!isRecord(definition)) {
+            throw graphPatchError(
+                "invalid_scoped_workflow",
+                "Every serialized subgraph definition must be an object.",
+            );
+        }
+        const id = definition.id ?? (Array.isArray(raw) ? undefined : mappingId);
+        if (typeof id !== "string" || !id) {
+            throw graphPatchError(
+                "invalid_scoped_workflow",
+                "Every serialized subgraph definition needs an exact string ID.",
+            );
+        }
+        if (result.has(id)) {
+            throw graphPatchError(
+                "duplicate_scoped_definition",
+                `Subgraph definition ${id} is repeated.`,
+            );
+        }
+        result.set(id, definition);
+    }
+    return result;
+}
+
+
+function payloadNodes(payload, label) {
+    const result = [];
+    const seen = new Set();
+    for (const [mappingId, node] of collectionEntries(payload?.nodes ?? [], `${label}.nodes`)) {
+        if (!isRecord(node)) {
+            throw graphPatchError("invalid_scoped_workflow", `${label} contains a non-object node.`);
+        }
+        const id = exactNodeId(
+            node.id ?? (Array.isArray(payload.nodes) ? undefined : mappingId),
+            `${label}.nodes.id`,
+        );
+        const key = typedIdKey(id);
+        if (seen.has(key)) {
+            throw graphPatchError(
+                "ambiguous_scoped_node_identity",
+                `${label} repeats typed node ID ${String(id)}.`,
+            );
+        }
+        seen.add(key);
+        result.push({ id, node });
+    }
+    return result;
+}
+
+
+function exactPayloadNode(payload, nodeIdValue, label) {
+    const matches = payloadNodes(payload, label).filter(item => (
+        typedValuesEqual(item.id, nodeIdValue)
+    ));
+    if (matches.length !== 1) {
+        throw graphPatchError(
+            matches.length === 0 ? "scoped_path_not_found" : "scoped_path_ambiguous",
+            `${label} does not contain exactly one typed node ${String(nodeIdValue)}.`,
+        );
+    }
+    return matches[0].node;
+}
+
+
+function exactInterfaceSlots(value, label) {
+    return collectionEntries(value ?? [], label).map(([, slot], index) => {
+        if (
+            !isRecord(slot)
+            || typeof slot.name !== "string"
+            || !slot.name
+            || typeof slot.type !== "string"
+            || !slot.type
+        ) {
+            throw graphPatchError(
+                "invalid_scoped_interface",
+                `${label}[${index}] is not an exact named typed slot.`,
+            );
+        }
+        return { name: slot.name, type: slot.type };
+    });
+}
+
+
+function assertContainerInterface(container, definition, label) {
+    for (const field of ["inputs", "outputs"]) {
+        const actual = exactInterfaceSlots(container?.[field] ?? [], `${label}.${field}`);
+        const expected = exactInterfaceSlots(definition?.[field] ?? [], `definition.${field}`);
+        if (!valuesEqual(actual, expected)) {
+            throw graphPatchError(
+                "scoped_container_interface_mismatch",
+                `${label}.${field} no longer matches the referenced definition boundary.`,
+            );
+        }
+    }
+}
+
+
+function resolveSerializedScope(rootSnapshot, scope) {
+    const definitions = definitionInventory(rootSnapshot);
+    let payload = rootSnapshot;
+    let definition = null;
+    for (const [index, step] of scope.scope_path.entries()) {
+        const container = exactPayloadNode(payload, step.container_node_id, `scope_path[${index}]`);
+        if (container.type !== step.subgraph_id) {
+            throw graphPatchError(
+                "scoped_path_definition_mismatch",
+                `scope_path[${index}] resolves to a different definition.`,
+            );
+        }
+        definition = definitions.get(step.subgraph_id) || null;
+        if (!definition) {
+            throw graphPatchError(
+                "scoped_definition_missing",
+                `Definition ${step.subgraph_id} is unavailable.`,
+            );
+        }
+        assertContainerInterface(container, definition, `scope_path[${index}].container`);
+        payload = definition;
+    }
+    if (!definition || definition.id !== scope.definition_id) {
+        throw graphPatchError(
+            "scoped_definition_mismatch",
+            "The resolved scope does not match its terminal definition authority.",
+        );
+    }
+    return { definitions, definition: projectNativeScopeDefinition(definition) };
+}
+
+
+function boundaryPort(definition, kind, identity) {
+    const field = kind === "scope_input" ? "inputs" : "outputs";
+    const ports = collectionEntries(definition?.[field] ?? [], `definition.${field}`)
+        .map(([, port]) => port);
+    const observed = ports[identity.slot_index];
+    if (
+        !isRecord(observed)
+        || observed.id !== identity.slot_id
+        || observed.name !== identity.name
+        || observed.type !== identity.type
+    ) {
+        throw graphPatchError(
+            "scoped_boundary_mismatch",
+            `${kind} ${identity.slot_id} no longer matches index, UUID, name, and type.`,
+        );
+    }
+    return observed;
+}
+
+
+function publicBoundaryRefs(plan) {
+    const result = [];
+    const add = edge => {
+        if (edge.source.ref.scope_input) result.push(["scope_input", edge.source.ref.scope_input]);
+        if (edge.target.ref.scope_output) result.push(["scope_output", edge.target.ref.scope_output]);
+    };
+    for (const edge of [...plan.assertions.edges, ...plan.remove_edges, ...plan.add_edges]) add(edge);
+    for (const removal of plan.remove_nodes) {
+        for (const edge of removal.expected_incident_edges) add(edge);
+    }
+    return result;
+}
+
+
+function enumerateScopeInstances(rootSnapshot, definitionId, definitions) {
+    const result = [];
+    const visit = (payload, path, stack) => {
+        if (path.length >= MAX_SCOPE_DEPTH) {
+            throw graphPatchError(
+                "scoped_path_depth_exceeded",
+                `Scoped instance expansion exceeds ${MAX_SCOPE_DEPTH} levels.`,
+            );
+        }
+        for (const { id, node } of payloadNodes(payload, path.length ? "definition" : "workflow")) {
+            if (typeof node.type !== "string" || !definitions.has(node.type)) continue;
+            const next = [...path, { container_node_id: id, subgraph_id: node.type }];
+            const definition = definitions.get(node.type);
+            assertContainerInterface(node, definition, `instance.${scopePathKey(next)}`);
+            if (node.type === definitionId) {
+                result.push(next);
+                if (result.length > MAX_SCOPE_INSTANCES) {
+                    throw graphPatchError(
+                        "scoped_instance_limit_exceeded",
+                        `Scoped instance expansion exceeds ${MAX_SCOPE_INSTANCES} paths.`,
+                    );
+                }
+            }
+            if (stack.has(node.type)) {
+                throw graphPatchError(
+                    "scoped_definition_cycle",
+                    `Definition recursion through ${node.type} is not mutation-safe.`,
+                );
+            }
+            visit(definition, next, new Set([...stack, node.type]));
+        }
+    };
+    visit(rootSnapshot, [], new Set());
+    return result.sort(compareScopePaths);
+}
+
+
+function assertAffectedScopePaths(scope, observedPaths) {
+    if (!valuesEqual(scope.affected_scope_paths, observedPaths)) {
+        throw graphPatchError(
+            "affected_scope_paths_mismatch",
+            "The acknowledged affected scope paths are not complete for this definition.",
+        );
+    }
+    if (!observedPaths.some(path => valuesEqual(path, scope.scope_path))) {
+        throw graphPatchError(
+            "selected_scope_path_missing",
+            "The selected scope path is absent from the affected instance inventory.",
+        );
+    }
+    if (scope.edit_mode === "instance" && observedPaths.length !== 1) {
+        throw graphPatchError(
+            "instance_detach_not_supported",
+            "A reused definition cannot be changed in instance mode.",
+        );
+    }
+}
+
+
+function scopedLinkAlias(link, aliases, label) {
+    const present = aliases.filter(alias => Object.prototype.hasOwnProperty.call(link, alias));
+    if (present.length === 0) return undefined;
+    const value = link[present[0]];
+    if (present.slice(1).some(alias => !typedValuesEqual(value, link[alias]))) {
+        throw graphPatchError(
+            "conflicting_scoped_link_aliases",
+            `Scoped link aliases for ${label} must contain one exact typed value.`,
+            { aliases: present },
+        );
+    }
+    return value;
+}
+
+
+function validateScopedLinkParts(parts) {
+    for (const [field, value] of [
+        ["id", parts.id],
+        ["source", parts.sourceId],
+        ["target", parts.targetId],
+    ]) {
+        if (
+            !(
+                (typeof value === "number" && Number.isInteger(value))
+                || (typeof value === "string" && value.length > 0)
+            )
+        ) {
+            throw graphPatchError("invalid_scoped_link", `Scoped link ${field} is invalid.`);
+        }
+    }
+    if (!isIndex(parts.sourceSlot) || !isIndex(parts.targetSlot)) {
+        throw graphPatchError("invalid_scoped_link", "Scoped link slot indexes are invalid.");
+    }
+    if (parts.type !== undefined && parts.type !== null && (
+        typeof parts.type !== "string" || !parts.type
+    )) {
+        throw graphPatchError("invalid_scoped_link", "Scoped link type is invalid.");
+    }
+    return parts;
+}
+
+
+function linkParts(link) {
+    if (Array.isArray(link)) {
+        if (link.length < 5 || link.length > 6) {
+            throw graphPatchError(
+                "invalid_scoped_link",
+                "Scoped link arrays need five or six exact fields.",
+            );
+        }
+        return validateScopedLinkParts({
+            id: link[0],
+            sourceId: link[1],
+            sourceSlot: link[2],
+            targetId: link[3],
+            targetSlot: link[4],
+            type: link.length === 6 ? link[5] : null,
+        });
+    }
+    if (!isRecord(link)) {
+        throw graphPatchError("invalid_scoped_link", "A scoped link must be an array or object.");
+    }
+    return validateScopedLinkParts({
+        id: scopedLinkAlias(link, ["id", "link_id"], "id"),
+        sourceId: scopedLinkAlias(
+            link,
+            ["origin_id", "source_id", "source_node_id", "from_node_id"],
+            "source",
+        ),
+        sourceSlot: scopedLinkAlias(
+            link,
+            ["origin_slot", "source_slot", "source_output_index"],
+            "source slot",
+        ),
+        targetId: scopedLinkAlias(
+            link,
+            ["target_id", "target_node_id", "to_node_id"],
+            "target",
+        ),
+        targetSlot: scopedLinkAlias(
+            link,
+            ["target_slot", "target_input_index"],
+            "target slot",
+        ),
+        type: scopedLinkAlias(link, ["type", "link_type"], "type"),
+    });
+}
+
+
+function multiset(values) {
+    const result = new Map();
+    for (const value of values) {
+        const key = typedIdKey(value);
+        result.set(key, (result.get(key) || 0) + 1);
+    }
+    return result;
+}
+
+
+function assertSameMultiset(left, right, label) {
+    const leftSet = multiset(left);
+    const rightSet = multiset(right);
+    if (
+        leftSet.size !== rightSet.size
+        || [...leftSet].some(([key, count]) => rightSet.get(key) !== count)
+    ) {
+        throw graphPatchError("scoped_boundary_bookkeeping_mismatch", `${label} linkIds are stale.`);
+    }
+}
+
+
+function attestDefinitionBoundaryBookkeeping(definition) {
+    const inputs = collectionEntries(definition?.inputs ?? [], "definition.inputs")
+        .map(([, port]) => port);
+    const outputs = collectionEntries(definition?.outputs ?? [], "definition.outputs")
+        .map(([, port]) => port);
+    const inputLinks = inputs.map(() => []);
+    const outputLinks = outputs.map(() => []);
+    for (const raw of collectionEntries(definition?.links ?? [], "definition.links").map(([, link]) => link)) {
+        const link = linkParts(raw);
+        if (
+            typedValuesEqual(link.sourceId, GRAPH_PATCH_SCOPE_OUTPUT_RUNTIME_ID)
+            || typedValuesEqual(link.targetId, GRAPH_PATCH_SCOPE_INPUT_RUNTIME_ID)
+        ) {
+            throw graphPatchError(
+                "invalid_scoped_boundary_direction",
+                "A scoped link uses a virtual boundary in the wrong direction.",
+            );
+        }
+        if (typedValuesEqual(link.sourceId, GRAPH_PATCH_SCOPE_INPUT_RUNTIME_ID)) {
+            if (link.sourceSlot >= inputLinks.length) {
+                throw graphPatchError(
+                    "scoped_boundary_slot_out_of_range",
+                    "A scoped input-boundary link references an absent slot.",
+                );
+            }
+            inputLinks[link.sourceSlot].push(link.id);
+        }
+        if (typedValuesEqual(link.targetId, GRAPH_PATCH_SCOPE_OUTPUT_RUNTIME_ID)) {
+            if (link.targetSlot >= outputLinks.length) {
+                throw graphPatchError(
+                    "scoped_boundary_slot_out_of_range",
+                    "A scoped output-boundary link references an absent slot.",
+                );
+            }
+            outputLinks[link.targetSlot].push(link.id);
+        }
+    }
+    inputs.forEach((port, index) => {
+        if (!Array.isArray(port?.linkIds)) {
+            throw graphPatchError("scoped_boundary_bookkeeping_mismatch", `inputs[${index}].linkIds is absent.`);
+        }
+        assertSameMultiset(port.linkIds, inputLinks[index], `inputs[${index}]`);
+    });
+    outputs.forEach((port, index) => {
+        if (!Array.isArray(port?.linkIds)) {
+            throw graphPatchError("scoped_boundary_bookkeeping_mismatch", `outputs[${index}].linkIds is absent.`);
+        }
+        assertSameMultiset(port.linkIds, outputLinks[index], `outputs[${index}]`);
+    });
+}
+
+
+async function attestScopeAuthority(rootSnapshot, request, expectedDefinitionHash) {
+    attestSharedDefinitionCounters(rootSnapshot, "current workflow");
+    const { definitions, definition } = resolveSerializedScope(rootSnapshot, request.scope);
+    const actualHash = await workflowScopeDefinitionHash(definition);
+    if (actualHash !== expectedDefinitionHash) {
+        throw graphPatchError(
+            "scoped_definition_precondition_failed",
+            "The selected subgraph definition hash no longer matches the scoped patch.",
+            { expected: expectedDefinitionHash, actual: actualHash },
+        );
+    }
+    for (const [kind, identity] of publicBoundaryRefs(request.public_plan)) {
+        boundaryPort(definition, kind, identity);
+    }
+    const affected = enumerateScopeInstances(rootSnapshot, request.scope.definition_id, definitions);
+    assertAffectedScopePaths(request.scope, affected);
+    attestDefinitionBoundaryBookkeeping(definition);
+    for (const { id } of payloadNodes(definition, "definition")) {
+        if ([GRAPH_PATCH_SCOPE_INPUT_RUNTIME_ID, GRAPH_PATCH_SCOPE_OUTPUT_RUNTIME_ID].includes(id)) {
+            throw graphPatchError(
+                "scoped_runtime_id_collision",
+                "The definition uses an ID reserved by the private scoped adapter.",
+            );
+        }
+    }
+    return { definition: clone(definition), definition_hash: actualHash };
+}
+
+
+function exactRootSharedCounter(root, legacyName, stateName, label) {
+    const values = [];
+    if (Object.prototype.hasOwnProperty.call(root || {}, legacyName)) {
+        values.push(root[legacyName]);
+    }
+    if (isRecord(root?.state) && Object.prototype.hasOwnProperty.call(root.state, stateName)) {
+        values.push(root.state[stateName]);
+    }
+    if (
+        values.length === 0
+        || values.some(value => !Number.isSafeInteger(value) || value < 0)
+        || values.slice(1).some(value => !typedValuesEqual(value, values[0]))
+    ) {
+        throw graphPatchError(
+            "scoped_shared_counter_mismatch",
+            `The ${label} does not expose one exact shared ${stateName} counter.`,
+        );
+    }
+    return values[0];
+}
+
+
+function attestSharedDefinitionCounters(root, label) {
+    const lastNodeId = exactRootSharedCounter(root, "last_node_id", "lastNodeId", label);
+    const lastLinkId = exactRootSharedCounter(root, "last_link_id", "lastLinkId", label);
+    const definitions = collectionEntries(
+        root?.definitions?.subgraphs ?? [],
+        `${label}.definitions.subgraphs`,
+    );
+    for (const [index, definition] of definitions) {
+        if (
+            !isRecord(definition?.state)
+            || !typedValuesEqual(definition.state.lastNodeId, lastNodeId)
+            || !typedValuesEqual(definition.state.lastLinkId, lastLinkId)
+        ) {
+            throw graphPatchError(
+                "scoped_shared_counter_mismatch",
+                `Definition ${String(definition?.id ?? index)} diverges from the root shared counters.`,
+            );
+        }
+    }
+    return { lastNodeId, lastLinkId };
+}
+
+
+function withoutSharedRootCounters(value) {
+    const detached = clone(value);
+    if (isRecord(detached)) {
+        delete detached.last_node_id;
+        delete detached.last_link_id;
+        delete detached.revision;
+        if (isRecord(detached.state)) {
+            delete detached.state.lastNodeId;
+            delete detached.state.lastLinkId;
+        }
+        for (const [, definition] of collectionEntries(
+            detached?.definitions?.subgraphs ?? [],
+            "workflow.definitions.subgraphs",
+        )) {
+            if (!isRecord(definition?.state)) continue;
+            delete definition.state.lastNodeId;
+            delete definition.state.lastLinkId;
+        }
+    }
+    return detached;
+}
+
+
+function replaceDefinitionExact(rootSnapshot, definitionId, replacement) {
+    const detached = clone(rootSnapshot);
+    const raw = detached?.definitions?.subgraphs;
+    let matches = 0;
+    if (Array.isArray(raw)) {
+        detached.definitions.subgraphs = raw.map(definition => {
+            if (definition?.id !== definitionId) return definition;
+            matches += 1;
+            return clone(replacement);
+        });
+    } else if (isRecord(raw)) {
+        for (const [key, definition] of Object.entries(raw)) {
+            const id = definition?.id ?? key;
+            if (id !== definitionId) continue;
+            matches += 1;
+            raw[key] = clone(replacement);
+        }
+    }
+    if (matches !== 1) {
+        throw graphPatchError(
+            "scoped_definition_ambiguous",
+            `Expected one root definition ${definitionId}; found ${matches}.`,
+        );
+    }
+    return detached;
+}
+
+
+function definitionEnvelope(definition) {
+    const detached = clone(definition);
+    delete detached.nodes;
+    delete detached.links;
+    delete detached.revision;
+    if (isRecord(detached.state)) {
+        delete detached.state.lastNodeId;
+        delete detached.state.lastLinkId;
+    }
+    for (const field of ["inputs", "outputs"]) {
+        for (const [, port] of collectionEntries(detached[field] ?? [], `definition.${field}`)) {
+            if (isRecord(port)) delete port.linkIds;
+        }
+    }
+    return detached;
+}
+
+
+function assertScopedRootPreserved(beforeRoot, afterRoot, definitionId, beforeDefinition, afterDefinition) {
+    attestSharedDefinitionCounters(beforeRoot, "baseline workflow");
+    attestSharedDefinitionCounters(afterRoot, "refined workflow");
+    if (!valuesEqual(definitionEnvelope(beforeDefinition), definitionEnvelope(afterDefinition))) {
+        throw graphPatchError(
+            "scoped_definition_envelope_changed",
+            "The scoped edit changed undeclared definition metadata, ports, groups, reroutes, or extra fields.",
+        );
+    }
+    const outsideBefore = withoutSharedRootCounters(beforeRoot);
+    const outsideAfter = withoutSharedRootCounters(
+        replaceDefinitionExact(afterRoot, definitionId, beforeDefinition),
+    );
+    if (!valuesEqual(outsideBefore, outsideAfter)) {
+        throw graphPatchError(
+            "scoped_root_preservation_failed",
+            "The scoped edit changed the root workflow outside its selected definition.",
+        );
+    }
 }
 
 
@@ -651,10 +2021,9 @@ function validateNormalizedPlan(plan) {
 }
 
 
-function validateAdapter(adapter, plan) {
+function validateAdapter(adapter, plan, includeWorkflowCommit = true) {
     const required = [
         "captureWorkflow",
-        "restoreWorkflow",
         "getNode",
         "listConnections",
         "createNode",
@@ -663,8 +2032,8 @@ function validateAdapter(adapter, plan) {
         "disconnectConnection",
         "connectNodes",
         "removeNodes",
-        "setWorkflowExtra",
     ];
+    if (includeWorkflowCommit) required.push("restoreWorkflow", "setWorkflowExtra");
     if (plan.add_edges.some(edge => edge.target.mode === "convert_widget")) {
         required.push("convertWidgetToInput");
     }
@@ -688,6 +2057,19 @@ function validateAdapter(adapter, plan) {
         throw graphPatchError(
             "invalid_graph_patch_adapter",
             `Graph patch adapter is missing: ${missing.join(", ")}.`,
+        );
+    }
+}
+
+
+function validateRootAdapter(adapter, scoped) {
+    const required = ["captureWorkflow", "restoreWorkflow", "setWorkflowExtra"];
+    if (scoped) required.push("resolveScopedGraph");
+    const missing = required.filter(name => typeof adapter?.[name] !== "function");
+    if (missing.length > 0) {
+        throw graphPatchError(
+            "invalid_graph_patch_adapter",
+            `Graph patch root adapter is missing: ${missing.join(", ")}.`,
         );
     }
 }
@@ -886,6 +2268,116 @@ function schemaInputOccurrence(inputs, endpoint) {
 }
 
 
+function convertedRetryTargetInput(node, endpoint) {
+    const candidates = liveNodeInputs(node).filter(input => (
+        input.name === endpoint.input
+        && manifestAcceptsType(input, endpoint.type)
+    ));
+    if (candidates.length === 0) return null;
+
+    const identities = candidates.map(input => {
+        const schemaIndices = [input.schema_index, input.input_index]
+            .filter(value => value !== undefined && value !== null);
+        const schemaIndexValid = (
+            schemaIndices.every(isIndex)
+            && new Set(schemaIndices).size <= 1
+        );
+        const occurrenceAvailable = (
+            input.occurrence_index !== undefined
+            && input.occurrence_index !== null
+        );
+        return {
+            input,
+            schema_index: schemaIndices.length > 0 && schemaIndexValid
+                ? schemaIndices[0]
+                : null,
+            schema_index_available: schemaIndices.length > 0,
+            schema_index_valid: schemaIndexValid,
+            occurrence_index: occurrenceAvailable ? input.occurrence_index : null,
+            occurrence_available: occurrenceAvailable,
+            occurrence_valid: !occurrenceAvailable || isIndex(input.occurrence_index),
+        };
+    });
+    if (identities.some(identity => (
+        !identity.schema_index_valid || !identity.occurrence_valid
+    ))) return null;
+
+    if (identities.length === 1) {
+        const [identity] = identities;
+        if (
+            identity.schema_index_available
+            && identity.schema_index !== endpoint.input_index
+        ) return null;
+        if (
+            identity.occurrence_available
+            && identity.occurrence_index !== endpoint.occurrence_index
+        ) return null;
+        return identity.input;
+    }
+
+    // Duplicate live sockets are safe only when every candidate carries enough
+    // schema identity to rule it in or out. An unlabelled duplicate could be the
+    // converted endpoint, so never infer its occurrence from live ordering.
+    if (identities.some(identity => !identity.schema_index_available)) return null;
+    const matchingSchemaIndex = identities.filter(identity => (
+        identity.schema_index === endpoint.input_index
+    ));
+    if (matchingSchemaIndex.length === 1) {
+        const [identity] = matchingSchemaIndex;
+        if (
+            identity.occurrence_available
+            && identity.occurrence_index !== endpoint.occurrence_index
+        ) return null;
+        return identity.input;
+    }
+    if (
+        matchingSchemaIndex.length === 0
+        || matchingSchemaIndex.some(identity => !identity.occurrence_available)
+    ) return null;
+    const matchingOccurrence = matchingSchemaIndex.filter(identity => (
+        identity.occurrence_index === endpoint.occurrence_index
+    ));
+    return matchingOccurrence.length === 1 ? matchingOccurrence[0].input : null;
+}
+
+
+async function resolveAppliedPostconditionEdge(edge, aliases, adapter) {
+    if (edge.target.mode !== "convert_widget") {
+        return await resolveRuntimeEdge(edge, aliases, adapter);
+    }
+    const sourceId = resolveRef(edge.source.ref, aliases);
+    const targetId = resolveRef(edge.target.ref, aliases);
+    if (sourceId === undefined || targetId === undefined) {
+        return { ready: false, reason: "node_ref_unresolved" };
+    }
+    const sourceNode = await adapter.getNode(sourceId);
+    const targetNode = await adapter.getNode(targetId);
+    if (!sourceNode || !targetNode) return { ready: false, reason: "node_missing" };
+    const sourceState = exactOutput(sourceNode, edge.source);
+    if (!sourceState.ready) return sourceState;
+    const schemaInput = schemaInputOccurrence(schemaNodeInputs(targetNode), edge.target);
+    if (!schemaInput) return { ready: false, reason: "target_schema_input_missing" };
+    const input = convertedRetryTargetInput(targetNode, edge.target);
+    if (!input) return { ready: false, reason: "converted_target_ambiguous" };
+    return {
+        ready: true,
+        sourceId,
+        targetId,
+        sourceNode,
+        targetNode,
+        runtime: {
+            source_node_id: sourceId,
+            source_output_index: edge.source.output_index,
+            source_output: edge.source.output,
+            target_node_id: targetId,
+            target_input_index: input.socket_index,
+            target_input: edge.target.input,
+            type: edge.source.type,
+        },
+    };
+}
+
+
 function exactTargetState(node, endpoint, convertedSocketIndex = null) {
     const schemaInput = schemaInputOccurrence(schemaNodeInputs(node), endpoint);
     if (!schemaInput) return { ready: false, reason: "target_schema_input_missing" };
@@ -999,6 +2491,21 @@ function observedExactKey(connection) {
 }
 
 
+function observedTypedExactKey(connection) {
+    return JSON.stringify([
+        typeof connection.source_node_id,
+        connection.source_node_id,
+        connection.source_output_index,
+        typeof connection.target_node_id,
+        connection.target_node_id,
+        connection.target_input_index,
+        connection.source_output ?? "",
+        connection.target_input ?? "",
+        connection.type ?? "",
+    ]);
+}
+
+
 function orderedRuntimeRemovals(connections) {
     return [...connections].sort((left, right) => {
         const leftTarget = idKey(left.target_node_id);
@@ -1078,6 +2585,19 @@ function connectionDetailsMatch(expected, observed) {
         nodeIdsEqual(expected.source_node_id, observed.source_node_id)
         && expected.source_output_index === observed.source_output_index
         && nodeIdsEqual(expected.target_node_id, observed.target_node_id)
+        && expected.target_input_index === observed.target_input_index
+        && expected.source_output === observed.source_output
+        && expected.target_input === observed.target_input
+        && expected.type === observed.type
+    );
+}
+
+
+function typedConnectionDetailsMatch(expected, observed) {
+    return (
+        typedValuesEqual(expected.source_node_id, observed.source_node_id)
+        && expected.source_output_index === observed.source_output_index
+        && typedValuesEqual(expected.target_node_id, observed.target_node_id)
         && expected.target_input_index === observed.target_input_index
         && expected.source_output === observed.source_output
         && expected.target_input === observed.target_input
@@ -1462,20 +2982,108 @@ function emptyLedger() {
 }
 
 
+function ledgerNodeId(value) {
+    return (
+        (typeof value === "number" && Number.isInteger(value))
+        || (
+            typeof value === "string"
+            && value.length > 0
+            && value.length <= LEDGER_NODE_ID_STRING_LIMIT
+        )
+    );
+}
+
+
+function assertLedgerEntry(entry, applicationId) {
+    if (!isRecord(entry)) {
+        throw graphPatchError("invalid_graph_patch_ledger", "A GraphPatch ledger entry is malformed.");
+    }
+    const fields = Object.keys(entry).sort();
+    const v2Fields = [
+        "aliases", "created_node_ids", "patch_hash", "removed_node_ids", "result_content_hash",
+    ].sort();
+    const v3Fields = [...v2Fields, "result_definition_hash"].sort();
+    if (!valuesEqual(fields, v2Fields) && !valuesEqual(fields, v3Fields)) {
+        throw graphPatchError(
+            "invalid_graph_patch_ledger",
+            `GraphPatch ledger entry ${applicationId} has undeclared fields.`,
+        );
+    }
+    if (
+        !SHA256_PATTERN.test(String(entry.patch_hash || ""))
+        || !SHA256_PATTERN.test(String(entry.result_content_hash || ""))
+        || (
+            Object.prototype.hasOwnProperty.call(entry, "result_definition_hash")
+            && !SHA256_PATTERN.test(String(entry.result_definition_hash || ""))
+        )
+        || !isRecord(entry.aliases)
+        || !Array.isArray(entry.created_node_ids)
+        || !Array.isArray(entry.removed_node_ids)
+        || Object.keys(entry.aliases).length > LEDGER_ENTRY_NODE_ID_LIMIT
+        || entry.created_node_ids.length > LEDGER_ENTRY_NODE_ID_LIMIT
+        || entry.removed_node_ids.length > LEDGER_ENTRY_NODE_ID_LIMIT
+    ) {
+        throw graphPatchError(
+            "invalid_graph_patch_ledger",
+            `GraphPatch ledger entry ${applicationId} has invalid bounded facts.`,
+        );
+    }
+    const aliasEntries = Object.entries(entry.aliases);
+    if (
+        aliasEntries.some(([alias, id]) => !ALIAS_PATTERN.test(alias) || !ledgerNodeId(id))
+        || entry.created_node_ids.some(id => !ledgerNodeId(id))
+        || entry.removed_node_ids.some(id => !ledgerNodeId(id))
+        || new Set(entry.created_node_ids.map(typedIdKey)).size !== entry.created_node_ids.length
+        || new Set(entry.removed_node_ids.map(typedIdKey)).size !== entry.removed_node_ids.length
+    ) {
+        throw graphPatchError(
+            "invalid_graph_patch_ledger",
+            `GraphPatch ledger entry ${applicationId} contains invalid typed IDs.`,
+        );
+    }
+    const aliasIds = multiset(aliasEntries.map(([, id]) => id));
+    const createdIds = multiset(entry.created_node_ids);
+    if (
+        aliasIds.size !== createdIds.size
+        || [...aliasIds].some(([key, count]) => createdIds.get(key) !== count)
+    ) {
+        throw graphPatchError(
+            "invalid_graph_patch_ledger",
+            `GraphPatch ledger entry ${applicationId} aliases disagree with created IDs.`,
+        );
+    }
+}
+
+
 function readLedger(snapshot) {
     const value = snapshot?.extra?.[GRAPH_PATCH_LEDGER_KEY];
     if (value === undefined || value === null) return emptyLedger();
+    try {
+        assertStrictJSON(value, "workflow.extra.fl_mcp_graph_patch_ledger");
+    } catch (error) {
+        throw graphPatchError(
+            "invalid_graph_patch_ledger",
+            `GraphPatch ledger exceeds its strict JSON bounds (${String(error?.message || error)}).`,
+        );
+    }
     if (
         !isRecord(value)
         || value.schema !== WORKFLOW_GRAPH_PATCH_SCHEMA
         || !Array.isArray(value.order)
         || !isRecord(value.entries)
-        || value.order.some(id => (
-            typeof id !== "string"
-            || !Object.prototype.hasOwnProperty.call(value.entries, id)
-        ))
+        || value.order.length > LEDGER_LIMIT
+        || value.order.some(id => typeof id !== "string" || !APPLICATION_ID_PATTERN.test(id))
+        || new Set(value.order).size !== value.order.length
+        || Object.keys(value.entries).length !== value.order.length
+        || Object.keys(value.entries).some(id => !value.order.includes(id))
     ) {
         throw graphPatchError("invalid_graph_patch_ledger", "GraphPatch ledger is malformed.");
+    }
+    for (const applicationId of value.order) {
+        if (!Object.prototype.hasOwnProperty.call(value.entries, applicationId)) {
+            throw graphPatchError("invalid_graph_patch_ledger", "GraphPatch ledger is incomplete.");
+        }
+        assertLedgerEntry(value.entries[applicationId], applicationId);
     }
     return clone(value);
 }
@@ -2201,7 +3809,7 @@ async function verifyPatch(
             const update = updatesById.get(id) || null;
             const attachmentNames = attachmentsByExistingId.get(id) || new Set();
             const beforeObserved = preflightResult.assertedNodes.get(id) || beforeNode;
-            const afterObserved = await adapter.getNode(id) || afterNode;
+            const afterObserved = await adapter.getNode(nodeId(beforeNode)) || afterNode;
             const rules = touchedManifestRules(
                 plan,
                 id,
@@ -2313,7 +3921,7 @@ async function verifyPatch(
         }
         const metadata = observed?.properties?.[WORKFLOW_GRAPH_PATCH_PROPERTY];
         if (
-            metadata?.schema !== WORKFLOW_GRAPH_PATCH_SCHEMA
+            metadata?.schema !== request.patch_schema
             || metadata?.application_id !== request.application_id
             || metadata?.patch_hash !== request.patch_hash
             || metadata?.alias !== created.alias
@@ -2341,6 +3949,220 @@ async function verifyPatch(
         edge_count: observedConnections.length,
         preserved_edge_count: preflightResult.preservedConnections.length,
     };
+}
+
+
+async function attestAlreadyApplied(request, adapter, entry) {
+    const issues = [];
+    const aliases = isRecord(entry?.aliases) ? entry.aliases : {};
+    const expectedEntryFields = [
+        "aliases",
+        "created_node_ids",
+        "patch_hash",
+        "removed_node_ids",
+        "result_content_hash",
+        ...(request.operation === "scoped_patch" ? ["result_definition_hash"] : []),
+    ].sort();
+    if (
+        !isRecord(entry)
+        || !valuesEqual(Object.keys(entry).sort(), expectedEntryFields)
+    ) {
+        issues.push({ code: "graph_patch_ledger_shape_mismatch" });
+    }
+    const expectedAliasNames = request.plan.create_nodes.map(item => item.alias).sort();
+    if (!valuesEqual(Object.keys(aliases).sort(), expectedAliasNames)) {
+        issues.push({ code: "graph_patch_ledger_alias_mismatch" });
+    }
+    const expectedCreatedIds = request.plan.create_nodes.map(item => aliases[item.alias]);
+    if (
+        expectedCreatedIds.some(id => id === undefined)
+        || !Array.isArray(entry?.created_node_ids)
+        || !valuesEqual(entry.created_node_ids, expectedCreatedIds)
+    ) {
+        issues.push({ code: "graph_patch_ledger_created_ids_mismatch" });
+    }
+    const expectedRemovedIds = request.plan.remove_nodes.map(item => item.ref.node_id);
+    if (
+        !Array.isArray(entry?.removed_node_ids)
+        || !valuesEqual(entry.removed_node_ids, expectedRemovedIds)
+    ) {
+        issues.push({ code: "graph_patch_ledger_removed_ids_mismatch" });
+    }
+    const observedConnections = (await adapter.listConnections())
+        .map(normalizeObservedConnection)
+        .filter(Boolean);
+    const snapshot = await adapter.captureWorkflow();
+    const observedNodeIds = snapshotNodeIds(snapshot);
+    if (
+        observedNodeIds.size !== request.plan.expected_delta.final_node_count
+        || observedConnections.length !== request.plan.expected_delta.final_edge_count
+    ) {
+        issues.push({ code: "graph_patch_delta_mismatch" });
+    }
+    const removedNodeIds = new Set(
+        request.plan.remove_nodes.map(item => idKey(item.ref.node_id)),
+    );
+    for (const assertion of request.plan.assertions.nodes) {
+        if (removedNodeIds.has(idKey(assertion.ref.node_id))) continue;
+        const node = await adapter.getNode(assertion.ref.node_id);
+        if (
+            !node
+            || !typedValuesEqual(nodeId(node), assertion.ref.node_id)
+            || nodeType(node) !== assertion.node_type
+            || schemaHashOf(node) !== assertion.schema_hash
+        ) {
+            issues.push({
+                code: "graph_patch_asserted_node_mismatch",
+                node_id: assertion.ref.node_id,
+            });
+        }
+    }
+    const removedEdgeKeys = new Set(request.plan.remove_edges.map(symbolicEdgeKey));
+    for (const edge of request.plan.assertions.edges) {
+        if (removedEdgeKeys.has(symbolicEdgeKey(edge))) continue;
+        try {
+            const resolved = await resolveRuntimeEdge(edge, {}, adapter);
+            const count = resolved.ready
+                ? observedConnections.filter(item => (
+                    typedConnectionDetailsMatch(resolved.runtime, item)
+                )).length
+                : 0;
+            if (count !== 1) {
+                issues.push({ code: "graph_patch_asserted_edge_mismatch", edge: clone(edge) });
+            }
+        } catch (error) {
+            issues.push({
+                code: "graph_patch_asserted_edge_mismatch",
+                edge: clone(edge),
+                reason: error.code || "graph_patch_slot_mismatch",
+            });
+        }
+    }
+    for (const created of request.plan.create_nodes) {
+        const id = aliases[created.alias];
+        const node = id === undefined ? null : await adapter.getNode(id);
+        if (
+            !node
+            || !typedValuesEqual(nodeId(node), id)
+            || nodeType(node) !== created.node_type
+            || schemaHashOf(node) !== created.schema_hash
+        ) {
+            issues.push({ code: "graph_patch_created_node_mismatch", alias: created.alias });
+            continue;
+        }
+        try {
+            assertValues(node, created.values, `create_nodes.${created.alias}`);
+        } catch (error) {
+            issues.push({ code: error.code || "graph_patch_value_mismatch", alias: created.alias });
+        }
+        const metadata = node?.properties?.[WORKFLOW_GRAPH_PATCH_PROPERTY];
+        if (
+            metadata?.schema !== request.patch_schema
+            || metadata?.application_id !== request.application_id
+            || metadata?.patch_hash !== request.patch_hash
+            || metadata?.alias !== created.alias
+            || metadata?.schema_hash !== created.schema_hash
+        ) issues.push({ code: "graph_patch_created_metadata_mismatch", alias: created.alias });
+        if (created.layout_hint && !layoutMatches(node, created.layout_hint)) {
+            issues.push({ code: "graph_patch_layout_mismatch", alias: created.alias });
+        }
+    }
+    for (const update of request.plan.update_nodes) {
+        const node = await adapter.getNode(update.ref.node_id);
+        if (
+            !node
+            || !typedValuesEqual(nodeId(node), update.ref.node_id)
+            || nodeType(node) !== update.node_type
+            || schemaHashOf(node) !== update.schema_hash
+            || !updatedValuesMatch(node, node, update)
+        ) issues.push({ code: "graph_patch_update_mismatch", node_id: update.ref.node_id });
+        if (update.layout_hint && !layoutMatches(node, update.layout_hint)) {
+            issues.push({ code: "graph_patch_layout_mismatch", node_id: update.ref.node_id });
+        }
+    }
+    for (const removal of request.plan.remove_nodes) {
+        if (await adapter.getNode(removal.ref.node_id)) {
+            issues.push({ code: "graph_patch_removed_node_present", node_id: removal.ref.node_id });
+        }
+    }
+    for (const attachment of request.plan.attachments) {
+        const id = resolveRef(attachment.ref, aliases);
+        try {
+            if (!await adapter.verifyAttachmentExact(id, clone(attachment))) {
+                issues.push({
+                    code: "graph_patch_attachment_mismatch",
+                    input: attachment.input,
+                });
+            }
+        } catch (error) {
+            issues.push({
+                code: error.code || "graph_patch_attachment_mismatch",
+                input: attachment.input,
+            });
+        }
+    }
+    const resolvedAddedEdges = [];
+    for (const edge of request.plan.add_edges) {
+        try {
+            const resolved = await resolveAppliedPostconditionEdge(edge, aliases, adapter);
+            const count = resolved.ready
+                ? observedConnections.filter(item => (
+                    typedConnectionDetailsMatch(resolved.runtime, item)
+                )).length
+                : 0;
+            if (count !== 1) {
+                issues.push({ code: "graph_patch_edge_mismatch", edge: clone(edge) });
+            } else {
+                resolvedAddedEdges.push({ edge, runtime: resolved.runtime });
+            }
+        } catch (error) {
+            issues.push({
+                code: "graph_patch_edge_mismatch",
+                edge: clone(edge),
+                reason: error.code || "graph_patch_slot_mismatch",
+            });
+        }
+    }
+    for (const created of request.plan.create_nodes) {
+        const id = aliases[created.alias];
+        if (id === undefined) continue;
+        const observedIncident = observedConnections.filter(connection => (
+            typedValuesEqual(connection.source_node_id, id)
+            || typedValuesEqual(connection.target_node_id, id)
+        ));
+        const expectedIncident = resolvedAddedEdges
+            .filter(item => (
+                item.edge.source.ref.alias === created.alias
+                || item.edge.target.ref.alias === created.alias
+            ))
+            .map(item => item.runtime);
+        if (!countsEqual(
+            countKeys(observedIncident, observedTypedExactKey),
+            countKeys(expectedIncident, observedTypedExactKey),
+        )) {
+            issues.push({
+                code: "graph_patch_created_incident_edge_mismatch",
+                alias: created.alias,
+            });
+        }
+    }
+    for (const edge of request.plan.remove_edges) {
+        const resolved = await resolveRuntimeEdge(edge, {}, adapter);
+        if (
+            resolved.ready
+            && observedConnections.some(item => (
+                typedConnectionDetailsMatch(resolved.runtime, item)
+            ))
+        ) issues.push({ code: "graph_patch_removed_edge_present", edge: clone(edge) });
+    }
+    if (issues.length > 0) {
+        throw graphPatchError(
+            "graph_patch_idempotency_conflict",
+            "The persisted GraphPatch ledger does not match the current graph postconditions.",
+            { issues },
+        );
+    }
+    return { valid: true, issues: [], idempotency_verified: true };
 }
 
 
@@ -2373,67 +4195,54 @@ async function restoreSnapshot(adapter, snapshot, expectedGraphHash) {
 
 
 /**
- * Apply one canonical GraphPatch v2. The function never queues execution and
- * restores the complete pre-mutation workflow after every guarded failure.
+ * Apply one canonical root GraphPatch v2 or definition-scoped GraphPatch v3.
+ * Both contracts use the same mutation scheduler and verifier. The complete
+ * root workflow remains the rollback, race, commit, and idempotency authority.
  */
 export async function applyWorkflowGraphPatchAtomic(rawRequest, adapter) {
     let request;
     try {
-        request = normalizeRequest(rawRequest);
-        validateAdapter(adapter, request.plan);
+        request = normalizeApplyRequest(rawRequest);
+        validateRootAdapter(adapter, request.operation === "scoped_patch");
+        if (request.operation === "patch") validateAdapter(adapter, request.plan);
     } catch (error) {
         return failureResult(rawRequest, error);
     }
 
-    let beforeSnapshot;
+    let beforeRootSnapshot;
     let beforeGraphHash;
+    let graphAdapter = adapter;
+    let graphBeforeSnapshot;
+    let scopeBeforeDefinition = null;
     let mutationStarted = false;
     let verification = { valid: false, issues: [] };
     const aliases = {};
     const createdNodeIds = [];
     const removedNodeIds = request.plan.remove_nodes.map(item => item.ref.node_id);
     try {
-        beforeSnapshot = await adapter.captureWorkflow();
-        assertUnambiguousSnapshotNodeIds(beforeSnapshot);
-        beforeGraphHash = await workflowGraphHash(beforeSnapshot);
-        const ledger = readLedger(beforeSnapshot);
+        beforeRootSnapshot = await adapter.captureWorkflow();
+        assertUnambiguousSnapshotNodeIds(beforeRootSnapshot);
+        beforeGraphHash = await workflowGraphHash(beforeRootSnapshot);
+        const ledger = readLedger(beforeRootSnapshot);
         const existing = Object.prototype.hasOwnProperty.call(
             ledger.entries,
             request.application_id,
         ) ? ledger.entries[request.application_id] : null;
+        if (existing?.patch_hash !== undefined && existing.patch_hash !== request.patch_hash) {
+            throw graphPatchError(
+                "graph_patch_idempotency_conflict",
+                "This application ID is bound to a different GraphPatch hash.",
+            );
+        }
         if (existing) {
-            if (existing.patch_hash !== request.patch_hash) {
-                throw graphPatchError(
-                    "graph_patch_idempotency_conflict",
-                    "This application ID is bound to a different GraphPatch hash.",
-                );
-            }
-            const currentContentHash = await contentGraphHash(beforeSnapshot);
+            const currentContentHash = await contentGraphHash(beforeRootSnapshot);
             if (currentContentHash !== existing.result_content_hash) {
                 throw graphPatchError(
                     "graph_patch_idempotency_conflict",
                     "The graph changed after this GraphPatch was applied.",
                 );
             }
-            return {
-                success: true,
-                applied: false,
-                already_applied: true,
-                patch_schema: WORKFLOW_GRAPH_PATCH_SCHEMA,
-                application_id: request.application_id,
-                patch_hash: request.patch_hash,
-                operation: "patch",
-                expected_workflow_identity: request.plan.expected_workflow_identity,
-                graph_hash: beforeGraphHash,
-                aliases: clone(existing.aliases || {}),
-                created_node_ids: clone(existing.created_node_ids || []),
-                removed_node_ids: clone(existing.removed_node_ids || []),
-                verification: { valid: true, issues: [], idempotency_verified: true },
-                rollback: emptyRollback(),
-                queued: false,
-            };
-        }
-        if (beforeGraphHash !== request.plan.expected_graph_hash) {
+        } else if (beforeGraphHash !== request.plan.expected_graph_hash) {
             throw graphPatchError(
                 "graph_patch_precondition_failed",
                 "The active graph hash no longer matches this GraphPatch.",
@@ -2441,23 +4250,106 @@ export async function applyWorkflowGraphPatchAtomic(rawRequest, adapter) {
             );
         }
 
+        if (request.operation === "scoped_patch") {
+            const expectedDefinitionHash = existing?.result_definition_hash
+                || request.scope.definition_hash;
+            if (!SHA256_PATTERN.test(String(expectedDefinitionHash || ""))) {
+                throw graphPatchError(
+                    "graph_patch_idempotency_conflict",
+                    "The scoped ledger lacks an exact result definition hash.",
+                );
+            }
+            const scopeFacts = await attestScopeAuthority(
+                beforeRootSnapshot,
+                request,
+                expectedDefinitionHash,
+            );
+            scopeBeforeDefinition = scopeFacts.definition;
+            graphAdapter = await adapter.resolveScopedGraph({
+                scope: clone(request.scope),
+                input_runtime_id: GRAPH_PATCH_SCOPE_INPUT_RUNTIME_ID,
+                output_runtime_id: GRAPH_PATCH_SCOPE_OUTPUT_RUNTIME_ID,
+                input_node_type: SCOPE_INPUT_NODE_TYPE,
+                output_node_type: SCOPE_OUTPUT_NODE_TYPE,
+                input_schema_hash: SCOPE_INPUT_SCHEMA_HASH,
+                output_schema_hash: SCOPE_OUTPUT_SCHEMA_HASH,
+            });
+            validateAdapter(graphAdapter, request.plan, false);
+            if (typeof graphAdapter?.captureDefinition !== "function") {
+                throw graphPatchError(
+                    "invalid_graph_patch_adapter",
+                    "The scoped adapter cannot capture its exact native definition.",
+                );
+            }
+            const nativeDefinition = projectNativeScopeDefinition(
+                await graphAdapter.captureDefinition(),
+            );
+            if (
+                !valuesEqual(nativeDefinition, scopeBeforeDefinition)
+                || await workflowScopeDefinitionHash(nativeDefinition) !== expectedDefinitionHash
+            ) {
+                throw graphPatchError(
+                    "scoped_native_definition_mismatch",
+                    "The native Subgraph object differs from the serialized scope authority.",
+                );
+            }
+            graphBeforeSnapshot = await graphAdapter.captureWorkflow();
+            assertUnambiguousSnapshotNodeIds(graphBeforeSnapshot);
+
+            // Close the async path/hash/native-resolution race before either a
+            // local graph mutation or a shared root counter can change.
+            const preEffectRoot = await adapter.captureWorkflow();
+            if (!valuesEqual(preEffectRoot, beforeRootSnapshot)) {
+                throw graphPatchError(
+                    "concurrent_workflow_edit",
+                    "The root workflow changed during scoped preflight.",
+                );
+            }
+        } else {
+            graphBeforeSnapshot = beforeRootSnapshot;
+        }
+
+        if (existing) {
+            verification = await withReadGuard(
+                graphAdapter,
+                () => attestAlreadyApplied(request, graphAdapter, existing),
+            );
+            return {
+                success: true,
+                applied: false,
+                already_applied: true,
+                patch_schema: request.patch_schema,
+                application_id: request.application_id,
+                patch_hash: request.patch_hash,
+                operation: request.operation,
+                expected_workflow_identity: request.plan.expected_workflow_identity,
+                graph_hash: beforeGraphHash,
+                aliases: clone(existing.aliases || {}),
+                created_node_ids: clone(existing.created_node_ids || []),
+                removed_node_ids: clone(existing.removed_node_ids || []),
+                verification,
+                rollback: emptyRollback(),
+                queued: false,
+            };
+        }
+
         const preflightResult = await withReadGuard(
-            adapter,
-            () => preflight(request, adapter, beforeSnapshot),
+            graphAdapter,
+            () => preflight(request, graphAdapter, graphBeforeSnapshot),
         );
         const delayMs = revealDelayMs(mutationStepCount(request.plan));
-        const initialNodeIds = snapshotNodeIds(beforeSnapshot);
+        const initialNodeIds = snapshotNodeIds(graphBeforeSnapshot);
         const valueTasks = [];
 
         for (const connection of orderedRuntimeRemovals(preflightResult.removedRuntime)) {
             mutationStarted = true;
-            await adapter.disconnectConnection(clone(connection));
-            await reveal(adapter, { phase: "disconnect", connection: clone(connection) }, delayMs);
+            await graphAdapter.disconnectConnection(clone(connection));
+            await reveal(graphAdapter, { phase: "disconnect", connection: clone(connection) }, delayMs);
         }
 
         for (const created of orderedCreatedNodes(request.plan)) {
             mutationStarted = true;
-            const observed = await adapter.createNode({
+            const observed = await graphAdapter.createNode({
                 alias: created.alias,
                 node_type: created.node_type,
                 schema_hash: created.schema_hash,
@@ -2477,8 +4369,8 @@ export async function applyWorkflowGraphPatchAtomic(rawRequest, adapter) {
             }
             aliases[created.alias] = id;
             createdNodeIds.push(id);
-            await adapter.setNodeMetadata(id, {
-                schema: WORKFLOW_GRAPH_PATCH_SCHEMA,
+            await graphAdapter.setNodeMetadata(id, {
+                schema: request.patch_schema,
                 application_id: request.application_id,
                 patch_hash: request.patch_hash,
                 alias: created.alias,
@@ -2486,7 +4378,7 @@ export async function applyWorkflowGraphPatchAtomic(rawRequest, adapter) {
             });
             const finishCreatedValues = async () => {
                 if (created.layout_hint) {
-                    await adapter.setNodeLayoutExact(id, clone(created.layout_hint));
+                    await graphAdapter.setNodeLayoutExact(id, clone(created.layout_hint));
                 }
             };
             if (Object.keys(created.values).length > 0) {
@@ -2499,16 +4391,16 @@ export async function applyWorkflowGraphPatchAtomic(rawRequest, adapter) {
             } else {
                 await finishCreatedValues();
             }
-            await reveal(adapter, { phase: "node", node_id: id, alias: created.alias }, delayMs);
+            await reveal(graphAdapter, { phase: "node", node_id: id, alias: created.alias }, delayMs);
         }
 
         for (const update of request.plan.update_nodes) {
             mutationStarted = true;
             const finishUpdatedValues = async () => {
                 if (update.layout_hint) {
-                    await adapter.setNodeLayoutExact(update.ref.node_id, clone(update.layout_hint));
+                    await graphAdapter.setNodeLayoutExact(update.ref.node_id, clone(update.layout_hint));
                 }
-                await reveal(adapter, { phase: "update", node_id: update.ref.node_id }, delayMs);
+                await reveal(graphAdapter, { phase: "update", node_id: update.ref.node_id }, delayMs);
             };
             if (Object.keys(update.set_values).length > 0) {
                 valueTasks.push(pendingValueTask(
@@ -2526,7 +4418,7 @@ export async function applyWorkflowGraphPatchAtomic(rawRequest, adapter) {
         const { runtimeEdges, conversionSockets } = await scheduleGraphDependencies(
             request.plan,
             aliases,
-            adapter,
+            graphAdapter,
             delayMs,
             valueTasks,
         );
@@ -2535,7 +4427,7 @@ export async function applyWorkflowGraphPatchAtomic(rawRequest, adapter) {
         for (const attachment of request.plan.attachments) {
             mutationStarted = true;
             const targetId = resolveRef(attachment.ref, aliases);
-            const beforeAssignment = await adapter.getNode(targetId);
+            const beforeAssignment = await graphAdapter.getNode(targetId);
             const targetState = beforeAssignment
                 ? exactAttachmentState(beforeAssignment, attachment)
                 : null;
@@ -2545,40 +4437,35 @@ export async function applyWorkflowGraphPatchAtomic(rawRequest, adapter) {
                     `Attachment target ${attachment.input} is unavailable (${targetState?.reason || "node_missing"}).`,
                 );
             }
-            await adapter.assignAttachmentExact(targetId, clone(attachment));
-            if (!await adapter.verifyAttachmentExact(targetId, clone(attachment))) {
+            await graphAdapter.assignAttachmentExact(targetId, clone(attachment));
+            if (!await graphAdapter.verifyAttachmentExact(targetId, clone(attachment))) {
                 throw graphPatchError(
                     "graph_patch_attachment_mismatch",
                     `Attachment ${attachment.input} did not persist exactly.`,
                 );
             }
-            await reveal(adapter, { phase: "attachment", node_id: targetId, input: attachment.input }, delayMs);
+            await reveal(graphAdapter, { phase: "attachment", node_id: targetId, input: attachment.input }, delayMs);
         }
 
         for (const removal of request.plan.remove_nodes) {
             mutationStarted = true;
-            await adapter.removeNodes([removal.ref.node_id]);
-            await reveal(adapter, { phase: "remove", node_id: removal.ref.node_id }, delayMs);
+            await graphAdapter.removeNodes([removal.ref.node_id]);
+            await reveal(graphAdapter, { phase: "remove", node_id: removal.ref.node_id }, delayMs);
         }
 
-        // Value/connection callbacks in ComfyUI may call computeSize() even when
-        // layout was not part of the patch. Re-assert the exact preflight rect
-        // for touched existing nodes (or the declared rect when one was given)
-        // before final verification. Unrelated nodes are deliberately excluded:
-        // any callback damage to them must still fail closed and roll back.
         await restoreDeclaredLayouts(
             request.plan,
-            adapter,
-            beforeSnapshot,
+            graphAdapter,
+            graphBeforeSnapshot,
             aliases,
         );
 
         verification = await withReadGuard(
-            adapter,
+            graphAdapter,
             () => verifyPatch(
                 request,
-                adapter,
-                beforeSnapshot,
+                graphAdapter,
+                graphBeforeSnapshot,
                 preflightResult,
                 aliases,
                 runtimeEdges,
@@ -2593,14 +4480,44 @@ export async function applyWorkflowGraphPatchAtomic(rawRequest, adapter) {
             );
         }
 
-        const refinedSnapshot = await adapter.captureWorkflow();
-        const resultContentHash = await contentGraphHash(refinedSnapshot);
+        let refinedRootSnapshot;
+        let resultDefinitionHash = null;
+        if (request.operation === "scoped_patch") {
+            refinedRootSnapshot = await adapter.captureWorkflow();
+            const afterDefinition = resolveSerializedScope(
+                refinedRootSnapshot,
+                request.scope,
+            ).definition;
+            const nativeDefinition = projectNativeScopeDefinition(
+                await graphAdapter.captureDefinition(),
+            );
+            if (!valuesEqual(nativeDefinition, afterDefinition)) {
+                throw graphPatchError(
+                    "scoped_native_definition_mismatch",
+                    "The mutated native Subgraph differs from the root serialization.",
+                );
+            }
+            attestDefinitionBoundaryBookkeeping(afterDefinition);
+            assertScopedRootPreserved(
+                beforeRootSnapshot,
+                refinedRootSnapshot,
+                request.scope.definition_id,
+                scopeBeforeDefinition,
+                afterDefinition,
+            );
+            resultDefinitionHash = await workflowScopeDefinitionHash(afterDefinition);
+        } else {
+            refinedRootSnapshot = await adapter.captureWorkflow();
+        }
+        const resultContentHash = await contentGraphHash(refinedRootSnapshot);
+        const canonicalCreatedNodeIds = request.plan.create_nodes.map(item => aliases[item.alias]);
         const entry = {
             patch_hash: request.patch_hash,
             result_content_hash: resultContentHash,
             aliases: clone(aliases),
-            created_node_ids: clone(createdNodeIds),
+            created_node_ids: clone(canonicalCreatedNodeIds),
             removed_node_ids: clone(removedNodeIds),
+            ...(resultDefinitionHash ? { result_definition_hash: resultDefinitionHash } : {}),
         };
         const nextLedger = ledgerWithEntry(ledger, request.application_id, entry);
         mutationStarted = true;
@@ -2619,15 +4536,15 @@ export async function applyWorkflowGraphPatchAtomic(rawRequest, adapter) {
             success: true,
             applied: true,
             already_applied: false,
-            patch_schema: WORKFLOW_GRAPH_PATCH_SCHEMA,
+            patch_schema: request.patch_schema,
             application_id: request.application_id,
             patch_hash: request.patch_hash,
-            operation: "patch",
+            operation: request.operation,
             expected_workflow_identity: request.plan.expected_workflow_identity,
             previous_graph_hash: beforeGraphHash,
             graph_hash: await workflowGraphHash(committedSnapshot),
             aliases,
-            created_node_ids: createdNodeIds,
+            created_node_ids: canonicalCreatedNodeIds,
             removed_node_ids: removedNodeIds,
             verification,
             reveal_delay_ms: delayMs,
@@ -2635,8 +4552,8 @@ export async function applyWorkflowGraphPatchAtomic(rawRequest, adapter) {
             queued: false,
         };
     } catch (error) {
-        const rollback = mutationStarted && beforeSnapshot && beforeGraphHash
-            ? await restoreSnapshot(adapter, beforeSnapshot, beforeGraphHash)
+        const rollback = mutationStarted && beforeRootSnapshot && beforeGraphHash
+            ? await restoreSnapshot(adapter, beforeRootSnapshot, beforeGraphHash)
             : emptyRollback();
         return failureResult(request, error, { verification, rollback });
     }

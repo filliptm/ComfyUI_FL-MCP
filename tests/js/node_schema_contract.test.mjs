@@ -214,3 +214,91 @@ test("GraphPatch contexts annotate concrete MATCHTYPE input and output facts", a
     assert.equal(target.live_inputs[0].resolved_type, "IMAGE");
     assert.equal(target.live_inputs[0].schema_index, 0);
 });
+
+
+test("scoped GraphPatch contexts skip only public boundary endpoints", async () => {
+    const sourceHash = await nodeSchemaHash("Source", sourceSchema);
+    const targetHash = await nodeSchemaHash("Example", schema);
+    const boundary = {
+        slot_id: "64d511b4-c315-4bff-9ae8-fc2d2ea668e2",
+        slot_index: 0,
+        name: "image",
+        type: "FLOAT",
+    };
+    const plan = {
+        assertions: { nodes: [], edges: [] },
+        create_nodes: [
+            { alias: "source", node_type: "Source", schema_hash: sourceHash },
+            { alias: "target", node_type: "Example", schema_hash: targetHash },
+        ],
+        update_nodes: [], remove_nodes: [], remove_edges: [], attachments: [],
+        add_edges: [
+            {
+                source: {
+                    ref: { scope_input: boundary },
+                    output_index: 0,
+                    output: "image",
+                    type: "FLOAT",
+                },
+                target: {
+                    ref: { alias: "target" }, input_index: 0, occurrence_index: 0,
+                    socket_index: null, input: "frame_rate", type: "FLOAT",
+                    mode: "convert_widget",
+                },
+            },
+            {
+                source: {
+                    ref: { alias: "source" }, output_index: 0, output: "fps", type: "FLOAT",
+                },
+                target: {
+                    ref: { scope_output: boundary }, input_index: 0, occurrence_index: 0,
+                    socket_index: 0, input: "image", type: "FLOAT", mode: "slot",
+                },
+            },
+        ],
+    };
+    const catalog = { Source: sourceSchema, Example: schema };
+    const contracts = {
+        Source: { schema_hash: sourceHash, schema: normalizeNodeSchemaContract(sourceSchema) },
+        Example: { schema_hash: targetHash, schema: normalizeNodeSchemaContract(schema) },
+    };
+
+    const contexts = await buildGraphPatchSchemaContexts(plan, catalog, contracts);
+
+    assert.deepEqual(contexts.get("new:source").schema_outputs, [{
+        index: 0, name: "fps", type: "FLOAT",
+    }]);
+    assert.deepEqual(contexts.get("new:target").schema_inputs, [{
+        index: 0,
+        occurrence_index: 0,
+        name: "frame_rate",
+        type: "FLOAT",
+        kind: "widget",
+        socket_index: null,
+    }]);
+});
+
+
+test("v2 GraphPatch contexts still require both real node endpoints", async () => {
+    const hash = await nodeSchemaHash("Example", schema);
+    const plan = {
+        assertions: { nodes: [], edges: [] },
+        create_nodes: [{ alias: "target", node_type: "Example", schema_hash: hash }],
+        update_nodes: [], remove_nodes: [], remove_edges: [], attachments: [],
+        add_edges: [{
+            source: { ref: { node_id: 99 }, output_index: 0, output: "fps", type: "FLOAT" },
+            target: {
+                ref: { alias: "target" }, input_index: 0, occurrence_index: 0,
+                socket_index: null, input: "frame_rate", type: "FLOAT", mode: "convert_widget",
+            },
+        }],
+    };
+    await assert.rejects(
+        buildGraphPatchSchemaContexts(
+            plan,
+            { Example: schema },
+            { Example: { schema_hash: hash, schema: normalizeNodeSchemaContract(schema) } },
+        ),
+        /source output has no node schema context/,
+    );
+});

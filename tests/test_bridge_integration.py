@@ -28,7 +28,7 @@ def _handshake(
         payload["supported_tools"] = supported_tools
         payload["tool_manifest_hash"] = canonical_tool_manifest_hash(supported_tools)
         revisions = {
-            tool: 2 if tool == "apply_workflow_graph_patch" else 1
+            tool: 3 if tool == "apply_workflow_graph_patch" else 1
             for tool in supported_tools
         }
         payload["tool_contract_revisions"] = revisions
@@ -258,7 +258,7 @@ def test_outdated_frontend_handshakes_cannot_replace_capable_active_bridge():
             with client.websocket_connect("/ws") as stale_frontend:
                 stale_tools = ["apply_workflow_graph_patch", "generate_seed"]
                 stale_revisions = {
-                    "apply_workflow_graph_patch": 1,
+                    "apply_workflow_graph_patch": 2,
                     "generate_seed": 1,
                 }
                 stale_frontend.send_json({
@@ -278,8 +278,8 @@ def test_outdated_frontend_handshakes_cannot_replace_capable_active_bridge():
                 assert failure["error_details"]["reason"] == (
                     "tool_contract_revision_outdated"
                 )
-                assert failure["error_details"]["required_contract_revision"] == 2
-                assert failure["error_details"]["advertised_contract_revision"] == 1
+                assert failure["error_details"]["required_contract_revision"] == 3
+                assert failure["error_details"]["advertised_contract_revision"] == 2
                 try:
                     stale_frontend.receive_json()
                 except WebSocketDisconnect as exc:

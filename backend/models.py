@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field, StrictInt, StrictStr, model_validator
 
 _TOOL_NAME_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 REQUIRED_FRONTEND_TOOL_CONTRACT_REVISIONS = {
-    "apply_workflow_graph_patch": 2,
+    "apply_workflow_graph_patch": 3,
 }
 ToolContractRevision = Annotated[StrictInt, Field(ge=1, le=2_147_483_647)]
 

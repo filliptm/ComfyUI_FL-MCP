@@ -184,6 +184,68 @@ test("GraphPatch summaries use neutral workflow language and report every nonzer
     }), "Workflow change already applied");
 });
 
+test("branch discovery, comparison, navigation, and mutation summaries are explicit", () => {
+    assert.equal(summarizeToolStep({
+        name: "workflow_branches_discover",
+        status: "done",
+        result: JSON.stringify({
+            resolution: { status: "resolved" },
+            selected_branch: { selectable_node_ids: [2, 3] },
+        }),
+    }), "Found workflow branch · 2 nodes");
+    assert.equal(summarizeToolStep({
+        name: "workflow_branches_discover",
+        status: "done",
+        result: '{"resolution":{"status":"needs_choice","candidate_count":2}}',
+    }), "Branch match needs your choice");
+    assert.equal(summarizeToolStep({
+        name: "workflow_branch_compare",
+        status: "done",
+        result: '{"status":"compared","structurally_equal":true,"value_equal":false}',
+    }), "Compared workflow branches · same structure · different values");
+    assert.equal(summarizeToolStep({
+        name: "workflow_branch_navigate",
+        status: "done",
+        result: '{"success":true,"selected_count":3}',
+    }), "Focused workflow branch · 3 nodes");
+    assert.equal(summarizeToolStep({
+        name: "compile_workflow_branch_operation",
+        status: "done",
+        result: JSON.stringify({
+            valid: true,
+            operation: "replace",
+            plan: {
+                expected_delta: {
+                    created_node_count: 2,
+                    removed_node_count: 1,
+                },
+            },
+        }),
+    }), "Planned branch replace · 2 new nodes · 1 removed node");
+    assert.equal(summarizeToolStep({
+        name: "resolve_workflow_branch_successor",
+        status: "done",
+        result: JSON.stringify({
+            valid: true,
+            successor_branch_ids: ["a".repeat(64), "b".repeat(64)],
+        }),
+    }), "Resolved 2 successor branches");
+    assert.equal(summarizeToolStep({
+        name: "resolve_workflow_branch_successor",
+        status: "done",
+        result: '{"valid":true,"successor_branch_ids":[]}',
+    }), "Confirmed branch removal · no successor branches");
+    assert.equal(summarizeToolStep({
+        name: "resolve_workflow_branch_successor",
+        status: "done",
+        result: '{"valid":false,"error_count":1}',
+    }), "Branch lineage stopped safely");
+    assert.equal(summarizeToolStep({
+        name: "workflow_branch_navigate",
+        status: "failed",
+    }), "Couldn’t focus workflow branch");
+});
+
 test("image review and mask summaries report the visible outcome", () => {
     assert.equal(summarizeToolStep({
         name: "view_output_image",

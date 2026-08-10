@@ -15,7 +15,7 @@ import sys
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, AsyncIterator, Dict, List, Optional, Union, Literal
+from typing import Any, AsyncIterator, Dict, List, Mapping, Optional, Union, Literal
 from urllib.parse import quote
 
 # Ensure this file's own directory is importable for flat sibling imports below.
@@ -105,13 +105,34 @@ from workflow_refinement import (
     normalize_workflow_graph,
 )
 from workflow_graph_patch import (
-    ApplyGraphPatchRequest,
+    ApplyScopedGraphPatchRequest,
     GRAPH_PATCH_SCHEMA,
     MAX_GRAPH_PATCH_ATTACHMENT_BYTES,
+    SCOPED_GRAPH_PATCH_SCHEMA,
+    WorkflowGraphPatchApplyRequest,
     compile_graph_patch,
+    compile_scoped_graph_patch,
     graph_patch_request_from_apply,
+    scoped_graph_patch_request_from_apply,
+    verify_completed_graph_patch_state,
 )
 from workflow_capability_graph import VerifiedCapabilityLesson
+from workflow_branch_operations import (
+    BranchOperationRequest,
+    ResolveBranchSuccessorsRequest,
+    WORKFLOW_BRANCH_SUCCESSOR_SCHEMA,
+    compile_workflow_branch_operation as compile_branch_operation,
+    resolve_workflow_branch_successors as resolve_branch_successors,
+)
+from workflow_branch_queries import (
+    CompareWorkflowBranchesRequest,
+    compare_workflow_branches,
+)
+from workflow_branch_tools import (
+    DiscoverWorkflowBranchesRequest,
+    NavigateWorkflowBranchRequest,
+    discover_workflow_branch_selection,
+)
 from workflow_refinement_compiler import (
     CompileWorkflowRefinementSpecRequest,
     compile_workflow_refinement_spec as compile_semantic_refinement,
@@ -3770,51 +3791,64 @@ def _validated_plan_attachment_values(
 GRAPH_PATCH_ATTACHMENT_HASH_CHUNK_BYTES = 1024 * 1024
 
 
-def _attachment_stat_identity(value: os.stat_result) -> tuple[int, int, int, int, int]:
+def _attachment_handle_stat_identity(
+    value: os.stat_result,
+) -> tuple[int, int, int, int]:
+    """Return stable same-handle facts without platform-specific ctime."""
+
     return (
         value.st_dev,
         value.st_ino,
         value.st_size,
         value.st_mtime_ns,
-        value.st_ctime_ns,
     )
 
 
-def _stable_graph_patch_attachment_integrity(path: Path) -> Dict[str, Any]:
-    """Hash one bounded regular file and reject replacement during the read."""
+def _read_graph_patch_attachment_once(path: Path) -> Dict[str, Any]:
+    """Hash one bounded file while proving its open handle stayed stable."""
 
-    try:
-        digest = hashlib.sha256()
-        byte_count = 0
-        with path.open("rb") as file_obj:
-            before = os.fstat(file_obj.fileno())
-            if before.st_size <= 0 or before.st_size > MAX_GRAPH_PATCH_ATTACHMENT_BYTES:
-                raise ComfyUIError("Chat attachment size is outside the supported range.")
-            while True:
-                chunk = file_obj.read(GRAPH_PATCH_ATTACHMENT_HASH_CHUNK_BYTES)
-                if not chunk:
-                    break
-                byte_count += len(chunk)
-                if byte_count > MAX_GRAPH_PATCH_ATTACHMENT_BYTES:
-                    raise ComfyUIError("Chat attachment exceeds the supported size limit.")
-                digest.update(chunk)
-            after = os.fstat(file_obj.fileno())
-        current = path.stat()
-    except ComfyUIError:
-        raise
-    except OSError as exc:
-        raise ComfyUIError("Chat attachment could not be read safely.") from exc
+    digest = hashlib.sha256()
+    byte_count = 0
+    with path.open("rb") as file_obj:
+        before = os.fstat(file_obj.fileno())
+        if before.st_size <= 0 or before.st_size > MAX_GRAPH_PATCH_ATTACHMENT_BYTES:
+            raise ComfyUIError("Chat attachment size is outside the supported range.")
+        while True:
+            chunk = file_obj.read(GRAPH_PATCH_ATTACHMENT_HASH_CHUNK_BYTES)
+            if not chunk:
+                break
+            byte_count += len(chunk)
+            if byte_count > MAX_GRAPH_PATCH_ATTACHMENT_BYTES:
+                raise ComfyUIError("Chat attachment exceeds the supported size limit.")
+            digest.update(chunk)
+        after = os.fstat(file_obj.fileno())
     if (
         byte_count != before.st_size
-        or _attachment_stat_identity(before) != _attachment_stat_identity(after)
-        or _attachment_stat_identity(after) != _attachment_stat_identity(current)
+        or byte_count != after.st_size
+        or _attachment_handle_stat_identity(before)
+        != _attachment_handle_stat_identity(after)
     ):
         raise ComfyUIError("Chat attachment changed while it was being validated.")
     return {"size_bytes": byte_count, "sha256": digest.hexdigest()}
 
 
+def _stable_graph_patch_attachment_integrity(path: Path) -> Dict[str, Any]:
+    """Hash a bounded file twice and reject replacement or mutation."""
+
+    try:
+        first = _read_graph_patch_attachment_once(path)
+        second = _read_graph_patch_attachment_once(path)
+    except ComfyUIError:
+        raise
+    except OSError as exc:
+        raise ComfyUIError("Chat attachment could not be read safely.") from exc
+    if first != second:
+        raise ComfyUIError("Chat attachment changed while it was being validated.")
+    return second
+
+
 def _graph_patch_attachment_integrity_issues(
-    request: ApplyGraphPatchRequest,
+    request: WorkflowGraphPatchApplyRequest,
 ) -> List[Dict[str, str]]:
     """Re-resolve and verify compiler-pinned attachments before browser mutation."""
 
@@ -4528,6 +4562,364 @@ async def apply_workflow_refinement(
 
 
 @mcp.tool()
+async def workflow_branches_discover(
+    request: DiscoverWorkflowBranchesRequest,
+    ctx: Context,
+) -> Dict[str, Any]:
+    """Discover deterministic branches in the active workflow without editing it.
+
+    Branches are bounded physical graph regions with exact typed node/slot
+    boundaries.  Natural-language evidence may resolve one unique branch; a tie
+    returns compact candidates and never guesses.  The result pins workflow,
+    graph, and branch-catalog hashes.  Full boundary edge IDs are returned only
+    for the uniquely resolved branch so later replace/remove mappings can be
+    explicit rather than positional.  Nested scopes are discoverable and
+    comparable across root and nested scopes. Writable status reflects the
+    exact scoped edit policy: unique definitions may be edited directly, while
+    reused definitions require explicit all-instance acknowledgement.
+    """
+
+    await _report_tool_activity(ctx, "workflow_branches_discover")
+    try:
+        active = await _active_editable_workflow(ctx)
+        _, result = discover_workflow_branch_selection(
+            request,
+            active["workflow"],
+            workflow_identity=active["workflow_identity"],
+            graph_hash=active["graph_hash"],
+        )
+        return result.model_dump(mode="json", by_alias=True)
+    except ValueError as exc:
+        raise RuntimeError(f"Active workflow branch discovery is invalid: {exc}") from exc
+    except Exception as exc:
+        logger.error("Unexpected error in workflow_branches_discover: %s", exc)
+        raise RuntimeError(f"Tool execution failed: {exc}") from exc
+
+
+@mcp.tool()
+async def workflow_branch_compare(
+    request: CompareWorkflowBranchesRequest,
+    ctx: Context,
+) -> Dict[str, Any]:
+    """Compare two exact pinned branches without exposing raw widget values.
+
+    Comparison is read-only and deterministic across topology, node classes,
+    boundary roles, schema shape, aligned value hashes, and active dynamic-input
+    facts.  Credential-like fields are redacted before hashing; incomplete or
+    sensitive dimensions are reported unavailable instead of claiming equality.
+    """
+
+    await _report_tool_activity(ctx, "workflow_branch_compare")
+    try:
+        active = await _active_editable_workflow(ctx)
+        client = get_node_library_client(
+            server_url=settings.comfyui_server_url,
+            timeout=settings.comfyui_api_timeout,
+        )
+        snapshot = await client.catalog_snapshot(force_refresh=True)
+        result = compare_workflow_branches(
+            request,
+            workflow=active["workflow"],
+            workflow_identity_attestation=active["workflow_identity"],
+            workflow_graph_hash=active["graph_hash"],
+            schema_mapping=snapshot.data,
+        )
+        return result.model_dump(mode="json", by_alias=True)
+    except NodeLibraryConnectionError as exc:
+        raise RuntimeError(f"ComfyUI server connection failed: {exc}") from exc
+    except NodeLibraryError as exc:
+        raise RuntimeError(f"Workflow branch comparison failed: {exc}") from exc
+    except ValueError as exc:
+        raise RuntimeError(f"Active workflow branch comparison is invalid: {exc}") from exc
+    except Exception as exc:
+        logger.error("Unexpected error in workflow_branch_compare: %s", exc)
+        raise RuntimeError(f"Tool execution failed: {exc}") from exc
+
+
+def _branch_navigation_failure(
+    request: NavigateWorkflowBranchRequest,
+    *,
+    code: str,
+    message: str,
+    details: Mapping[str, Any] | None = None,
+) -> Dict[str, Any]:
+    return {
+        "success": False,
+        "navigated": False,
+        "selection_changed": False,
+        "branch_id": request.branch_id,
+        "error": {
+            "code": code,
+            "message": message,
+            **({"details": dict(details)} if details else {}),
+        },
+        "queued": False,
+    }
+
+
+@mcp.tool()
+async def workflow_branch_navigate(
+    request: NavigateWorkflowBranchRequest,
+    ctx: Context,
+) -> Dict[str, Any]:
+    """Atomically select and focus one exact pinned branch on the canvas.
+
+    The backend re-discovers the branch from the active graph before calling the
+    browser.  The browser then validates the full root hash, recursive scope,
+    and every exact typed node ID before the first selection or viewport effect.
+    Ambiguity and stale pins perform no navigation and never partially select.
+    """
+
+    await _report_tool_activity(ctx, "workflow_branch_navigate")
+    if not settings.enable_workflow_writes:
+        return _disabled_by_config("FL_MCP_ENABLE_WORKFLOW_WRITES")
+    try:
+        active = await _active_editable_workflow(ctx)
+        catalog, discovered = discover_workflow_branch_selection(
+            DiscoverWorkflowBranchesRequest(branch_id=request.branch_id),
+            active["workflow"],
+            workflow_identity=active["workflow_identity"],
+            graph_hash=active["graph_hash"],
+        )
+        stale_fields = []
+        if request.expected_workflow_identity != active["workflow_identity"]:
+            stale_fields.append("expected_workflow_identity")
+        if request.expected_graph_hash != active["graph_hash"]:
+            stale_fields.append("expected_graph_hash")
+        if request.expected_branch_catalog_hash != catalog.branch_catalog_hash:
+            stale_fields.append("expected_branch_catalog_hash")
+        if stale_fields:
+            return _branch_navigation_failure(
+                request,
+                code="branch_navigation_stale",
+                message=(
+                    "The workflow or branch catalog changed after discovery; "
+                    "nothing was selected."
+                ),
+                details={"fields": stale_fields},
+            )
+        branch = discovered.selected_branch
+        scope = discovered.selected_scope
+        if not discovered.valid or branch is None or scope is None:
+            return _branch_navigation_failure(
+                request,
+                code="branch_not_found",
+                message="The exact branch is absent from the current pinned catalog.",
+            )
+        node_ids = list(branch.selectable_node_ids)
+        if not node_ids:
+            return _branch_navigation_failure(
+                request,
+                code="branch_has_no_selectable_nodes",
+                message="This branch contains no selectable canvas nodes.",
+            )
+        scope_path = [item.model_dump(mode="json") for item in scope.scope_path]
+        result = await _execute_tool(
+            ctx,
+            "navigate_workflow_branch",
+            {
+                "branch_id": request.branch_id,
+                "expected_workflow_identity": request.expected_workflow_identity,
+                "expected_graph_hash": request.expected_graph_hash,
+                "scope_path": scope_path,
+                "node_ids": node_ids,
+            },
+        )
+        if not isinstance(result, dict):
+            raise RuntimeError("The frontend returned an invalid branch navigation result.")
+        expected = {
+            "branch_id": request.branch_id,
+            "workflow_identity": request.expected_workflow_identity,
+            "graph_hash": request.expected_graph_hash,
+            "scope_path": scope_path,
+            "selected_node_ids": node_ids,
+            "selected_count": len(node_ids),
+            "fitted_count": len(node_ids),
+            "queued": False,
+        }
+        mismatches = [key for key, value in expected.items() if result.get(key) != value]
+        if mismatches:
+            raise RuntimeError(
+                "The frontend branch navigation result failed request attestation: "
+                + ", ".join(mismatches)
+            )
+        return {
+            "success": True,
+            "navigated": True,
+            "selection_changed": True,
+            **result,
+        }
+    except FrontendToolExecutionError as exc:
+        return _branch_navigation_failure(
+            request,
+            code=exc.code,
+            message=str(exc),
+            details=exc.details if isinstance(exc.details, Mapping) else None,
+        )
+    except ValueError as exc:
+        return _branch_navigation_failure(
+            request,
+            code="branch_navigation_invalid",
+            message=str(exc),
+        )
+    except Exception as exc:
+        logger.error("Unexpected error in workflow_branch_navigate: %s", exc)
+        raise RuntimeError(f"Tool execution failed: {exc}") from exc
+
+
+@mcp.tool()
+async def compile_workflow_branch_operation(
+    request: BranchOperationRequest,
+    ctx: Context,
+) -> Dict[str, Any]:
+    """Compile one exact root or authorized nested branch operation.
+
+    This compiler rereads the active workflow and refreshed local catalog,
+    re-discovers the exact branch under all supplied pins, asserts every owned
+    node and incident/cut edge, and lowers the operation through the existing
+    semantic compiler and canonical GraphPatch kernel.  It never calls the
+    browser and never queues.  If valid, pass its ``apply_request`` unchanged to
+    ``apply_workflow_graph_patch``. Unique nested definitions lower to scoped
+    GraphPatch v3; reused definitions require explicit all-instance authority.
+    """
+
+    await _report_tool_activity(ctx, "compile_workflow_branch_operation")
+    try:
+        active = await _active_editable_workflow(ctx)
+        client = get_node_library_client(
+            server_url=settings.comfyui_server_url,
+            timeout=settings.comfyui_api_timeout,
+        )
+        snapshot = await client.catalog_snapshot(force_refresh=True)
+        return compile_branch_operation(
+            request,
+            active["workflow"],
+            workflow_identity=active["workflow_identity"],
+            graph_hash=active["graph_hash"],
+            catalog=snapshot.data,
+            catalog_hash=snapshot.catalog_hash,
+            source=snapshot.source,
+        )
+    except NodeLibraryConnectionError as exc:
+        raise RuntimeError(f"ComfyUI server connection failed: {exc}") from exc
+    except NodeLibraryError as exc:
+        raise RuntimeError(f"Workflow branch compilation failed: {exc}") from exc
+    except ValueError as exc:
+        raise RuntimeError(f"Active workflow branch operation is invalid: {exc}") from exc
+    except Exception as exc:
+        logger.error("Unexpected error in compile_workflow_branch_operation: %s", exc)
+        raise RuntimeError(f"Tool execution failed: {exc}") from exc
+
+
+def _branch_successor_failure(
+    request: ResolveBranchSuccessorsRequest,
+    *,
+    workflow_identity: str,
+    graph_hash: str,
+    code: str,
+    message: str,
+) -> Dict[str, Any]:
+    return {
+        "schema": WORKFLOW_BRANCH_SUCCESSOR_SCHEMA,
+        "valid": False,
+        "application_id": request.apply_request.application_id,
+        "patch_hash": request.apply_request.patch_hash,
+        "workflow_identity": workflow_identity,
+        "graph_hash": graph_hash,
+        "branch_catalog_hash": None,
+        "lineage": [],
+        "successor_branch_ids": [],
+        "successor_branch_id": None,
+        "issues": [
+            {
+                "severity": "error",
+                "code": code,
+                "path": "apply_request",
+                "message": message,
+                "details": {},
+            }
+        ],
+        "error_count": 1,
+        "queued": False,
+    }
+
+
+@mcp.tool()
+async def resolve_workflow_branch_successor(
+    request: ResolveBranchSuccessorsRequest,
+    ctx: Context,
+) -> Dict[str, Any]:
+    """Resolve exact successor branch IDs after one attested GraphPatch apply.
+
+    Call this read-only tool only after ``apply_workflow_graph_patch`` succeeds,
+    passing its unchanged apply envelope, alias map, final workflow identity,
+    final graph hash, and the compiler's pending successor locator.  The backend
+    rereads the active workflow, validates the persisted application ledger and
+    exact GraphPatch postconditions, then rediscovers every affected scope.  It
+    never mutates, navigates, queues, or guesses an incomplete lineage.
+    """
+
+    await _report_tool_activity(ctx, "resolve_workflow_branch_successor")
+    try:
+        active = await _active_editable_workflow(ctx)
+        client = get_node_library_client(
+            server_url=settings.comfyui_server_url,
+            timeout=settings.comfyui_api_timeout,
+        )
+        snapshot = await client.catalog_snapshot(force_refresh=True)
+        completed = _completed_graph_patch_result(
+            active,
+            request.apply_request,
+            catalog=snapshot.data,
+        )
+        if completed is None or completed.get("success") is not True:
+            return _branch_successor_failure(
+                request,
+                workflow_identity=str(active.get("workflow_identity") or "unknown"),
+                graph_hash=str(active.get("graph_hash") or "0" * 64),
+                code="graph_patch_completion_not_attested",
+                message=(
+                    "The exact GraphPatch is not proven complete in the active workflow; "
+                    "no successor lineage was returned."
+                ),
+            )
+        if (
+            completed.get("already_applied") is not True
+            or completed.get("application_id") != request.apply_request.application_id
+            or completed.get("patch_hash") != request.apply_request.patch_hash
+            or completed.get("workflow_identity") != request.expected_workflow_identity
+            or completed.get("graph_hash") != request.expected_graph_hash
+            or completed.get("aliases") != request.aliases
+        ):
+            return _branch_successor_failure(
+                request,
+                workflow_identity=str(active.get("workflow_identity") or "unknown"),
+                graph_hash=str(active.get("graph_hash") or "0" * 64),
+                code="graph_patch_completion_facts_changed",
+                message=(
+                    "The attested GraphPatch result differs from the supplied post-apply "
+                    "identity or alias facts; no successor lineage was returned."
+                ),
+            )
+        return resolve_branch_successors(
+            request,
+            active["workflow"],
+            workflow_identity=active["workflow_identity"],
+            graph_hash=active["graph_hash"],
+            catalog=snapshot.data,
+        )
+    except NodeLibraryConnectionError as exc:
+        raise RuntimeError(f"ComfyUI server connection failed: {exc}") from exc
+    except NodeLibraryError as exc:
+        raise RuntimeError(f"Workflow branch successor resolution failed: {exc}") from exc
+    except ValueError as exc:
+        raise RuntimeError(f"Active workflow branch lineage is invalid: {exc}") from exc
+    except Exception as exc:
+        logger.error("Unexpected error in resolve_workflow_branch_successor: %s", exc)
+        raise RuntimeError(f"Tool execution failed: {exc}") from exc
+
+
+@mcp.tool()
 async def compile_workflow_refinement_spec(
     request: CompileWorkflowRefinementSpecRequest,
     ctx: Context,
@@ -4654,7 +5046,7 @@ def _graph_patch_schema_contracts(
 
 
 def _graph_patch_failure(
-    request: ApplyGraphPatchRequest,
+    request: WorkflowGraphPatchApplyRequest,
     *,
     code: str,
     message: str,
@@ -4679,9 +5071,139 @@ def _graph_patch_failure(
     }
 
 
+_GRAPH_PATCH_LEDGER_SCHEMA = "fl-mcp.workflow-graph-patch.v2"
+_GRAPH_PATCH_LEDGER_LIMIT = 64
+_GRAPH_PATCH_LEDGER_FACT_LIMIT = 100
+_GRAPH_PATCH_LEDGER_NODE_ID_STRING_LIMIT = 4_096
+_GRAPH_PATCH_LEDGER_APPLICATION_ID = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$"
+)
+_GRAPH_PATCH_LEDGER_ALIAS = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+_GRAPH_PATCH_LEDGER_HASH = re.compile(r"^[0-9a-f]{64}$")
+_GRAPH_PATCH_LEDGER_ENTRY_FIELDS = frozenset(
+    {
+        "aliases",
+        "created_node_ids",
+        "patch_hash",
+        "removed_node_ids",
+        "result_content_hash",
+    }
+)
+
+
+def _valid_graph_patch_ledger_node_id(value: Any) -> bool:
+    return bool(
+        type(value) is int
+        or (
+            type(value) is str
+            and 0 < len(value) <= _GRAPH_PATCH_LEDGER_NODE_ID_STRING_LIMIT
+        )
+    )
+
+
+def _valid_graph_patch_ledger_hash(value: Any) -> bool:
+    return bool(
+        type(value) is str
+        and _GRAPH_PATCH_LEDGER_HASH.fullmatch(value) is not None
+    )
+
+
+def _graph_patch_ledger_is_valid(ledger: Any) -> bool:
+    """Validate the complete untrusted persisted ledger without copying it."""
+
+    if not isinstance(ledger, dict) or len(ledger) != 3:
+        return False
+    if set(ledger) != {"schema", "order", "entries"}:
+        return False
+    order = ledger.get("order")
+    entries = ledger.get("entries")
+    if (
+        ledger.get("schema") != _GRAPH_PATCH_LEDGER_SCHEMA
+        or not isinstance(order, list)
+        or len(order) > _GRAPH_PATCH_LEDGER_LIMIT
+        or not isinstance(entries, dict)
+        or len(entries) > _GRAPH_PATCH_LEDGER_LIMIT
+    ):
+        return False
+    if any(
+        type(application_id) is not str
+        or _GRAPH_PATCH_LEDGER_APPLICATION_ID.fullmatch(application_id) is None
+        for application_id in order
+    ):
+        return False
+    if len(order) != len(set(order)):
+        return False
+    if any(
+        type(application_id) is not str
+        or _GRAPH_PATCH_LEDGER_APPLICATION_ID.fullmatch(application_id) is None
+        for application_id in entries
+    ):
+        return False
+    if set(order) != set(entries):
+        return False
+
+    for application_id in order:
+        entry = entries.get(application_id)
+        if not isinstance(entry, dict):
+            return False
+        fields = set(entry)
+        if fields not in (
+            _GRAPH_PATCH_LEDGER_ENTRY_FIELDS,
+            _GRAPH_PATCH_LEDGER_ENTRY_FIELDS | {"result_definition_hash"},
+        ):
+            return False
+        if any(
+            not _valid_graph_patch_ledger_hash(entry.get(field))
+            for field in ("patch_hash", "result_content_hash")
+        ):
+            return False
+        if (
+            "result_definition_hash" in entry
+            and not _valid_graph_patch_ledger_hash(entry.get("result_definition_hash"))
+        ):
+            return False
+        aliases = entry.get("aliases")
+        created = entry.get("created_node_ids")
+        removed = entry.get("removed_node_ids")
+        if (
+            not isinstance(aliases, dict)
+            or len(aliases) > _GRAPH_PATCH_LEDGER_FACT_LIMIT
+            or not isinstance(created, list)
+            or len(created) > _GRAPH_PATCH_LEDGER_FACT_LIMIT
+            or not isinstance(removed, list)
+            or len(removed) > _GRAPH_PATCH_LEDGER_FACT_LIMIT
+        ):
+            return False
+        if any(
+            type(alias) is not str
+            or _GRAPH_PATCH_LEDGER_ALIAS.fullmatch(alias) is None
+            or not _valid_graph_patch_ledger_node_id(node_id)
+            for alias, node_id in aliases.items()
+        ):
+            return False
+        if any(not _valid_graph_patch_ledger_node_id(item) for item in created):
+            return False
+        if any(not _valid_graph_patch_ledger_node_id(item) for item in removed):
+            return False
+        typed_alias_ids = {(type(item).__name__, item) for item in aliases.values()}
+        typed_created = {(type(item).__name__, item) for item in created}
+        typed_removed = {(type(item).__name__, item) for item in removed}
+        if (
+            len(typed_alias_ids) != len(aliases)
+            or len(typed_created) != len(created)
+            or len(typed_removed) != len(removed)
+            or typed_alias_ids != typed_created
+            or typed_created & typed_removed
+        ):
+            return False
+    return True
+
+
 def _completed_graph_patch_result(
     active: Dict[str, Any],
-    request: ApplyGraphPatchRequest,
+    request: WorkflowGraphPatchApplyRequest,
+    *,
+    catalog: Mapping[str, Any],
 ) -> Dict[str, Any] | None:
     """Return a verified idempotent result from the persisted GraphPatch ledger."""
 
@@ -4693,12 +5215,7 @@ def _completed_graph_patch_result(
     ledger = extra.get("fl_mcp_graph_patch_ledger") if isinstance(extra, dict) else None
     if ledger is None:
         return None
-    if not (
-        isinstance(ledger, dict)
-        and ledger.get("schema") == "fl-mcp.workflow-graph-patch.v2"
-        and isinstance(ledger.get("order"), list)
-        and isinstance(ledger.get("entries"), dict)
-    ):
+    if not _graph_patch_ledger_is_valid(ledger):
         return _graph_patch_failure(
             request,
             code="invalid_graph_patch_ledger",
@@ -4708,6 +5225,17 @@ def _completed_graph_patch_result(
     entry = ledger["entries"].get(request.application_id)
     if entry is None:
         return None
+    target_has_definition_hash = "result_definition_hash" in entry
+    if target_has_definition_hash != isinstance(request, ApplyScopedGraphPatchRequest):
+        return _graph_patch_failure(
+            request,
+            code="invalid_graph_patch_ledger",
+            message=(
+                "The persisted GraphPatch ledger entry has the wrong root/scoped "
+                "result shape; the canvas was not edited."
+            ),
+            validation={"valid": False, "issues": [], "error_count": 1},
+        )
     if not isinstance(entry, dict) or entry.get("patch_hash") != request.patch_hash:
         return _graph_patch_failure(
             request,
@@ -4726,14 +5254,18 @@ def _completed_graph_patch_result(
             message="The workflow changed after this GraphPatch was applied.",
             validation={"valid": False, "issues": [], "error_count": 1},
         )
-    return {
+    completed = {
         "success": True,
         "applied": False,
         "already_applied": True,
-        "patch_schema": "fl-mcp.workflow-graph-patch.v2",
+        "patch_schema": (
+            SCOPED_GRAPH_PATCH_SCHEMA
+            if isinstance(request, ApplyScopedGraphPatchRequest)
+            else GRAPH_PATCH_SCHEMA
+        ),
         "application_id": request.application_id,
         "patch_hash": request.patch_hash,
-        "operation": "patch",
+        "operation": request.plan.operation,
         "expected_workflow_identity": request.plan.expected_workflow_identity,
         "workflow_identity": active.get("workflow_identity"),
         "graph_hash": active.get("graph_hash"),
@@ -4757,21 +5289,59 @@ def _completed_graph_patch_result(
         },
         "queued": False,
     }
+    try:
+        attested = _attest_graph_patch_frontend_result(completed, request)
+    except RuntimeError:
+        return _graph_patch_failure(
+            request,
+            code="invalid_graph_patch_ledger",
+            message=(
+                "The persisted GraphPatch ledger does not match the exact plan-shaped "
+                "application result; the canvas was not edited."
+            ),
+            validation={"valid": False, "issues": [], "error_count": 1},
+        )
+    state_issues = verify_completed_graph_patch_state(
+        request,
+        workflow,
+        catalog,
+        attested["aliases"],
+        result_definition_hash=entry.get("result_definition_hash"),
+    )
+    if state_issues:
+        return _graph_patch_failure(
+            request,
+            code="invalid_graph_patch_ledger",
+            message=(
+                "The persisted GraphPatch ledger is not proven by the current exact "
+                "plan postconditions; the canvas was not edited."
+            ),
+            validation={
+                "valid": False,
+                "issues": state_issues,
+                "error_count": len(state_issues),
+            },
+        )
+    return attested
 
 
 def _attest_graph_patch_frontend_result(
     result: Any,
-    request: ApplyGraphPatchRequest,
+    request: WorkflowGraphPatchApplyRequest,
 ) -> Dict[str, Any]:
     """Bind a bridge response to this exact request before trusting success."""
 
     if not isinstance(result, dict):
         raise RuntimeError("The frontend returned a non-object GraphPatch result.")
     expected_facts = {
-        "patch_schema": GRAPH_PATCH_SCHEMA,
+        "patch_schema": (
+            SCOPED_GRAPH_PATCH_SCHEMA
+            if isinstance(request, ApplyScopedGraphPatchRequest)
+            else GRAPH_PATCH_SCHEMA
+        ),
         "application_id": request.application_id,
         "patch_hash": request.patch_hash,
-        "operation": "patch",
+        "operation": request.plan.operation,
         "expected_workflow_identity": request.plan.expected_workflow_identity,
     }
     mismatches = [
@@ -4829,8 +5399,16 @@ def _attest_graph_patch_frontend_result(
         raise RuntimeError("The frontend GraphPatch returned duplicate created node IDs.")
     if {(type(value).__name__, value) for value in aliases.values()} != typed_created:
         raise RuntimeError("The frontend alias mapping disagrees with created node IDs.")
-    expected_removed = [item.ref.node_id for item in request.plan.remove_nodes]
-    if removed_node_ids != expected_removed:
+    if any(type(value) not in (int, str) for value in removed_node_ids):
+        raise RuntimeError("The frontend GraphPatch returned an invalid removed node ID.")
+    typed_removed = [(type(value).__name__, value) for value in removed_node_ids]
+    if len(set(typed_removed)) != len(typed_removed):
+        raise RuntimeError("The frontend GraphPatch returned duplicate removed node IDs.")
+    expected_removed = [
+        (type(item.ref.node_id).__name__, item.ref.node_id)
+        for item in request.plan.remove_nodes
+    ]
+    if typed_removed != expected_removed:
         raise RuntimeError("The frontend removed-node facts do not match the plan.")
     graph_hash = result.get("graph_hash")
     if not isinstance(graph_hash, str) or re.fullmatch(r"[0-9a-f]{64}", graph_hash) is None:
@@ -4842,16 +5420,18 @@ def _attest_graph_patch_frontend_result(
 
 @mcp.tool()
 async def apply_workflow_graph_patch(
-    request: ApplyGraphPatchRequest,
+    request: WorkflowGraphPatchApplyRequest,
     ctx: Context,
 ) -> Dict[str, Any]:
-    """Atomically apply one unchanged semantic GraphPatch v2 envelope.
+    """Atomically apply one unchanged semantic GraphPatch v2 or scoped v3 envelope.
 
     The backend rereads the active graph, refreshes the local node catalog, and
-    recompiles the supplied canonical plan. Any workflow, graph, catalog, schema,
-    slot, value, or hash drift stops before browser mutation. The frontend then
-    applies the arbitrary DAG delta under one canvas lock with exact verification,
-    idempotency, full snapshot rollback, visible bounded pacing, and no queue call.
+    recompiles the supplied canonical plan. Scoped v3 plans additionally resolve
+    the exact definition hash, edit mode, immutable boundary ports, and complete
+    shared-definition instance set from the fresh root workflow. Any workflow,
+    graph, catalog, schema, scope, slot, value, or hash drift stops before browser
+    mutation. The frontend applies the delta under one canvas lock with exact
+    verification, idempotency, rollback, bounded pacing, and no queue call.
     """
 
     await _report_tool_activity(ctx, "apply_workflow_graph_patch")
@@ -4883,7 +5463,16 @@ async def apply_workflow_graph_patch(
                     "error_count": len(attachment_issues),
                 },
             )
-        completed = _completed_graph_patch_result(active, request)
+        client = get_node_library_client(
+            server_url=settings.comfyui_server_url,
+            timeout=settings.comfyui_api_timeout,
+        )
+        snapshot = await client.catalog_snapshot(force_refresh=True)
+        completed = _completed_graph_patch_result(
+            active,
+            request,
+            catalog=snapshot.data,
+        )
         if completed is not None:
             return completed
         if active["workflow_identity"] != request.plan.expected_workflow_identity:
@@ -4900,19 +5489,26 @@ async def apply_workflow_graph_patch(
                 message="The active workflow graph changed; compile the refinement again.",
                 validation=empty_validation,
             )
-        graph = normalize_workflow_graph(active["workflow"])
-        client = get_node_library_client(
-            server_url=settings.comfyui_server_url,
-            timeout=settings.comfyui_api_timeout,
-        )
-        snapshot = await client.catalog_snapshot(force_refresh=True)
-        canonical_request = graph_patch_request_from_apply(request, graph)
-        compiled = compile_graph_patch(
-            canonical_request,
-            snapshot.data,
-            catalog_hash=snapshot.catalog_hash,
-            source=snapshot.source,
-        )
+        if isinstance(request, ApplyScopedGraphPatchRequest):
+            canonical_request = scoped_graph_patch_request_from_apply(request)
+            compiled = compile_scoped_graph_patch(
+                canonical_request,
+                active["workflow"],
+                workflow_identity=active["workflow_identity"],
+                graph_hash=active["graph_hash"],
+                catalog=snapshot.data,
+                catalog_hash=snapshot.catalog_hash,
+                source=snapshot.source,
+            )
+        else:
+            graph = normalize_workflow_graph(active["workflow"])
+            canonical_request = graph_patch_request_from_apply(request, graph)
+            compiled = compile_graph_patch(
+                canonical_request,
+                snapshot.data,
+                catalog_hash=snapshot.catalog_hash,
+                source=snapshot.source,
+            )
         validation = _graph_patch_validation_summary(compiled)
         if not compiled["valid"]:
             return _graph_patch_failure(

@@ -91,6 +91,15 @@ function refKey(ref) {
 }
 
 
+function isExactScopeBoundaryRef(ref, kind) {
+    return (
+        isRecord(ref)
+        && Object.keys(ref).length === 1
+        && isRecord(ref[kind])
+    );
+}
+
+
 function addNodeContext(contexts, ref, nodeType, schemaHash) {
     const key = refKey(ref);
     const existing = contexts.get(key);
@@ -240,8 +249,12 @@ export async function buildGraphPatchSchemaContexts(plan, catalog, schemaContrac
         ...(plan.remove_nodes || []).flatMap(item => item.expected_incident_edges || []),
     ];
     for (const edge of allEdges) {
-        addOutputContext(contexts, edge.source);
-        addInputContext(contexts, edge.target);
+        if (!isExactScopeBoundaryRef(edge.source?.ref, "scope_input")) {
+            addOutputContext(contexts, edge.source);
+        }
+        if (!isExactScopeBoundaryRef(edge.target?.ref, "scope_output")) {
+            addInputContext(contexts, edge.target);
+        }
     }
     for (const attachment of plan.attachments || []) {
         addInputContext(contexts, {

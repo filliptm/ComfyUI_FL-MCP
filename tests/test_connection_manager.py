@@ -58,11 +58,11 @@ def test_frontend_tool_contract_manifest_matches_browser_canonical_hash():
         "workflow_get_current_json",
     ]
     revisions = {
-        "apply_workflow_graph_patch": 2,
+        "apply_workflow_graph_patch": 3,
         "find_node": 1,
         "workflow_get_current_json": 1,
     }
-    expected_hash = "6661aaeea5f3593ee103b41b941b5a5234b61c039906a5a75d763833da892292"
+    expected_hash = "a50992e03368df832d12a5d17cad5ecfe7672223efe5a1c6a79b5dc16a6d1c49"
     handshake = Handshake(
         session_id="session",
         connection_type="frontend",
@@ -76,7 +76,7 @@ def test_frontend_tool_contract_manifest_matches_browser_canonical_hash():
     assert canonical_tool_contract_manifest_hash(revisions) == expected_hash
 
     invalid_manifests = (
-        {"find_node": 1, "apply_workflow_graph_patch": 2},
+        {"find_node": 1, "apply_workflow_graph_patch": 3},
         {"apply_workflow_graph_patch": 1},
         {"apply_workflow_graph_patch": True, "find_node": 1, "workflow_get_current_json": 1},
     )
@@ -165,9 +165,9 @@ async def test_frontend_replacement_atomically_replaces_capability_manifest():
         "frontend",
         supported_tools=old_tools,
         tool_manifest_hash=canonical_tool_manifest_hash(old_tools),
-        tool_contract_revisions={"apply_workflow_graph_patch": 2},
+        tool_contract_revisions={"apply_workflow_graph_patch": 3},
         tool_contract_manifest_hash=canonical_tool_contract_manifest_hash(
-            {"apply_workflow_graph_patch": 2}
+            {"apply_workflow_graph_patch": 3}
         ),
     )
     await manager.connect(
@@ -225,7 +225,7 @@ async def test_graph_patch_contract_revision_guard_fails_before_forwarding():
     manager = ConnectionManager()
     socket = FakeWebSocket()
     tools = ["apply_workflow_graph_patch"]
-    revisions = {"apply_workflow_graph_patch": 1}
+    revisions = {"apply_workflow_graph_patch": 2}
     await manager.connect(
         socket,
         "session",
@@ -247,7 +247,7 @@ async def test_graph_patch_contract_revision_guard_fails_before_forwarding():
         "capability_code": "frontend_contract_revision_outdated",
         "reason": "tool_contract_revision_outdated",
         "requested_tool": "apply_workflow_graph_patch",
-        "required_contract_revision": 2,
-        "advertised_contract_revision": 1,
+        "required_contract_revision": 3,
+        "advertised_contract_revision": 2,
         "tool_contract_manifest_hash": canonical_tool_contract_manifest_hash(revisions),
     }

@@ -174,7 +174,7 @@ test("frontend handshake advertises a sorted handler manifest including GraphPat
         {
             workflow_get_current_json: 1,
             find_node: 1,
-            apply_workflow_graph_patch: 2,
+            apply_workflow_graph_patch: 3,
         },
     );
 
@@ -186,11 +186,11 @@ test("frontend handshake advertises a sorted handler manifest including GraphPat
         ],
         tool_manifest_hash: "400fe558f797a1ae3fb9d7514a9b1927c9694d47b9384f0c41c1aefcbe162e3c",
         tool_contract_revisions: {
-            apply_workflow_graph_patch: 2,
+            apply_workflow_graph_patch: 3,
             find_node: 1,
             workflow_get_current_json: 1,
         },
-        tool_contract_manifest_hash: "6661aaeea5f3593ee103b41b941b5a5234b61c039906a5a75d763833da892292",
+        tool_contract_manifest_hash: "a50992e03368df832d12a5d17cad5ecfe7672223efe5a1c6a79b5dc16a6d1c49",
     });
 
     client.connect();
@@ -253,26 +253,26 @@ test("same tool names with a stale GraphPatch contract have a distinct manifest"
     const current = canonicalToolContractRevisions(tools, {
         workflow_get_current_json: 1,
         find_node: 1,
-        apply_workflow_graph_patch: 2,
+        apply_workflow_graph_patch: 3,
     });
     const stale = canonicalToolContractRevisions(tools, {
         workflow_get_current_json: 1,
         find_node: 1,
-        apply_workflow_graph_patch: 1,
+        apply_workflow_graph_patch: 2,
     });
 
     assert.deepEqual(current, {
-        apply_workflow_graph_patch: 2,
+        apply_workflow_graph_patch: 3,
         find_node: 1,
         workflow_get_current_json: 1,
     });
     assert.equal(
         await toolContractManifestHash(tools, current),
-        "6661aaeea5f3593ee103b41b941b5a5234b61c039906a5a75d763833da892292",
+        "a50992e03368df832d12a5d17cad5ecfe7672223efe5a1c6a79b5dc16a6d1c49",
     );
     assert.equal(
         await toolContractManifestHash(tools, stale),
-        "96f3031ef86d1ce855ea98a0e2175b28800a2d16e04d02441b422d98de90cebd",
+        "6661aaeea5f3593ee103b41b941b5a5234b61c039906a5a75d763833da892292",
     );
     assert.notEqual(
         await toolContractManifestHash(tools, current),
