@@ -1,20 +1,32 @@
 """WebSocket connection manager with MCP and browser bridge support."""
 
-from fastapi import WebSocket
-from typing import Any, Dict, Optional, List
-from datetime import datetime, timedelta
+import json
 import logging
 from collections import deque
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from typing import Any, Dict, List, Optional
 
-import json
-
+from fastapi import WebSocket
 from models import (
-    HandshakeAck,
     ErrorMessage,
+    HandshakeAck,
+    REQUIRED_FRONTEND_TOOL_CONTRACT_REVISIONS,
     SessionContext,
 )
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class FrontendCapabilityManifest:
+    """Capabilities advertised by one exact active browser connection."""
+
+    websocket: WebSocket
+    supported_tools: Optional[tuple[str, ...]]
+    tool_manifest_hash: Optional[str]
+    tool_contract_revisions: Optional[tuple[tuple[str, int], ...]]
+    tool_contract_manifest_hash: Optional[str]
 
 
 class ErrorBuffer:
@@ -219,6 +231,9 @@ class ConnectionManager:
         # Browser tool results are returned only to the MCP client that originated
         # the request. The timestamp supports bounded cleanup of abandoned calls.
         self.pending_tool_requests: Dict[tuple[str, str], Dict[str, Any]] = {}
+        # Capabilities are socket-bound so a replaced or stale browser cannot leave
+        # behind a manifest that authorizes requests on a newer connection.
+        self.frontend_capabilities: Dict[str, FrontendCapabilityManifest] = {}
         # Map session_id -> SessionContext
         self.session_contexts: Dict[str, SessionContext] = {}
         # Session timeout
@@ -236,6 +251,10 @@ class ConnectionManager:
         session_id: str,
         connection_type: str = "frontend",
         client_id: Optional[str] = None,
+        supported_tools: Optional[List[str]] = None,
+        tool_manifest_hash: Optional[str] = None,
+        tool_contract_revisions: Optional[Dict[str, int]] = None,
+        tool_contract_manifest_hash: Optional[str] = None,
     ) -> SessionContext:
         """Register a new WebSocket connection.
 
@@ -261,6 +280,19 @@ class ConnectionManager:
         else:
             previous = self.active_connections[session_id].get("frontend")
             self.active_connections[session_id]["frontend"] = websocket
+            self.frontend_capabilities[session_id] = FrontendCapabilityManifest(
+                websocket=websocket,
+                supported_tools=(
+                    tuple(supported_tools) if supported_tools is not None else None
+                ),
+                tool_manifest_hash=tool_manifest_hash,
+                tool_contract_revisions=(
+                    tuple(sorted(tool_contract_revisions.items()))
+                    if tool_contract_revisions is not None
+                    else None
+                ),
+                tool_contract_manifest_hash=tool_contract_manifest_hash,
+            )
         if previous is not None and previous is not websocket:
             logger.warning(
                 "Session %s - %s/%s connection replaced by a newer client",
@@ -344,6 +376,9 @@ class ConnectionManager:
                     logger.info("Session %s - ignored stale frontend disconnect", session_id)
                     return
                 del self.active_connections[session_id]["frontend"]
+                capabilities = self.frontend_capabilities.get(session_id)
+                if capabilities is not None and capabilities.websocket is websocket:
+                    self.frontend_capabilities.pop(session_id, None)
                 logger.info("Session %s - frontend disconnected", session_id)
             
             # Clean up session entry if no more connections
@@ -495,6 +530,110 @@ class ConnectionManager:
             mcp_connections = connections.get("mcp", {})
             return client_id in mcp_connections if client_id else bool(mcp_connections)
         return connection_type in connections
+
+    def get_frontend_capabilities(
+        self,
+        session_id: str,
+    ) -> Optional[FrontendCapabilityManifest]:
+        """Return capabilities only when they belong to the active browser socket."""
+
+        connections = self.active_connections.get(session_id, {})
+        active_frontend = connections.get("frontend")
+        capabilities = self.frontend_capabilities.get(session_id)
+        if (
+            active_frontend is None
+            or capabilities is None
+            or capabilities.websocket is not active_frontend
+        ):
+            return None
+        return capabilities
+
+    def frontend_tool_capability_failure(
+        self,
+        session_id: str,
+        tool_name: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Describe why one tool must not be forwarded to the active browser."""
+
+        capabilities = self.get_frontend_capabilities(session_id)
+        if capabilities is None or capabilities.supported_tools is None:
+            return {
+                "error_code": "frontend_bridge_outdated",
+                "error": (
+                    "frontend_bridge_outdated: the connected ComfyUI browser bridge "
+                    "did not advertise its tool capabilities. Hard-refresh ComfyUI "
+                    "before retrying."
+                ),
+                "error_details": {
+                    "bridge_state": "frontend_bridge_outdated",
+                    "capability_code": "frontend_capability_missing",
+                    "reason": "capability_manifest_missing",
+                    "requested_tool": tool_name,
+                    "supported_tool_count": None,
+                    "tool_manifest_hash": None,
+                },
+            }
+
+        if tool_name not in capabilities.supported_tools:
+            return {
+                "error_code": "frontend_capability_missing",
+                "error": (
+                    "frontend_bridge_outdated: the connected ComfyUI browser bridge "
+                    f"does not advertise required tool '{tool_name}'. Hard-refresh "
+                    "ComfyUI before retrying."
+                ),
+                "error_details": {
+                    "bridge_state": "frontend_bridge_outdated",
+                    "capability_code": "frontend_capability_missing",
+                    "reason": "tool_not_advertised",
+                    "requested_tool": tool_name,
+                    "supported_tool_count": len(capabilities.supported_tools),
+                    "tool_manifest_hash": capabilities.tool_manifest_hash,
+                },
+            }
+
+        required_revision = REQUIRED_FRONTEND_TOOL_CONTRACT_REVISIONS.get(tool_name)
+        if required_revision is None:
+            return None
+        revisions = (
+            dict(capabilities.tool_contract_revisions)
+            if capabilities.tool_contract_revisions is not None
+            else {}
+        )
+        advertised_revision = revisions.get(tool_name)
+        if advertised_revision is not None and advertised_revision >= required_revision:
+            return None
+        missing_manifest = capabilities.tool_contract_revisions is None
+        return {
+            "error_code": "frontend_bridge_outdated",
+            "error": (
+                "frontend_bridge_outdated: the connected ComfyUI browser bridge "
+                f"implements contract revision {advertised_revision!r} for "
+                f"'{tool_name}', but revision {required_revision} is required. "
+                "Hard-refresh ComfyUI before retrying."
+            ),
+            "error_details": {
+                "bridge_state": "frontend_bridge_outdated",
+                "capability_code": (
+                    "frontend_contract_revision_missing"
+                    if missing_manifest or advertised_revision is None
+                    else "frontend_contract_revision_outdated"
+                ),
+                "reason": (
+                    "contract_revision_manifest_missing"
+                    if missing_manifest
+                    else "required_contract_revision_missing"
+                    if advertised_revision is None
+                    else "tool_contract_revision_outdated"
+                ),
+                "requested_tool": tool_name,
+                "required_contract_revision": required_revision,
+                "advertised_contract_revision": advertised_revision,
+                "tool_contract_manifest_hash": (
+                    capabilities.tool_contract_manifest_hash
+                ),
+            },
+        }
 
     def register_tool_request(
         self,

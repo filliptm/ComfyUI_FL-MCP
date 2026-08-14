@@ -102,6 +102,41 @@ def test_chat_settings_reject_secret_fields(tmp_path, monkeypatch):
     assert "credential endpoint" in response.json()["detail"]
 
 
+def test_conversation_api_filters_and_attaches_workflow_history(tmp_path, monkeypatch):
+    settings = ChatSettingsStore(tmp_path / "settings.json")
+    store = ChatStore(tmp_path / "chat.db", tmp_path / "missing.db")
+    monkeypatch.setattr(chat_routes, "chat_settings", settings)
+    monkeypatch.setattr(chat_routes, "chat_store", store)
+    workflow = {
+        "id": "workflow-a",
+        "path": "workflows/a.json",
+        "name": "A",
+    }
+
+    with TestClient(server.app) as client:
+        bound = client.post("/api/chat/conversations", json={"workflow": workflow})
+        legacy = client.post("/api/chat/conversations", json={})
+        filtered = client.get(
+            "/api/chat/conversations?view=active&workflow_id=workflow-a"
+        )
+        attached = client.patch(
+            f"/api/chat/conversations/{legacy.json()['conversation']['id']}",
+            json={"workflow": workflow},
+        )
+        rejected = client.patch(
+            f"/api/chat/conversations/{bound.json()['conversation']['id']}",
+            json={"workflow": {"id": "workflow-b", "name": "B"}},
+        )
+
+    assert bound.status_code == 201
+    assert bound.json()["conversation"]["workflow"] == workflow
+    assert [item["id"] for item in filtered.json()["conversations"]] == [
+        bound.json()["conversation"]["id"]
+    ]
+    assert attached.json()["conversation"]["workflow"]["id"] == "workflow-a"
+    assert rejected.status_code == 409
+
+
 def test_tavily_credential_uses_dedicated_endpoint(tmp_path, monkeypatch):
     settings = ChatSettingsStore(tmp_path / "settings.json")
     credentials = CredentialStore()

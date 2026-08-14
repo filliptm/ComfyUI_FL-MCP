@@ -186,3 +186,13 @@ export async function workflowGraphHash(workflow) {
     });
     return sha256Hex(payload);
 }
+
+
+/** Hash graph content while excluding named workflow-extra bookkeeping keys. */
+export async function workflowGraphHashExcludingExtra(workflow, extraKeys = []) {
+    const detached = structuredClone(workflow);
+    if (detached?.extra && typeof detached.extra === "object") {
+        for (const key of extraKeys) delete detached.extra[key];
+    }
+    return await workflowGraphHash(detached);
+}

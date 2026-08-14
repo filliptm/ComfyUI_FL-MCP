@@ -47,12 +47,20 @@ def test_consequential_tools_require_approval():
 
 
 def test_official_registry_discovery_is_read_only():
+    assert classify_tool("view_canvas_images") == "read_only"
     assert classify_tool("registry_search_packages") == "read_only"
     assert classify_tool("registry_get_package") == "read_only"
     assert classify_tool("plan_workflow") == "read_only"
     assert classify_tool("compile_workflow_spec") == "read_only"
+    assert classify_tool("compile_workflow_refinement_spec") == "read_only"
+    assert classify_tool("workflow_branches_discover") == "read_only"
+    assert classify_tool("workflow_branch_compare") == "read_only"
+    assert classify_tool("compile_workflow_branch_operation") == "read_only"
+    assert classify_tool("resolve_workflow_branch_successor") == "read_only"
     assert classify_tool("resolve_workflow_spec") == "read_only"
     assert classify_tool("node_knowledge_search") == "read_only"
     assert classify_tool("plan_workflow_refinement") == "read_only"
     assert classify_tool("apply_workflow_plan") == "canvas_edit"
     assert classify_tool("apply_workflow_refinement") == "canvas_edit"
+    assert classify_tool("apply_workflow_graph_patch") == "canvas_edit"
+    assert classify_tool("workflow_branch_navigate") == "canvas_edit"

@@ -73,6 +73,11 @@ test("tool summaries expose human outcomes for core canvas operations", () => {
         result: '{"node_count":12}',
     }), "Inspected 12 nodes");
     assert.equal(summarizeToolStep({
+        name: "view_canvas_images",
+        status: "done",
+        result: '{"returned_count":6,"total_count":6,"has_more":false}',
+    }), "Inspected all 6 canvas images");
+    assert.equal(summarizeToolStep({
         name: "queue_workflow",
         status: "done",
         result: '{"status":"completed"}',
@@ -124,6 +129,128 @@ test("tool summaries expose human outcomes for core canvas operations", () => {
     }), "Couldn’t search official Comfy Registry");
 });
 
+test("GraphPatch summaries use neutral workflow language and report every nonzero delta", () => {
+    const delta = {
+        created_node_count: 2,
+        updated_node_count: 1,
+        removed_node_count: 3,
+        added_edge_count: 4,
+        removed_edge_count: 1,
+    };
+    const expected = (
+        "2 new nodes · 1 updated node · 3 removed nodes · "
+        + "4 added connections · 1 removed connection"
+    );
+    assert.equal(summarizeToolStep({
+        name: "compile_workflow_refinement_spec",
+        status: "done",
+        result: JSON.stringify({ valid: true, plan: { expected_delta: delta } }),
+    }), `Planned workflow · ${expected}`);
+    assert.equal(summarizeToolStep({
+        name: "apply_workflow_graph_patch",
+        status: "done",
+        arguments: JSON.stringify({ plan: { expected_delta: delta } }),
+        result: '{"success":true,"created_node_ids":[1,2],"removed_node_ids":[3,4,5]}',
+    }), `Built workflow · ${expected}`);
+    assert.equal(summarizeToolStep({
+        name: "apply_workflow_graph_patch",
+        status: "done",
+        arguments: JSON.stringify({
+            plan: {
+                expected_delta: {
+                    created_node_count: 0,
+                    updated_node_count: 1,
+                    removed_node_count: 1,
+                    added_edge_count: 0,
+                    removed_edge_count: 2,
+                },
+            },
+        }),
+        result: '{"success":true,"created_node_ids":[],"removed_node_ids":[9]}',
+    }), "Built workflow · 1 updated node · 1 removed node · 2 removed connections");
+    assert.equal(summarizeToolStep({
+        name: "compile_workflow_refinement_spec",
+        status: "done",
+        result: '{"valid":false,"needs_choice":true,"error_count":1}',
+    }), "Workflow plan needs your choice");
+    assert.equal(summarizeToolStep({
+        name: "apply_workflow_graph_patch",
+        status: "done",
+        result: '{"success":false}',
+    }), "Workflow build failed safely");
+    assert.equal(summarizeToolStep({
+        name: "apply_workflow_graph_patch",
+        status: "failed",
+    }), "Couldn’t build workflow");
+    assert.equal(summarizeToolStep({
+        name: "apply_workflow_graph_patch",
+        status: "done",
+        result: '{"success":true,"already_applied":true}',
+    }), "Workflow change already applied");
+});
+
+test("branch discovery, comparison, navigation, and mutation summaries are explicit", () => {
+    assert.equal(summarizeToolStep({
+        name: "workflow_branches_discover",
+        status: "done",
+        result: JSON.stringify({
+            resolution: { status: "resolved" },
+            selected_branch: { selectable_node_ids: [2, 3] },
+        }),
+    }), "Found workflow branch · 2 nodes");
+    assert.equal(summarizeToolStep({
+        name: "workflow_branches_discover",
+        status: "done",
+        result: '{"resolution":{"status":"needs_choice","candidate_count":2}}',
+    }), "Branch match needs your choice");
+    assert.equal(summarizeToolStep({
+        name: "workflow_branch_compare",
+        status: "done",
+        result: '{"status":"compared","structurally_equal":true,"value_equal":false}',
+    }), "Compared workflow branches · same structure · different values");
+    assert.equal(summarizeToolStep({
+        name: "workflow_branch_navigate",
+        status: "done",
+        result: '{"success":true,"selected_count":3}',
+    }), "Focused workflow branch · 3 nodes");
+    assert.equal(summarizeToolStep({
+        name: "compile_workflow_branch_operation",
+        status: "done",
+        result: JSON.stringify({
+            valid: true,
+            operation: "replace",
+            plan: {
+                expected_delta: {
+                    created_node_count: 2,
+                    removed_node_count: 1,
+                },
+            },
+        }),
+    }), "Planned branch replace · 2 new nodes · 1 removed node");
+    assert.equal(summarizeToolStep({
+        name: "resolve_workflow_branch_successor",
+        status: "done",
+        result: JSON.stringify({
+            valid: true,
+            successor_branch_ids: ["a".repeat(64), "b".repeat(64)],
+        }),
+    }), "Resolved 2 successor branches");
+    assert.equal(summarizeToolStep({
+        name: "resolve_workflow_branch_successor",
+        status: "done",
+        result: '{"valid":true,"successor_branch_ids":[]}',
+    }), "Confirmed branch removal · no successor branches");
+    assert.equal(summarizeToolStep({
+        name: "resolve_workflow_branch_successor",
+        status: "done",
+        result: '{"valid":false,"error_count":1}',
+    }), "Branch lineage stopped safely");
+    assert.equal(summarizeToolStep({
+        name: "workflow_branch_navigate",
+        status: "failed",
+    }), "Couldn’t focus workflow branch");
+});
+
 test("image review and mask summaries report the visible outcome", () => {
     assert.equal(summarizeToolStep({
         name: "view_output_image",
@@ -150,7 +277,28 @@ test("image review and mask summaries report the visible outcome", () => {
         name: "view_node_mask",
         status: "done",
         result: JSON.stringify(maskResult),
-    }), "Inspected mask on LOAD & MASK IMAGE · 4% covered");
+    }), "Inspected LOAD & MASK IMAGE for masking · 4% covered");
+
+    assert.equal(summarizeToolStep({
+        name: "view_node_mask",
+        status: "done",
+        result: JSON.stringify({
+            node_id: 12,
+            title: "LOAD & MASK IMAGE",
+            mask: { coveragePercent: 0 },
+        }),
+    }), "Inspected LOAD & MASK IMAGE for masking · empty mask");
+
+    assert.equal(summarizeToolStep({
+        name: "view_node_mask",
+        status: "failed",
+    }), "Couldn’t inspect image for masking");
+
+    assert.equal(summarizeToolStep({
+        name: "view_node_mask",
+        status: "needs_choice",
+        result: JSON.stringify({ success: false, needs_choice: true }),
+    }), "Choose the exact image node to inspect");
 
     assert.equal(summarizeToolStep({
         name: "edit_node_mask",
@@ -199,7 +347,7 @@ test("image review and mask summaries report the visible outcome", () => {
         name: "view_node_mask",
         status: "done",
         result: JSON.stringify(maskResult),
-    }), "Inspected mask on LOAD & MASK IMAGE · 4% covered");
+    }), "Inspected LOAD & MASK IMAGE for masking · 4% covered");
 
     assert.equal(summarizeToolStep({
         name: "edit_node_mask",
@@ -376,6 +524,7 @@ test("large tool histories summarize every individual call without grouping", ()
         done: 1,
         retried: 1,
         failed: 1,
+        needsChoice: 0,
         interrupted: 1,
         active: steps[2],
     });

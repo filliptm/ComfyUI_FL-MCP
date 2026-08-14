@@ -7,6 +7,7 @@ import {
     GRAPH_PRECONDITION_SCHEMA,
     REFINEMENT_LEDGER_KEY,
     workflowGraphHash,
+    workflowGraphHashExcludingExtra,
 } from "../../web/js/graph_precondition.js";
 
 
@@ -93,6 +94,23 @@ test("only root viewport and refinement ledger state are excluded", async () => 
     const nodeMetadata = structuredClone(first);
     nodeMetadata.nodes[0].properties[REFINEMENT_LEDGER_KEY] = { keep: true };
     assert.notEqual(await workflowGraphHash(first), await workflowGraphHash(nodeMetadata));
+});
+
+
+test("callers can exclude one additional ledger without hiding graph edits", async () => {
+    const first = workflow();
+    const withLedger = structuredClone(first);
+    withLedger.extra.fl_mcp_graph_patch_ledger = { schema: "v2", entries: {} };
+
+    assert.equal(
+        await workflowGraphHashExcludingExtra(first, ["fl_mcp_graph_patch_ledger"]),
+        await workflowGraphHashExcludingExtra(withLedger, ["fl_mcp_graph_patch_ledger"]),
+    );
+    withLedger.nodes[0].widgets_values[0] = 2048;
+    assert.notEqual(
+        await workflowGraphHashExcludingExtra(first, ["fl_mcp_graph_patch_ledger"]),
+        await workflowGraphHashExcludingExtra(withLedger, ["fl_mcp_graph_patch_ledger"]),
+    );
 });
 
 

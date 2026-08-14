@@ -129,8 +129,18 @@ export const TOOL_CONFIG = {
     },
     "view_node_mask": {
         icon: "🎭",
-        label: "Inspect Mask",
-        description: "Highlighting masked pixels in magenta"
+        label: "Inspect Image for Masking",
+        description: "Loading the source image and current alpha; an empty mask is valid"
+    },
+    "view_prompt_reference_image": {
+        icon: "👁️",
+        label: "Inspect Reference",
+        description: "Loading the exact image connected to the reference input"
+    },
+    "update_connected_prompt": {
+        icon: "✍️",
+        label: "Update Prompt",
+        description: "Updating the exact connected prompt value"
     },
     "edit_node_mask": {
         icon: "🖌️",
@@ -382,6 +392,41 @@ export const TOOL_CONFIG = {
         label: "Refine Workflow",
         description: "Applying a verified workflow graph change"
     },
+    "compile_workflow_refinement_spec": {
+        icon: "🧠",
+        label: "Plan Workflow",
+        description: "Resolving and validating the requested workflow graph"
+    },
+    "apply_workflow_graph_patch": {
+        icon: "🕸️",
+        label: "Build Workflow",
+        description: "Building and atomically verifying the requested workflow graph"
+    },
+    "workflow_branches_discover": {
+        icon: "🌿",
+        label: "Find Branches",
+        description: "Discovering exact workflow branches and boundaries"
+    },
+    "workflow_branch_compare": {
+        icon: "⚖️",
+        label: "Compare Branches",
+        description: "Comparing two exact workflow branches"
+    },
+    "workflow_branch_navigate": {
+        icon: "🎯",
+        label: "Jump to Branch",
+        description: "Selecting and focusing the exact workflow branch"
+    },
+    "compile_workflow_branch_operation": {
+        icon: "🌱",
+        label: "Plan Branch Change",
+        description: "Compiling a safe whole-branch change"
+    },
+    "resolve_workflow_branch_successor": {
+        icon: "🧬",
+        label: "Resolve Branch Lineage",
+        description: "Resolving exact successor branch identities after the change"
+    },
     "registry_search_packages": {
         icon: "🌐",
         label: "Registry Search",
@@ -505,6 +550,8 @@ const TOOL_ICON_CLASSES = {
     view_chat_image: "pi pi-eye",
     place_chat_image_in_node: "pi pi-sign-in",
     view_node_mask: "pi pi-eye",
+    view_prompt_reference_image: "pi pi-eye",
+    update_connected_prompt: "pi pi-pencil",
     edit_node_mask: "pi pi-pencil",
     confirm_mask_review: "pi pi-check-circle",
     cancel_workflow: "pi pi-stop",
@@ -524,6 +571,13 @@ const TOOL_ICON_CLASSES = {
     plan_workflow: "pi pi-check-circle",
     plan_workflow_refinement: "pi pi-directions",
     apply_workflow_refinement: "pi pi-arrows-h",
+    compile_workflow_refinement_spec: "pi pi-sitemap",
+    apply_workflow_graph_patch: "pi pi-share-alt",
+    workflow_branches_discover: "pi pi-sitemap",
+    workflow_branch_compare: "pi pi-arrows-h",
+    workflow_branch_navigate: "pi pi-crosshairs",
+    compile_workflow_branch_operation: "pi pi-code",
+    resolve_workflow_branch_successor: "pi pi-directions-alt",
     registry_search_packages: "pi pi-globe",
     registry_get_package: "pi pi-box",
     manager_check_updates: "pi pi-refresh",
@@ -550,7 +604,9 @@ const TOOL_RUNNING_LABELS = {
     view_output_image: "Loading final output for review",
     view_chat_image: "Inspecting attached image",
     place_chat_image_in_node: "Placing image in selected node",
-    view_node_mask: "Loading mask overlay",
+    view_node_mask: "Inspecting source image for masking",
+    view_prompt_reference_image: "Inspecting connected reference image",
+    update_connected_prompt: "Updating connected prompt",
     edit_node_mask: "Saving mask edit",
     confirm_mask_review: "Waiting for mask approval",
     take_screenshot: "Capturing canvas",
@@ -564,6 +620,13 @@ const TOOL_RUNNING_LABELS = {
     plan_workflow: "Validating workflow plan",
     plan_workflow_refinement: "Planning workflow refinement",
     apply_workflow_refinement: "Refining workflow graph",
+    compile_workflow_refinement_spec: "Planning workflow graph",
+    apply_workflow_graph_patch: "Building workflow graph",
+    workflow_branches_discover: "Discovering workflow branches",
+    workflow_branch_compare: "Comparing workflow branches",
+    workflow_branch_navigate: "Focusing workflow branch",
+    compile_workflow_branch_operation: "Planning branch change",
+    resolve_workflow_branch_successor: "Resolving branch lineage",
     registry_search_packages: "Searching official Comfy Registry",
     registry_get_package: "Inspecting Registry package",
     manager_check_updates: "Checking for updates",

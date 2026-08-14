@@ -5,6 +5,7 @@ import {
     REFINEMENT_LEDGER_KEY,
     workflowGraphHash,
 } from "./graph_precondition.js";
+import { nodeIdsEqual } from "./node_identity.js";
 
 export const WORKFLOW_REFINEMENT_PROPERTY = "fl_mcp_workflow_refinement";
 export const WORKFLOW_REFINEMENT_SCHEMA = "fl-mcp.workflow-refinement.v1";
@@ -42,12 +43,14 @@ function valuesEqual(left, right) {
 
 
 function idKey(value) {
-    return `${typeof value}:${JSON.stringify(value)}`;
+    // ComfyUI may expose one node as 52 in serialized workflow JSON and as
+    // "52" through the live LiteGraph API. Those are the same node identity.
+    return String(value);
 }
 
 
 function idsEqual(left, right) {
-    return idKey(left) === idKey(right);
+    return nodeIdsEqual(left, right);
 }
 
 

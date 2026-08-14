@@ -45,6 +45,11 @@ test("run requests include per-message reasoning and search modes", async () => 
             message: "Inspect this workflow",
             reasoningEffort: "xhigh",
             searchMode: "tavily_basic",
+            workflow: {
+                id: "workflow-a",
+                name: "A",
+                path: "workflows/a.json",
+            },
         });
     } finally {
         globalThis.fetch = originalFetch;
@@ -59,6 +64,11 @@ test("run requests include per-message reasoning and search modes", async () => 
         searchMode: "tavily_basic",
         editMessageId: null,
         attachments: [],
+        workflow: {
+            id: "workflow-a",
+            name: "A",
+            path: "workflows/a.json",
+        },
     });
 });
 

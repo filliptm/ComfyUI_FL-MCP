@@ -135,6 +135,30 @@ async def test_handshake_includes_explicit_client_identity(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_embedded_tool_requests_include_expected_workflow(monkeypatch):
+    socket = FakeClientSocket()
+
+    async def connect(_url):
+        return socket
+
+    monkeypatch.setattr(mcp_server.websockets, "connect", connect)
+    monkeypatch.setenv("FL_MCP_WORKFLOW_ID", "workflow-a")
+    monkeypatch.setenv("FL_MCP_WORKFLOW_NAME", "A")
+    monkeypatch.setenv("FL_MCP_WORKFLOW_PATH", "workflows/a.json")
+    client = mcp_server.MCPWebSocketClient("session", "ws://bridge/ws")
+
+    await client.execute_tool("workflow_overview", {})
+
+    request = next(item for item in socket.sent if item["type"] == "tool_request")
+    assert request["workflow"] == {
+        "id": "workflow-a",
+        "name": "A",
+        "path": "workflows/a.json",
+    }
+    await client.disconnect()
+
+
+@pytest.mark.asyncio
 async def test_embedded_tool_filter_removes_unselected_tools(monkeypatch):
     class Tool:
         def __init__(self, name):
@@ -186,3 +210,27 @@ async def test_embedded_tool_filter_supports_current_fastmcp_api(monkeypatch):
     await mcp_server._restrict_tools_from_environment()
 
     assert fake.removed == ["queue_workflow"]
+
+
+@pytest.mark.asyncio
+async def test_embedded_tool_filter_rejects_a_missing_selected_tool(monkeypatch):
+    class Tool:
+        def __init__(self, name):
+            self.name = name
+
+    class FakeMcp:
+        async def list_tools(self, *, run_middleware):
+            assert run_middleware is False
+            return [Tool("workflow_overview")]
+
+        def remove_tool(self, _name):
+            raise AssertionError("filter must fail before removing tools")
+
+    monkeypatch.setattr(mcp_server, "mcp", FakeMcp())
+    monkeypatch.setenv(
+        "FL_MCP_ALLOWED_TOOLS",
+        "workflow_overview,update_connected_prompt",
+    )
+
+    with pytest.raises(RuntimeError, match="provider_tool_surface_mismatch"):
+        await mcp_server._restrict_tools_from_environment()

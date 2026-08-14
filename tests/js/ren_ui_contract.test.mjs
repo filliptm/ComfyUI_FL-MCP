@@ -19,6 +19,32 @@ test("sidebar keeps the stable Ren entry and reads live canvas context", async (
 });
 
 
+test("browser bridge advertises its instantiated ToolExecutor before connecting", async () => {
+    const extension = await readFile(new URL("web/js/extension.js", root), "utf8");
+    const executor = await readFile(new URL("web/js/tool_executor.js", root), "utf8");
+
+    assert.match(
+        extension,
+        /await wsClient\.setSupportedTools\([\s\S]*?toolExecutor\.getSupportedTools\(\),[\s\S]*?toolExecutor\.getToolContractRevisions\(\),[\s\S]*?\)/,
+    );
+    const manifestIndex = extension.indexOf("await wsClient.setSupportedTools");
+    assert.ok(manifestIndex >= 0);
+    assert.ok(manifestIndex < extension.indexOf("wsClient.connect()", manifestIndex));
+    assert.match(executor, /getSupportedTools\(\)\s*\{\s*return Object\.keys\(this\.toolHandlers\)\.sort\(\)/s);
+    assert.match(executor, /getToolContractRevisions\(\)/);
+    assert.match(executor, /"apply_workflow_graph_patch": withToolContractRevision\([\s\S]*?,\s*3,/);
+    assert.match(executor, /"edit_node_mask": withToolContractRevision\([\s\S]*?,\s*5,/);
+    assert.match(executor, /"confirm_mask_review": withToolContractRevision\([\s\S]*?,\s*3,/);
+    assert.match(executor, /"set_node_values_exact": withToolContractRevision\([\s\S]*?,\s*4,/);
+    assert.match(executor, /"queue_workflow": withToolContractRevision\([\s\S]*?,\s*3,/);
+    assert.match(executor, /"recover_narrow_operation":/);
+    assert.match(executor, /"get_node_image_ref": withToolContractRevision\([\s\S]*?,\s*2,/);
+    assert.match(executor, /"get_canvas_image_refs": withToolContractRevision\([\s\S]*?,\s*1,/);
+    assert.match(executor, /"get_selected_nodes": withToolContractRevision\([\s\S]*?,\s*2,/);
+    assert.doesNotMatch(extension, /supportedTools:\s*\[/);
+});
+
+
 test("run identity remains available across CORS and provider startup", async () => {
     const client = await readFile(new URL("web/js/chat_client.js", root), "utf8");
     const runtime = await readFile(new URL("backend/chat_runtime.py", root), "utf8");
@@ -72,13 +98,13 @@ test("chat shell has compact two-row chrome and full-panel sheets", async () => 
 });
 
 
-test("settings use defined cards with live state and collapsed diagnostics", async () => {
+test("settings use a compact single-open accordion with live state", async () => {
     const panel = await readFile(new URL("web/js/chat_panel.js", root), "utf8");
     const styles = await readFile(new URL("web/js/style.css", root), "utf8");
 
     assert.match(panel, /<h2 id="fl-settings-title">Settings<\/h2>/);
     assert.match(panel, /fl-settings-card-model/);
-    assert.match(panel, /Model &amp; provider/);
+    assert.match(panel, /<h3 id="fl-settings-model-title">Connection<\/h3>/);
     assert.match(panel, /fl-settings-card-search/);
     assert.match(panel, /Free · no cost/);
     assert.match(panel, /data-settings-state="search"/);
@@ -86,7 +112,8 @@ test("settings use defined cards with live state and collapsed diagnostics", asy
     assert.match(panel, /data-setting="show_action_buttons"/);
     assert.match(panel, /data-setting="tavily_credential"/);
     assert.match(panel, /fl-settings-card-approvals/);
-    assert.match(panel, /Tool approvals/);
+    assert.match(panel, /<h3 id="fl-settings-approvals-title">Permissions<\/h3>/);
+    assert.match(panel, /<div class="fl-settings-group-label">Advanced<\/div>/);
     assert.match(panel, /fl-settings-card-bridge/);
     assert.match(panel, /Bridge &amp; safety/);
     assert.match(panel, /data-bridge-setting="ws_port"/);
@@ -98,22 +125,29 @@ test("settings use defined cards with live state and collapsed diagnostics", asy
     assert.match(panel, /pendingRestartFields/);
     assert.match(
         panel,
-        /<details class="fl-settings-card fl-settings-disclosure fl-settings-card-diagnostics"/,
+        /<details class="fl-settings-card fl-settings-disclosure fl-settings-card-model"[^>]*\sopen>/,
     );
-    assert.doesNotMatch(
-        panel,
-        /<details class="fl-settings-card fl-settings-disclosure fl-settings-card-diagnostics"[^>]*\sopen/,
+    assert.equal(
+        panel.match(/<details class="fl-settings-card fl-settings-disclosure/g)?.length,
+        5,
     );
+    assert.equal(panel.match(/data-settings-section="[^"]+" open/g)?.length, 1);
     assert.match(panel, /data-settings-state="model"/);
     assert.match(panel, /data-settings-state="approvals"/);
     assert.match(panel, /data-settings-state="diagnostics"/);
-    assert.match(panel, /target instanceof HTMLDetailsElement/);
-    assert.match(panel, /target\.open = true/);
+    assert.match(panel, /this\.settingsDisclosures/);
+    assert.match(panel, /openSettingsSection\(section\)/);
+    assert.match(panel, /handleSettingsDisclosureToggle\(disclosure\)/);
+    assert.match(panel, /data-section="model"/);
     assert.match(panel, /updateModelSettingsState/);
     assert.match(panel, /updateDiagnosticsSettingsState/);
-    assert.match(styles, /\.fl-settings-content\s*\{[^}]*gap:\s*10px/s);
-    assert.match(styles, /\.fl-settings-card\s*\{[^}]*border-radius:\s*10px/s);
+    assert.match(styles, /\.fl-settings-content\s*\{[^}]*gap:\s*6px/s);
+    assert.match(styles, /\.fl-settings-card\s*\{[^}]*border-radius:\s*9px[^}]*box-shadow:\s*none/s);
+    assert.match(styles, /\.fl-settings-card-header\s*\{[^}]*min-height:\s*48px/s);
+    assert.match(styles, /\.fl-settings-state::before\s*\{[^}]*border-radius:\s*50%/s);
     assert.match(styles, /\.fl-bridge-settings-grid\s*\{[^}]*display:\s*grid/s);
+    assert.match(styles, /\.fl-bridge-settings-group\s*\{[^}]*border-top:\s*1px solid var\(--ren-border\)/s);
+    assert.match(styles, /\.fl-mcp-metric\s*\{[^}]*grid-template-columns:\s*72px minmax\(0, 1fr\)/s);
     assert.match(styles, /\.fl-settings-disclosure > summary\s*\{[^}]*list-style:\s*none/s);
     assert.match(
         styles,
@@ -292,7 +326,8 @@ test("mask edits show a live preview and block queueing until review", async () 
     assert.match(api, /node\.imgs = \[reviewPreview\.image\]/);
     assert.match(api, /previewUrl: reviewPreview\.url/);
     assert.match(api, /this\._assignImageToNode\(node, pending\.image\)/);
-    assert.match(api, /preview\.src = api\.apiURL\(`\/fl_mcp\/image\/thumbnail\?/);
+    assert.match(api, /preview\.src = api\.apiURL\(`\/view\?/);
+    assert.doesNotMatch(api, /preview\.src = api\.apiURL\(`\/fl_mcp\/image\/thumbnail\?/);
     assert.match(api, /_releaseMaskReviewPreview/);
     assert.match(api, /discardMaskReviews\(\)/);
     assert.doesNotMatch(editImplementation, /_assignImageToNode/);
@@ -301,12 +336,49 @@ test("mask edits show a live preview and block queueing until review", async () 
     assert.match(previewImplementation, /catch \(error\)[\s\S]*URL\.revokeObjectURL\(url\)/);
     assert.match(api, /app\.canvas\?\.centerOnNode\?\.\(node\)/);
     assert.match(api, /this\.pendingMaskReviews/);
+    assert.match(api, /drawMaskRegionPath\(regionContext, region\)/);
+    assert.match(api, /await this\._loadComfyImageExact\(source, exactContext\.expectedSourceAttestation\)/);
+    assert.match(api, /const sha256 = await sha256BlobHex\(blob\)/);
+    assert.match(api, /image\.width !== expected\.width \|\| image\.height !== expected\.height/);
+    assert.match(api, /return \{\s*blob,\s*image,\s*attestation:/s);
+    assert.doesNotMatch(editImplementation, /_loadComfyImage\(source, "rgb"\)/);
+    assert.doesNotMatch(editImplementation, /_loadComfyImage\(source, "a"\)/);
+    assert.match(editImplementation, /buildExactMaskComposeFormData\(\s*sourceBlob,\s*alphaBlob,\s*sourceAttestation/s);
+    assert.match(editImplementation, /api\.fetchApi\("\/fl_mcp\/mask\/compose"/);
+    assert.match(editImplementation, /_loadComfyImageChannel\(image, "rgb"\)/);
+    assert.doesNotMatch(editImplementation, /uploadContext\.drawImage\(sourceImage/);
+    assert.doesNotMatch(editImplementation, /api\.fetchApi\("\/upload\/image"/);
+    assert.doesNotMatch(editImplementation, /api\.fetchApi\("\/upload\/mask"/);
+    assert.match(editImplementation, /image_size: \{ width: sourceWidth, height: sourceHeight \}/);
     assert.match(api, /Mask review required for node/);
     assert.match(api, /_pauseAutoQueueForMaskReview/);
     assert.match(executor, /confirm_mask_review/);
     assert.match(extension, /toolExecutor\.flApi\.discardMaskReviews\(\)/);
     assert.match(panel, /this\.discardMaskReviews\?\.\(\)/);
     assert.match(prompt, /Never queue until the latest mask is approved/);
+    assert.match(prompt, /not proof or an expectation that a mask already exists/);
+    assert.match(prompt, /an empty mask is valid and expected before the first paint/);
+    assert.match(prompt, /Stop immediately on a classified failed step/);
+    assert.match(prompt, /do not invoke GraphPatch, a planner, or diagnostic tools/);
+});
+
+
+test("mask confirmation verifies the commit before restoring auto-queue", async () => {
+    const api = await readFile(new URL("web/js/fl_api.js", root), "utf8");
+    const start = api.indexOf("async confirmMaskReview(");
+    const end = api.indexOf("\n    discardMaskReviews()", start);
+    assert.ok(start >= 0 && end > start);
+    const confirm = api.slice(start, end);
+    assert.match(confirm, /includePending: false/);
+    assert.match(confirm, /did not retain its exact value/);
+    assert.match(confirm, /workflow_state_compromised/);
+    assert.match(api, /pendingMaskReviews\.set\(typedNodeKey\(reviewNodeId\)/);
+    assert.match(api, /typedValuesEqual\(value\.nodeId, nodeId\)/);
+    assert.ok(confirm.indexOf("this._markGraphChanged()") >= 0);
+    assert.ok(
+        confirm.indexOf("this._markGraphChanged()")
+        < confirm.indexOf("this._restoreAutoQueueAfterMaskReview"),
+    );
 });
 
 
@@ -330,7 +402,24 @@ test("composer can steer an active response and exposes real stop progress", asy
     assert.match(styles, /\.fl-inline-action:disabled/);
     assert.match(
         styles,
-        /\.fl-chat-layout \.fl-chat-input:focus-visible\s*\{[^}]*outline:\s*0;[^}]*box-shadow:\s*inset 0 0 0 1px #b888ee/s,
+        /\.fl-chat-input-container:focus-within\s*\{[^}]*border-color:\s*rgba\(184, 136, 238, 0\.82\);[^}]*box-shadow:[^}]*0 0 16px rgba\(153, 102, 217, 0\.14\)/s,
+    );
+});
+
+
+test("composer defaults to three lines with a rounded focused shell", async () => {
+    const panel = await readFile(new URL("web/js/chat_panel.js", root), "utf8");
+    const styles = await readFile(new URL("web/js/style.css", root), "utf8");
+
+    assert.match(panel, /class="fl-chat-input" rows="3"/);
+    assert.match(
+        styles,
+        /\.fl-chat-input-container\s*\{[^}]*margin:\s*0 10px 14px;[^}]*border-radius:\s*12px;/s,
+    );
+    assert.match(styles, /\.fl-chat-input\s*\{[^}]*min-height:\s*76px;[^}]*padding:\s*7px 4px 12px 10px;/s);
+    assert.match(
+        styles,
+        /\.fl-chat-layout \.fl-chat-input:focus-visible\s*\{[^}]*outline:\s*0;[^}]*box-shadow:\s*none;/s,
     );
 });
 
@@ -375,8 +464,9 @@ test("chat accepts local images and can place them into a selected image node", 
     assert.match(api, /formData\.append\("image", file,/);
     assert.match(api, /placeChatImageInNode/);
     assert.match(api, /restoreNestedImageReferences/);
+    assert.match(api, /hydrateNestedImagePreviews/);
     assert.match(api, /optionValues\.push\(widgetValue\)/);
-    assert.match(api, /\/fl_mcp\/image\/thumbnail\?/);
+    assert.doesNotMatch(api, /api\.apiURL\(`\/fl_mcp\/image\/thumbnail\?/);
     assert.match(api, /preview\.onload = \(\) => \{[\s\S]*node\.imgs = \[preview\]/);
     assert.match(api, /preview\.onerror = \(\) =>/);
     assert.match(api, /preview\.src = api\.apiURL\(`\/view\?/);
@@ -458,16 +548,40 @@ test("deterministic workflow planning has clear human tool activity", async () =
     assert.match(tools, /"apply_workflow_refinement"\s*:\s*\{/);
     assert.match(tools, /label:\s*"Refine Workflow"/);
     assert.match(tools, /apply_workflow_refinement:\s*"Refining workflow graph"/);
+    assert.match(tools, /"compile_workflow_refinement_spec"\s*:\s*\{/);
+    assert.match(tools, /label:\s*"Plan Workflow"/);
+    assert.match(
+        tools,
+        /compile_workflow_refinement_spec:\s*"Planning workflow graph"/,
+    );
+    assert.match(tools, /"apply_workflow_graph_patch"\s*:\s*\{/);
+    assert.match(tools, /label:\s*"Build Workflow"/);
+    assert.match(tools, /apply_workflow_graph_patch:\s*"Building workflow graph"/);
+    assert.match(tools, /"workflow_branches_discover"\s*:\s*\{/);
+    assert.match(tools, /label:\s*"Find Branches"/);
+    assert.match(tools, /workflow_branches_discover:\s*"Discovering workflow branches"/);
+    assert.match(tools, /"workflow_branch_compare"\s*:\s*\{/);
+    assert.match(tools, /"workflow_branch_navigate"\s*:\s*\{/);
+    assert.match(tools, /"compile_workflow_branch_operation"\s*:\s*\{/);
 });
 
 
 test("workflow queueing preserves ComfyUI frontend authentication", async () => {
     const api = await readFile(new URL("web/js/fl_api.js", root), "utf8");
+    const capture = await readFile(new URL("web/js/queue_capture.js", root), "utf8");
 
-    assert.match(api, /await app\.queuePrompt\(0, effectiveBatchCount\)/);
-    assert.match(api, /const originalQueuePrompt = api\.queuePrompt/);
-    assert.match(api, /api\.queuePrompt = originalQueuePrompt/);
+    assert.match(api, /\(\) => app\.queuePrompt\(0, effectiveBatchCount\)/);
+    assert.match(api, /onSubmitting: \(\) =>/);
+    assert.match(api, /captureAuthenticatedQueue\(/);
+    assert.match(capture, /const originalQueuePrompt = api\.queuePrompt/);
+    assert.match(capture, /api\.queuePrompt === captureQueuePrompt/);
     assert.match(api, /partner\/API nodes report "Please login first"/);
+    assert.match(api, /effectiveBatchCount !== 1/);
+    assert.match(api, /exactly one workflow at a time/);
+    assert.match(api, /if \(!renQueueRequestActive\) return prompt/);
+    assert.match(api, /onRequestActiveChange: active =>/);
+    assert.match(api, /shouldCapture: \(args, \{ requestActive \}\) =>/);
+    assert.match(capture, /accepted: capturedAccepted \|\| Boolean\(outerAccepted\)/);
 });
 
 

@@ -4,16 +4,18 @@ This module defines MCP tools for controlling and inspecting ComfyUI.
 """
 
 import asyncio
+import hashlib
 import io
 import json
 import logging
 import mimetypes
 import os
+import re
 import sys
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, AsyncIterator, Dict, List, Optional, Union, Literal
+from typing import Any, AsyncIterator, Dict, List, Mapping, Optional, Union, Literal
 from urllib.parse import quote
 
 # Ensure this file's own directory is importable for flat sibling imports below.
@@ -67,15 +69,37 @@ from comfy_models import (
     ComfyReadFileRequest, ComfyReadFileResponse,
     ComfySearchFilesRequest, ComfySearchFilesResponse, ComfyFolderType
 )
-from comfy_tools import get_comfy_tools, ComfyUIError, ComfyUINotFoundError
+from comfy_tools import (
+    EXECUTION_SUBMISSION_ATTESTATION_SCHEMA,
+    ComfyUIError,
+    ComfyUINotFoundError,
+    get_comfy_tools,
+)
 from chat_images import ChatImageReference
 from node_library import (
     get_node_library_client,
+    normalize_node_schema_contract,
     NodeLibraryError,
     NodeLibraryConnectionError,
     NodeTypeNotFoundError
 )
 from node_catalog_store import NodeCatalogStore
+from mask_targeting import (
+    DirectPromptWidgetResolution,
+    MASK_CONTEXT_TTL_SECONDS,
+    MaskContextTokenStore,
+    normalize_image_reference,
+    resolve_connected_prompt_producer,
+    resolve_direct_prompt_widget,
+    resolve_mask_target,
+    resolve_reference_image_producer,
+    resolve_reference_prompt_producer,
+)
+from narrow_edit_idempotency import (
+    NarrowEditIdempotencyError,
+    NarrowEditOperationLedger,
+    canonical_narrow_operation_hash,
+)
 from workflow_planner import (
     ApplyWorkflowPlanRequest,
     PlanWorkflowRequest,
@@ -100,6 +124,39 @@ from workflow_refinement import (
     WorkflowRefinementSideInputMapping,
     compile_workflow_refinement,
     normalize_workflow_graph,
+)
+from workflow_graph_patch import (
+    ApplyScopedGraphPatchRequest,
+    GRAPH_PATCH_SCHEMA,
+    MAX_GRAPH_PATCH_ATTACHMENT_BYTES,
+    SCOPED_GRAPH_PATCH_SCHEMA,
+    WorkflowGraphPatchApplyRequest,
+    compile_graph_patch,
+    compile_scoped_graph_patch,
+    graph_patch_request_from_apply,
+    scoped_graph_patch_request_from_apply,
+    verify_completed_graph_patch_state,
+)
+from workflow_capability_graph import VerifiedCapabilityLesson
+from workflow_branch_operations import (
+    BranchOperationRequest,
+    ResolveBranchSuccessorsRequest,
+    WORKFLOW_BRANCH_SUCCESSOR_SCHEMA,
+    compile_workflow_branch_operation as compile_branch_operation,
+    resolve_workflow_branch_successors as resolve_branch_successors,
+)
+from workflow_branch_queries import (
+    CompareWorkflowBranchesRequest,
+    compare_workflow_branches,
+)
+from workflow_branch_tools import (
+    DiscoverWorkflowBranchesRequest,
+    NavigateWorkflowBranchRequest,
+    discover_workflow_branch_selection,
+)
+from workflow_refinement_compiler import (
+    CompileWorkflowRefinementSpecRequest,
+    compile_workflow_refinement_spec as compile_semantic_refinement,
 )
 from comfy_registry import ComfyRegistryClient, normalize_github_repository_url
 
@@ -178,11 +235,19 @@ class FrontendToolExecutionError(RuntimeError):
 
 class MCPWebSocketClient:
     """WebSocket client for MCP subprocess to communicate with backend."""
-    
+
     def __init__(self, session_id: str, ws_url: str, client_id: Optional[str] = None):
         self.session_id = session_id
         self.ws_url = ws_url
         self.client_id = client_id or os.getenv("FL_MCP_CLIENT_ID") or f"mcp-{os.getpid()}"
+        workflow_id = os.getenv("FL_MCP_WORKFLOW_ID", "").strip()
+        self.workflow = None
+        if workflow_id:
+            self.workflow = {
+                "id": workflow_id,
+                "name": os.getenv("FL_MCP_WORKFLOW_NAME", "").strip() or "Workflow",
+                "path": os.getenv("FL_MCP_WORKFLOW_PATH", "").strip() or None,
+            }
         self.ws = None
         self.pending_requests = {}  # request_id -> (Future, connection generation)
         self.connected = False
@@ -228,7 +293,7 @@ class MCPWebSocketClient:
             self._receive_task = asyncio.create_task(
                 self._receive_loop(websocket, generation)
             )
-    
+
     async def _receive_loop(self, websocket, generation: int):
         """Receive and process messages from backend."""
         try:
@@ -297,14 +362,17 @@ class MCPWebSocketClient:
         logger.info(f"[MCP-WS] Executing tool: {tool_name} (request_id: {request_id})")
         
         try:
-            await websocket.send(json.dumps({
+            message = {
                 'type': 'tool_request',
                 'session_id': self.session_id,
                 'request_id': request_id,
                 'tool_name': tool_name,
                 'parameters': parameters,
                 'timeout_ms': timeout_ms,
-            }))
+            }
+            if self.workflow:
+                message['workflow'] = self.workflow
+            await websocket.send(json.dumps(message))
             
             timeout_seconds = timeout_ms / 1000.0
             result = await asyncio.wait_for(future, timeout=timeout_seconds)
@@ -519,7 +587,7 @@ import time
 async def _report_tool_activity(ctx: Context, tool_name: str) -> None:
     """Report tool activity to frontend for Python-only tools."""
     _ws_client = ctx.request_context.lifespan_context.get('client')
-    if _ws_client and _ws_client.connected:
+    if _ws_client and getattr(_ws_client, "connected", False):
         try:
             await _ws_client.ws.send(json.dumps({
                 'type': 'tool_report',
@@ -540,6 +608,45 @@ def _node_knowledge_store(ctx: Context) -> NodeCatalogStore | None:
         return None
     store = lifespan_context.get("node_catalog_store")
     return store if isinstance(store, NodeCatalogStore) else None
+
+
+def _active_verified_capability_lessons(
+    ctx: Context,
+) -> tuple[VerifiedCapabilityLesson, ...]:
+    """Load current-schema lessons as optional compiler ranking priors.
+
+    Lesson retrieval is best-effort and never weakens live catalog validation.
+    Invalid or stale rows are ignored by the schema-scoped capability graph.
+    """
+
+    store = _node_knowledge_store(ctx)
+    if store is None:
+        return ()
+    try:
+        rows = store.get_all_active_verified_lessons()
+    except Exception as exc:
+        logger.warning("Could not load verified capability lessons: %s", exc)
+        return ()
+    lessons: list[VerifiedCapabilityLesson] = []
+    for row in rows:
+        node_type = row.get("node_type") if isinstance(row, dict) else None
+        schema_hash = row.get("schema_hash") if isinstance(row, dict) else None
+        payload = row.get("payload") if isinstance(row, dict) else None
+        if (
+            isinstance(node_type, str)
+            and node_type
+            and isinstance(schema_hash, str)
+            and re.fullmatch(r"[0-9a-f]{64}", schema_hash)
+            and isinstance(payload, dict)
+        ):
+            lessons.append(
+                VerifiedCapabilityLesson(
+                    node_type=node_type,
+                    schema_hash=schema_hash,
+                    payload=payload,
+                )
+            )
+    return tuple(lessons)
 
 
 def _comfy_base_url() -> str:
@@ -625,22 +732,7 @@ def _history_completion_result(
         }
 
     if status_str == "error":
-        errors = []
-        for message in messages:
-            if (
-                not isinstance(message, (list, tuple))
-                or len(message) < 2
-                or message[0] != "execution_error"
-                or not isinstance(message[1], dict)
-            ):
-                continue
-            data = message[1]
-            errors.append({
-                "node_id": data.get("node_id"),
-                "node_type": data.get("node_type"),
-                "exception_type": data.get("exception_type"),
-                "exception_message": data.get("exception_message"),
-            })
+        errors = _execution_history_error_facts(status)
         return {
             "success": False,
             "status": "execution_error",
@@ -899,7 +991,13 @@ class GetNodeValuesRequest(BaseModel):
 
 class ViewNodeMaskRequest(BaseModel):
     """Request to inspect a node image with its mask highlighted."""
-    node_id: Union[int, str] = Field(..., description="Node ID or title")
+    node_id: Optional[Union[int, str]] = Field(
+        default=None,
+        description=(
+            "Exact node ID. Omit to use exactly one selected compatible image node "
+            "or one uniquely topology-qualified IMAGE+MASK source."
+        ),
+    )
     max_dimension: int = Field(
         default=2048,
         ge=256,
@@ -908,20 +1006,97 @@ class ViewNodeMaskRequest(BaseModel):
     )
 
 
+class MaskPointRequest(BaseModel):
+    """One polygon vertex in pixel or normalized mask coordinates."""
+
+    x: float = Field(..., ge=0, allow_inf_nan=False)
+    y: float = Field(..., ge=0, allow_inf_nan=False)
+
+
 class MaskRegionRequest(BaseModel):
-    """One rectangle or ellipse to paint into or erase from a mask."""
-    x: float = Field(..., ge=0, description="Left edge in pixels or normalized coordinates")
-    y: float = Field(..., ge=0, description="Top edge in pixels or normalized coordinates")
-    width: float = Field(..., gt=0, description="Region width in pixels or normalized coordinates")
-    height: float = Field(..., gt=0, description="Region height in pixels or normalized coordinates")
-    shape: Literal["rectangle", "ellipse"] = Field("rectangle", description="Region shape")
+    """One rectangle, ellipse, or polygon to paint into or erase from a mask."""
+
+    x: Optional[float] = Field(
+        default=None,
+        ge=0,
+        allow_inf_nan=False,
+        description="Left edge in pixels or normalized coordinates",
+    )
+    y: Optional[float] = Field(
+        default=None,
+        ge=0,
+        allow_inf_nan=False,
+        description="Top edge in pixels or normalized coordinates",
+    )
+    width: Optional[float] = Field(
+        default=None,
+        gt=0,
+        allow_inf_nan=False,
+        description="Region width in pixels or normalized coordinates",
+    )
+    height: Optional[float] = Field(
+        default=None,
+        gt=0,
+        allow_inf_nan=False,
+        description="Region height in pixels or normalized coordinates",
+    )
+    shape: Literal["rectangle", "ellipse", "polygon"] = Field(
+        "rectangle",
+        description="Region shape",
+    )
+    points: Optional[List[MaskPointRequest]] = Field(
+        default=None,
+        min_length=3,
+        max_length=64,
+        description="Polygon vertices; required only when shape is polygon",
+    )
     operation: Literal["paint", "erase"] = Field("paint", description="Add to or remove from the mask")
     feather: float = Field(0, ge=0, le=512, description="Soft edge radius in image pixels")
+
+    @model_validator(mode="after")
+    def validate_geometry(self) -> "MaskRegionRequest":
+        box_values = (self.x, self.y, self.width, self.height)
+        if self.shape == "polygon":
+            if any(value is not None for value in box_values):
+                raise ValueError("Polygon mask regions cannot include box coordinates")
+            if self.points is None:
+                raise ValueError("Polygon mask regions require at least three points")
+            twice_area = abs(
+                sum(
+                    point.x * self.points[(index + 1) % len(self.points)].y
+                    - self.points[(index + 1) % len(self.points)].x * point.y
+                    for index, point in enumerate(self.points)
+                )
+            )
+            if twice_area <= 1e-9:
+                raise ValueError("Polygon mask regions must have non-zero area")
+        else:
+            if self.points is not None:
+                raise ValueError("Rectangle and ellipse mask regions cannot include points")
+            if any(value is None for value in box_values):
+                raise ValueError("Rectangle and ellipse mask regions require x, y, width, and height")
+        return self
 
 
 class EditNodeMaskRequest(BaseModel):
     """Paint or erase regions in the image mask attached to a canvas node."""
     node_id: Union[int, str] = Field(..., description="Load Image node ID or title")
+    operation_id: str = Field(
+        ...,
+        min_length=8,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$",
+        description="Stable opaque ID; reuse only for an identical lost-response retry",
+    )
+    mask_context_token: str = Field(
+        ...,
+        min_length=16,
+        max_length=256,
+        description=(
+            "Short-lived source attestation returned by view_node_mask. It is bound "
+            "to this Ren session, workflow, graph, exact node ID, and source image."
+        ),
+    )
     regions: List[MaskRegionRequest] = Field(..., min_length=1, max_length=100)
     coordinate_space: Literal["pixels", "normalized"] = Field(
         "pixels",
@@ -936,6 +1111,13 @@ class EditNodeMaskRequest(BaseModel):
     def validate_normalized_regions(self) -> "EditNodeMaskRequest":
         if self.coordinate_space == "normalized":
             for region in self.regions:
+                if region.shape == "polygon":
+                    assert region.points is not None
+                    if any(point.x > 1 or point.y > 1 for point in region.points):
+                        raise ValueError("Normalized mask polygon points must remain within 0..1")
+                    continue
+                assert region.x is not None and region.y is not None
+                assert region.width is not None and region.height is not None
                 if region.x + region.width > 1 or region.y + region.height > 1:
                     raise ValueError("Normalized mask regions must remain within 0..1")
         return self
@@ -947,11 +1129,121 @@ class ConfirmMaskReviewRequest(BaseModel):
         ...,
         description="Edited image node ID or title",
     )
+    operation_id: str = Field(
+        ...,
+        min_length=8,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$",
+        description="Stable opaque ID; reuse only for an identical lost-response retry",
+    )
     review_token: str = Field(
         ...,
         min_length=1,
         description="Token returned by edit_node_mask",
     )
+
+
+class ViewPromptReferenceImageRequest(BaseModel):
+    """Inspect the exact image producer connected to an image2/reference input."""
+
+    consumer_node_id: Optional[Union[int, str]] = Field(
+        default=None,
+        description="Optional exact consumer node ID when more than one reference route exists",
+    )
+    max_dimension: int = Field(default=2048, ge=256, le=4096)
+
+
+class ViewCanvasImagesRequest(BaseModel):
+    """Inspect an exact bounded page of image references already on the canvas."""
+
+    node_ids: Optional[List[Union[StrictInt, StrictStr]]] = Field(
+        default=None,
+        min_length=1,
+        max_length=8,
+        description=(
+            "Optional exact typed node IDs. Omit to discover all current root-canvas "
+            "image references in stable visual order."
+        ),
+    )
+    offset: int = Field(default=0, ge=0)
+    limit: int = Field(default=8, ge=1, le=8)
+    max_dimension: int = Field(default=1600, ge=256, le=2048)
+
+    @model_validator(mode="after")
+    def validate_node_ids(self) -> "ViewCanvasImagesRequest":
+        if self.node_ids is not None:
+            typed = [(type(value).__name__, value) for value in self.node_ids]
+            if len(typed) != len(set(typed)):
+                raise ValueError("node_ids cannot contain duplicate exact typed IDs")
+        return self
+
+
+class UpdateConnectedPromptRequest(BaseModel):
+    """Update an exact connected prompt producer or direct prompt widget."""
+
+    prompt: str = Field(..., min_length=1, max_length=50_000)
+    operation_id: str = Field(
+        ...,
+        min_length=8,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$",
+        description="Stable opaque ID; reuse only for an identical lost-response retry",
+    )
+    operation: Literal["replace", "append", "prepend", "remove_exact"] = Field(
+        default="replace",
+        description=(
+            "How to apply prompt: replace the full value, append/prepend this exact "
+            "operand, or remove one exact literal occurrence"
+        ),
+    )
+    separator: str = Field(
+        default=" ",
+        max_length=32,
+        description=(
+            "Exact separator for append/prepend; ignored for replace/remove_exact"
+        ),
+    )
+    consumer_node_id: Optional[Union[int, str]] = Field(
+        default=None,
+        description=(
+            "Optional exact prompt consumer node ID. Supply this for a direct, "
+            "unconnected prompt widget when more than one prompt consumer exists."
+        ),
+    )
+    consumer_input: Optional[str] = Field(
+        default=None,
+        min_length=1,
+        max_length=256,
+        description=(
+            "Optional exact prompt input role, such as prompt or negative_prompt. "
+            "For a direct widget this must match the unconnected STRING input."
+        ),
+    )
+    prompt_context_token: Optional[str] = Field(
+        default=None,
+        min_length=16,
+        max_length=256,
+        description=(
+            "One-use workflow/graph/reference binding returned by "
+            "view_prompt_reference_image"
+        ),
+    )
+    reference_image_used: bool = Field(
+        default=False,
+        description=(
+            "Set true when the new prompt was composed from image2/reference pixels; "
+            "requires the unchanged one-use prompt_context_token returned by inspection"
+        ),
+    )
+
+    @model_validator(mode="after")
+    def require_inspection_token_for_reference_edit(self) -> "UpdateConnectedPromptRequest":
+        if self.reference_image_used and self.prompt_context_token is None:
+            raise ValueError(
+                "Reference-based prompt edits require the prompt_context_token returned "
+                "by view_prompt_reference_image."
+            )
+        return self
 
 
 class SetNodeValuesRequest(BaseModel):
@@ -1115,6 +1407,13 @@ class MoveNodeBottomRequest(BaseModel):
 # Workflow Control
 class QueueWorkflowRequest(BaseModel):
     """Request to queue workflow for execution."""
+    operation_id: str = Field(
+        ...,
+        min_length=8,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$",
+        description="Stable opaque ID; reuse only for an identical lost-response retry",
+    )
     wait_for_completion: Optional[bool] = Field(
         None,
         description="Override the saved generation waiting behavior for this call",
@@ -1411,6 +1710,26 @@ class GetWorkflowHistoryRequest(BaseModel):
         le=100,
         description="Maximum number of history items to return (1-100)"
     )
+    attest_node_ids: Optional[List[Union[StrictInt, StrictStr]]] = Field(
+        default=None,
+        max_length=20,
+        description=(
+            "Up to 20 exact typed node IDs to attest for one prompt_id. Returns only "
+            "class type, canonical input hashes, and bounded string length/hash facts."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def validate_attested_node_ids(self) -> "GetWorkflowHistoryRequest":
+        if self.attest_node_ids and not self.prompt_id:
+            raise ValueError("attest_node_ids requires one exact prompt_id")
+        typed = [
+            (type(node_id).__name__, node_id)
+            for node_id in (self.attest_node_ids or [])
+        ]
+        if len(typed) != len(set(typed)):
+            raise ValueError("attest_node_ids cannot contain duplicate exact typed IDs")
+        return self
 
 class GetQueueStatusDetailsRequest(BaseModel):
     """Request to get detailed queue status and active executions."""
@@ -2254,32 +2573,1062 @@ async def get_node_values(request: GetNodeValuesRequest, ctx: Context) -> Dict[s
 
 
 @mcp.tool()
+async def view_canvas_images(
+    request: ViewCanvasImagesRequest,
+    ctx: Context,
+) -> ToolResult:
+    """View image sources already present on the active ComfyUI canvas.
+
+    Omit node_ids to inspect a stable, paginated page of all exact root-canvas
+    image references. Identical image references are returned once with every
+    source node listed. This tool is read-only and returns actual visual MCP
+    content; filenames and node titles are never treated as pixel evidence.
+    """
+
+    active = await _active_editable_workflow(ctx)
+    page = await _execute_tool(
+        ctx,
+        "get_canvas_image_refs",
+        {
+            "node_ids": request.node_ids,
+            "offset": request.offset,
+            "limit": request.limit,
+            "expected_workflow_identity": active["workflow_identity"],
+            "expected_graph_hash": active["graph_hash"],
+        },
+    )
+    if not isinstance(page, dict) or page.get("success") is False:
+        raise RuntimeError("Canvas image discovery failed in the browser bridge.")
+    if not (
+        page.get("workflow_identity") == active["workflow_identity"]
+        and page.get("graph_hash") == active["graph_hash"]
+    ):
+        raise RuntimeError("The browser returned canvas images from a different graph.")
+    raw_images = page.get("images")
+    if not isinstance(raw_images, list) or len(raw_images) > request.limit:
+        raise RuntimeError("The browser returned an invalid canvas image page.")
+
+    comfy_tools = get_comfy_tools()
+    images: list[Dict[str, Any]] = []
+    content: list[Any] = []
+    for raw in raw_images:
+        if not isinstance(raw, dict):
+            raise RuntimeError("The browser returned invalid canvas image metadata.")
+        raw_ref = raw.get("image")
+        if not isinstance(raw_ref, Mapping):
+            raise RuntimeError("A canvas image has no exact ComfyUI reference.")
+        filename, subfolder, image_type = normalize_image_reference(raw_ref)
+        image_ref = {
+            "filename": filename,
+            "subfolder": subfolder,
+            "type": image_type,
+        }
+        path = _resolve_comfy_image_path(comfy_tools, image_ref)
+        source, source_attestation = _read_mask_source_snapshot(path)
+        preview, preview_format, preview_size = _bounded_vision_preview(
+            source,
+            request.max_dimension,
+        )
+        sources = raw.get("sources")
+        if not isinstance(sources, list) or not sources:
+            raise RuntimeError("A canvas image has no exact source-node metadata.")
+        public_sources = []
+        for source_fact in sources:
+            if not isinstance(source_fact, Mapping):
+                raise RuntimeError("Canvas image source metadata is invalid.")
+            node_id = source_fact.get("node_id")
+            if isinstance(node_id, bool) or not isinstance(node_id, (int, str)):
+                raise RuntimeError("Canvas image source node ID is invalid.")
+            public_sources.append({
+                "node_id": node_id,
+                "node_type": str(source_fact.get("node_type") or ""),
+                "title": str(source_fact.get("title") or ""),
+                "position": source_fact.get("position"),
+                "image_index": source_fact.get("image_index"),
+            })
+        item = {
+            "page_index": raw.get("page_index"),
+            "image": image_ref,
+            "source_attestation": source_attestation,
+            "originalSize": {
+                "width": source.width,
+                "height": source.height,
+            },
+            "previewSize": {
+                "width": preview_size[0],
+                "height": preview_size[1],
+            },
+            "pending_review": bool(raw.get("pending_review")),
+            "source_count": int(raw.get("source_count") or len(public_sources)),
+            "sources": public_sources,
+            "sources_truncated": bool(raw.get("sources_truncated")),
+        }
+        images.append(item)
+        content.extend([item, MCPImage(data=preview, format=preview_format)])
+
+    active_after = await _active_editable_workflow(ctx)
+    if not (
+        active_after["workflow_identity"] == active["workflow_identity"]
+        and active_after["graph_hash"] == active["graph_hash"]
+    ):
+        raise RuntimeError(
+            "The active canvas changed during image inspection; inspect the current page again."
+        )
+    result = {
+        "success": True,
+        "images": images,
+        "returned_count": len(images),
+        "total_count": int(page.get("total_count") or 0),
+        "offset": int(page.get("offset") or 0),
+        "limit": int(page.get("limit") or request.limit),
+        "has_more": bool(page.get("has_more")),
+        "next_offset": page.get("next_offset"),
+        "deduplicated": bool(page.get("deduplicated")),
+        "workflow_identity": active["workflow_identity"],
+        "workflow_hash": _workflow_identity_hash(active["workflow_identity"]),
+        "graph_hash": active["graph_hash"],
+        "message": (
+            "These are the exact canvas image pixels for this page. Continue from "
+            "next_offset until has_more is false before claiming every image was inspected."
+        ),
+    }
+    if not content:
+        content.append(result)
+    else:
+        content.insert(0, result)
+    return ToolResult(content=content, structured_content=result)
+
+
+@mcp.tool()
+async def view_prompt_reference_image(
+    request: ViewPromptReferenceImageRequest,
+    ctx: Context,
+) -> ToolResult:
+    """View the exact image connected to an image2/image_2/reference input.
+
+    ``image2`` is treated only as a topology role or socket label, never as a
+    node ID or title. Ambiguous routes return bounded exact candidates without
+    inspecting or changing any node.
+    """
+
+    active = await _active_editable_workflow(ctx)
+    resolution = resolve_reference_image_producer(
+        active["workflow"],
+        consumer_node_id=request.consumer_node_id,
+    )
+    if resolution.needs_choice:
+        result = {
+            "success": False,
+            "needs_choice": True,
+            "reason": resolution.reason,
+            "candidates": [candidate.public() for candidate in resolution.candidates],
+            "message": "Choose one exact consumer node ID; no image or prompt was changed.",
+        }
+        return ToolResult(content=result, structured_content=result)
+
+    target = resolution.target
+    assert target is not None
+    node_result = await _execute_tool(
+        ctx,
+        "get_node_image_ref",
+        {
+            "node_id": target.producer_node_id,
+            "expected_workflow_identity": active["workflow_identity"],
+            "expected_graph_hash": active["graph_hash"],
+        },
+    )
+    if not isinstance(node_result, dict) or node_result.get("success") is False:
+        raise RuntimeError("The connected reference image could not be read from the canvas.")
+    if not (
+        _typed_workflow_node_id_equal(node_result.get("node_id"), target.producer_node_id)
+        and node_result.get("workflow_identity") == active["workflow_identity"]
+        and node_result.get("graph_hash") == active["graph_hash"]
+    ):
+        raise RuntimeError("The browser returned a different reference image producer.")
+    image_ref = node_result.get("image")
+    if not isinstance(image_ref, dict):
+        raise RuntimeError("The connected reference producer has no exact ComfyUI image.")
+    path = _resolve_comfy_image_path(get_comfy_tools(), image_ref)
+    reference_image, source_attestation = _read_mask_source_snapshot(path)
+    original_size = reference_image.size
+    preview, preview_format, preview_size = _bounded_vision_preview(
+        reference_image,
+        request.max_dimension,
+    )
+    prompt_resolution = resolve_connected_prompt_producer(
+        active["workflow"], consumer_node_id=target.consumer_node_id
+    )
+    if prompt_resolution.target is None:
+        prompt_resolution = resolve_reference_prompt_producer(active["workflow"], target)
+    prompt_context_token = None
+    if prompt_resolution.target is not None:
+        prompt_context_token, _ = _prompt_context_tokens.issue(
+            session_id=_mask_session_id(ctx),
+            workflow_identity=active["workflow_identity"],
+            graph_hash=active["graph_hash"],
+            node_id=prompt_resolution.target.producer_node_id,
+            source_image=image_ref,
+            source_attestation=source_attestation,
+            reference_node_id=target.producer_node_id,
+            reference_consumer_node_id=target.consumer_node_id,
+            prompt_consumer_node_id=prompt_resolution.target.consumer_node_id,
+        )
+    result = {
+        "success": True,
+        "resolution": resolution.reason,
+        **target.public(),
+        "reference_node_id": target.producer_node_id,
+        "image": image_ref,
+        "source_image": image_ref,
+        "source_attestation": source_attestation,
+        "originalSize": {"width": original_size[0], "height": original_size[1]},
+        "previewSize": {"width": preview_size[0], "height": preview_size[1]},
+        "workflow_identity": active["workflow_identity"],
+        "workflow_hash": _workflow_identity_hash(active["workflow_identity"]),
+        "graph_hash": active["graph_hash"],
+        "prompt_producer": (
+            prompt_resolution.target.public()
+            if prompt_resolution.target is not None
+            else None
+        ),
+        "prompt_candidates": [
+            candidate.public() for candidate in prompt_resolution.candidates
+        ],
+        "prompt_context_token": prompt_context_token,
+        "message": (
+            "This is the exact image connected to the reference role. Inspect its "
+            "pixels before composing an updated prompt."
+        ),
+    }
+    return ToolResult(
+        content=[result, MCPImage(data=preview, format=preview_format)],
+        structured_content=result,
+    )
+
+
+@mcp.tool()
+async def update_connected_prompt(
+    request: UpdateConnectedPromptRequest,
+    ctx: Context,
+) -> Dict[str, Any]:
+    """Update one exact prompt value without a graph planner.
+
+    Connected STRING producers remain authoritative when present. If the prompt
+    input is unconnected, one exact prompt-role STRING widget on its consumer
+    node may be updated directly. The active workflow and graph are pinned for
+    the duration of this one-shot operation; ambiguity never mutates the canvas.
+    """
+
+    if not settings.enable_workflow_writes:
+        return _disabled_by_config("FL_MCP_ENABLE_WORKFLOW_WRITES")
+    if (
+        os.environ.get("FL_MCP_PROMPT_REFERENCE_REQUIRED", "0") == "1"
+        and request.prompt_context_token is None
+    ):
+        raise ValueError(
+            "This routed prompt edit depends on the inspected reference image; pass "
+            "the prompt_context_token from view_prompt_reference_image unchanged."
+        )
+    operation_claim, operation_payload, recovered = await _begin_narrow_operation(
+        request, ctx, "update_connected_prompt"
+    )
+    if recovered is not None:
+        return recovered
+    def release_precommit_claim() -> None:
+        _narrow_edit_operations.discard_pending(operation_claim)
+
+    try:
+        active = await _active_editable_workflow(ctx)
+    except Exception:
+        release_precommit_claim()
+        raise
+    prompt_authority = None
+    reference_target = None
+    direct_resolution = None
+    if request.prompt_context_token is not None:
+        try:
+            prompt_authority = _prompt_context_tokens.inspect(
+                request.prompt_context_token,
+                session_id=_mask_session_id(ctx),
+            )
+        except Exception:
+            release_precommit_claim()
+            raise
+        reference_resolution = resolve_reference_image_producer(
+            active["workflow"],
+            consumer_node_id=prompt_authority.reference_consumer_node_id,
+        )
+        reference_target = reference_resolution.target
+        if reference_target is None:
+            release_precommit_claim()
+            raise ValueError("The inspected reference image route is no longer unique.")
+        resolution = resolve_reference_prompt_producer(
+            active["workflow"], reference_target
+        )
+        if isinstance(resolution, DirectPromptWidgetResolution):
+            direct_resolution = resolution
+        correlated = resolution.target
+        if correlated is not None and (
+            request.consumer_node_id is not None
+            and not _typed_workflow_node_id_equal(
+                request.consumer_node_id, correlated.consumer_node_id
+            )
+            or request.consumer_input is not None
+            and request.consumer_input != correlated.consumer_input
+        ):
+            release_precommit_claim()
+            raise ValueError("The explicit prompt consumer does not match the inspected route.")
+    else:
+        resolution = resolve_connected_prompt_producer(
+            active["workflow"],
+            consumer_node_id=request.consumer_node_id,
+            consumer_input=request.consumer_input,
+        )
+        if (
+            resolution.target is None
+            and not resolution.candidates
+            and resolution.reason == "no_connected_prompt_producer"
+        ):
+            direct_resolution = resolve_direct_prompt_widget(
+                active["workflow"],
+                consumer_node_id=request.consumer_node_id,
+                consumer_input=request.consumer_input,
+            )
+    if direct_resolution is not None and direct_resolution.needs_choice:
+        _narrow_edit_operations.discard_pending(operation_claim)
+        return {
+            "success": False,
+            "needs_choice": True,
+            "reason": direct_resolution.reason,
+            "candidates": [
+                candidate.public() for candidate in direct_resolution.candidates
+            ],
+            "message": (
+                "Choose one exact prompt consumer node ID and input; no value was changed."
+            ),
+        }
+    if direct_resolution is None and resolution.needs_choice:
+        _narrow_edit_operations.discard_pending(operation_claim)
+        return {
+            "success": False,
+            "needs_choice": True,
+            "reason": resolution.reason,
+            "candidates": [candidate.public() for candidate in resolution.candidates],
+            "message": "Choose one exact prompt consumer node ID; no value was changed.",
+        }
+
+    target = resolution.target
+    direct_target = direct_resolution.target if direct_resolution is not None else None
+    if direct_target is not None:
+        target_mode = "direct_widget"
+        producer_node_id = direct_target.node_id
+        producer_node_type = direct_target.node_type
+        consumer_node_id = direct_target.node_id
+        consumer_input = direct_target.consumer_input
+        target_public = direct_target.public()
+    else:
+        if target is None:
+            release_precommit_claim()
+            raise RuntimeError("The exact prompt route could not be resolved.")
+        target_mode = "connected_producer"
+        producer_node_id = target.producer_node_id
+        producer_node_type = target.producer_node_type
+        consumer_node_id = target.consumer_node_id
+        consumer_input = target.consumer_input
+        target_public = target.public()
+    if request.prompt_context_token is not None:
+        if prompt_authority is None or reference_target is None or target is None:
+            release_precommit_claim()
+            raise RuntimeError("The inspected prompt reference authority is incomplete.")
+        if (
+            prompt_authority.workflow_identity != active["workflow_identity"]
+            or prompt_authority.graph_hash != active["graph_hash"]
+            or not _typed_workflow_node_id_equal(
+                prompt_authority.node_id,
+                target.producer_node_id,
+            )
+        ):
+            release_precommit_claim()
+            raise ValueError(
+                "The prompt reference context is stale or resolves to a different prompt route."
+            )
+        correlated_prompt = resolve_reference_prompt_producer(
+            active["workflow"], reference_target
+        )
+        if correlated_prompt.target is None or not (
+            _prompt_target_binding(correlated_prompt.target)
+            == _prompt_target_binding(target)
+            and _typed_workflow_node_id_equal(
+                reference_target.producer_node_id,
+                prompt_authority.reference_node_id,
+            )
+            and _typed_workflow_node_id_equal(
+                reference_target.consumer_node_id,
+                prompt_authority.reference_consumer_node_id,
+            )
+            and _typed_workflow_node_id_equal(
+                target.consumer_node_id,
+                prompt_authority.prompt_consumer_node_id,
+            )
+        ):
+            release_precommit_claim()
+            raise ValueError("The inspected reference-to-prompt route changed; inspect it again.")
+        try:
+            reference_result = await _execute_tool(
+                ctx,
+                "get_node_image_ref",
+                {
+                    "node_id": reference_target.producer_node_id,
+                    "expected_workflow_identity": active["workflow_identity"],
+                    "expected_graph_hash": active["graph_hash"],
+                },
+            )
+        except Exception:
+            release_precommit_claim()
+            raise
+        if (
+            not isinstance(reference_result, dict)
+            or not _typed_workflow_node_id_equal(
+                reference_result.get("node_id"), reference_target.producer_node_id
+            )
+            or reference_result.get("workflow_identity") != active["workflow_identity"]
+            or reference_result.get("graph_hash") != active["graph_hash"]
+            or normalize_image_reference(reference_result.get("image") or {})
+            != prompt_authority.source_image
+        ):
+            release_precommit_claim()
+            raise ValueError("The inspected prompt reference image changed; inspect it again.")
+        if prompt_authority.source_attestation is None:
+            release_precommit_claim()
+            raise ValueError(
+                "The prompt reference token is not bound to exact source bytes; inspect it again."
+            )
+        try:
+            current_reference_path = _resolve_comfy_image_path(
+                get_comfy_tools(), reference_result["image"]
+            )
+            _reference_image, current_reference_attestation = _read_mask_source_snapshot(
+                current_reference_path
+            )
+        except Exception:
+            release_precommit_claim()
+            raise
+        expected_reference_attestation = {
+            "sha256": prompt_authority.source_attestation[0],
+            "size_bytes": prompt_authority.source_attestation[1],
+            "width": prompt_authority.source_attestation[2],
+            "height": prompt_authority.source_attestation[3],
+        }
+        if current_reference_attestation != expected_reference_attestation:
+            release_precommit_claim()
+            raise ValueError(
+                "The prompt reference bytes changed after inspection; inspect it again."
+            )
+    try:
+        value_result = await _execute_tool(
+            ctx,
+            "get_node_values_exact",
+            {
+                "expected_workflow_identity": active["workflow_identity"],
+                "expected_graph_hash": active["graph_hash"],
+                "node_id": producer_node_id,
+            },
+        )
+    except Exception:
+        release_precommit_claim()
+        raise
+    values = value_result.get("values") if isinstance(value_result, dict) else None
+    if not (
+        isinstance(value_result, dict)
+        and value_result.get("success") is True
+        and _typed_workflow_node_id_equal(
+            value_result.get("node_id"),
+            producer_node_id,
+        )
+        and value_result.get("workflow_identity") == active["workflow_identity"]
+        and value_result.get("graph_hash") == active["graph_hash"]
+        and isinstance(values, dict)
+    ):
+        release_precommit_claim()
+        raise RuntimeError("The exact prompt producer values could not be read.")
+    if direct_target is not None:
+        selected_prompt, choices = _select_direct_prompt_widget(
+            values,
+            direct_target.producer_widget,
+        )
+    else:
+        selected_prompt, choices = _select_prompt_widget(values)
+    if selected_prompt is None:
+        _narrow_edit_operations.discard_pending(operation_claim)
+        return {
+            "success": False,
+            "needs_choice": True,
+            "reason": (
+                "direct_prompt_widget_value_unavailable"
+                if direct_target is not None
+                else "ambiguous_prompt_widgets" if choices else "no_string_prompt_widget"
+            ),
+            "producer": target_public,
+            "candidates": [
+                {"widget": name, "current_value_attestation": _text_value_attestation(value)}
+                for name, value in choices[:8]
+            ],
+            "message": "The prompt producer widget is ambiguous; no value was changed.",
+        }
+    widget_name, old_value = selected_prompt
+    try:
+        new_value = _derive_prompt_update(
+            old_value,
+            operation=request.operation,
+            operand=request.prompt,
+            separator=request.separator,
+        )
+    except Exception:
+        release_precommit_claim()
+        raise
+
+    try:
+        current = await _active_editable_workflow(ctx)
+    except Exception:
+        release_precommit_claim()
+        raise
+    if (
+        current["workflow_identity"] != active["workflow_identity"]
+        or current["graph_hash"] != active["graph_hash"]
+    ):
+        _narrow_edit_operations.discard_pending(operation_claim)
+        raise ValueError("The active workflow or graph changed before the prompt update.")
+    if prompt_authority is not None:
+        # Claim the one-use context immediately before mutation. Concurrent
+        # callers cannot reuse it; an unknown frontend result requires a fresh
+        # reference inspection rather than an unsafe blind retry.
+        try:
+            _prompt_context_tokens.consume(
+                request.prompt_context_token,
+                expected=prompt_authority,
+            )
+        except Exception:
+            release_precommit_claim()
+            raise
+    frontend_request = {
+        "expected_workflow_identity": active["workflow_identity"],
+        "expected_graph_hash": active["graph_hash"],
+        "node_id": producer_node_id,
+        "widget_name": widget_name,
+        "value": new_value,
+        "expected_current_value": old_value,
+        "operation_id": request.operation_id,
+        "operation_request_hash": operation_claim.request_hash,
+        # Preserve the original public request as the idempotency identity.
+        # Reference attestation below is execution authority, not user intent.
+        "operation_payload": operation_payload,
+    }
+    if prompt_authority is not None:
+        assert reference_target is not None
+        frontend_request.update(
+            {
+                "expected_reference_node_id": reference_target.producer_node_id,
+                "expected_reference_image": {
+                    "filename": prompt_authority.source_image[0],
+                    "subfolder": prompt_authority.source_image[1],
+                    "type": prompt_authority.source_image[2],
+                },
+                "expected_reference_attestation": expected_reference_attestation,
+            }
+        )
+    update_result = await _execute_tool(
+        ctx,
+        "set_node_values_exact",
+        frontend_request,
+    )
+    if not (
+        isinstance(update_result, dict)
+        and update_result.get("success") is True
+        and update_result.get("verified") is True
+        and update_result.get("queued") is False
+        and update_result.get("applied") == [widget_name]
+        and _typed_workflow_node_id_equal(
+            update_result.get("node_id"),
+            producer_node_id,
+        )
+        and update_result.get("widget_name") == widget_name
+        and update_result.get("workflow_identity") == active["workflow_identity"]
+        and update_result.get("previous_graph_hash") == active["graph_hash"]
+        and isinstance(update_result.get("graph_hash"), str)
+    ):
+        raise RuntimeError("The exact connected prompt value could not be attested.")
+    try:
+        verified_values_result = await _execute_tool(
+            ctx,
+            "get_node_values_exact",
+            {
+                "expected_workflow_identity": active["workflow_identity"],
+                "expected_graph_hash": update_result["graph_hash"],
+                "node_id": producer_node_id,
+            },
+        )
+        verified_values = (
+            verified_values_result.get("values")
+            if isinstance(verified_values_result, dict)
+            else None
+        )
+        if (
+            not isinstance(verified_values_result, dict)
+            or verified_values_result.get("success") is not True
+            or not _typed_workflow_node_id_equal(
+                verified_values_result.get("node_id"),
+                producer_node_id,
+            )
+            or verified_values_result.get("workflow_identity")
+            != active["workflow_identity"]
+            or verified_values_result.get("graph_hash") != update_result["graph_hash"]
+            or not isinstance(verified_values, dict)
+            or verified_values.get(widget_name) != new_value
+        ):
+            raise RuntimeError(
+                "The connected prompt widget did not retain the exact requested text."
+            )
+        completed = await _active_editable_workflow(ctx)
+        if (
+            completed["workflow_identity"] != active["workflow_identity"]
+            or completed["graph_hash"] != update_result["graph_hash"]
+        ):
+            raise RuntimeError("The active workflow changed during the exact prompt update.")
+        if direct_target is not None:
+            completed_resolution = resolve_direct_prompt_widget(
+                completed["workflow"],
+                consumer_node_id=consumer_node_id,
+                consumer_input=consumer_input,
+            )
+            completed_direct_target = completed_resolution.target
+            if (
+                completed_direct_target is None
+                or not _typed_workflow_node_id_equal(
+                    completed_direct_target.node_id,
+                    producer_node_id,
+                )
+                or completed_direct_target.consumer_input_index
+                != direct_target.consumer_input_index
+                or completed_direct_target.producer_widget
+                != direct_target.producer_widget
+            ):
+                raise RuntimeError(
+                    "The exact direct prompt widget route changed during the update."
+                )
+        else:
+            assert target is not None
+            completed_resolution = resolve_connected_prompt_producer(
+                completed["workflow"],
+                consumer_node_id=consumer_node_id,
+                consumer_input=consumer_input,
+            )
+            completed_target = completed_resolution.target
+            if (
+                completed_target is None
+                or not _typed_workflow_node_id_equal(
+                    completed_target.producer_node_id,
+                    producer_node_id,
+                )
+                or completed_target.producer_output_index != target.producer_output_index
+            ):
+                raise RuntimeError(
+                    "The exact connected prompt route changed during the update."
+                )
+    except Exception as update_error:
+        try:
+            rollback_result = await _execute_tool(
+                ctx,
+                "set_node_values_exact",
+                {
+                    "expected_workflow_identity": active["workflow_identity"],
+                    "expected_graph_hash": update_result["graph_hash"],
+                    "node_id": producer_node_id,
+                    "widget_name": widget_name,
+                    "value": old_value,
+                    "expected_current_value": new_value,
+                    "expected_result_graph_hash": active["graph_hash"],
+                    "quarantine_on_failure": True,
+                },
+            )
+        except Exception as rollback_error:
+            raise RuntimeError(
+                "Prompt update verification failed and exact rollback could not be "
+                "proven; the browser quarantined workflow mutations. Reload or reopen "
+                "the workflow before continuing."
+            ) from rollback_error
+        if not (
+            isinstance(rollback_result, dict)
+            and rollback_result.get("success") is True
+            and rollback_result.get("verified") is True
+            and rollback_result.get("queued") is False
+            and rollback_result.get("applied") == [widget_name]
+            and rollback_result.get("workflow_identity") == active["workflow_identity"]
+            and rollback_result.get("previous_graph_hash") == update_result["graph_hash"]
+            and rollback_result.get("graph_hash") == active["graph_hash"]
+        ):
+            raise RuntimeError(
+                "Prompt update verification failed and rollback attestation was invalid; "
+                "reload or reopen the workflow before continuing."
+            ) from update_error
+        raise RuntimeError(
+            "Prompt update verification failed; the original prompt was restored exactly."
+        ) from update_error
+    result = {
+        "success": True,
+        "target_mode": target_mode,
+        "producer_node_id": producer_node_id,
+        "producer_node_type": producer_node_type,
+        "producer_widget": widget_name,
+        "widget_name": widget_name,
+        "consumer_node_id": consumer_node_id,
+        "consumer_input": consumer_input,
+        "operation": request.operation,
+        "old_value_attestation": _text_value_attestation(old_value),
+        "new_value_attestation": _text_value_attestation(new_value),
+        "workflow_identity": active["workflow_identity"],
+        "workflow_hash": _workflow_identity_hash(active["workflow_identity"]),
+        "previous_graph_hash": active["graph_hash"],
+        "graph_hash": completed["graph_hash"],
+        "verified": True,
+        "queued": False,
+    }
+    _narrow_edit_operations.complete(operation_claim, result)
+    return result
+
+
+_mask_context_tokens = MaskContextTokenStore()
+_prompt_context_tokens = MaskContextTokenStore()
+_narrow_edit_operations = NarrowEditOperationLedger()
+
+
+def _mask_session_id(ctx: Context) -> str:
+    """Return the browser-session authority domain for a mask context token."""
+
+    request_context = getattr(ctx, "request_context", None)
+    lifespan_context = getattr(request_context, "lifespan_context", None)
+    if not isinstance(lifespan_context, dict):
+        raise RuntimeError("Mask inspection requires an active Ren browser session.")
+    client = lifespan_context.get("client")
+    session_id = getattr(client, "session_id", None) if client is not None else None
+    if not isinstance(session_id, str) or not session_id:
+        session_id = lifespan_context.get("session_id")
+    if not isinstance(session_id, str) or not session_id:
+        raise RuntimeError("Mask inspection requires an exact Ren browser session ID.")
+    return session_id
+
+
+def _narrow_public_payload(request: BaseModel, *, exclude: set[str] | None = None) -> dict[str, Any]:
+    """Return exact public arguments; never retain this prompt-bearing payload."""
+
+    excluded = {"operation_id"} | set(exclude or ())
+    return request.model_dump(mode="json", exclude=excluded)
+
+
+def _narrow_claim(request: BaseModel, ctx: Context, tool: str):
+    payload = _narrow_public_payload(request)
+    request_hash = canonical_narrow_operation_hash(tool, payload)
+    claim = _narrow_edit_operations.claim(
+        session_id=_mask_session_id(ctx),
+        tool=tool,
+        operation_id=request.operation_id,
+        request_hash=request_hash,
+    )
+    return claim, payload
+
+
+async def _recover_narrow_operation(ctx: Context, claim, payload: dict[str, Any]):
+    return await _execute_tool(ctx, "recover_narrow_operation", {
+        "tool": claim.tool,
+        "operation_id": claim.operation_id,
+        "operation_request_hash": claim.request_hash,
+        "operation_payload": payload,
+    })
+
+
+async def _begin_narrow_operation(request: BaseModel, ctx: Context, tool: str):
+    """Claim an operation and ask the page ledger before validating stale tokens."""
+
+    claim, payload = _narrow_claim(request, ctx, tool)
+    try:
+        recovered = await _recover_narrow_operation(ctx, claim, payload)
+    except FrontendToolExecutionError as exc:
+        if exc.code != "narrow_edit_operation_not_found":
+            if claim.status == "new":
+                _narrow_edit_operations.discard_pending(claim)
+            raise
+        if claim.status != "new":
+            raise NarrowEditIdempotencyError(
+                "narrow_edit_receipt_lost",
+                "The backend remembers this operation but its exact browser receipt expired; "
+                "the mutation was not run again.",
+            ) from exc
+        return claim, payload, None
+    except Exception:
+        if claim.status == "new":
+            _narrow_edit_operations.discard_pending(claim)
+        raise
+    _narrow_edit_operations.complete(claim, recovered)
+    return claim, payload, recovered
+
+
+def _selected_node_ids(selection: Any) -> list[int | str]:
+    if not isinstance(selection, dict) or not isinstance(selection.get("nodes"), list):
+        raise RuntimeError("The browser bridge did not return the current node selection.")
+    result: list[int | str] = []
+    seen: set[tuple[str, Any]] = set()
+    for index, node in enumerate(selection["nodes"]):
+        node_id = node.get("id") if isinstance(node, dict) else None
+        if isinstance(node_id, bool) or not isinstance(node_id, (int, str)):
+            raise RuntimeError(f"Selected node {index} has no exact node ID.")
+        key = (type(node_id).__name__, node_id)
+        if key not in seen:
+            result.append(node_id)
+            seen.add(key)
+    return result
+
+
+def _workflow_identity_hash(workflow_identity: str) -> str:
+    return hashlib.sha256(workflow_identity.encode("utf-8")).hexdigest()
+
+
+MAX_CONNECTED_PROMPT_CHARACTERS = 50_000
+MAX_CONNECTED_PROMPT_UTF8_BYTES = 200_000
+
+
+def _bounded_connected_prompt(value: str, *, label: str, allow_empty: bool) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{label} must be text")
+    try:
+        encoded = value.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise ValueError(f"{label} must be valid UTF-8 text") from exc
+    if not allow_empty and not value:
+        raise ValueError(f"{label} cannot be empty")
+    if (
+        len(value) > MAX_CONNECTED_PROMPT_CHARACTERS
+        or len(encoded) > MAX_CONNECTED_PROMPT_UTF8_BYTES
+    ):
+        raise ValueError(f"{label} exceeds the connected prompt size limit")
+    return value
+
+
+def _derive_prompt_update(
+    current: str,
+    *,
+    operation: str,
+    operand: str,
+    separator: str,
+) -> str:
+    """Derive one bounded literal prompt edit without exposing the old value."""
+
+    current = _bounded_connected_prompt(current, label="current prompt", allow_empty=True)
+    operand = _bounded_connected_prompt(operand, label="prompt operand", allow_empty=False)
+    if not isinstance(separator, str) or len(separator) > 32:
+        raise ValueError("prompt separator is invalid")
+    try:
+        separator.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise ValueError("prompt separator must be valid UTF-8 text") from exc
+
+    if operation == "replace":
+        updated = operand
+    elif operation == "append":
+        updated = f"{current}{separator}{operand}" if current else operand
+    elif operation == "prepend":
+        updated = f"{operand}{separator}{current}" if current else operand
+    elif operation == "remove_exact":
+        occurrences = current.count(operand)
+        if occurrences == 0:
+            raise ValueError("remove_exact operand is absent from the current prompt")
+        if occurrences != 1:
+            raise ValueError(
+                "remove_exact operand is ambiguous in the current prompt; provide a "
+                "longer exact literal"
+            )
+        updated = current.replace(operand, "", 1)
+    else:
+        raise ValueError("unsupported connected prompt operation")
+
+    return _bounded_connected_prompt(updated, label="updated prompt", allow_empty=False)
+
+
+def _text_value_attestation(value: str) -> Dict[str, Any]:
+    encoded = value.encode("utf-8")
+    return {
+        "sha256": hashlib.sha256(encoded).hexdigest(),
+        "character_count": len(value),
+        "utf8_bytes": len(encoded),
+    }
+
+
+def _select_prompt_widget(
+    values: Mapping[str, Any],
+) -> tuple[tuple[str, str] | None, list[tuple[str, str]]]:
+    """Select one conventional STRING widget without any first-match fallback."""
+
+    string_values = [
+        (name, value)
+        for name, value in values.items()
+        if isinstance(name, str) and isinstance(value, str)
+    ]
+    preferred_names = {"prompt", "text", "string", "value"}
+    preferred = [
+        item
+        for item in string_values
+        if "".join(character for character in item[0].casefold() if character.isalnum())
+        in preferred_names
+    ]
+    if len(preferred) == 1:
+        return preferred[0], preferred
+    if len(string_values) == 1:
+        return string_values[0], string_values
+    return None, preferred if preferred else string_values
+
+
+def _select_direct_prompt_widget(
+    values: Mapping[str, Any],
+    widget_name: str,
+) -> tuple[tuple[str, str] | None, list[tuple[str, str]]]:
+    """Read only the widget name attested by the serialized prompt input."""
+
+    value = values.get(widget_name)
+    if isinstance(value, str):
+        selected = (widget_name, value)
+        return selected, [selected]
+    return None, []
+
+
+def _normalized_prompt_role(value: str) -> str:
+    return "".join(character for character in value.casefold() if character.isalnum())
+
+
+def _prompt_target_binding(target: Any) -> tuple[Any, ...]:
+    """Return the exact public route identity for connected or direct prompts."""
+
+    public = target.public()
+    return (
+        public.get("target_mode", "connected_producer"),
+        type(public.get("producer_node_id")).__name__,
+        public.get("producer_node_id"),
+        public.get("producer_output_index"),
+        public.get("producer_widget"),
+        type(public.get("consumer_node_id")).__name__,
+        public.get("consumer_node_id"),
+        public.get("consumer_input"),
+        public.get("consumer_input_index"),
+    )
+
+
+@mcp.tool()
 async def view_node_mask(request: ViewNodeMaskRequest, ctx: Context) -> ToolResult:
     """View a node's current image with masked pixels highlighted in magenta.
 
     Inspect this overlay before editing so coordinates avoid subjects that must
-    remain unchanged. Coordinates reported by visual inspection use the image's
-    top-left as (0, 0).
+    remain unchanged. Omit node_id to resolve exactly one selected compatible
+    image node or a unique IMAGE+MASK source feeding the active graph. Ambiguity
+    returns bounded candidates instead of choosing the first matching class.
+    Coordinates reported by visual inspection use the image's top-left as (0, 0).
+    The returned mask_context_token is required by edit_node_mask and expires
+    after five minutes.
     """
+    active = await _active_editable_workflow(ctx)
+    resolution = resolve_mask_target(
+        active["workflow"],
+        requested_node_id=request.node_id,
+    )
+    if request.node_id is None and resolution.needs_choice:
+        selection = await _execute_tool(
+            ctx,
+            "get_selected_nodes",
+            {
+                "expected_workflow_identity": active["workflow_identity"],
+                "expected_graph_hash": active["graph_hash"],
+            },
+        )
+        if not (
+            isinstance(selection, dict)
+            and selection.get("workflow_identity") == active["workflow_identity"]
+            and selection.get("graph_hash") == active["graph_hash"]
+        ):
+            raise RuntimeError("The exact selected-node projection could not be verified.")
+        resolution = resolve_mask_target(
+            active["workflow"],
+            selected_node_ids=_selected_node_ids(selection),
+        )
+    if resolution.needs_choice:
+        result = {
+            "success": False,
+            "needs_choice": True,
+            "reason": resolution.reason,
+            "candidates": [candidate.public() for candidate in resolution.candidates],
+            "message": (
+                "Choose one exact mask-capable image node ID and call view_node_mask "
+                "once more. No node or mask was changed."
+            ),
+        }
+        return ToolResult(content=result, structured_content=result)
+
+    target = resolution.target
+    assert target is not None
     node_result = await _execute_tool(
         ctx,
         "get_node_image_ref",
-        {"node_id": request.node_id},
+        {
+            "node_id": target.node_id,
+            "expected_workflow_identity": active["workflow_identity"],
+            "expected_graph_hash": active["graph_hash"],
+        },
     )
+    if not isinstance(node_result, dict) or node_result.get("success") is False:
+        raise RuntimeError("The resolved mask source image could not be read from the canvas.")
+    if not (
+        _typed_workflow_node_id_equal(node_result.get("node_id"), target.node_id)
+        and node_result.get("workflow_identity") == active["workflow_identity"]
+        and node_result.get("graph_hash") == active["graph_hash"]
+    ):
+        raise RuntimeError("The browser returned a different node than the resolved mask target.")
     image_ref = node_result["image"]
     path = _resolve_comfy_image_path(get_comfy_tools(), image_ref)
-    preview, preview_format, original_size, preview_size, mask_info = _mask_overlay_preview(
+    (
+        preview,
+        preview_format,
+        original_size,
+        preview_size,
+        mask_info,
+        source_attestation,
+    ) = _mask_overlay_preview_with_attestation(
         path,
         request.max_dimension,
+    )
+    mask_context_token, _authority = _mask_context_tokens.issue(
+        session_id=_mask_session_id(ctx),
+        workflow_identity=active["workflow_identity"],
+        graph_hash=active["graph_hash"],
+        node_id=target.node_id,
+        source_image=image_ref,
+        source_attestation=source_attestation,
     )
     result = {
         "success": True,
         **node_result,
+        "resolution": resolution.reason,
         "image": image_ref,
+        "source_image": image_ref,
+        "source_attestation": source_attestation,
         "originalSize": {"width": original_size[0], "height": original_size[1]},
         "previewSize": {"width": preview_size[0], "height": preview_size[1]},
         "mask": mask_info,
-        "message": "Masked pixels are highlighted in magenta. Inspect the overlay before choosing edit coordinates.",
+        "workflow_identity": active["workflow_identity"],
+        "workflow_hash": _workflow_identity_hash(active["workflow_identity"]),
+        "graph_hash": active["graph_hash"],
+        "mask_context_token": mask_context_token,
+        "mask_context_expires_in_seconds": int(MASK_CONTEXT_TTL_SECONDS),
+        "prompt_producers": list(resolution.prompt_producers),
+        "message": (
+            "Masked pixels are highlighted in magenta. Inspect the overlay before "
+            "choosing edit coordinates, then pass this exact mask_context_token to "
+            "edit_node_mask."
+        ),
     }
     return ToolResult(
         content=[result, MCPImage(data=preview, format=preview_format)],
@@ -2292,21 +3641,107 @@ async def edit_node_mask(request: EditNodeMaskRequest, ctx: Context) -> ToolResu
     """Paint or erase rectangular/elliptical regions in a node's image mask.
 
     This uses ComfyUI's authenticated browser upload path and updates the node's
-    image widget to the newly saved masked image. Use normalized coordinates for
+    image widget to the newly saved masked image. The required one-use context
+    token proves that the same session, workflow, graph, exact node, and source
+    image were inspected immediately beforehand. Use normalized coordinates for
     resolution-independent edits. Set clear_existing=true when the supplied
     regions should be the only masked areas.
     """
     if not settings.enable_workflow_writes:
         result = _disabled_by_config("FL_MCP_ENABLE_WORKFLOW_WRITES")
         return ToolResult(content=result, structured_content=result)
+    operation_claim, operation_payload, edit_result = await _begin_narrow_operation(
+        request, ctx, "edit_node_mask"
+    )
+    if edit_result is not None:
+        image_ref = edit_result["image"]
+        path = _resolve_comfy_image_path(get_comfy_tools(), image_ref)
+        preview, preview_format, original_size, preview_size, mask_info = (
+            _mask_overlay_preview(path, 2048)
+        )
+        result = {
+            **edit_result,
+            "originalSize": {"width": original_size[0], "height": original_size[1]},
+            "previewSize": {"width": preview_size[0], "height": preview_size[1]},
+            "mask": mask_info,
+        }
+        return ToolResult(
+            content=[result, MCPImage(data=preview, format=preview_format)],
+            structured_content=result,
+        )
+    session_id = _mask_session_id(ctx)
+    authority = _mask_context_tokens.inspect(
+        request.mask_context_token,
+        session_id=session_id,
+    )
+    if not _typed_workflow_node_id_equal(request.node_id, authority.node_id):
+        raise ValueError("edit_node_mask node_id does not match the inspected exact node ID")
+    active = await _active_editable_workflow(ctx)
+    if active["workflow_identity"] != authority.workflow_identity:
+        raise ValueError("The active workflow changed after mask inspection; inspect again.")
+    if active["graph_hash"] != authority.graph_hash:
+        raise ValueError("The active graph changed after mask inspection; inspect again.")
+    node_result = await _execute_tool(
+        ctx,
+        "get_node_image_ref",
+        {
+            "node_id": authority.node_id,
+            "expected_workflow_identity": active["workflow_identity"],
+            "expected_graph_hash": active["graph_hash"],
+        },
+    )
+    if not isinstance(node_result, dict) or node_result.get("success") is False:
+        raise ValueError("The inspected mask source image is no longer available.")
+    if not (
+        _typed_workflow_node_id_equal(node_result.get("node_id"), authority.node_id)
+        and node_result.get("workflow_identity") == active["workflow_identity"]
+        and node_result.get("graph_hash") == active["graph_hash"]
+    ):
+        raise ValueError("The inspected mask target no longer resolves to the same exact node.")
+    if normalize_image_reference(node_result.get("image") or {}) != authority.source_image:
+        raise ValueError("The node source image changed after mask inspection; inspect again.")
+    if authority.source_attestation is None:
+        raise ValueError("The mask inspection token is not bound to exact source bytes; inspect again.")
+    expected_source_attestation = {
+        "sha256": authority.source_attestation[0],
+        "size_bytes": authority.source_attestation[1],
+        "width": authority.source_attestation[2],
+        "height": authority.source_attestation[3],
+    }
+    source_path = _resolve_comfy_image_path(get_comfy_tools(), node_result["image"])
+    _source_image, current_source_attestation = _read_mask_source_snapshot(source_path)
+    if current_source_attestation != expected_source_attestation:
+        raise ValueError(
+            "The mask source bytes changed after inspection even though its image reference "
+            "is unchanged; inspect again."
+        )
+    _mask_context_tokens.consume(request.mask_context_token, expected=authority)
+    frontend_request = request.model_dump(exclude={"mask_context_token"})
+    frontend_request["node_id"] = authority.node_id
+    frontend_request["expected_workflow_identity"] = authority.workflow_identity
+    frontend_request["expected_graph_hash"] = authority.graph_hash
+    frontend_request["expected_source_image"] = {
+        "filename": authority.source_image[0],
+        "subfolder": authority.source_image[1],
+        "type": authority.source_image[2],
+    }
+    frontend_request["expected_source_attestation"] = expected_source_attestation
+    frontend_request["operation_request_hash"] = operation_claim.request_hash
+    frontend_request["operation_payload"] = operation_payload
     edit_result = await _execute_tool(
         ctx,
         "edit_node_mask",
-        request.model_dump(),
+        frontend_request,
     )
     image_ref = edit_result["image"]
     path = _resolve_comfy_image_path(get_comfy_tools(), image_ref)
-    preview, preview_format, original_size, preview_size, mask_info = _mask_overlay_preview(
+    (
+        preview,
+        preview_format,
+        original_size,
+        preview_size,
+        mask_info,
+    ) = _mask_overlay_preview(
         path,
         2048,
     )
@@ -2321,6 +3756,7 @@ async def edit_node_mask(request: EditNodeMaskRequest, ctx: Context) -> ToolResu
             "can approve it before queueing."
         ),
     }
+    _narrow_edit_operations.complete(operation_claim, edit_result)
     return ToolResult(
         content=[result, MCPImage(data=preview, format=preview_format)],
         structured_content=result,
@@ -2338,7 +3774,17 @@ async def confirm_mask_review(
     explicitly accept the magenta canvas preview; this review cannot be bypassed
     or remembered for future masks. Queueing remains blocked until it succeeds.
     """
-    return await _execute_tool(ctx, "confirm_mask_review", request.model_dump())
+    operation_claim, operation_payload, recovered = await _begin_narrow_operation(
+        request, ctx, "confirm_mask_review"
+    )
+    if recovered is not None:
+        return recovered
+    frontend_request = request.model_dump()
+    frontend_request["operation_request_hash"] = operation_claim.request_hash
+    frontend_request["operation_payload"] = operation_payload
+    result = await _execute_tool(ctx, "confirm_mask_review", frontend_request)
+    _narrow_edit_operations.complete(operation_claim, result)
+    return result
 
 
 @mcp.tool()
@@ -2352,13 +3798,13 @@ async def set_node_values(request: SetNodeValuesRequest, ctx: Context) -> Dict[s
 @mcp.tool()
 async def connect_nodes(request: ConnectNodesRequest, ctx: Context) -> Dict[str, Any]:
     """Connect two nodes with optional auto-matching.
-    
+
     BASIC USAGE (with slot names):
     Provide exact slot names for reliable connections.
-    
+
     SMART USAGE (auto-match by type):
     Omit slot names to automatically find compatible connections by type.
-    
+
     PARAMETERS:
     - source_node_id: Source node ID or title (required)
     - target_node_id: Target node ID or title (required)
@@ -2369,10 +3815,10 @@ async def connect_nodes(request: ConnectNodesRequest, ctx: Context) -> Dict[str,
       - "first": Use first available output/input
       - "type": Match by compatible types
       - "name": Match by similar slot names
-    
+
     RETURNS:
     Dictionary with connection details including source/target nodes, slots, and data type.
-    
+
     ERROR HANDLING:
     If connection fails, error message includes available slots on both nodes
     and suggestion to use get_node_slots() for discovery.
@@ -2580,6 +4026,161 @@ async def modify_layout(request: BatchLayoutRequest, ctx: Context) -> List[Dict[
 # WORKFLOW CONTROL TOOLS
 # ============================================================================
 
+_EXECUTION_PROVENANCE_FIELDS = {
+    "schema",
+    "source",
+    "api_prompt",
+    "editable_workflow",
+    "graph_hash",
+    "graph_hash_schema",
+    "raw_prompt_returned",
+    "captured_at_ms",
+    "operation_id",
+    "operation_request_hash",
+}
+_EXECUTION_API_PROVENANCE_FIELDS = {
+    "schema",
+    "sha256",
+    "canonical_bytes",
+    "node_count",
+}
+_EXECUTION_WORKFLOW_PROVENANCE_FIELDS = {
+    *_EXECUTION_API_PROVENANCE_FIELDS,
+    "workflow_id",
+    "revision",
+}
+_EXECUTION_PROVENANCE_MAX_CANONICAL_BYTES = 8 * 1024 * 1024
+_EXECUTION_PROVENANCE_MAX_SAFE_INTEGER = 9_007_199_254_740_991
+_EXECUTION_HISTORY_MAX_ERRORS = 32
+_EXECUTION_HISTORY_MAX_IDENTIFIER_BYTES = 256
+_EXECUTION_HISTORY_IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z0-9_.:/-]{1,128}$")
+_EXECUTION_HISTORY_STATUSES = frozenset({"success", "error", "running", "unknown"})
+
+
+def _execution_safe_integer(value: Any, *, nonnegative: bool = False) -> bool:
+    return (
+        type(value) is int
+        and abs(value) <= _EXECUTION_PROVENANCE_MAX_SAFE_INTEGER
+        and (not nonnegative or value >= 0)
+    )
+
+
+def _validated_execution_provenance(value: Any) -> dict[str, Any]:
+    """Validate and detach the exact plaintext-free browser queue receipt."""
+
+    if not isinstance(value, dict) or set(value) != _EXECUTION_PROVENANCE_FIELDS:
+        raise RuntimeError("The browser returned malformed execution provenance.")
+    api_fact = value.get("api_prompt")
+    workflow_fact = value.get("editable_workflow")
+    if (
+        not isinstance(api_fact, dict)
+        or set(api_fact) != _EXECUTION_API_PROVENANCE_FIELDS
+        or not isinstance(workflow_fact, dict)
+        or set(workflow_fact) != _EXECUTION_WORKFLOW_PROVENANCE_FIELDS
+    ):
+        raise RuntimeError("The browser returned malformed execution provenance.")
+    if (
+        value.get("schema") != "fl-mcp.execution-provenance.v1"
+        or value.get("source") != "frontend_queue_capture"
+        or value.get("raw_prompt_returned") is not False
+        or type(value.get("operation_id")) is not str
+        or re.fullmatch(
+            r"[A-Za-z0-9][A-Za-z0-9._:-]{7,127}", value["operation_id"]
+        ) is None
+        or type(value.get("operation_request_hash")) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", value["operation_request_hash"]) is None
+        or value.get("graph_hash_schema") != "fl-mcp.graph-precondition.v1"
+        or type(value.get("graph_hash")) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", value["graph_hash"]) is None
+        or not _execution_safe_integer(value.get("captured_at_ms"), nonnegative=True)
+    ):
+        raise RuntimeError("The browser returned malformed execution provenance.")
+    for field, fact, schema in (
+        ("api_prompt", api_fact, "fl-mcp.execution-api-prompt.typed-v1"),
+        ("editable_workflow", workflow_fact, "fl-mcp.execution-workflow.typed-v1"),
+    ):
+        if (
+            fact.get("schema") != schema
+            or type(fact.get("sha256")) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", fact["sha256"]) is None
+            or not _execution_safe_integer(fact.get("canonical_bytes"), nonnegative=True)
+            or not (0 < fact["canonical_bytes"] <= _EXECUTION_PROVENANCE_MAX_CANONICAL_BYTES)
+            or not _execution_safe_integer(fact.get("node_count"), nonnegative=True)
+            or not (0 <= fact["node_count"] <= 10_000)
+        ):
+            raise RuntimeError(f"The browser returned malformed {field} provenance.")
+    workflow_id = workflow_fact.get("workflow_id")
+    revision = workflow_fact.get("revision")
+    try:
+        workflow_id_bytes = workflow_id.encode("utf-8") if isinstance(workflow_id, str) else b""
+    except UnicodeEncodeError as exc:
+        raise RuntimeError("The browser returned malformed editable_workflow provenance.") from exc
+    if (
+        (workflow_id is not None and type(workflow_id) is not str)
+        or len(workflow_id_bytes) > 256
+        or (revision is not None and not _execution_safe_integer(revision))
+    ):
+        raise RuntimeError("The browser returned malformed editable_workflow provenance.")
+    return json.loads(json.dumps(value, ensure_ascii=False, allow_nan=False))
+
+
+def _execution_history_identifier(value: Any) -> str | int | None:
+    """Return one bounded non-plaintext execution identifier."""
+
+    if type(value) is int and _execution_safe_integer(value):
+        return value
+    if type(value) is not str:
+        return None
+    try:
+        encoded = value.encode("utf-8")
+    except UnicodeEncodeError:
+        return None
+    if (
+        not (1 <= len(encoded) <= _EXECUTION_HISTORY_MAX_IDENTIFIER_BYTES)
+        or _EXECUTION_HISTORY_IDENTIFIER_PATTERN.fullmatch(value) is None
+    ):
+        return None
+    return value
+
+
+def _execution_history_status_facts(status: Any) -> tuple[str, bool]:
+    if not isinstance(status, Mapping):
+        return "unknown", False
+    status_str = status.get("status_str")
+    if status_str not in _EXECUTION_HISTORY_STATUSES:
+        status_str = "unknown"
+    return status_str, status.get("completed") is True
+
+
+def _execution_history_error_facts(status: Any) -> list[dict[str, Any]]:
+    """Extract bounded error identity without prompt/input/message plaintext."""
+
+    if not isinstance(status, Mapping):
+        return []
+    messages = status.get("messages")
+    if not isinstance(messages, list):
+        return []
+    errors: list[dict[str, Any]] = []
+    for message in messages:
+        if (
+            len(errors) >= _EXECUTION_HISTORY_MAX_ERRORS
+            or not isinstance(message, (list, tuple))
+            or len(message) != 2
+            or message[0] != "execution_error"
+            or not isinstance(message[1], Mapping)
+        ):
+            continue
+        data = message[1]
+        errors.append({
+            "node_id": _execution_history_identifier(data.get("node_id")),
+            "node_type": _execution_history_identifier(data.get("node_type")),
+            "exception_type": _execution_history_identifier(data.get("exception_type")),
+            "exception_message_redacted": True,
+            "traceback_redacted": True,
+            "current_inputs_redacted": True,
+        })
+    return errors
+
 @mcp.tool()
 async def queue_workflow(request: QueueWorkflowRequest, ctx: Context) -> Dict[str, Any]:
     """Queue the workflow for execution.
@@ -2589,46 +4190,138 @@ async def queue_workflow(request: QueueWorkflowRequest, ctx: Context) -> Dict[st
     one tool call remains open and returns completed, execution_error, cancelled,
     or timeout without requiring model-driven status calls.
     """
-    frontend_parameters = request.model_dump(
-        exclude={"wait_for_completion", "completion_timeout"},
-        exclude_none=True,
+    operation_claim, operation_payload, recovered = await _begin_narrow_operation(
+        request, ctx, "queue_workflow"
     )
-    r = await _execute_tool(ctx, "queue_workflow", frontend_parameters)
-    logger.debug(f"Queue result: {r}")
-
-    prompt_id = r.get("prompt_id")
-    node_errors = r.get("node_errors", {})
-    queue_number = r.get("queue_number")
-    batch_count = r.get("batch_count")
-
-    if node_errors:
-        logger.warning(f"Workflow validation failed: {node_errors}")
-        return {
-            "success": False,
-            "error": "Workflow validation failed",
-            "node_errors": node_errors,
-            "suggestion": (
-                "The workflow has node configuration errors. "
-                "Use workflow_overview to identify disconnected nodes or missing inputs. "
-                "Fix the errors and try queueing again."
-            )
+    if recovered is None:
+        frontend_parameters = {
+            **request.model_dump(
+                exclude={"wait_for_completion", "completion_timeout"},
+                exclude_none=True,
+            ),
+            "operation_request_hash": operation_claim.request_hash,
+            "operation_payload": operation_payload,
         }
+        r = await _execute_tool(ctx, "queue_workflow", frontend_parameters)
+    else:
+        r = recovered
+    queue_result = r if isinstance(r, Mapping) else {}
+
+    raw_prompt_id = queue_result.get("prompt_id")
+    prompt_id = _execution_history_identifier(raw_prompt_id)
+    if type(prompt_id) is not str:
+        prompt_id = None
+    node_errors = queue_result.get("node_errors", {})
+    raw_queue_number = queue_result.get("queue_number")
+    queue_number = (
+        raw_queue_number if _execution_safe_integer(raw_queue_number) else None
+    )
+    raw_batch_count = queue_result.get("batch_count")
+    batch_count = (
+        raw_batch_count
+        if _execution_safe_integer(raw_batch_count, nonnegative=True)
+        else None
+    )
+    execution_provenance = queue_result.get("execution_provenance")
+    logger.debug(
+        "Queue result received (prompt_id_present=%s, node_errors_present=%s, "
+        "provenance_present=%s)",
+        prompt_id is not None,
+        bool(node_errors),
+        execution_provenance is not None,
+    )
 
     if not prompt_id:
-        logger.error(f"No prompt_id in queue result: {r}")
+        _narrow_edit_operations.discard_pending(operation_claim)
+        if node_errors:
+            logger.warning(
+                "Queue validation failed before a valid prompt_id was issued"
+            )
+            return {
+                "success": False,
+                "status": "validation_failed",
+                "side_effect_known": True,
+                "error": (
+                    "Workflow validation failed before a prompt ID was issued."
+                ),
+                "node_errors_present": True,
+                "node_error_details_redacted": True,
+            }
+        logger.error("Queue result did not contain a valid prompt_id")
         return {
             "success": False,
-            "error": r.get("error", "No prompt_id returned from queue operation"),
-            "raw_result": r,
-            "suggestion": "Check the open workflow for validation errors and try again.",
+            "status": "queue_result_unconfirmed",
+            "side_effect_known": False,
+            "error": "Queue result did not contain a valid prompt ID.",
         }
+
+    provenance_result: dict[str, Any]
+    if execution_provenance is None:
+        provenance_result = {
+            "execution_provenance_attestation": {
+                "available": False,
+                "reason": "missing",
+                "queue_accepted": True,
+            },
+        }
+        logger.warning(
+            "Workflow %s was queued without an execution provenance attestation",
+            prompt_id,
+        )
+    else:
+        try:
+            validated_provenance = _validated_execution_provenance(
+                execution_provenance
+            )
+        except (RuntimeError, TypeError, ValueError, OverflowError):
+            provenance_result = {
+                "execution_provenance_attestation": {
+                    "available": False,
+                    "reason": "malformed",
+                    "queue_accepted": True,
+                },
+            }
+            logger.warning(
+                "Workflow %s was queued with malformed execution provenance",
+                prompt_id,
+            )
+        else:
+            if (
+                validated_provenance["operation_id"] != request.operation_id
+                or validated_provenance["operation_request_hash"]
+                != operation_claim.request_hash
+            ):
+                provenance_result = {
+                    "execution_provenance_attestation": {
+                        "available": False,
+                        "reason": "operation_binding_mismatch",
+                        "queue_accepted": True,
+                    },
+                }
+                logger.warning(
+                    "Workflow %s was queued with mismatched operation provenance",
+                    prompt_id,
+                )
+            else:
+                provenance_result = {"execution_provenance": validated_provenance}
 
     base_result = {
         "queued": True,
         "prompt_id": prompt_id,
         "queue_number": queue_number,
         "batch_count": batch_count,
-    }
+    } | provenance_result
+    _narrow_edit_operations.complete(operation_claim, base_result)
+    if node_errors:
+        base_result["validation_warnings"] = {
+            "node_errors_present": True,
+            "details_redacted": True,
+            "queue_accepted": True,
+        }
+        logger.warning(
+            "Workflow %s was accepted with redacted validation diagnostics",
+            prompt_id,
+        )
     wait_for_completion = (
         request.wait_for_completion
         if request.wait_for_completion is not None
@@ -3670,20 +5363,134 @@ async def node_knowledge_search(
 
 
 def _validated_plan_attachment_values(
-    request: PlanWorkflowRequest | CompileWorkflowSpecRequest,
-) -> Dict[tuple[str, str], str]:
-    """Validate every declared chat image and return its exact widget value."""
+    request: Any,
+) -> Dict[tuple[str, str], Dict[str, Any]]:
+    """Attest every declared chat image and return its exact immutable facts."""
 
     if not request.attachments:
         return {}
 
     comfy_tools = get_comfy_tools()
-    values: Dict[tuple[str, str], str] = {}
+    values: Dict[tuple[str, str], Dict[str, Any]] = {}
     for binding in request.attachments:
         image = binding.image.model_dump(mode="json")
-        _resolve_comfy_image_path(comfy_tools, image)
-        values[(binding.node_alias, binding.input_name)] = binding.image.widget_value()
+        path = _resolve_comfy_image_path(comfy_tools, image)
+        integrity = _stable_graph_patch_attachment_integrity(path)
+        alias = getattr(binding, "node_alias", None) or getattr(
+            binding,
+            "target_alias",
+            None,
+        )
+        input_name = getattr(binding, "input_name", None) or getattr(
+            binding,
+            "target_input",
+            None,
+        )
+        if not isinstance(alias, str) or not isinstance(input_name, str):
+            raise ValueError("Attachment bindings need a semantic node alias and input name")
+        values[(alias, input_name)] = {
+            "widget_value": binding.image.widget_value(),
+            **integrity,
+        }
     return values
+
+
+GRAPH_PATCH_ATTACHMENT_HASH_CHUNK_BYTES = 1024 * 1024
+
+
+def _attachment_handle_stat_identity(
+    value: os.stat_result,
+) -> tuple[int, int, int, int]:
+    """Return stable same-handle facts without platform-specific ctime."""
+
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_size,
+        value.st_mtime_ns,
+    )
+
+
+def _read_graph_patch_attachment_once(path: Path) -> Dict[str, Any]:
+    """Hash one bounded file while proving its open handle stayed stable."""
+
+    digest = hashlib.sha256()
+    byte_count = 0
+    with path.open("rb") as file_obj:
+        before = os.fstat(file_obj.fileno())
+        if before.st_size <= 0 or before.st_size > MAX_GRAPH_PATCH_ATTACHMENT_BYTES:
+            raise ComfyUIError("Chat attachment size is outside the supported range.")
+        while True:
+            chunk = file_obj.read(GRAPH_PATCH_ATTACHMENT_HASH_CHUNK_BYTES)
+            if not chunk:
+                break
+            byte_count += len(chunk)
+            if byte_count > MAX_GRAPH_PATCH_ATTACHMENT_BYTES:
+                raise ComfyUIError("Chat attachment exceeds the supported size limit.")
+            digest.update(chunk)
+        after = os.fstat(file_obj.fileno())
+    if (
+        byte_count != before.st_size
+        or byte_count != after.st_size
+        or _attachment_handle_stat_identity(before)
+        != _attachment_handle_stat_identity(after)
+    ):
+        raise ComfyUIError("Chat attachment changed while it was being validated.")
+    return {"size_bytes": byte_count, "sha256": digest.hexdigest()}
+
+
+def _stable_graph_patch_attachment_integrity(path: Path) -> Dict[str, Any]:
+    """Hash a bounded file twice and reject replacement or mutation."""
+
+    try:
+        first = _read_graph_patch_attachment_once(path)
+        second = _read_graph_patch_attachment_once(path)
+    except ComfyUIError:
+        raise
+    except OSError as exc:
+        raise ComfyUIError("Chat attachment could not be read safely.") from exc
+    if first != second:
+        raise ComfyUIError("Chat attachment changed while it was being validated.")
+    return second
+
+
+def _graph_patch_attachment_integrity_issues(
+    request: WorkflowGraphPatchApplyRequest,
+) -> List[Dict[str, str]]:
+    """Re-resolve and verify compiler-pinned attachments before browser mutation."""
+
+    if not request.plan.attachments:
+        return []
+    comfy_tools = get_comfy_tools()
+    issues: List[Dict[str, str]] = []
+    for index, binding in enumerate(request.plan.attachments):
+        image = {
+            "filename": binding.filename,
+            "subfolder": binding.subfolder,
+            "type": binding.file_type,
+        }
+        try:
+            path = _resolve_comfy_image_path(comfy_tools, image)
+            observed = _stable_graph_patch_attachment_integrity(path)
+        except ComfyUIError:
+            issues.append({
+                "severity": "error",
+                "code": "attachment_missing_or_changed",
+                "path": f"plan.attachments[{index}]",
+                "message": "The compiler-attested Ren chat image is no longer available.",
+            })
+            continue
+        if (
+            observed["size_bytes"] != binding.size_bytes
+            or observed["sha256"] != binding.sha256
+        ):
+            issues.append({
+                "severity": "error",
+                "code": "attachment_missing_or_changed",
+                "path": f"plan.attachments[{index}]",
+                "message": "The Ren chat image changed after workflow compilation.",
+            })
+    return issues
 
 
 def _record_verified_connection_lessons(
@@ -3711,9 +5518,11 @@ def _record_verified_connection_lessons(
             continue
         identity = {
             "source_node_type": source.get("node_type"),
+            "source_schema_hash": source.get("schema_hash"),
             "source_output": connection.get("source_output"),
             "source_output_index": connection.get("source_output_index"),
             "target_node_type": target.get("node_type"),
+            "target_schema_hash": target.get("schema_hash"),
             "target_input": connection.get("target_input"),
         }
         lesson_id = uuid.uuid5(
@@ -3743,6 +5552,91 @@ def _record_verified_connection_lessons(
             logger.warning("Could not persist verified node connection lesson: %s", exc)
 
 
+def _record_verified_graph_patch_lessons(
+    store: NodeCatalogStore | None,
+    *,
+    plan: Dict[str, Any],
+    patch_hash: str,
+    application_id: str,
+) -> None:
+    """Learn every exact added edge, including existing-to-new GraphPatch edges."""
+
+    if store is None:
+        return
+
+    def ref_key(ref: Any) -> tuple[str, Any] | None:
+        if not isinstance(ref, dict):
+            return None
+        if set(ref) == {"alias"}:
+            return "new", str(ref["alias"])
+        if set(ref) == {"node_id"}:
+            value = ref["node_id"]
+            return "existing", (type(value).__name__, value)
+        return None
+
+    facts: Dict[tuple[str, Any], Dict[str, Any]] = {}
+    for item in plan.get("create_nodes", []):
+        if isinstance(item, dict) and item.get("alias"):
+            facts[("new", str(item["alias"]))] = item
+    for item in plan.get("assertions", {}).get("nodes", []):
+        if not isinstance(item, dict):
+            continue
+        key = ref_key(item.get("ref"))
+        if key is not None:
+            facts[key] = item
+
+    for connection in plan.get("add_edges", []):
+        if not isinstance(connection, dict):
+            continue
+        source_endpoint = connection.get("source")
+        target_endpoint = connection.get("target")
+        if not isinstance(source_endpoint, dict) or not isinstance(target_endpoint, dict):
+            continue
+        source = facts.get(ref_key(source_endpoint.get("ref")))
+        target = facts.get(ref_key(target_endpoint.get("ref")))
+        if source is None or target is None:
+            continue
+        identity = {
+            "source_node_type": source.get("node_type"),
+            "source_schema_hash": source.get("schema_hash"),
+            "source_output": source_endpoint.get("output"),
+            "source_output_index": source_endpoint.get("output_index"),
+            "source_type": source_endpoint.get("type"),
+            "target_node_type": target.get("node_type"),
+            "target_schema_hash": target.get("schema_hash"),
+            "target_input": target_endpoint.get("input"),
+            "target_input_index": target_endpoint.get("input_index"),
+            "target_occurrence_index": target_endpoint.get("occurrence_index"),
+            "target_type": target_endpoint.get("type"),
+            "target_mode": target_endpoint.get("mode"),
+        }
+        lesson_id = uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            json.dumps(identity, sort_keys=True, separators=(",", ":")),
+        ).hex
+        evidence = {
+            **identity,
+            "evidence": "atomic_graph_patch_application",
+            "patch_hash": patch_hash,
+            "application_id": application_id,
+        }
+        try:
+            store.record_verified_lesson(
+                str(source["node_type"]),
+                str(source["schema_hash"]),
+                f"downstream-connection:{lesson_id}",
+                {**evidence, "direction": "downstream"},
+            )
+            store.record_verified_lesson(
+                str(target["node_type"]),
+                str(target["schema_hash"]),
+                f"upstream-connection:{lesson_id}",
+                {**evidence, "direction": "upstream"},
+            )
+        except Exception as exc:
+            logger.warning("Could not persist verified GraphPatch lesson: %s", exc)
+
+
 def _typed_workflow_node_id_equal(left: Any, right: Any) -> bool:
     """Match the frontend graph-hash domain without conflating ``2`` and ``"2"``."""
 
@@ -3765,6 +5659,7 @@ async def _active_editable_workflow(ctx: Context) -> Dict[str, Any]:
     workflow_identity_schema = result.get("workflow_identity_schema")
     graph_hash = result.get("graph_hash")
     graph_hash_schema = result.get("graph_hash_schema")
+    graph_patch_content_hash = result.get("graph_patch_content_hash")
     if not isinstance(workflow, dict):
         raise RuntimeError("The browser bridge returned no editable workflow JSON.")
     if (
@@ -3791,6 +5686,7 @@ async def _active_editable_workflow(ctx: Context) -> Dict[str, Any]:
         "workflow_identity_schema": workflow_identity_schema,
         "graph_hash": graph_hash,
         "graph_hash_schema": graph_hash_schema,
+        "graph_patch_content_hash": graph_patch_content_hash,
     }
 
 
@@ -4273,6 +6169,1052 @@ async def apply_workflow_refinement(
 
 
 @mcp.tool()
+async def workflow_branches_discover(
+    request: DiscoverWorkflowBranchesRequest,
+    ctx: Context,
+) -> Dict[str, Any]:
+    """Discover deterministic branches in the active workflow without editing it.
+
+    Branches are bounded physical graph regions with exact typed node/slot
+    boundaries.  Natural-language evidence may resolve one unique branch; a tie
+    returns compact candidates and never guesses.  The result pins workflow,
+    graph, and branch-catalog hashes.  Full boundary edge IDs are returned only
+    for the uniquely resolved branch so later replace/remove mappings can be
+    explicit rather than positional.  Nested scopes are discoverable and
+    comparable across root and nested scopes. Writable status reflects the
+    exact scoped edit policy: unique definitions may be edited directly, while
+    reused definitions require explicit all-instance acknowledgement.
+    """
+
+    await _report_tool_activity(ctx, "workflow_branches_discover")
+    try:
+        active = await _active_editable_workflow(ctx)
+        _, result = discover_workflow_branch_selection(
+            request,
+            active["workflow"],
+            workflow_identity=active["workflow_identity"],
+            graph_hash=active["graph_hash"],
+        )
+        return result.model_dump(mode="json", by_alias=True)
+    except ValueError as exc:
+        raise RuntimeError(f"Active workflow branch discovery is invalid: {exc}") from exc
+    except Exception as exc:
+        logger.error("Unexpected error in workflow_branches_discover: %s", exc)
+        raise RuntimeError(f"Tool execution failed: {exc}") from exc
+
+
+@mcp.tool()
+async def workflow_branch_compare(
+    request: CompareWorkflowBranchesRequest,
+    ctx: Context,
+) -> Dict[str, Any]:
+    """Compare two exact pinned branches without exposing raw widget values.
+
+    Comparison is read-only and deterministic across topology, node classes,
+    boundary roles, schema shape, aligned value hashes, and active dynamic-input
+    facts.  Credential-like fields are redacted before hashing; incomplete or
+    sensitive dimensions are reported unavailable instead of claiming equality.
+    """
+
+    await _report_tool_activity(ctx, "workflow_branch_compare")
+    try:
+        active = await _active_editable_workflow(ctx)
+        client = get_node_library_client(
+            server_url=settings.comfyui_server_url,
+            timeout=settings.comfyui_api_timeout,
+        )
+        snapshot = await client.catalog_snapshot(force_refresh=True)
+        result = compare_workflow_branches(
+            request,
+            workflow=active["workflow"],
+            workflow_identity_attestation=active["workflow_identity"],
+            workflow_graph_hash=active["graph_hash"],
+            schema_mapping=snapshot.data,
+        )
+        return result.model_dump(mode="json", by_alias=True)
+    except NodeLibraryConnectionError as exc:
+        raise RuntimeError(f"ComfyUI server connection failed: {exc}") from exc
+    except NodeLibraryError as exc:
+        raise RuntimeError(f"Workflow branch comparison failed: {exc}") from exc
+    except ValueError as exc:
+        raise RuntimeError(f"Active workflow branch comparison is invalid: {exc}") from exc
+    except Exception as exc:
+        logger.error("Unexpected error in workflow_branch_compare: %s", exc)
+        raise RuntimeError(f"Tool execution failed: {exc}") from exc
+
+
+def _branch_navigation_failure(
+    request: NavigateWorkflowBranchRequest,
+    *,
+    code: str,
+    message: str,
+    details: Mapping[str, Any] | None = None,
+) -> Dict[str, Any]:
+    return {
+        "success": False,
+        "navigated": False,
+        "selection_changed": False,
+        "branch_id": request.branch_id,
+        "error": {
+            "code": code,
+            "message": message,
+            **({"details": dict(details)} if details else {}),
+        },
+        "queued": False,
+    }
+
+
+@mcp.tool()
+async def workflow_branch_navigate(
+    request: NavigateWorkflowBranchRequest,
+    ctx: Context,
+) -> Dict[str, Any]:
+    """Atomically select and focus one exact pinned branch on the canvas.
+
+    The backend re-discovers the branch from the active graph before calling the
+    browser.  The browser then validates the full root hash, recursive scope,
+    and every exact typed node ID before the first selection or viewport effect.
+    Ambiguity and stale pins perform no navigation and never partially select.
+    """
+
+    await _report_tool_activity(ctx, "workflow_branch_navigate")
+    if not settings.enable_workflow_writes:
+        return _disabled_by_config("FL_MCP_ENABLE_WORKFLOW_WRITES")
+    try:
+        active = await _active_editable_workflow(ctx)
+        catalog, discovered = discover_workflow_branch_selection(
+            DiscoverWorkflowBranchesRequest(branch_id=request.branch_id),
+            active["workflow"],
+            workflow_identity=active["workflow_identity"],
+            graph_hash=active["graph_hash"],
+        )
+        stale_fields = []
+        if request.expected_workflow_identity != active["workflow_identity"]:
+            stale_fields.append("expected_workflow_identity")
+        if request.expected_graph_hash != active["graph_hash"]:
+            stale_fields.append("expected_graph_hash")
+        if request.expected_branch_catalog_hash != catalog.branch_catalog_hash:
+            stale_fields.append("expected_branch_catalog_hash")
+        if stale_fields:
+            return _branch_navigation_failure(
+                request,
+                code="branch_navigation_stale",
+                message=(
+                    "The workflow or branch catalog changed after discovery; "
+                    "nothing was selected."
+                ),
+                details={"fields": stale_fields},
+            )
+        branch = discovered.selected_branch
+        scope = discovered.selected_scope
+        if not discovered.valid or branch is None or scope is None:
+            return _branch_navigation_failure(
+                request,
+                code="branch_not_found",
+                message="The exact branch is absent from the current pinned catalog.",
+            )
+        node_ids = list(branch.selectable_node_ids)
+        if not node_ids:
+            return _branch_navigation_failure(
+                request,
+                code="branch_has_no_selectable_nodes",
+                message="This branch contains no selectable canvas nodes.",
+            )
+        scope_path = [item.model_dump(mode="json") for item in scope.scope_path]
+        result = await _execute_tool(
+            ctx,
+            "navigate_workflow_branch",
+            {
+                "branch_id": request.branch_id,
+                "expected_workflow_identity": request.expected_workflow_identity,
+                "expected_graph_hash": request.expected_graph_hash,
+                "scope_path": scope_path,
+                "node_ids": node_ids,
+            },
+        )
+        if not isinstance(result, dict):
+            raise RuntimeError("The frontend returned an invalid branch navigation result.")
+        expected = {
+            "branch_id": request.branch_id,
+            "workflow_identity": request.expected_workflow_identity,
+            "graph_hash": request.expected_graph_hash,
+            "scope_path": scope_path,
+            "selected_node_ids": node_ids,
+            "selected_count": len(node_ids),
+            "fitted_count": len(node_ids),
+            "queued": False,
+        }
+        mismatches = [key for key, value in expected.items() if result.get(key) != value]
+        if mismatches:
+            raise RuntimeError(
+                "The frontend branch navigation result failed request attestation: "
+                + ", ".join(mismatches)
+            )
+        return {
+            "success": True,
+            "navigated": True,
+            "selection_changed": True,
+            **result,
+        }
+    except FrontendToolExecutionError as exc:
+        return _branch_navigation_failure(
+            request,
+            code=exc.code,
+            message=str(exc),
+            details=exc.details if isinstance(exc.details, Mapping) else None,
+        )
+    except ValueError as exc:
+        return _branch_navigation_failure(
+            request,
+            code="branch_navigation_invalid",
+            message=str(exc),
+        )
+    except Exception as exc:
+        logger.error("Unexpected error in workflow_branch_navigate: %s", exc)
+        raise RuntimeError(f"Tool execution failed: {exc}") from exc
+
+
+@mcp.tool()
+async def compile_workflow_branch_operation(
+    request: BranchOperationRequest,
+    ctx: Context,
+) -> Dict[str, Any]:
+    """Compile one exact root or authorized nested branch operation.
+
+    This compiler rereads the active workflow and refreshed local catalog,
+    re-discovers the exact branch under all supplied pins, asserts every owned
+    node and incident/cut edge, and lowers the operation through the existing
+    semantic compiler and canonical GraphPatch kernel.  It never calls the
+    browser and never queues.  If valid, pass its ``apply_request`` unchanged to
+    ``apply_workflow_graph_patch``. Unique nested definitions lower to scoped
+    GraphPatch v3; reused definitions require explicit all-instance authority.
+    """
+
+    await _report_tool_activity(ctx, "compile_workflow_branch_operation")
+    try:
+        active = await _active_editable_workflow(ctx)
+        client = get_node_library_client(
+            server_url=settings.comfyui_server_url,
+            timeout=settings.comfyui_api_timeout,
+        )
+        snapshot = await client.catalog_snapshot(force_refresh=True)
+        return compile_branch_operation(
+            request,
+            active["workflow"],
+            workflow_identity=active["workflow_identity"],
+            graph_hash=active["graph_hash"],
+            catalog=snapshot.data,
+            catalog_hash=snapshot.catalog_hash,
+            source=snapshot.source,
+        )
+    except NodeLibraryConnectionError as exc:
+        raise RuntimeError(f"ComfyUI server connection failed: {exc}") from exc
+    except NodeLibraryError as exc:
+        raise RuntimeError(f"Workflow branch compilation failed: {exc}") from exc
+    except ValueError as exc:
+        raise RuntimeError(f"Active workflow branch operation is invalid: {exc}") from exc
+    except Exception as exc:
+        logger.error("Unexpected error in compile_workflow_branch_operation: %s", exc)
+        raise RuntimeError(f"Tool execution failed: {exc}") from exc
+
+
+def _branch_successor_failure(
+    request: ResolveBranchSuccessorsRequest,
+    *,
+    workflow_identity: str,
+    graph_hash: str,
+    code: str,
+    message: str,
+) -> Dict[str, Any]:
+    return {
+        "schema": WORKFLOW_BRANCH_SUCCESSOR_SCHEMA,
+        "valid": False,
+        "application_id": request.apply_request.application_id,
+        "patch_hash": request.apply_request.patch_hash,
+        "workflow_identity": workflow_identity,
+        "graph_hash": graph_hash,
+        "branch_catalog_hash": None,
+        "lineage": [],
+        "successor_branch_ids": [],
+        "successor_branch_id": None,
+        "issues": [
+            {
+                "severity": "error",
+                "code": code,
+                "path": "apply_request",
+                "message": message,
+                "details": {},
+            }
+        ],
+        "error_count": 1,
+        "queued": False,
+    }
+
+
+@mcp.tool()
+async def resolve_workflow_branch_successor(
+    request: ResolveBranchSuccessorsRequest,
+    ctx: Context,
+) -> Dict[str, Any]:
+    """Resolve exact successor branch IDs after one attested GraphPatch apply.
+
+    Call this read-only tool only after ``apply_workflow_graph_patch`` succeeds,
+    passing its unchanged apply envelope, alias map, final workflow identity,
+    final graph hash, and the compiler's pending successor locator.  The backend
+    rereads the active workflow, validates the persisted application ledger and
+    exact GraphPatch postconditions, then rediscovers every affected scope.  It
+    never mutates, navigates, queues, or guesses an incomplete lineage.
+    """
+
+    await _report_tool_activity(ctx, "resolve_workflow_branch_successor")
+    try:
+        active = await _active_editable_workflow(ctx)
+        client = get_node_library_client(
+            server_url=settings.comfyui_server_url,
+            timeout=settings.comfyui_api_timeout,
+        )
+        snapshot = await client.catalog_snapshot(force_refresh=True)
+        completed = _completed_graph_patch_result(
+            active,
+            request.apply_request,
+            catalog=snapshot.data,
+        )
+        if completed is None or completed.get("success") is not True:
+            return _branch_successor_failure(
+                request,
+                workflow_identity=str(active.get("workflow_identity") or "unknown"),
+                graph_hash=str(active.get("graph_hash") or "0" * 64),
+                code="graph_patch_completion_not_attested",
+                message=(
+                    "The exact GraphPatch is not proven complete in the active workflow; "
+                    "no successor lineage was returned."
+                ),
+            )
+        if (
+            completed.get("already_applied") is not True
+            or completed.get("application_id") != request.apply_request.application_id
+            or completed.get("patch_hash") != request.apply_request.patch_hash
+            or completed.get("workflow_identity") != request.expected_workflow_identity
+            or completed.get("graph_hash") != request.expected_graph_hash
+            or completed.get("aliases") != request.aliases
+        ):
+            return _branch_successor_failure(
+                request,
+                workflow_identity=str(active.get("workflow_identity") or "unknown"),
+                graph_hash=str(active.get("graph_hash") or "0" * 64),
+                code="graph_patch_completion_facts_changed",
+                message=(
+                    "The attested GraphPatch result differs from the supplied post-apply "
+                    "identity or alias facts; no successor lineage was returned."
+                ),
+            )
+        return resolve_branch_successors(
+            request,
+            active["workflow"],
+            workflow_identity=active["workflow_identity"],
+            graph_hash=active["graph_hash"],
+            catalog=snapshot.data,
+        )
+    except NodeLibraryConnectionError as exc:
+        raise RuntimeError(f"ComfyUI server connection failed: {exc}") from exc
+    except NodeLibraryError as exc:
+        raise RuntimeError(f"Workflow branch successor resolution failed: {exc}") from exc
+    except ValueError as exc:
+        raise RuntimeError(f"Active workflow branch lineage is invalid: {exc}") from exc
+    except Exception as exc:
+        logger.error("Unexpected error in resolve_workflow_branch_successor: %s", exc)
+        raise RuntimeError(f"Tool execution failed: {exc}") from exc
+
+
+@mcp.tool()
+async def compile_workflow_refinement_spec(
+    request: CompileWorkflowRefinementSpecRequest,
+    ctx: Context,
+) -> Dict[str, Any]:
+    """Compile a new workflow or existing-workflow change into GraphPatch v2.
+
+    This is the default planning tool for both an empty canvas and edits to an
+    active graph. It resolves deterministic existing-node selectors and every
+    requested native/custom/partner role against one refreshed local catalog,
+    infers active dynamic selectors and stable defaults, validates exact
+    arbitrary-DAG edges (including widget-to-input conversion), prefers direct
+    connections, and may synthesize one unique safe schema-derived converter
+    route of at most two local nodes. Exact-schema verified lessons influence
+    ranking only; the refreshed live schema remains authoritative. The result
+    includes compact endpoint/route candidates when a choice is required and
+    one hash-pinned ``apply_request`` when valid. It never mutates or queues the
+    canvas.
+
+    If ``valid=true``, pass ``apply_request`` unchanged to
+    ``apply_workflow_graph_patch``. Use lower-level JSON/search/details/planner
+    tools only when this compiler returns ``needs_choice`` or a classified
+    unsupported schema.
+    """
+
+    await _report_tool_activity(ctx, "compile_workflow_refinement_spec")
+    try:
+        active = await _active_editable_workflow(ctx)
+        selected_node_ids = None
+        if any(selector.selected for selector in request.existing_nodes):
+            selection = await _execute_tool(ctx, "get_selected_nodes", {})
+            selected_nodes = selection.get("nodes") if isinstance(selection, dict) else None
+            if not isinstance(selected_nodes, list):
+                raise ValueError("current canvas selection did not return a nodes array")
+            selected_node_ids = []
+            selected_keys = set()
+            for index, node in enumerate(selected_nodes):
+                node_id = node.get("id") if isinstance(node, dict) else None
+                if isinstance(node_id, bool) or not isinstance(node_id, (int, str)):
+                    raise ValueError(
+                        f"current canvas selection node {index} has an invalid exact ID"
+                    )
+                key = (type(node_id).__name__, node_id)
+                if key in selected_keys:
+                    raise ValueError(
+                        f"current canvas selection repeats node ID {node_id!r}"
+                    )
+                selected_keys.add(key)
+                selected_node_ids.append(node_id)
+        client = get_node_library_client(
+            server_url=settings.comfyui_server_url,
+            timeout=settings.comfyui_api_timeout,
+        )
+        snapshot = await client.catalog_snapshot(force_refresh=True)
+        attachment_values = _validated_plan_attachment_values(request)
+        return compile_semantic_refinement(
+            request,
+            active["workflow"],
+            workflow_identity=active["workflow_identity"],
+            graph_hash=active["graph_hash"],
+            catalog=snapshot.data,
+            catalog_hash=snapshot.catalog_hash,
+            source=snapshot.source,
+            validated_attachment_values=attachment_values,
+            selected_node_ids=selected_node_ids,
+            verified_lessons=_active_verified_capability_lessons(ctx),
+        )
+    except NodeLibraryConnectionError as exc:
+        raise RuntimeError(f"ComfyUI server connection failed: {exc}") from exc
+    except NodeLibraryError as exc:
+        raise RuntimeError(f"Workflow refinement compilation failed: {exc}") from exc
+    except ComfyUIError as exc:
+        raise RuntimeError(f"Workflow attachment validation failed: {exc}") from exc
+    except ValueError as exc:
+        raise RuntimeError(f"Active workflow refinement input is invalid: {exc}") from exc
+    except Exception as exc:
+        logger.error("Unexpected error in compile_workflow_refinement_spec: %s", exc)
+        raise RuntimeError(f"Tool execution failed: {exc}") from exc
+
+
+def _graph_patch_validation_summary(compiled: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "valid": compiled.get("valid") is True,
+        "schema": compiled.get("schema"),
+        "patch_hash": compiled.get("patch_hash"),
+        "catalog": compiled.get("catalog"),
+        "expected_final": compiled.get("expected_final"),
+        "issues": compiled.get("issues", []),
+        "error_count": compiled.get("error_count", 0),
+    }
+
+
+def _graph_patch_schema_contracts(
+    plan: Dict[str, Any],
+    catalog: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Provide browser-verifiable normalized schemas for only touched node classes."""
+
+    facts: Dict[str, str] = {}
+    for item in [
+        *plan.get("assertions", {}).get("nodes", []),
+        *plan.get("create_nodes", []),
+        *plan.get("update_nodes", []),
+        *plan.get("remove_nodes", []),
+    ]:
+        if not isinstance(item, dict):
+            continue
+        node_type = item.get("node_type")
+        schema_hash = item.get("schema_hash")
+        if not isinstance(node_type, str) or not isinstance(schema_hash, str):
+            continue
+        previous = facts.setdefault(node_type, schema_hash)
+        if previous != schema_hash:
+            raise ValueError(f"GraphPatch has conflicting schema hashes for {node_type}")
+    contracts: Dict[str, Any] = {}
+    for node_type, schema_hash in sorted(facts.items()):
+        node_info = catalog.get(node_type)
+        if not isinstance(node_info, dict):
+            raise ValueError(f"GraphPatch node type {node_type} is absent from the catalog")
+        contracts[node_type] = {
+            "schema_hash": schema_hash,
+            "schema": normalize_node_schema_contract(node_info),
+        }
+    return contracts
+
+
+def _graph_patch_failure(
+    request: WorkflowGraphPatchApplyRequest,
+    *,
+    code: str,
+    message: str,
+    validation: Dict[str, Any],
+) -> Dict[str, Any]:
+    return {
+        "success": False,
+        "applied": False,
+        "already_applied": False,
+        "application_id": request.application_id,
+        "patch_hash": request.patch_hash,
+        "error": {"code": code, "message": message},
+        "validation": validation,
+        "rollback": {
+            "attempted": False,
+            "complete": True,
+            "snapshot_restored": False,
+            "hash_verified": False,
+            "errors": [],
+        },
+        "queued": False,
+    }
+
+
+_GRAPH_PATCH_LEDGER_SCHEMA = "fl-mcp.workflow-graph-patch.v2"
+_GRAPH_PATCH_LEDGER_LIMIT = 64
+_GRAPH_PATCH_LEDGER_FACT_LIMIT = 100
+_GRAPH_PATCH_LEDGER_NODE_ID_STRING_LIMIT = 4_096
+_GRAPH_PATCH_LEDGER_APPLICATION_ID = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$"
+)
+_GRAPH_PATCH_LEDGER_ALIAS = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+_GRAPH_PATCH_LEDGER_HASH = re.compile(r"^[0-9a-f]{64}$")
+_GRAPH_PATCH_LEDGER_ENTRY_FIELDS = frozenset(
+    {
+        "aliases",
+        "created_node_ids",
+        "patch_hash",
+        "removed_node_ids",
+        "result_content_hash",
+    }
+)
+
+
+def _valid_graph_patch_ledger_node_id(value: Any) -> bool:
+    return bool(
+        type(value) is int
+        or (
+            type(value) is str
+            and 0 < len(value) <= _GRAPH_PATCH_LEDGER_NODE_ID_STRING_LIMIT
+        )
+    )
+
+
+def _valid_graph_patch_ledger_hash(value: Any) -> bool:
+    return bool(
+        type(value) is str
+        and _GRAPH_PATCH_LEDGER_HASH.fullmatch(value) is not None
+    )
+
+
+def _graph_patch_ledger_is_valid(ledger: Any) -> bool:
+    """Validate the complete untrusted persisted ledger without copying it."""
+
+    if not isinstance(ledger, dict) or len(ledger) != 3:
+        return False
+    if set(ledger) != {"schema", "order", "entries"}:
+        return False
+    order = ledger.get("order")
+    entries = ledger.get("entries")
+    if (
+        ledger.get("schema") != _GRAPH_PATCH_LEDGER_SCHEMA
+        or not isinstance(order, list)
+        or len(order) > _GRAPH_PATCH_LEDGER_LIMIT
+        or not isinstance(entries, dict)
+        or len(entries) > _GRAPH_PATCH_LEDGER_LIMIT
+    ):
+        return False
+    if any(
+        type(application_id) is not str
+        or _GRAPH_PATCH_LEDGER_APPLICATION_ID.fullmatch(application_id) is None
+        for application_id in order
+    ):
+        return False
+    if len(order) != len(set(order)):
+        return False
+    if any(
+        type(application_id) is not str
+        or _GRAPH_PATCH_LEDGER_APPLICATION_ID.fullmatch(application_id) is None
+        for application_id in entries
+    ):
+        return False
+    if set(order) != set(entries):
+        return False
+
+    for application_id in order:
+        entry = entries.get(application_id)
+        if not isinstance(entry, dict):
+            return False
+        fields = set(entry)
+        if fields not in (
+            _GRAPH_PATCH_LEDGER_ENTRY_FIELDS,
+            _GRAPH_PATCH_LEDGER_ENTRY_FIELDS | {"result_definition_hash"},
+        ):
+            return False
+        if any(
+            not _valid_graph_patch_ledger_hash(entry.get(field))
+            for field in ("patch_hash", "result_content_hash")
+        ):
+            return False
+        if (
+            "result_definition_hash" in entry
+            and not _valid_graph_patch_ledger_hash(entry.get("result_definition_hash"))
+        ):
+            return False
+        aliases = entry.get("aliases")
+        created = entry.get("created_node_ids")
+        removed = entry.get("removed_node_ids")
+        if (
+            not isinstance(aliases, dict)
+            or len(aliases) > _GRAPH_PATCH_LEDGER_FACT_LIMIT
+            or not isinstance(created, list)
+            or len(created) > _GRAPH_PATCH_LEDGER_FACT_LIMIT
+            or not isinstance(removed, list)
+            or len(removed) > _GRAPH_PATCH_LEDGER_FACT_LIMIT
+        ):
+            return False
+        if any(
+            type(alias) is not str
+            or _GRAPH_PATCH_LEDGER_ALIAS.fullmatch(alias) is None
+            or not _valid_graph_patch_ledger_node_id(node_id)
+            for alias, node_id in aliases.items()
+        ):
+            return False
+        if any(not _valid_graph_patch_ledger_node_id(item) for item in created):
+            return False
+        if any(not _valid_graph_patch_ledger_node_id(item) for item in removed):
+            return False
+        typed_alias_ids = {(type(item).__name__, item) for item in aliases.values()}
+        typed_created = {(type(item).__name__, item) for item in created}
+        typed_removed = {(type(item).__name__, item) for item in removed}
+        if (
+            len(typed_alias_ids) != len(aliases)
+            or len(typed_created) != len(created)
+            or len(typed_removed) != len(removed)
+            or typed_alias_ids != typed_created
+            or typed_created & typed_removed
+        ):
+            return False
+    return True
+
+
+def _completed_graph_patch_result(
+    active: Dict[str, Any],
+    request: WorkflowGraphPatchApplyRequest,
+    *,
+    catalog: Mapping[str, Any],
+) -> Dict[str, Any] | None:
+    """Return a verified idempotent result from the persisted GraphPatch ledger."""
+
+    if active.get("workflow_identity") != request.plan.expected_workflow_identity:
+        return None
+
+    workflow = active.get("workflow")
+    extra = workflow.get("extra") if isinstance(workflow, dict) else None
+    ledger = extra.get("fl_mcp_graph_patch_ledger") if isinstance(extra, dict) else None
+    if ledger is None:
+        return None
+    if not _graph_patch_ledger_is_valid(ledger):
+        return _graph_patch_failure(
+            request,
+            code="invalid_graph_patch_ledger",
+            message="The persisted GraphPatch ledger is malformed; the canvas was not edited.",
+            validation={"valid": False, "issues": [], "error_count": 1},
+        )
+    entry = ledger["entries"].get(request.application_id)
+    if entry is None:
+        return None
+    target_has_definition_hash = "result_definition_hash" in entry
+    if target_has_definition_hash != isinstance(request, ApplyScopedGraphPatchRequest):
+        return _graph_patch_failure(
+            request,
+            code="invalid_graph_patch_ledger",
+            message=(
+                "The persisted GraphPatch ledger entry has the wrong root/scoped "
+                "result shape; the canvas was not edited."
+            ),
+            validation={"valid": False, "issues": [], "error_count": 1},
+        )
+    if not isinstance(entry, dict) or entry.get("patch_hash") != request.patch_hash:
+        return _graph_patch_failure(
+            request,
+            code="graph_patch_idempotency_conflict",
+            message="This application ID is already bound to a different GraphPatch.",
+            validation={"valid": False, "issues": [], "error_count": 1},
+        )
+    current_content_hash = active.get("graph_patch_content_hash")
+    if (
+        not isinstance(current_content_hash, str)
+        or current_content_hash != entry.get("result_content_hash")
+    ):
+        return _graph_patch_failure(
+            request,
+            code="graph_patch_idempotency_conflict",
+            message="The workflow changed after this GraphPatch was applied.",
+            validation={"valid": False, "issues": [], "error_count": 1},
+        )
+    completed = {
+        "success": True,
+        "applied": False,
+        "already_applied": True,
+        "patch_schema": (
+            SCOPED_GRAPH_PATCH_SCHEMA
+            if isinstance(request, ApplyScopedGraphPatchRequest)
+            else GRAPH_PATCH_SCHEMA
+        ),
+        "application_id": request.application_id,
+        "patch_hash": request.patch_hash,
+        "operation": request.plan.operation,
+        "expected_workflow_identity": request.plan.expected_workflow_identity,
+        "workflow_identity": active.get("workflow_identity"),
+        "graph_hash": active.get("graph_hash"),
+        "aliases": entry.get("aliases", {}),
+        "created_node_ids": entry.get("created_node_ids", []),
+        "removed_node_ids": entry.get("removed_node_ids", []),
+        "verification": {"valid": True, "issues": [], "idempotency_verified": True},
+        "rollback": {
+            "attempted": False,
+            "complete": True,
+            "snapshot_restored": False,
+            "hash_verified": False,
+            "errors": [],
+        },
+        "validation": {
+            "valid": True,
+            "patch_hash": request.patch_hash,
+            "issues": [],
+            "error_count": 0,
+            "idempotency_verified": True,
+        },
+        "queued": False,
+    }
+    try:
+        attested = _attest_graph_patch_frontend_result(completed, request)
+    except RuntimeError:
+        return _graph_patch_failure(
+            request,
+            code="invalid_graph_patch_ledger",
+            message=(
+                "The persisted GraphPatch ledger does not match the exact plan-shaped "
+                "application result; the canvas was not edited."
+            ),
+            validation={"valid": False, "issues": [], "error_count": 1},
+        )
+    state_issues = verify_completed_graph_patch_state(
+        request,
+        workflow,
+        catalog,
+        attested["aliases"],
+        result_definition_hash=entry.get("result_definition_hash"),
+    )
+    if state_issues:
+        return _graph_patch_failure(
+            request,
+            code="invalid_graph_patch_ledger",
+            message=(
+                "The persisted GraphPatch ledger is not proven by the current exact "
+                "plan postconditions; the canvas was not edited."
+            ),
+            validation={
+                "valid": False,
+                "issues": state_issues,
+                "error_count": len(state_issues),
+            },
+        )
+    return attested
+
+
+def _attest_graph_patch_frontend_result(
+    result: Any,
+    request: WorkflowGraphPatchApplyRequest,
+) -> Dict[str, Any]:
+    """Bind a bridge response to this exact request before trusting success."""
+
+    if not isinstance(result, dict):
+        raise RuntimeError("The frontend returned a non-object GraphPatch result.")
+    expected_facts = {
+        "patch_schema": (
+            SCOPED_GRAPH_PATCH_SCHEMA
+            if isinstance(request, ApplyScopedGraphPatchRequest)
+            else GRAPH_PATCH_SCHEMA
+        ),
+        "application_id": request.application_id,
+        "patch_hash": request.patch_hash,
+        "operation": request.plan.operation,
+        "expected_workflow_identity": request.plan.expected_workflow_identity,
+    }
+    mismatches = [
+        field
+        for field, expected in expected_facts.items()
+        if result.get(field) != expected
+    ]
+    if mismatches:
+        raise RuntimeError(
+            "The frontend GraphPatch result failed request attestation: "
+            + ", ".join(mismatches)
+        )
+    for field in ("success", "applied", "already_applied"):
+        if type(result.get(field)) is not bool:
+            raise RuntimeError(f"The frontend GraphPatch result has invalid {field} state.")
+    if result.get("queued") is not False:
+        raise RuntimeError("The frontend GraphPatch result did not attest queued=false.")
+    if result["success"] is not True:
+        if result["applied"] or result["already_applied"]:
+            raise RuntimeError("A failed GraphPatch result claimed a committed application.")
+        rollback = result.get("rollback")
+        if not isinstance(rollback, dict):
+            raise RuntimeError("The frontend GraphPatch failure lacks rollback state.")
+        attempted = rollback.get("attempted")
+        complete = rollback.get("complete")
+        if type(attempted) is not bool or type(complete) is not bool:
+            raise RuntimeError("The frontend GraphPatch failure has invalid rollback state.")
+        compromised = result.get("workflow_state_compromised")
+        quarantined = result.get("mutation_quarantined")
+        recovery = result.get("recovery")
+        if attempted and not complete:
+            if not (
+                compromised is True
+                and quarantined is True
+                and recovery == "reload_or_reopen_workflow"
+            ):
+                raise RuntimeError(
+                    "An incomplete GraphPatch rollback must quarantine mutations and "
+                    "require workflow reload or reopen recovery."
+                )
+        elif (
+            compromised is True
+            or quarantined is True
+            or recovery == "reload_or_reopen_workflow"
+        ):
+            raise RuntimeError(
+                "The frontend GraphPatch failure contradicts its complete rollback state."
+            )
+        return result
+    if result["applied"] == result["already_applied"]:
+        raise RuntimeError(
+            "A successful GraphPatch result must be applied or already_applied, exclusively."
+        )
+    verification = result.get("verification")
+    if not (
+        isinstance(verification, dict)
+        and verification.get("valid") is True
+        and verification.get("issues") == []
+    ):
+        raise RuntimeError("The frontend GraphPatch success lacks exact clean verification.")
+    rollback = result.get("rollback")
+    if not (
+        isinstance(rollback, dict)
+        and rollback.get("attempted") is False
+        and rollback.get("complete") is True
+        and rollback.get("errors") == []
+    ):
+        raise RuntimeError("The frontend GraphPatch success has an invalid rollback state.")
+    aliases = result.get("aliases")
+    created_node_ids = result.get("created_node_ids")
+    removed_node_ids = result.get("removed_node_ids")
+    if not isinstance(aliases, dict) or not isinstance(created_node_ids, list):
+        raise RuntimeError("The frontend GraphPatch success lacks created-node identity facts.")
+    if not isinstance(removed_node_ids, list):
+        raise RuntimeError("The frontend GraphPatch success lacks removed-node identity facts.")
+    expected_aliases = {item.alias for item in request.plan.create_nodes}
+    if set(aliases) != expected_aliases or len(created_node_ids) != len(expected_aliases):
+        raise RuntimeError("The frontend GraphPatch created-node facts do not match the plan.")
+    if any(type(value) not in (int, str) for value in created_node_ids):
+        raise RuntimeError("The frontend GraphPatch returned an invalid created node ID.")
+    typed_created = {(type(value).__name__, value) for value in created_node_ids}
+    if len(typed_created) != len(created_node_ids):
+        raise RuntimeError("The frontend GraphPatch returned duplicate created node IDs.")
+    if {(type(value).__name__, value) for value in aliases.values()} != typed_created:
+        raise RuntimeError("The frontend alias mapping disagrees with created node IDs.")
+    if any(type(value) not in (int, str) for value in removed_node_ids):
+        raise RuntimeError("The frontend GraphPatch returned an invalid removed node ID.")
+    typed_removed = [(type(value).__name__, value) for value in removed_node_ids]
+    if len(set(typed_removed)) != len(typed_removed):
+        raise RuntimeError("The frontend GraphPatch returned duplicate removed node IDs.")
+    expected_removed = [
+        (type(item.ref.node_id).__name__, item.ref.node_id)
+        for item in request.plan.remove_nodes
+    ]
+    if typed_removed != expected_removed:
+        raise RuntimeError("The frontend removed-node facts do not match the plan.")
+    graph_hash = result.get("graph_hash")
+    if not isinstance(graph_hash, str) or re.fullmatch(r"[0-9a-f]{64}", graph_hash) is None:
+        raise RuntimeError("The frontend GraphPatch success lacks a valid final graph hash.")
+    if result["already_applied"] and verification.get("idempotency_verified") is not True:
+        raise RuntimeError("The frontend idempotent GraphPatch result was not verified.")
+    return result
+
+
+@mcp.tool()
+async def apply_workflow_graph_patch(
+    request: WorkflowGraphPatchApplyRequest,
+    ctx: Context,
+) -> Dict[str, Any]:
+    """Atomically apply one unchanged semantic GraphPatch v2 or scoped v3 envelope.
+
+    The backend rereads the active graph, refreshes the local node catalog, and
+    recompiles the supplied canonical plan. Scoped v3 plans additionally resolve
+    the exact definition hash, edit mode, immutable boundary ports, and complete
+    shared-definition instance set from the fresh root workflow. Any workflow,
+    graph, catalog, schema, scope, slot, value, or hash drift stops before browser
+    mutation. The frontend applies the delta under one canvas lock with exact
+    verification, idempotency, rollback, bounded pacing, and no queue call.
+    """
+
+    await _report_tool_activity(ctx, "apply_workflow_graph_patch")
+    if not settings.enable_workflow_writes:
+        return _disabled_by_config("FL_MCP_ENABLE_WORKFLOW_WRITES")
+    try:
+        active = await _active_editable_workflow(ctx)
+        empty_validation = {
+            "valid": False,
+            "schema": None,
+            "patch_hash": None,
+            "catalog": None,
+            "expected_final": None,
+            "issues": [],
+            "error_count": 0,
+        }
+        attachment_issues = _graph_patch_attachment_integrity_issues(request)
+        if attachment_issues:
+            return _graph_patch_failure(
+                request,
+                code="attachment_missing_or_changed",
+                message=(
+                    "A compiler-attested Ren chat image is missing or changed; "
+                    "compile the workflow refinement again."
+                ),
+                validation={
+                    **empty_validation,
+                    "issues": attachment_issues,
+                    "error_count": len(attachment_issues),
+                },
+            )
+        client = get_node_library_client(
+            server_url=settings.comfyui_server_url,
+            timeout=settings.comfyui_api_timeout,
+        )
+        snapshot = await client.catalog_snapshot(force_refresh=True)
+        completed = _completed_graph_patch_result(
+            active,
+            request,
+            catalog=snapshot.data,
+        )
+        if completed is not None:
+            return completed
+        if active["workflow_identity"] != request.plan.expected_workflow_identity:
+            return _graph_patch_failure(
+                request,
+                code="workflow_identity_changed",
+                message="The active workflow tab changed; the canvas was not edited.",
+                validation=empty_validation,
+            )
+        if active["graph_hash"] != request.plan.expected_graph_hash:
+            return _graph_patch_failure(
+                request,
+                code="graph_changed",
+                message="The active workflow graph changed; compile the refinement again.",
+                validation=empty_validation,
+            )
+        if isinstance(request, ApplyScopedGraphPatchRequest):
+            canonical_request = scoped_graph_patch_request_from_apply(request)
+            compiled = compile_scoped_graph_patch(
+                canonical_request,
+                active["workflow"],
+                workflow_identity=active["workflow_identity"],
+                graph_hash=active["graph_hash"],
+                catalog=snapshot.data,
+                catalog_hash=snapshot.catalog_hash,
+                source=snapshot.source,
+            )
+        else:
+            graph = normalize_workflow_graph(active["workflow"])
+            canonical_request = graph_patch_request_from_apply(request, graph)
+            compiled = compile_graph_patch(
+                canonical_request,
+                snapshot.data,
+                catalog_hash=snapshot.catalog_hash,
+                source=snapshot.source,
+            )
+        validation = _graph_patch_validation_summary(compiled)
+        if not compiled["valid"]:
+            return _graph_patch_failure(
+                request,
+                code="patch_invalid",
+                message="The graph patch is no longer valid; the canvas was not edited.",
+                validation=validation,
+            )
+        if (
+            compiled["patch_hash"] != request.patch_hash
+            or compiled["plan"] != request.plan.model_dump(mode="json")
+        ):
+            return _graph_patch_failure(
+                request,
+                code="patch_hash_mismatch",
+                message="The current canonical graph patch differs from the supplied plan.",
+                validation=validation,
+            )
+        # Catalog refresh and recompilation are awaited operations. Recheck the
+        # compiler-pinned bytes at the last backend boundary before the browser
+        # is allowed to mutate the canvas, closing that apply-time TOCTOU gap.
+        attachment_issues = _graph_patch_attachment_integrity_issues(request)
+        if attachment_issues:
+            return _graph_patch_failure(
+                request,
+                code="attachment_missing_or_changed",
+                message=(
+                    "A compiler-attested Ren chat image is missing or changed; "
+                    "compile the workflow refinement again."
+                ),
+                validation={
+                    **empty_validation,
+                    "issues": attachment_issues,
+                    "error_count": len(attachment_issues),
+                },
+            )
+        result = await _execute_tool(
+            ctx,
+            "apply_workflow_graph_patch",
+            {
+                **compiled["apply_request"],
+                "schema_contracts": _graph_patch_schema_contracts(
+                    compiled["plan"],
+                    snapshot.data,
+                ),
+            },
+            timeout_ms=240000,
+        )
+        result = _attest_graph_patch_frontend_result(result, request)
+        if result.get("success") is True and (
+            result.get("applied") is True or result.get("already_applied") is True
+        ):
+            _record_verified_graph_patch_lessons(
+                _node_knowledge_store(ctx),
+                plan=compiled["plan"],
+                patch_hash=request.patch_hash,
+                application_id=request.application_id,
+            )
+        return {**result, "validation": validation}
+    except NodeLibraryConnectionError as exc:
+        raise RuntimeError(f"ComfyUI server connection failed: {exc}") from exc
+    except NodeLibraryError as exc:
+        raise RuntimeError(f"Graph-patch application failed: {exc}") from exc
+    except ValueError as exc:
+        raise RuntimeError(f"Active workflow graph is invalid: {exc}") from exc
+    except Exception as exc:
+        logger.error("Unexpected error in apply_workflow_graph_patch: %s", exc)
+        raise RuntimeError(f"Tool execution failed: {exc}") from exc
+
+
+@mcp.tool()
 async def plan_workflow(request: PlanWorkflowRequest, ctx: Context) -> Dict[str, Any]:
     """Validate a deterministic workflow plan without changing the canvas.
 
@@ -4294,7 +7236,7 @@ async def plan_workflow(request: PlanWorkflowRequest, ctx: Context) -> Dict[str,
             server_url=settings.comfyui_server_url,
             timeout=settings.comfyui_api_timeout,
         )
-        snapshot = await client.catalog_snapshot()
+        snapshot = await client.catalog_snapshot(force_refresh=True)
         attachment_values = _validated_plan_attachment_values(request)
         return compile_workflow_plan(
             request,
@@ -4339,7 +7281,7 @@ async def compile_workflow_spec(
             server_url=settings.comfyui_server_url,
             timeout=settings.comfyui_api_timeout,
         )
-        snapshot = await client.catalog_snapshot()
+        snapshot = await client.catalog_snapshot(force_refresh=True)
         attachment_values = _validated_plan_attachment_values(request)
         return compile_semantic_workflow(
             request,
@@ -4386,7 +7328,7 @@ async def resolve_workflow_spec(
             server_url=settings.comfyui_server_url,
             timeout=settings.comfyui_api_timeout,
         )
-        snapshot = await client.catalog_snapshot()
+        snapshot = await client.catalog_snapshot(force_refresh=True)
         return resolve_workflow_capabilities(
             request,
             snapshot.data,
@@ -4429,7 +7371,7 @@ async def apply_workflow_plan(
             server_url=settings.comfyui_server_url,
             timeout=settings.comfyui_api_timeout,
         )
-        snapshot = await client.catalog_snapshot()
+        snapshot = await client.catalog_snapshot(force_refresh=True)
         plan_request = PlanWorkflowRequest(
             nodes=request.nodes,
             connections=request.connections,
@@ -4548,8 +7490,10 @@ async def node_library_search(request: NodeLibrarySearchRequest, ctx: Context) -
     - "Find LoRA loaders" → query="lora"
     
     RETURNS:
-    Array of matching node type definitions with inputs, outputs, categories.
-    Use node_library_get_details() for comprehensive info on a specific type.
+    A compact ranked candidate list. Full input schemas are intentionally omitted
+    so a broad search cannot inject hundreds of kilobytes into the chat context.
+    Use node_library_get_details() only for a chosen exact type; normal workflow
+    builds/refinements should prefer their one-pass semantic compiler instead.
     """
     await _report_tool_activity(ctx, "node_library_search")
     
@@ -4576,8 +7520,9 @@ async def node_library_search(request: NodeLibrarySearchRequest, ctx: Context) -
                 "display_name": r.display_name,
                 "category": r.category,
                 "description": r.description,
-                "inputs": r.inputs,
-                "outputs": r.outputs,
+                "output_types": sorted(
+                    {str(item) for item in r.outputs if isinstance(item, str)}
+                ),
                 "match_reason": r.match_reason,
                 "origin": r.origin,
                 "python_module": r.python_module,
@@ -4592,6 +7537,8 @@ async def node_library_search(request: NodeLibrarySearchRequest, ctx: Context) -
             "results": formatted_results,
             "total_results": len(formatted_results),
             "truncated": truncated,
+            "compact": True,
+            "schema_details_tool": "node_library_get_details",
             "catalog": await client.catalog_status(),
         }
         
@@ -5308,6 +8255,7 @@ def _resolve_comfy_image_path(comfy_tools: Any, image: Dict[str, Any]) -> Path:
 
 MCP_VISION_PREVIEW_MAX_BYTES = 600_000
 MCP_VISION_PREVIEW_MIN_DIMENSION = 256
+MCP_VISION_JPEG_QUALITY_LADDER = (88, 80, 72, 64, 56, 48, 40, 32)
 
 
 def _has_visible_transparency(image: PILImage.Image) -> bool:
@@ -5334,19 +8282,29 @@ def _bounded_vision_preview(
             (target_dimension, target_dimension),
             PILImage.Resampling.LANCZOS,
         )
-        buffer = io.BytesIO()
         if preserve_alpha:
+            buffer = io.BytesIO()
             preview.save(buffer, format="PNG", optimize=True)
             preview_format = "png"
+            content = buffer.getvalue()
         else:
-            preview.convert("RGB").save(
-                buffer,
-                format="JPEG",
-                quality=88,
-                optimize=True,
-            )
             preview_format = "jpeg"
-        content = buffer.getvalue()
+            rgb_preview = preview.convert("RGB")
+            content = b""
+            # Spatial detail is more important than modest JPEG artifacts for
+            # mask-coordinate inspection. Exhaust a bounded quality ladder at
+            # the requested dimensions before reducing width or height.
+            for quality in MCP_VISION_JPEG_QUALITY_LADDER:
+                buffer = io.BytesIO()
+                rgb_preview.save(
+                    buffer,
+                    format="JPEG",
+                    quality=quality,
+                    optimize=True,
+                )
+                content = buffer.getvalue()
+                if len(content) <= MCP_VISION_PREVIEW_MAX_BYTES:
+                    break
         current_dimension = max(preview.size)
         if (
             len(content) <= MCP_VISION_PREVIEW_MAX_BYTES
@@ -5381,17 +8339,52 @@ def _output_image_preview(path: Path, max_dimension: int) -> tuple[bytes, str, t
     return preview, preview_format, original_size, preview_size
 
 
-def _mask_overlay_preview(
-    path: Path,
-    max_dimension: int,
-) -> tuple[bytes, str, tuple[int, int], tuple[int, int], Dict[str, Any]]:
-    """Render masked pixels as a magenta overlay for visual verification."""
+def _read_mask_source_snapshot(path: Path) -> tuple[PILImage.Image, Dict[str, Any]]:
+    """Read, hash, and decode one stable source-file snapshot.
+
+    The digest, byte count, and decoded dimensions all describe the same bytes.
+    A later same-path overwrite is detected by re-reading this attestation before
+    the browser mutation and again by the browser against its one fetched blob.
+    """
     try:
-        with PILImage.open(path) as source:
+        with path.open("rb") as file_obj:
+            before = os.fstat(file_obj.fileno())
+            payload = file_obj.read()
+            after = os.fstat(file_obj.fileno())
+        if (
+            not payload
+            or len(payload) != before.st_size
+            or len(payload) != after.st_size
+            or _attachment_handle_stat_identity(before)
+            != _attachment_handle_stat_identity(after)
+        ):
+            raise ComfyUIError("Mask source changed while its exact bytes were inspected.")
+        with PILImage.open(io.BytesIO(payload)) as source:
             source.seek(0)
             image = ImageOps.exif_transpose(source).convert("RGBA")
     except (OSError, UnidentifiedImageError) as exc:
         raise ComfyUIError(f"Mask source is not a readable image: {path.name}") from exc
+    return image, {
+        "sha256": hashlib.sha256(payload).hexdigest(),
+        "size_bytes": len(payload),
+        "width": image.width,
+        "height": image.height,
+    }
+
+
+def _mask_overlay_preview_with_attestation(
+    path: Path,
+    max_dimension: int,
+) -> tuple[
+    bytes,
+    str,
+    tuple[int, int],
+    tuple[int, int],
+    Dict[str, Any],
+    Dict[str, Any],
+]:
+    """Render masked pixels as a magenta overlay for visual verification."""
+    image, source_attestation = _read_mask_source_snapshot(path)
 
     original_size = image.size
     mask = ImageOps.invert(image.getchannel("A"))
@@ -5416,7 +8409,16 @@ def _mask_overlay_preview(
         preview,
         max_dimension,
     )
-    return content, preview_format, original_size, preview_size, mask_info
+    return content, preview_format, original_size, preview_size, mask_info, source_attestation
+
+
+def _mask_overlay_preview(
+    path: Path,
+    max_dimension: int,
+) -> tuple[bytes, str, tuple[int, int], tuple[int, int], Dict[str, Any]]:
+    """Backward-compatible overlay helper for callers that do not need byte identity."""
+    preview = _mask_overlay_preview_with_attestation(path, max_dimension)
+    return preview[:5]
 
 
 @mcp.tool()
@@ -5570,7 +8572,7 @@ async def place_chat_image_in_node(
 
 @mcp.tool()
 async def get_execution_history(request: GetWorkflowHistoryRequest, ctx: Context) -> Dict[str, Any]:
-    """Get workflow currently processing queue and history from ComfyUI.
+    """Get ComfyUI execution status, outputs, and compact submission identity.
     
     Retrieves execution history including status, errors, and outputs for workflows.
     Can fetch a specific workflow by prompt_id or recent history.
@@ -5578,8 +8580,10 @@ async def get_execution_history(request: GetWorkflowHistoryRequest, ctx: Context
     For each workflow in history, you'll get:
     - status: "success", "error", or "running"
     - outputs: Generated images/files (if successful)
-    - errors: Full error details with traceback (if failed)
-    - prompt: The workflow that was executed
+    - errors: Bounded node/type facts with message, inputs, and traceback redacted
+    - submission_attestation: Versioned SHA-256 identities and node counts for the
+      exact submitted API prompt and editable workflow. Raw prompt/widget plaintext
+      is never returned.
     
     Use this to:
     - Check if a workflow succeeded or failed
@@ -5594,9 +8598,13 @@ async def get_execution_history(request: GetWorkflowHistoryRequest, ctx: Context
             "status": "success" | "error" | "unknown",
             "completed": bool,
             "outputs": {...},  # Only if successful
-            "errors": [...],   # Only if failed, with full traceback
-            "executed_nodes": [...],  # Nodes that ran successfully
-            "prompt": {...}    # The workflow definition
+            "errors": [...],   # Only if failed; plaintext-bearing fields redacted
+            "submission_attestation": {
+                "schema": str,
+                "available": bool,
+                "api_prompt": {...},
+                "editable_workflow": {...}
+            }
         }
         
         If prompt_id not provided:
@@ -5618,7 +8626,9 @@ async def get_execution_history(request: GetWorkflowHistoryRequest, ctx: Context
         if request.prompt_id:
             # Get specific workflow history
             history_entry = await comfy_tools.fetch_history(
-                prompt_id=request.prompt_id
+                prompt_id=request.prompt_id,
+                include_submission_attestation=True,
+                attest_node_ids=tuple(request.attest_node_ids or ()),
             )
             
             if not history_entry:
@@ -5631,44 +8641,28 @@ async def get_execution_history(request: GetWorkflowHistoryRequest, ctx: Context
             
             # Parse the history entry
             status = history_entry.get("status", {})
-            status_str = status.get("status_str", "unknown")
-            completed = status.get("completed", False)
+            status_str, completed = _execution_history_status_facts(status)
             
+            submission_attestation = history_entry.get("submission_attestation")
+            if not isinstance(submission_attestation, dict):
+                submission_attestation = {
+                    "schema": EXECUTION_SUBMISSION_ATTESTATION_SCHEMA,
+                    "available": False,
+                    "reason": "attestation_unavailable",
+                }
             result = {
                 "prompt_id": request.prompt_id,
                 "status": status_str,
                 "completed": completed,
                 "outputs": history_entry.get("outputs", {}),
-                "prompt": history_entry.get("prompt", [])
+                "submission_attestation": submission_attestation,
             }
             
             # Add error details if failed
             if status_str == "error":
-                errors = []
-                messages = status.get("messages", [])
-                
-                for msg_type, msg_data in messages:
-                    if msg_type == "execution_error":
-                        error = {
-                            "node_id": msg_data.get("node_id"),
-                            "node_type": msg_data.get("node_type"),
-                            "exception_type": msg_data.get("exception_type"),
-                            "exception_message": msg_data.get("exception_message"),
-                            "traceback": msg_data.get("traceback", []),
-                            "current_inputs": msg_data.get("current_inputs", {}),
-                            "timestamp": msg_data.get("timestamp")
-                        }
-                        errors.append(error)
-                
+                errors = _execution_history_error_facts(status)
                 result["errors"] = errors
                 result["error_count"] = len(errors)
-                
-                # Add executed nodes (nodes that ran before failure)
-                if errors:
-                    result["executed_nodes"] = errors[0].get("executed", [])
-            
-            # Add execution messages for all statuses
-            result["messages"] = status.get("messages", [])
             
             return result
             
@@ -5680,26 +8674,20 @@ async def get_execution_history(request: GetWorkflowHistoryRequest, ctx: Context
             parsed_history = {}
             for prompt_id, entry in history.items():
                 status = entry.get("status", {})
-                status_str = status.get("status_str", "unknown")
+                status_str, completed = _execution_history_status_facts(status)
                 
                 parsed_entry = {
                     "status": status_str,
-                    "completed": status.get("completed", False),
+                    "completed": completed,
                     "has_outputs": bool(entry.get("outputs")),
                     "has_errors": status_str == "error"
                 }
                 
                 # Add error summary if failed
                 if status_str == "error":
-                    messages = status.get("messages", [])
-                    for msg_type, msg_data in messages:
-                        if msg_type == "execution_error":
-                            parsed_entry["error_summary"] = {
-                                "node_id": msg_data.get("node_id"),
-                                "node_type": msg_data.get("node_type"),
-                                "exception_message": msg_data.get("exception_message")
-                            }
-                            break
+                    errors = _execution_history_error_facts(status)
+                    if errors:
+                        parsed_entry["error_summary"] = errors[0]
                 
                 parsed_history[prompt_id] = parsed_entry
             
@@ -5721,7 +8709,7 @@ async def get_execution_history(request: GetWorkflowHistoryRequest, ctx: Context
         logger.error(f"Unexpected error in get_workflow_history: {e}")
         return {
             "success": False,
-            "error": f"Unexpected error: {str(e)}",
+            "error": "Unexpected execution-history processing error.",
             "prompt_id": request.prompt_id if request.prompt_id else None
         }
         
@@ -5946,6 +8934,14 @@ async def _restrict_tools_from_environment() -> None:
         registered = await mcp.list_tools(run_middleware=False)
     else:
         registered = (await mcp.get_tools()).values()
+    registered = list(registered)
+    registered_names = {tool.name for tool in registered}
+    missing = sorted(allowed - registered_names)
+    if missing:
+        raise RuntimeError(
+            "provider_tool_surface_mismatch: selected Ren tools are not registered "
+            f"({','.join(missing[:16])})"
+        )
     removed = 0
     for tool in registered:
         if tool.name not in allowed:

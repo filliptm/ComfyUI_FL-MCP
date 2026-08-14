@@ -35,7 +35,7 @@ flowchart LR
 
 ## Highlights
 
-- **120 MCP tools** for workflow inspection, graph editing, queue control, Manager v4, model discovery, filesystem inspection, custom node development, and diagnostics.
+- **135 MCP tools** for workflow inspection, graph editing, queue control, Manager v4, model discovery, filesystem inspection, custom node development, and diagnostics.
 - **Built-in MCP chat**, powered by Ren, with streaming responses, persistent conversation history, chronological tool activity, and approval cards.
 - **Bring your own model** through LM Studio, Ollama, OpenAI, OpenRouter, Anthropic, Claude Code, Codex, or a custom OpenAI-compatible endpoint.
 - **Use existing subscriptions** from Claude Code or Codex without copying OAuth credentials into FL-MCP.
@@ -121,7 +121,7 @@ To use a Claude Pro, Max, Team, or Enterprise subscription, install Claude Code 
 claude auth login
 ```
 
-Then choose **Claude subscription** under **Settings → Model & provider**. FL-MCP checks the official Claude Code login, does not read or copy its OAuth credentials, and keeps direct Anthropic API-key access as a separate provider.
+Then choose **Claude subscription** under **Settings → Connection**. FL-MCP checks the official Claude Code login, does not read or copy its OAuth credentials, and keeps direct Anthropic API-key access as a separate provider.
 
 To use a ChatGPT Plus, Pro, Business, Edu, or Enterprise subscription with Codex, install the Codex CLI and sign in once:
 
@@ -129,21 +129,103 @@ To use a ChatGPT Plus, Pro, Business, Edu, or Enterprise subscription with Codex
 codex login
 ```
 
-Then choose **Codex subscription** under **Settings → Model & provider**. FL-MCP uses the official Codex SDK and its existing ChatGPT login without reading or copying OAuth credentials. Direct OpenAI API-key access remains a separate provider and billing path.
+Then choose **Codex subscription** under **Settings → Connection**. FL-MCP uses the official Codex SDK and its existing ChatGPT login without reading or copying OAuth credentials. Direct OpenAI API-key access remains a separate provider and billing path.
 
-Routine canvas edits can run without an extra prompt. Queueing, workflow deletion, package changes, file writes, Git operations, and process restarts display an approval card before the tool runs by default. Choose **Always allow** on a card to remember that MCP tool, or enable **Bypass all approval prompts** under **Settings → Tool approvals** to skip every chat approval. The server-side safety gates described below still apply in either mode.
+Routine canvas edits can run without an extra prompt. Queueing, workflow deletion, package changes, file writes, Git operations, and process restarts display an approval card before the tool runs by default. Choose **Always allow** on a card to remember that MCP tool, or enable **Bypass all approval prompts** under **Settings → Permissions** to skip every chat approval. The server-side safety gates described below still apply in either mode.
 
 ### Using the built-in chat
 
 - The fixed top bar shows **MCP**, connection status, and the active provider and model.
+- Each open workflow tab has its own selected conversation and unsent draft. Switching tabs restores that workflow's chat and stops any response that was still running in the previous tab.
 - Select **History** to search, rename, archive, restore, or permanently delete conversations.
+- History remains global: use **Switch workflow** for a conversation whose workflow is open, or attach an older unassigned conversation to the active workflow.
 - Tool calls stay at their chronological position in the conversation. Consecutive identical calls collapse into a single row with an `×N` count while retaining each call's details.
-- Approval cards support **Deny**, **Allow once**, and persistent per-tool **Always allow** decisions. Saved rules can be cleared from **Settings → Tool approvals**.
+- Approval cards support **Deny**, **Allow once**, and persistent per-tool **Always allow** decisions. Saved rules can be cleared from **Settings → Permissions**.
 - **Bypass all approval prompts** disables the chat approval layer globally. It does not override the server-side workflow, file, Git, Manager, or process safety gates.
 - **Wait for generation completion by default** keeps a single `queue_workflow` tool call open while ComfyUI runs, avoiding repeated model-driven status requests. Each call can override the saved behavior and timeout.
 - The composer remains fixed below the scrollable conversation. **Jump to present** scrolls smoothly when new activity arrives out of view.
 - ComfyUI's native Fit View accounts for the visible canvas beside the open chat panel.
 - Automatic node insertion uses real node bounds and graph extents to avoid stacking new nodes on top of existing nodes.
+
+### Deterministic workflow building
+
+Ren uses the same two-step graph compiler for a new workflow, a small edit, or a
+multi-branch refinement:
+
+1. `compile_workflow_refinement_spec` resolves the request against the active
+   native, partner, and custom-node catalog, the current canvas (which may be
+   empty), exact node schemas, dynamic inputs, attachments, stable defaults,
+   and active exact-schema verified connection lessons.
+2. `apply_workflow_graph_patch` refreshes and recompiles that canonical plan,
+   then applies it as one guarded transaction without queueing the workflow.
+
+The root GraphPatch v2 plan describes edges directly, so it can create fan-in,
+fan-out, merges, multiple terminal outputs, retained-node updates, removals,
+and widget-to-input connections such as wiring a video's FPS into Video
+Combine. Before changing the canvas it checks workflow, graph, catalog, schema,
+slot, value, attachment, and cycle preconditions. Afterward it verifies the
+exact final graph while preserving unrelated workflow state. Any mismatch
+restores the complete original snapshot. Ambiguous node selection is returned
+to the user as a choice instead of being resolved alphabetically.
+
+Scoped GraphPatch v3 applies the same transaction, verification, rollback, and
+idempotency guarantees inside one exact subgraph definition while retaining the
+full root workflow as the mutation authority. Public subgraph input/output
+boundaries are schema-attested ports; compiler-only virtual nodes never appear
+on the apply wire.
+
+The compiler resolves semantic endpoint intent to exact dynamic paths and
+prefers direct connections. If source and target types are incompatible, it may
+search a bounded capability hypergraph for a unique supported local converter.
+This is schema-driven for every loaded class rather than hardcoded to named
+nodes. Equal routes require a user choice; partner/API/heavy/output nodes are
+never inferred without explicit intent, and exact/no-extra requests disable
+inference entirely.
+
+### Branch navigation and scoped editing
+
+Ren can discover workflow splits, reconvergences, terminal arms, and maximal
+non-branching segments without enumerating every source-to-sink path. Each
+region receives an exact `branch_id` for mutation authority and an ID-independent
+structural fingerprint for comparison. IDs are typed, scope-aware, and pinned to
+the active workflow and graph before any navigation or edit.
+
+Natural requests such as “jump to the upscale branch,” “compare the preview and
+final branches,” or “replace this whole branch” use the branch tools first.
+Ambiguous matches return bounded candidates and perform no selection. Exact
+navigation selects and fits every branch node as one locked UI action. Root and
+authorized nested clone, replace, and remove requests compile back into the same
+atomic GraphPatch writer, including the complete incident-edge boundary, so
+sibling nodes, connections, values, rectangles, groups, reroutes, definitions,
+and workflow fields remain unchanged.
+
+After a successful branch mutation,
+`resolve_workflow_branch_successor` re-attests the persisted GraphPatch result,
+rediscovers every affected scope, and returns exact predecessor-to-successor
+lineage. It returns a singular successor only when exactly one exists; clones or
+replacement DAGs may correctly return several, while a verified removal returns
+an empty successor list. No lineage result is guessed from a label or stale
+fingerprint.
+
+Clone is deliberately bounded to private branch regions whose widgets and
+boundaries can be reconstructed exactly. External sources are shared. For a
+non-terminal or reconvergent branch, the copied region's external outputs stay
+detached and the result reports their exact edge IDs; the merge target and every
+sibling remain untouched. Upload/attachment or credential-bearing inputs,
+unreproducible execution state, and unacknowledged risky partner/output work fail
+closed rather than being copied implicitly.
+
+Nested branches use recursive `{container_node_id, subgraph_id}` scope paths.
+Unique definitions can be edited in place. Reused definitions require an
+explicit shared-definition acknowledgement listing every affected instance;
+instance-only copy-on-write detachment is rejected until that separate operation
+is supported. Virtual subgraph inputs and outputs are schema-attested boundary
+ports rather than ordinary editable nodes. Branch tools never run or queue the
+workflow.
+
+Node creation and connections remain visibly sequential on the canvas. Small
+graphs retain the deliberate step-by-step feel, while larger patches use a
+bounded animation budget so visual pacing does not make complex builds slow.
 
 ### External MCP clients
 
@@ -241,7 +323,7 @@ these gates, save, and restart ComfyUI.
 
 ## Tool Inventory
 
-FL-MCP currently exposes **109 tools**.
+FL-MCP currently exposes **135 tools**.
 
 <details open>
 <summary><strong>Capability and Utility Tools</strong></summary>
@@ -276,6 +358,13 @@ These generally require the browser bridge.
 | `workflow_duplicate_current` | Duplicates the active workflow tab |
 | `find_node` | Finds a node by ID, type, or title |
 | `create_nodes` | Creates one or more nodes |
+| `compile_workflow_refinement_spec` | Compiles a semantic new build or existing-workflow edit into one exact catalog-, schema-, graph-, and workflow-pinned root GraphPatch v2 |
+| `apply_workflow_graph_patch` | Atomically applies a root GraphPatch v2 or scoped GraphPatch v3 with deterministic visible pacing, exact verification, idempotency, full-root rollback, and no queue action |
+| `workflow_branches_discover` | Discovers deterministic root or nested branch regions, exact boundaries, stable IDs, relationships, and bounded ambiguity diagnostics |
+| `workflow_branch_compare` | Compares two exact branches read-only using topology, node classes, schema facts, and credential-safe value/dynamic digests |
+| `workflow_branch_navigate` | Atomically selects and focuses one exact workflow-, graph-, catalog-, and scope-pinned branch |
+| `compile_workflow_branch_operation` | Compiles an exact root or nested branch clone, replacement, or removal into GraphPatch v2/v3 without mutating or queueing; reused definitions require explicit all-instance acknowledgement |
+| `resolve_workflow_branch_successor` | Re-attests a completed branch GraphPatch and returns exact per-scope predecessor-to-successor branch IDs without mutating or queueing |
 | `apply_workflow_plan` | Atomically creates and connects a validated catalog-pinned plan with idempotency, verification, and rollback |
 | `plan_workflow_refinement` | Validates exact linear edits or a terminal append with retained-source side-input fan-in against the current graph and live node schemas |
 | `apply_workflow_refinement` | Atomically applies a graph refinement while preserving unrelated nodes, edges, and source fan-out, with full-snapshot rollback and no queue action |
@@ -290,6 +379,8 @@ These generally require the browser bridge.
 | `take_screenshot` | Captures the current canvas |
 | `get_node_values` | Reads widget values from a node |
 | `set_node_values` | Sets widget values on a node |
+| `view_prompt_reference_image` | Resolves and displays the exact image producer connected to an `image2`/reference input without treating the role label as a node ID |
+| `update_connected_prompt` | Resolves and exactly replaces, appends, prepends, or removes literal text in one connected STRING prompt producer with workflow/graph attestation and no graph planner |
 | `get_node_slots` | Reads detailed input/output slot metadata |
 | `connect_nodes` | Connects two nodes |
 | `connect_nodes_batch` | Connects multiple node pairs |
@@ -298,6 +389,10 @@ These generally require the browser bridge.
 | `modify_layout` | Applies manual layout or auto-layout |
 
 </details>
+
+New clients should use `compile_workflow_refinement_spec` followed by the returned
+unchanged `apply_workflow_graph_patch` request for both new builds and edits. The
+older plan/apply workflow and linear-refinement tools remain compatibility APIs.
 
 <details>
 <summary><strong>Workflow Files and Tabs</strong></summary>
@@ -391,12 +486,14 @@ or stale records are discovery aids and can never authorize a build.
 | `node_knowledge_search` | Searches the last-valid local index with exact origin/schema identity while labeling it discovery-only |
 | `node_library_get_details` | Reads detailed metadata for a node type |
 | `node_library_find_compatible` | Finds compatible node types for connections |
-| `compile_workflow_spec` | Resolves a complete semantic request, canonicalizes dynamic inputs, binds trusted chat images, fills stable defaults, and returns one ready-to-apply valid plan |
+| `compile_workflow_refinement_spec` | Resolves a semantic build or refinement against the active canvas and all locally loaded native, partner, and custom nodes, then returns one ready-to-apply GraphPatch v2 |
+| `apply_workflow_graph_patch` | Recompiles and atomically applies the exact root-v2 or scoped-v3 arbitrary-DAG patch without queueing, preserving unrelated graph and workflow state |
+| `compile_workflow_spec` *(legacy compatibility)* | Resolves a complete semantic request, canonicalizes dynamic inputs, binds trusted chat images, fills stable defaults, and returns one ready-to-apply valid plan |
 | `resolve_workflow_spec` | Deterministically resolves semantic roles to exact locally loaded classes with catalog pinning and origin guardrails |
-| `plan_workflow` | Dry-runs a catalog-pinned workflow plan and validates exact node schemas, values, and connections |
-| `apply_workflow_plan` | Recompiles and atomically applies an exact valid plan without queueing |
-| `plan_workflow_refinement` | Plans a catalog- and graph-pinned linear edit or terminal append, including exact retained-source side inputs |
-| `apply_workflow_refinement` | Applies the exact refinement transactionally with unrelated-graph preservation, rollback on failure, and no queue action |
+| `plan_workflow` *(legacy compatibility)* | Dry-runs a catalog-pinned workflow plan and validates exact node schemas, values, and connections |
+| `apply_workflow_plan` *(legacy compatibility)* | Recompiles and atomically applies an exact valid plan without queueing |
+| `plan_workflow_refinement` *(legacy compatibility)* | Plans a catalog- and graph-pinned linear edit or terminal append, including exact retained-source side inputs |
+| `apply_workflow_refinement` *(legacy compatibility)* | Applies the exact refinement transactionally with unrelated-graph preservation, rollback on failure, and no queue action |
 | `registry_search_packages` | Searches all published packages in the official Comfy Registry and returns Registry + GitHub links |
 | `registry_get_package` | Inspects one official Registry package, its published nodes, and its Registry + GitHub links |
 
@@ -544,7 +641,7 @@ claude auth status
 codex login status
 ```
 
-Return to **Settings → Model & provider**, select the subscription provider, and use its refresh action. FL-MCP never substitutes an API key provider for a subscription provider.
+Return to **Settings → Connection**, select the subscription provider, and use its refresh action. FL-MCP never substitutes an API key provider for a subscription provider.
 
 </details>
 
@@ -625,7 +722,7 @@ Useful local checks:
 ```bash
 python -m compileall -q backend mcp_daemon.py __init__.py
 python -I -c "import runpy; runpy.run_path('backend/mcp_server.py', run_name='embedded_mcp'); runpy.run_path('backend/server.py', run_name='embedded_server')"
-node --experimental-default-type=module --test tests/js/*.test.mjs
+node --test tests/js/*.test.mjs
 for f in web/js/*.js; do node --check "$f"; done
 python -m pip check
 ```

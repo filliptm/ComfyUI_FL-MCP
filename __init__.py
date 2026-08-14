@@ -33,6 +33,7 @@ from backend.chat_image_preview import (  # noqa: E402
     resolve_chat_image_path,
 )
 from backend.comfy_runtime_paths import export_comfy_runtime_paths  # noqa: E402
+from backend.mask_compositor import handle_mask_compose_request  # noqa: E402
 from backend.process_utils import daemon_process_kwargs, pid_is_running  # noqa: E402
 
 bridge_settings_payload = None
@@ -272,7 +273,15 @@ try:
             },
         )
 
-    print("[FL-MCP] Registered launcher, settings, and image thumbnail routes")
+    @PromptServer.instance.routes.post("/fl_mcp/mask/compose")
+    async def fl_mcp_compose_mask(request):
+        input_root = folder_paths.get_input_directory()
+        return await handle_mask_compose_request(
+            request,
+            input_root=Path(input_root) if input_root else None,
+        )
+
+    print("[FL-MCP] Registered launcher, settings, image thumbnail, and mask compose routes")
 except Exception as exc:
     print(f"[FL-MCP] Warning: could not register launcher routes: {exc}")
 

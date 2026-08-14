@@ -135,6 +135,20 @@ function plural(count, singular, pluralForm = `${singular}s`) {
     return `${count} ${count === 1 ? singular : pluralForm}`;
 }
 
+function workflowDeltaParts(delta) {
+    const normalized = delta && typeof delta === "object" ? delta : {};
+    return [
+        [normalized.created_node_count, "new node"],
+        [normalized.updated_node_count, "updated node"],
+        [normalized.removed_node_count, "removed node"],
+        [normalized.added_edge_count, "added connection"],
+        [normalized.removed_edge_count, "removed connection"],
+    ]
+        .map(([count, label]) => [Number(count || 0), label])
+        .filter(([count]) => Number.isFinite(count) && count > 0)
+        .map(([count, label]) => plural(count, label));
+}
+
 const PROVIDER_MARKS = {
     lmstudio: "LM",
     ollama: "OL",
@@ -187,12 +201,14 @@ export function toolHistorySummary(steps = []) {
         done: 0,
         retried: 0,
         failed: 0,
+        needsChoice: 0,
         interrupted: 0,
     };
     for (const step of entries) {
         const status = String(step?.status || "").toLowerCase();
         if (status === "running") counts.running += 1;
         else if (["failed", "error"].includes(status)) counts.failed += 1;
+        else if (status === "needs_choice") counts.needsChoice += 1;
         else if (status === "retried") counts.retried += 1;
         else if (["cancelled", "interrupted"].includes(status)) counts.interrupted += 1;
         else counts.done += 1;
@@ -209,17 +225,37 @@ export function summarizeToolStep(step, config = {}) {
         : args;
     const result = toolResultPayload(step?.result);
     const failed = ["failed", "error"].includes(step?.status);
+    const needsChoice = step?.status === "needs_choice"
+        || (failed && result?.needs_choice === true);
+    if (needsChoice) {
+        const choiceLabels = {
+            view_node_mask: "Choose the exact image node to inspect",
+            view_prompt_reference_image: "Choose the exact reference image route",
+            update_connected_prompt: "Choose the exact prompt target",
+        };
+        return choiceLabels[name] || `${config.label || name || "Action"} needs your choice`;
+    }
     if (failed) {
         const failureLabels = {
             view_output_image: "Couldn’t review output image",
             view_chat_image: "Couldn’t inspect attached image",
+            view_canvas_images: "Couldn’t inspect canvas images",
             place_chat_image_in_node: "Couldn’t place attached image",
-            view_node_mask: "Couldn’t inspect image mask",
+            view_node_mask: "Couldn’t inspect image for masking",
+            view_prompt_reference_image: "Couldn’t inspect reference image",
+            update_connected_prompt: "Couldn’t update connected prompt",
             edit_node_mask: "Couldn’t update image mask",
             confirm_mask_review: "Mask needs changes",
             web_search: "Couldn’t search the web",
             web_fetch_page: "Couldn’t read the web page",
             compile_workflow_spec: "Couldn’t compile workflow",
+            compile_workflow_refinement_spec: "Couldn’t plan workflow",
+            apply_workflow_graph_patch: "Couldn’t build workflow",
+            workflow_branches_discover: "Couldn’t discover workflow branches",
+            workflow_branch_compare: "Couldn’t compare workflow branches",
+            workflow_branch_navigate: "Couldn’t focus workflow branch",
+            compile_workflow_branch_operation: "Couldn’t plan branch change",
+            resolve_workflow_branch_successor: "Couldn’t resolve branch lineage",
             plan_workflow: "Couldn’t validate workflow plan",
             registry_search_packages: "Couldn’t search official Comfy Registry",
             registry_get_package: "Couldn’t inspect Registry package",
@@ -245,6 +281,16 @@ export function summarizeToolStep(step, config = {}) {
         const size = dimensionsLabel(result?.originalSize);
         return size ? `Inspected attached image · ${size}` : "Inspected attached image";
     }
+    if (name === "view_canvas_images") {
+        const returned = Number(result?.returned_count);
+        const total = Number(result?.total_count);
+        if (Number.isInteger(returned) && Number.isInteger(total)) {
+            return result?.has_more
+                ? `Inspected ${returned} of ${total} canvas images`
+                : `Inspected all ${total} canvas images`;
+        }
+        return "Inspected canvas images";
+    }
     if (name === "place_chat_image_in_node") {
         const node = result?.title
             || (result?.node_id !== undefined ? `node ${result.node_id}` : "selected node");
@@ -254,8 +300,18 @@ export function summarizeToolStep(step, config = {}) {
         const node = result?.title
             || (result?.node_id !== undefined ? `node ${result.node_id}` : "image");
         const coverage = coverageLabel(result);
-        const summary = `Inspected mask on ${node}`;
+        const summary = `Inspected ${node} for masking`;
         return coverage ? `${summary} · ${coverage}` : summary;
+    }
+    if (name === "view_prompt_reference_image") {
+        const input = result?.consumer_input || "reference input";
+        return `Inspected image connected to ${input}`;
+    }
+    if (name === "update_connected_prompt") {
+        const node = result?.producer_node_id !== undefined
+            ? `node ${result.producer_node_id}`
+            : "connected prompt";
+        return `Updated exact prompt on ${node}`;
     }
     if (name === "edit_node_mask") {
         const regions = Array.isArray(request?.regions) ? request.regions : [];
@@ -387,6 +443,86 @@ export function summarizeToolStep(step, config = {}) {
         if (result?.success === false) return "Workflow refinement failed safely";
         if (result?.already_applied) return "Workflow refinement already applied";
         return `Refined workflow · ${result?.operation || "updated graph"}`;
+    }
+    if (name === "compile_workflow_refinement_spec") {
+        if (result?.valid === false) {
+            if (result?.needs_choice) return "Workflow plan needs your choice";
+            return `Workflow plan needs fixes · ${plural(Number(result?.error_count || 0), "error")}`;
+        }
+        const delta = result?.plan?.expected_delta || {};
+        const parts = workflowDeltaParts(delta);
+        return parts.length > 0
+            ? `Planned workflow · ${parts.join(" · ")}`
+            : "Planned workflow";
+    }
+    if (name === "apply_workflow_graph_patch") {
+        if (result?.success === false) return "Workflow build failed safely";
+        if (result?.already_applied) return "Workflow change already applied";
+        const declared = request?.plan?.expected_delta || result?.expected_delta;
+        const fallback = {
+            created_node_count: Array.isArray(result?.created_node_ids)
+                ? result.created_node_ids.length
+                : 0,
+            removed_node_count: Array.isArray(result?.removed_node_ids)
+                ? result.removed_node_ids.length
+                : 0,
+        };
+        const parts = workflowDeltaParts(declared || fallback);
+        return parts.length > 0
+            ? `Built workflow · ${parts.join(" · ")}`
+            : "Built workflow";
+    }
+    if (name === "workflow_branches_discover") {
+        const resolution = result?.resolution || {};
+        if (resolution.status === "needs_choice") return "Branch match needs your choice";
+        if (["stale", "invalid_catalog"].includes(resolution.status)) {
+            return "Branch discovery stopped safely";
+        }
+        if (resolution.status === "not_found") return "No matching workflow branch";
+        if (resolution.status === "resolved") {
+            const count = Number(result?.selected_branch?.selectable_node_ids?.length ?? 0);
+            return `Found workflow branch · ${plural(count, "node")}`;
+        }
+        const count = Number(resolution.candidate_count ?? result?.summary?.branch_count ?? 0);
+        return `Listed ${plural(count, "workflow branch", "workflow branches")}`;
+    }
+    if (name === "workflow_branch_compare") {
+        if (result?.status !== "compared") return "Branch comparison stopped safely";
+        const structure = result?.structurally_equal === true
+            ? "same structure"
+            : result?.structurally_equal === false
+                ? "different structure"
+                : "structure unavailable";
+        const values = result?.value_equal === true
+            ? "same values"
+            : result?.value_equal === false
+                ? "different values"
+                : "values protected";
+        return `Compared workflow branches · ${structure} · ${values}`;
+    }
+    if (name === "workflow_branch_navigate") {
+        if (result?.success === false) return "Branch navigation stopped safely";
+        const count = Number(result?.selected_count ?? result?.selected_node_ids?.length ?? 0);
+        return `Focused workflow branch · ${plural(count, "node")}`;
+    }
+    if (name === "compile_workflow_branch_operation") {
+        if (result?.valid === false) {
+            if (result?.needs_choice) return "Branch change needs your choice";
+            return `Branch change needs fixes · ${plural(Number(result?.error_count || 0), "error")}`;
+        }
+        const operation = String(result?.operation || "change");
+        const parts = workflowDeltaParts(result?.plan?.expected_delta || {});
+        return parts.length > 0
+            ? `Planned branch ${operation} · ${parts.join(" · ")}`
+            : `Planned branch ${operation}`;
+    }
+    if (name === "resolve_workflow_branch_successor") {
+        if (result?.valid !== true) return "Branch lineage stopped safely";
+        const count = Array.isArray(result?.successor_branch_ids)
+            ? result.successor_branch_ids.length
+            : 0;
+        if (count === 0) return "Confirmed branch removal · no successor branches";
+        return `Resolved ${plural(count, "successor branch", "successor branches")}`;
     }
     if (name === "compile_workflow_spec") {
         const nodeCount = Array.isArray(result?.plan?.nodes)
