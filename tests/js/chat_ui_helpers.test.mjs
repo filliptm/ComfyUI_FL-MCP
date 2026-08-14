@@ -73,6 +73,11 @@ test("tool summaries expose human outcomes for core canvas operations", () => {
         result: '{"node_count":12}',
     }), "Inspected 12 nodes");
     assert.equal(summarizeToolStep({
+        name: "view_canvas_images",
+        status: "done",
+        result: '{"returned_count":6,"total_count":6,"has_more":false}',
+    }), "Inspected all 6 canvas images");
+    assert.equal(summarizeToolStep({
         name: "queue_workflow",
         status: "done",
         result: '{"status":"completed"}',
@@ -272,7 +277,28 @@ test("image review and mask summaries report the visible outcome", () => {
         name: "view_node_mask",
         status: "done",
         result: JSON.stringify(maskResult),
-    }), "Inspected mask on LOAD & MASK IMAGE · 4% covered");
+    }), "Inspected LOAD & MASK IMAGE for masking · 4% covered");
+
+    assert.equal(summarizeToolStep({
+        name: "view_node_mask",
+        status: "done",
+        result: JSON.stringify({
+            node_id: 12,
+            title: "LOAD & MASK IMAGE",
+            mask: { coveragePercent: 0 },
+        }),
+    }), "Inspected LOAD & MASK IMAGE for masking · empty mask");
+
+    assert.equal(summarizeToolStep({
+        name: "view_node_mask",
+        status: "failed",
+    }), "Couldn’t inspect image for masking");
+
+    assert.equal(summarizeToolStep({
+        name: "view_node_mask",
+        status: "needs_choice",
+        result: JSON.stringify({ success: false, needs_choice: true }),
+    }), "Choose the exact image node to inspect");
 
     assert.equal(summarizeToolStep({
         name: "edit_node_mask",
@@ -321,7 +347,7 @@ test("image review and mask summaries report the visible outcome", () => {
         name: "view_node_mask",
         status: "done",
         result: JSON.stringify(maskResult),
-    }), "Inspected mask on LOAD & MASK IMAGE · 4% covered");
+    }), "Inspected LOAD & MASK IMAGE for masking · 4% covered");
 
     assert.equal(summarizeToolStep({
         name: "edit_node_mask",
@@ -498,6 +524,7 @@ test("large tool histories summarize every individual call without grouping", ()
         done: 1,
         retried: 1,
         failed: 1,
+        needsChoice: 0,
         interrupted: 1,
         active: steps[2],
     });

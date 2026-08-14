@@ -35,7 +35,7 @@ flowchart LR
 
 ## Highlights
 
-- **133 MCP tools** for workflow inspection, graph editing, queue control, Manager v4, model discovery, filesystem inspection, custom node development, and diagnostics.
+- **135 MCP tools** for workflow inspection, graph editing, queue control, Manager v4, model discovery, filesystem inspection, custom node development, and diagnostics.
 - **Built-in MCP chat**, powered by Ren, with streaming responses, persistent conversation history, chronological tool activity, and approval cards.
 - **Bring your own model** through LM Studio, Ollama, OpenAI, OpenRouter, Anthropic, Claude Code, Codex, or a custom OpenAI-compatible endpoint.
 - **Use existing subscriptions** from Claude Code or Codex without copying OAuth credentials into FL-MCP.
@@ -323,7 +323,7 @@ these gates, save, and restart ComfyUI.
 
 ## Tool Inventory
 
-FL-MCP currently exposes **133 tools**.
+FL-MCP currently exposes **135 tools**.
 
 <details open>
 <summary><strong>Capability and Utility Tools</strong></summary>
@@ -379,6 +379,8 @@ These generally require the browser bridge.
 | `take_screenshot` | Captures the current canvas |
 | `get_node_values` | Reads widget values from a node |
 | `set_node_values` | Sets widget values on a node |
+| `view_prompt_reference_image` | Resolves and displays the exact image producer connected to an `image2`/reference input without treating the role label as a node ID |
+| `update_connected_prompt` | Resolves and exactly replaces, appends, prepends, or removes literal text in one connected STRING prompt producer with workflow/graph attestation and no graph planner |
 | `get_node_slots` | Reads detailed input/output slot metadata |
 | `connect_nodes` | Connects two nodes |
 | `connect_nodes_batch` | Connects multiple node pairs |

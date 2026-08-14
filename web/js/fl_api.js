@@ -23,16 +23,34 @@ import {
     workflowGraphHashExcludingExtra,
 } from "./graph_precondition.js";
 import {
+    buildExactMaskComposeFormData,
+    drawMaskRegionPath,
     formatImageWidgetRef,
     nestedImageRefForNode,
     normalizeMaskRegion,
     parseImageWidgetRef,
     summarizeMaskPixels,
 } from "./mask_utils.js";
+import {
+    executionProvenanceFromSubmission,
+    prepareExecutionSubmission,
+    recoverQueueOperationFromPayloads,
+    submissionCarriesExecutionProvenance,
+} from "./execution_provenance.js";
+import { captureAuthenticatedQueue } from "./queue_capture.js";
 
 const WORKFLOW_IDENTITY_SCHEMA = "fl-mcp.workflow-instance.v1";
 const GRAPH_PATCH_LEDGER_KEY = "fl_mcp_graph_patch_ledger";
 const SHA256_PATTERN = /^[0-9a-f]{64}$/;
+const CREATED_NODE_NORMALIZATION_STABLE_FRAMES = 3;
+const CREATED_NODE_NORMALIZATION_QUIET_MS = 200;
+const CREATED_NODE_NORMALIZATION_MAX_TURNS = 512;
+const CREATED_NODE_NORMALIZATION_VISIBLE_TIMEOUT_MS = 5000;
+const CREATED_NODE_NORMALIZATION_HIDDEN_TIMEOUT_MS = 15000;
+const CREATED_NODE_NORMALIZATION_SAMPLE_MS = 40;
+const CREATED_NODE_NORMALIZATION_FRAME_WATCHDOG_MS = 250;
+const CREATED_NODE_NORMALIZATION_REVISION_SENTINEL =
+    "__fl_mcp_created_node_normalization_revision__";
 
 const WORKFLOW_IDENTITY_TOKENS = new WeakMap();
 const WORKFLOW_IDENTITY_SESSION = (() => {
@@ -76,6 +94,31 @@ function graphPatchScopeError(code, message, details = null) {
 
 function typedValuesEqual(left, right) {
     return typeof left === typeof right && Object.is(left, right);
+}
+
+
+function typedNodeKey(nodeId) {
+    return `${typeof nodeId}:${String(nodeId)}`;
+}
+
+
+function maskSourcePreconditionError(message) {
+    const error = new Error(message);
+    error.code = "mask_source_precondition_failed";
+    return error;
+}
+
+
+async function sha256BlobHex(blob) {
+    if (typeof globalThis.crypto?.subtle?.digest !== "function") {
+        throw maskSourcePreconditionError(
+            "SHA-256 is unavailable; the exact mask source cannot be verified.",
+        );
+    }
+    const bytes = await blob.arrayBuffer();
+    const digest = await globalThis.crypto.subtle.digest("SHA-256", bytes);
+    return Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, "0"))
+        .join("");
 }
 
 /**
@@ -435,10 +478,8 @@ export class FL_API {
 
     /** Pin the graph content expected between staged refinement operations. */
     async createWorkflowMutationGuard(pin) {
-        this.assertActiveWorkflow(pin);
-        const expectedGraphHash = await workflowGraphHash(app.graph.serialize());
-        this.assertActiveWorkflow(pin);
-        return { pin, expectedGraphHash };
+        const observation = await this._stableWorkflowGuardObservation(pin, null, "start");
+        return { pin, expectedGraphHash: observation.graphHash };
     }
 
     /** Detect a same-tab user edit before it can be folded into an agent mutation. */
@@ -446,31 +487,438 @@ export class FL_API {
         if (!guard?.pin || typeof guard.expectedGraphHash !== "string") {
             throw new Error("A workflow mutation guard is required.");
         }
-        this.assertActiveWorkflow(guard.pin);
-        const actualGraphHash = await workflowGraphHash(app.graph.serialize());
-        this.assertActiveWorkflow(guard.pin);
-        if (actualGraphHash !== guard.expectedGraphHash) {
-            const error = new Error(
-                "The canvas changed outside the guarded refinement transaction.",
+        const observation = await this._stableWorkflowGuardObservation(
+            guard.pin,
+            guard.expectedGraphHash,
+            "assert",
+        );
+        if (observation.graphHash !== guard.expectedGraphHash) {
+            throw this._workflowMutationGuardError(
+                guard.expectedGraphHash,
+                observation.graphHash,
             );
-            error.code = "concurrent_workflow_edit";
-            error.details = {
-                expected_graph_hash: guard.expectedGraphHash,
-                actual_graph_hash: actualGraphHash,
-            };
-            throw error;
         }
-        return actualGraphHash;
+        return observation.graphHash;
     }
 
     /** Accept exactly one completed agent mutation as the next guarded state. */
     async acceptWorkflowMutationGuard(guard) {
         if (!guard?.pin) throw new Error("A workflow mutation guard is required.");
-        this.assertActiveWorkflow(guard.pin);
-        const expectedGraphHash = await workflowGraphHash(app.graph.serialize());
-        this.assertActiveWorkflow(guard.pin);
-        guard.expectedGraphHash = expectedGraphHash;
-        return expectedGraphHash;
+        const observation = await this._stableWorkflowGuardObservation(
+            guard.pin,
+            guard.expectedGraphHash,
+            "accept",
+        );
+        this._advanceWorkflowMutationGuard(guard, observation);
+        return observation.graphHash;
+    }
+
+    /** Capture the synchronous post-create state before deferred frontend hooks run. */
+    captureCreatedNodeNormalizationCheckpoint(guard, target) {
+        if (!guard?.pin || typeof guard.expectedGraphHash !== "string") {
+            throw new Error("A workflow mutation guard is required.");
+        }
+        const normalizedTarget = {
+            node_id: target?.node_id,
+            node_type: target?.node_type,
+            definition_id: target?.definition_id ?? null,
+        };
+        if (
+            normalizedTarget.node_id === undefined
+            || normalizedTarget.node_id === null
+            || typeof normalizedTarget.node_type !== "string"
+            || !normalizedTarget.node_type
+            || (
+                normalizedTarget.definition_id !== null
+                && (
+                    typeof normalizedTarget.definition_id !== "string"
+                    || !normalizedTarget.definition_id
+                )
+            )
+        ) {
+            throw new Error("An exact created-node normalization target is required.");
+        }
+        const observation = this._captureWorkflowGuardObservation(guard.pin);
+        const projection = this._createdNodeNormalizationProjection(
+            observation.snapshot,
+            normalizedTarget,
+        );
+        return {
+            expectedGraphHash: guard.expectedGraphHash,
+            target: normalizedTarget,
+            outsideGraphToken: projection.outsideGraphToken,
+            revisions: projection.revisions,
+            graphToken: observation.graphToken,
+        };
+    }
+
+    /** Accept only bounded frontend normalization of one freshly-created node. */
+    async acceptCreatedNodeNormalization(guard, checkpoint) {
+        if (
+            !guard?.pin
+            || !checkpoint
+            || checkpoint.expectedGraphHash !== guard.expectedGraphHash
+        ) {
+            throw new Error("A current created-node normalization checkpoint is required.");
+        }
+        const hidden = globalThis.document?.visibilityState === "hidden";
+        const timeoutMs = hidden
+            ? CREATED_NODE_NORMALIZATION_HIDDEN_TIMEOUT_MS
+            : CREATED_NODE_NORMALIZATION_VISIBLE_TIMEOUT_MS;
+        const deadline = this._createdNodeNormalizationNow() + timeoutMs;
+        let previousGraphToken = checkpoint.graphToken;
+        let stableFrames = 0;
+        let quietSince = hidden ? null : this._createdNodeNormalizationNow();
+
+        for (
+            let turn = 0;
+            turn < CREATED_NODE_NORMALIZATION_MAX_TURNS;
+            turn += 1
+        ) {
+            const turnObservation = await this._waitForCreatedNodeNormalizationTurn();
+            const observedAt = this._createdNodeNormalizationNow();
+            if (observedAt > deadline) break;
+            const observation = this._captureWorkflowGuardObservation(guard.pin);
+            const projection = this._createdNodeNormalizationProjection(
+                observation.snapshot,
+                checkpoint.target,
+            );
+            if (!this._createdNodeNormalizationRevisionsMatch(
+                checkpoint.revisions,
+                projection.revisions,
+            )) {
+                const actualGraphHash = await workflowGraphHash(observation.snapshot);
+                throw this._workflowMutationGuardError(
+                    guard.expectedGraphHash,
+                    actualGraphHash,
+                    {
+                        phase: "created_node_normalization",
+                        reason: "workflow_revision_changed",
+                        node_id: checkpoint.target.node_id,
+                        definition_id: checkpoint.target.definition_id,
+                    },
+                );
+            }
+            if (projection.outsideGraphToken !== checkpoint.outsideGraphToken) {
+                const actualGraphHash = await workflowGraphHash(observation.snapshot);
+                throw this._workflowMutationGuardError(
+                    guard.expectedGraphHash,
+                    actualGraphHash,
+                    {
+                        phase: "created_node_normalization",
+                        reason: "change_outside_created_node",
+                        node_id: checkpoint.target.node_id,
+                        definition_id: checkpoint.target.definition_id,
+                    },
+                );
+            }
+
+            const visibleFrame = Boolean(
+                turnObservation?.visible
+                && turnObservation?.frameObserved
+                && globalThis.document?.visibilityState !== "hidden"
+            );
+            if (!visibleFrame) {
+                previousGraphToken = observation.graphToken;
+                stableFrames = 0;
+                quietSince = null;
+                continue;
+            }
+            if (observation.graphToken !== previousGraphToken) {
+                previousGraphToken = observation.graphToken;
+                stableFrames = 0;
+                quietSince = observedAt;
+                continue;
+            }
+            if (quietSince === null) quietSince = observedAt;
+            stableFrames += 1;
+            if (
+                stableFrames < CREATED_NODE_NORMALIZATION_STABLE_FRAMES
+                || observedAt - quietSince < CREATED_NODE_NORMALIZATION_QUIET_MS
+            ) continue;
+
+            const graphHash = await workflowGraphHash(observation.snapshot);
+            if (this._createdNodeNormalizationNow() > deadline) break;
+            const recaptured = this._captureWorkflowGuardObservation(guard.pin);
+            const recapturedProjection = this._createdNodeNormalizationProjection(
+                recaptured.snapshot,
+                checkpoint.target,
+            );
+            if (!this._createdNodeNormalizationRevisionsMatch(
+                checkpoint.revisions,
+                recapturedProjection.revisions,
+            )) {
+                const actualGraphHash = await workflowGraphHash(recaptured.snapshot);
+                throw this._workflowMutationGuardError(
+                    guard.expectedGraphHash,
+                    actualGraphHash,
+                    {
+                        phase: "created_node_normalization",
+                        reason: "workflow_revision_changed_during_hash",
+                        node_id: checkpoint.target.node_id,
+                        definition_id: checkpoint.target.definition_id,
+                    },
+                );
+            }
+            if (recapturedProjection.outsideGraphToken !== checkpoint.outsideGraphToken) {
+                const actualGraphHash = await workflowGraphHash(recaptured.snapshot);
+                throw this._workflowMutationGuardError(
+                    guard.expectedGraphHash,
+                    actualGraphHash,
+                    {
+                        phase: "created_node_normalization",
+                        reason: "change_outside_created_node_during_hash",
+                        node_id: checkpoint.target.node_id,
+                        definition_id: checkpoint.target.definition_id,
+                    },
+                );
+            }
+            if (recaptured.graphToken !== observation.graphToken) {
+                previousGraphToken = recaptured.graphToken;
+                stableFrames = 0;
+                quietSince = globalThis.document?.visibilityState === "hidden"
+                    ? null
+                    : this._createdNodeNormalizationNow();
+                continue;
+            }
+
+            this._advanceWorkflowMutationGuard(guard, {
+                ...observation,
+                graphHash,
+            });
+            return graphHash;
+        }
+
+        const error = new Error(
+            "The created node did not reach a stable frontend-normalized state.",
+        );
+        error.code = "frontend_normalization_timeout";
+        error.details = {
+            phase: "created_node_normalization",
+            node_id: checkpoint.target.node_id,
+            definition_id: checkpoint.target.definition_id,
+            timeout_ms: timeoutMs,
+        };
+        throw error;
+    }
+
+    _captureWorkflowGuardObservation(pin) {
+        this.assertActiveWorkflow(pin);
+        const snapshot = structuredClone(app.graph.serialize());
+        const graphToken = canonicalWorkflowJSON(snapshot);
+        this.assertActiveWorkflow(pin);
+        return { snapshot, graphToken };
+    }
+
+    async _stableWorkflowGuardObservation(pin, expectedGraphHash, phase) {
+        const observation = this._captureWorkflowGuardObservation(pin);
+        const graphHash = await workflowGraphHash(observation.snapshot);
+        const recaptured = this._captureWorkflowGuardObservation(pin);
+        if (recaptured.graphToken !== observation.graphToken) {
+            const actualGraphHash = await workflowGraphHash(recaptured.snapshot);
+            throw this._workflowMutationGuardError(
+                expectedGraphHash,
+                actualGraphHash,
+                { phase, reason: "graph_changed_during_hash" },
+            );
+        }
+        return { ...observation, graphHash };
+    }
+
+    _advanceWorkflowMutationGuard(guard, observation) {
+        guard.expectedGraphHash = observation.graphHash;
+    }
+
+    _workflowMutationGuardError(expectedGraphHash, actualGraphHash, details = {}) {
+        const error = new Error(
+            "The canvas changed outside the guarded refinement transaction.",
+        );
+        error.code = "concurrent_workflow_edit";
+        error.details = {
+            expected_graph_hash: expectedGraphHash,
+            actual_graph_hash: actualGraphHash,
+            ...details,
+        };
+        return error;
+    }
+
+    _createdNodeNormalizationProjection(snapshot, target) {
+        const projected = { ...snapshot };
+        let sourceOwningGraph = snapshot;
+        let owningGraph = projected;
+        if (target.definition_id !== null) {
+            const definitions = this._serializedSubgraphDefinitions(snapshot);
+            const matches = definitions.filter(definition => (
+                String(definition?.id ?? "") === target.definition_id
+            ));
+            if (matches.length !== 1) {
+                throw this._workflowMutationGuardError(
+                    null,
+                    null,
+                    {
+                        phase: "created_node_normalization",
+                        reason: "definition_identity_changed",
+                        node_id: target.node_id,
+                        definition_id: target.definition_id,
+                    },
+                );
+            }
+            [sourceOwningGraph] = matches;
+            owningGraph = { ...sourceOwningGraph };
+            const rawDefinitions = snapshot?.definitions?.subgraphs;
+            if (Array.isArray(rawDefinitions)) {
+                const definitionIndex = rawDefinitions.indexOf(sourceOwningGraph);
+                const copiedDefinitions = [...rawDefinitions];
+                copiedDefinitions[definitionIndex] = owningGraph;
+                projected.definitions = {
+                    ...snapshot.definitions,
+                    subgraphs: copiedDefinitions,
+                };
+            } else {
+                const definitionEntry = Object.entries(rawDefinitions || {})
+                    .find(([, definition]) => definition === sourceOwningGraph);
+                if (!definitionEntry) {
+                    throw this._workflowMutationGuardError(
+                        null,
+                        null,
+                        {
+                            phase: "created_node_normalization",
+                            reason: "definition_identity_changed",
+                            node_id: target.node_id,
+                            definition_id: target.definition_id,
+                        },
+                    );
+                }
+                projected.definitions = {
+                    ...snapshot.definitions,
+                    subgraphs: {
+                        ...rawDefinitions,
+                        [definitionEntry[0]]: owningGraph,
+                    },
+                };
+            }
+        }
+        const nodes = Array.isArray(sourceOwningGraph?.nodes)
+            ? [...sourceOwningGraph.nodes]
+            : [];
+        const matches = nodes
+            .map((node, index) => ({ node, index }))
+            .filter(item => typedValuesEqual(item.node?.id, target.node_id));
+        if (matches.length !== 1 || matches[0].node?.type !== target.node_type) {
+            throw this._workflowMutationGuardError(
+                null,
+                null,
+                {
+                    phase: "created_node_normalization",
+                    reason: "created_node_identity_changed",
+                    node_id: target.node_id,
+                    definition_id: target.definition_id,
+                },
+            );
+        }
+        nodes[matches[0].index] = {
+            id: structuredClone(target.node_id),
+            type: target.node_type,
+            fl_mcp_created_node_normalization: true,
+        };
+        owningGraph.nodes = nodes;
+
+        const revisions = [this._createdNodeNormalizationRevisionFact(snapshot, "root")];
+        if (sourceOwningGraph !== snapshot) {
+            revisions.push(this._createdNodeNormalizationRevisionFact(
+                sourceOwningGraph,
+                `definition:${target.definition_id}`,
+            ));
+        }
+        if (revisions[0].controlled) {
+            projected.revision = CREATED_NODE_NORMALIZATION_REVISION_SENTINEL;
+        }
+        if (sourceOwningGraph !== snapshot && revisions[1].controlled) {
+            owningGraph.revision = CREATED_NODE_NORMALIZATION_REVISION_SENTINEL;
+        }
+        return {
+            outsideGraphToken: canonicalWorkflowJSON(projected),
+            revisions,
+        };
+    }
+
+    _createdNodeNormalizationRevisionFact(graph, scope) {
+        const present = Boolean(
+            graph
+            && typeof graph === "object"
+            && Object.prototype.hasOwnProperty.call(graph, "revision")
+        );
+        const value = present ? graph.revision : null;
+        return {
+            scope,
+            present,
+            controlled: present && Number.isSafeInteger(value) && value >= 0,
+            value,
+        };
+    }
+
+    _createdNodeNormalizationRevisionsMatch(expected, actual) {
+        if (!Array.isArray(expected) || !Array.isArray(actual)) return false;
+        if (expected.length !== actual.length) return false;
+        return expected.every((item, index) => {
+            const candidate = actual[index];
+            if (
+                item?.scope !== candidate?.scope
+                || item?.present !== candidate?.present
+                || item?.controlled !== candidate?.controlled
+            ) return false;
+            if (item.controlled) return candidate.value >= item.value;
+            return Object.is(candidate.value, item.value);
+        });
+    }
+
+    _createdNodeNormalizationNow() {
+        const monotonic = globalThis.performance?.now?.();
+        return Number.isFinite(monotonic) ? monotonic : Date.now();
+    }
+
+    _waitForCreatedNodeNormalizationTurn() {
+        return new Promise(resolve => {
+            let finished = false;
+            let sampleTimerId = null;
+            let watchdogTimerId = null;
+            let afterFrameTimerId = null;
+            let frameId = null;
+            const finish = observation => {
+                if (finished) return;
+                finished = true;
+                if (sampleTimerId !== null) globalThis.clearTimeout(sampleTimerId);
+                if (watchdogTimerId !== null) globalThis.clearTimeout(watchdogTimerId);
+                if (afterFrameTimerId !== null) globalThis.clearTimeout(afterFrameTimerId);
+                if (
+                    frameId !== null
+                    && typeof globalThis.cancelAnimationFrame === "function"
+                ) globalThis.cancelAnimationFrame(frameId);
+                resolve(observation);
+            };
+            sampleTimerId = globalThis.setTimeout(() => {
+                sampleTimerId = null;
+                const visible = globalThis.document?.visibilityState !== "hidden";
+                if (!visible || typeof globalThis.requestAnimationFrame !== "function") {
+                    finish({ visible, frameObserved: false });
+                    return;
+                }
+                watchdogTimerId = globalThis.setTimeout(
+                    () => finish({
+                        visible: globalThis.document?.visibilityState !== "hidden",
+                        frameObserved: false,
+                    }),
+                    CREATED_NODE_NORMALIZATION_FRAME_WATCHDOG_MS,
+                );
+                frameId = globalThis.requestAnimationFrame(() => {
+                    frameId = null;
+                    afterFrameTimerId = globalThis.setTimeout(() => finish({
+                        visible: globalThis.document?.visibilityState !== "hidden",
+                        frameObserved: true,
+                    }), 0);
+                });
+            }, CREATED_NODE_NORMALIZATION_SAMPLE_MS);
+        });
     }
 
     /** Return every current graph edge in one normalized, name-enriched shape. */
@@ -1315,8 +1763,11 @@ export class FL_API {
             throw new Error("A serialized workflow snapshot is required for rollback.");
         }
         if (!pin?.workflow) throw new Error("The original ComfyUI workflow identity is required.");
+        const expectedSnapshot = structuredClone(snapshot);
+        const expectedCanonical = canonicalWorkflowJSON(expectedSnapshot);
+        const expectedGraphHash = await workflowGraphHash(expectedSnapshot);
         await app.loadGraphData(
-            structuredClone(snapshot),
+            structuredClone(expectedSnapshot),
             false,
             false,
             pin.workflow,
@@ -1328,13 +1779,28 @@ export class FL_API {
             },
         );
         this.assertActiveWorkflow(pin);
-        this.restoreNestedImageReferences();
+        const restoredSnapshot = structuredClone(app.graph.serialize());
+        const restoredGraphHash = await workflowGraphHash(restoredSnapshot);
+        if (
+            canonicalWorkflowJSON(restoredSnapshot) !== expectedCanonical
+            || restoredGraphHash !== expectedGraphHash
+        ) {
+            throw new Error(
+                "The workflow snapshot did not restore exactly; preview hydration was skipped.",
+            );
+        }
+        // Hydration must happen only after exact rollback verification. This
+        // helper is deliberately presentation-only and cannot change anything
+        // emitted by graph.serialize().
+        this.hydrateNestedImagePreviews();
         this.assertActiveWorkflow(pin);
-        this._markGraphChanged();
+        this._markCanvasDirty();
         return {
             restored: true,
             workflow_identity_verified: true,
-            graph_hash: await workflowGraphHash(app.graph.serialize()),
+            snapshot_restored: true,
+            hash_verified: true,
+            graph_hash: restoredGraphHash,
             graph_hash_schema: GRAPH_PRECONDITION_SCHEMA,
         };
     }
@@ -1738,12 +2204,19 @@ export class FL_API {
      * Get currently selected nodes with full details
      * @returns {Array<object>} Array of selected node objects
      */
-    getSelectedNodes() {
+    getSelectedNodes(pin = null) {
         try {
+            if (pin) this.assertActiveWorkflow(pin);
             const selectedNodes = Object.values(app.canvas.selected_nodes || {});
+            const authority = pin ? structuredClone(app.graph.serialize()) : null;
             const result = [];
             
             for (const node of selectedNodes) {
+                const projection = pin
+                    ? this._projectRuntimeNode(app.graph, authority, node, {
+                        label: "Selected workflow",
+                    })
+                    : null;
                 // Extract parameters from widgets
                 const parameters = {};
                 if (node.widgets) {
@@ -1779,7 +2252,7 @@ export class FL_API {
                 }
                 
                 result.push({
-                    id: node.id,
+                    id: projection?.serializedId ?? node.id,
                     title: node.title,
                     type: node.comfyClass || node.type,
                     position: { x: node.pos[0], y: node.pos[1] },
@@ -1790,6 +2263,7 @@ export class FL_API {
                     outputs: outputs
                 });
             }
+            if (pin) this.assertActiveWorkflow(pin);
             
             console.log(`[FL_API] Retrieved ${result.length} selected node(s)`);
             return result;
@@ -2210,27 +2684,269 @@ export class FL_API {
         );
     }
 
-    getNodeImageRef(nodeId) {
-        const node = this._findNode(nodeId);
+    _nodeImageRefs(node, canonicalNodeId, {
+        includePending = true,
+        allowMissing = false,
+    } = {}) {
+        const pendingReview = [...this.pendingMaskReviews.values()].find(
+            value => typedValuesEqual(value.nodeId, canonicalNodeId),
+        );
+        const imageWidget = node.widgets?.find(widget => widget.name === "image");
+        const widgetRef = parseImageWidgetRef(imageWidget?.value);
+        const refs = [];
+        const seen = new Set();
+        const addRef = (image, imageIndex, pending = false) => {
+            if (!image?.filename) return;
+            const normalized = structuredClone({
+                filename: String(image.filename),
+                subfolder: String(image.subfolder || ""),
+                type: String(image.type || (imageIndex === null ? "input" : "output")),
+            });
+            const key = JSON.stringify([
+                normalized.type,
+                normalized.subfolder,
+                normalized.filename,
+            ]);
+            if (seen.has(key)) return;
+            seen.add(key);
+            refs.push({
+                node_id: canonicalNodeId,
+                node_type: node.comfyClass || node.type,
+                title: node.title,
+                image: normalized,
+                image_index: imageIndex,
+                pending_review: pending,
+                ...(pending && pendingReview?.originalImage
+                    ? { original_image: structuredClone(pendingReview.originalImage) }
+                    : {}),
+            });
+        };
+
+        // A pending review is the exact image the next mask edit will use, so it
+        // replaces the committed image widget in this current-source projection.
+        if (includePending && pendingReview?.image) {
+            addRef(pendingReview.image, null, true);
+        } else {
+            addRef(widgetRef, null, false);
+        }
+        for (const [imageIndex, image] of (node.images || []).entries()) {
+            addRef(image, imageIndex, false);
+        }
+        if (!refs.length) {
+            if (allowMissing) return null;
+            throw new Error(`Node ${canonicalNodeId} does not reference a ComfyUI image`);
+        }
+        return refs;
+    }
+
+    _nodeImageRef(node, canonicalNodeId, options = {}) {
+        return this._nodeImageRefs(node, canonicalNodeId, options)?.[0] || null;
+    }
+
+    getNodeImageRef(nodeId, pin = null, { includePending = true } = {}) {
+        const projection = pin ? this._workflowNodeProjection(nodeId, pin, false) : null;
+        const node = projection?.node || this._findNode(nodeId);
         if (!node) {
             throw new Error(`Node not found: ${nodeId}`);
         }
-        const imageWidget = node.widgets?.find(widget => widget.name === "image");
-        const widgetRef = parseImageWidgetRef(imageWidget?.value);
-        const nodeImage = node.images?.[0];
-        const image = widgetRef || (nodeImage?.filename ? {
-            filename: nodeImage.filename,
-            subfolder: nodeImage.subfolder || "",
-            type: nodeImage.type || "output",
-        } : null);
-        if (!image) {
-            throw new Error(`Node ${nodeId} does not reference a ComfyUI image`);
+        return this._nodeImageRef(
+            node,
+            projection?.serializedId ?? node.id,
+            { includePending },
+        );
+    }
+
+    /** Return a stable, bounded page of exact image references on the active canvas. */
+    getCanvasImageRefs({
+        nodeIds = null,
+        offset = 0,
+        limit = 8,
+    } = {}, pin = null) {
+        if (pin) this.assertActiveWorkflow(pin);
+        if (!Number.isSafeInteger(offset) || offset < 0) {
+            throw new Error("Canvas image offset must be a nonnegative safe integer.");
         }
+        if (!Number.isSafeInteger(limit) || limit < 1 || limit > 8) {
+            throw new Error("Canvas image limit must be between 1 and 8.");
+        }
+        if (
+            nodeIds !== null
+            && (
+                !Array.isArray(nodeIds)
+                || nodeIds.length < 1
+                || nodeIds.length > 8
+            )
+        ) {
+            throw new Error("Canvas image node_ids must contain between 1 and 8 exact IDs.");
+        }
+        if (
+            Array.isArray(nodeIds)
+            && new Set(nodeIds.map(typedNodeKey)).size !== nodeIds.length
+        ) {
+            throw new Error("Canvas image node_ids cannot contain duplicate exact IDs.");
+        }
+
+        const graph = app.graph;
+        const authority = structuredClone(graph.serialize());
+        const runtimeFacts = this._graphNodes(graph).map(node => ({
+            node,
+            serialized: this._serializeRuntimeNode(node),
+        }));
+        const bucketById = values => {
+            const buckets = new Map();
+            for (const value of values) {
+                const nodeId = value?.id;
+                const key = typedNodeKey(nodeId);
+                const bucket = buckets.get(key) || [];
+                bucket.push(value);
+                buckets.set(key, bucket);
+            }
+            return buckets;
+        };
+        const authorityById = bucketById(this._serializedGraphNodes(authority));
+        const runtimeByProjectedId = bucketById(runtimeFacts.map(fact => ({
+            ...fact,
+            id: fact.serialized?.id ?? fact.node?.id,
+        })));
+        const candidates = runtimeFacts
+            .flatMap(({ node, serialized }) => {
+                const canonicalNodeId = serialized?.id ?? node?.id;
+                const results = this._nodeImageRefs(node, canonicalNodeId, {
+                    includePending: true,
+                    allowMissing: true,
+                });
+                if (!results) return [];
+                const serializedPosition = serialized?.pos;
+                const x = Number.isFinite(Number(serializedPosition?.[0]))
+                    ? Number(serializedPosition[0])
+                    : Number.isFinite(Number(node?.pos?.[0]))
+                        ? Number(node.pos[0])
+                        : 0;
+                const y = Number.isFinite(Number(serializedPosition?.[1]))
+                    ? Number(serializedPosition[1])
+                    : Number.isFinite(Number(node?.pos?.[1]))
+                        ? Number(node.pos[1])
+                        : 0;
+                return results.map(result => ({
+                    node,
+                    serialized,
+                    canonicalNodeId,
+                    x,
+                    y,
+                    result,
+                }));
+            });
+
+        const verifyCandidateProjection = candidate => {
+            const key = typedNodeKey(candidate.canonicalNodeId);
+            const projectedMatches = runtimeByProjectedId.get(key) || [];
+            const authorityMatches = authorityById.get(key) || [];
+            if (projectedMatches.length !== 1 || authorityMatches.length !== 1) {
+                throw this._nodeProjectionError(
+                    projectedMatches.length > 1 || authorityMatches.length > 1
+                        ? "workflow_node_projection_ambiguous"
+                        : "workflow_node_projection_missing",
+                    `Canvas image node ${String(candidate.canonicalNodeId)} has no exact projection.`,
+                    candidate.canonicalNodeId,
+                    Math.max(projectedMatches.length, authorityMatches.length),
+                );
+            }
+            const liveType = candidate.node.comfyClass || candidate.node.type;
+            const projectedType = candidate.serialized?.type ?? liveType;
+            const authorityType = authorityMatches[0].type ?? projectedType;
+            if (
+                (liveType != null && projectedType != null && liveType !== projectedType)
+                || (
+                    projectedType != null
+                    && authorityType != null
+                    && projectedType !== authorityType
+                )
+            ) {
+                throw this._nodeProjectionError(
+                    "workflow_node_projection_ambiguous",
+                    `Canvas image node ${String(candidate.canonicalNodeId)} conflicts with type authority.`,
+                    candidate.canonicalNodeId,
+                    1,
+                );
+            }
+            return authorityMatches[0].id;
+        };
+
+        let ordered = candidates.sort((left, right) => (
+            left.y - right.y
+            || left.x - right.x
+            || typedNodeKey(left.canonicalNodeId)
+                .localeCompare(typedNodeKey(right.canonicalNodeId))
+        ));
+        if (Array.isArray(nodeIds)) {
+            ordered = nodeIds.flatMap(nodeId => {
+                const matches = candidates.filter(candidate => (
+                    typedValuesEqual(candidate.canonicalNodeId, nodeId)
+                ));
+                if (!matches.length) {
+                    const error = new Error(
+                        `Canvas image node ${String(nodeId)} is unavailable or has no image.`,
+                    );
+                    error.code = "canvas_image_node_unavailable";
+                    throw error;
+                }
+                return matches;
+            });
+        }
+
+        const grouped = [];
+        const groupedByImage = new Map();
+        for (const candidate of ordered) {
+            const image = candidate.result.image;
+            const imageKey = JSON.stringify([
+                String(image?.type || "input"),
+                String(image?.subfolder || ""),
+                String(image?.filename || ""),
+            ]);
+            let group = groupedByImage.get(imageKey);
+            if (!group) {
+                group = {
+                    image: structuredClone(image),
+                    pending_review: Boolean(candidate.result.pending_review),
+                    sources: [],
+                };
+                groupedByImage.set(imageKey, group);
+                grouped.push(group);
+            }
+            group.pending_review ||= Boolean(candidate.result.pending_review);
+            group.sources.push(candidate);
+        }
+
+        const selected = grouped.slice(offset, offset + limit);
+        const images = selected.map((group, pageIndex) => {
+            const publicSources = group.sources.slice(0, 16).map(candidate => {
+                return {
+                    node_id: verifyCandidateProjection(candidate),
+                    node_type: candidate.result.node_type,
+                    title: candidate.result.title,
+                    position: { x: candidate.x, y: candidate.y },
+                    image_index: candidate.result.image_index,
+                };
+            });
+            return {
+                page_index: offset + pageIndex,
+                image: group.image,
+                pending_review: group.pending_review,
+                source_count: group.sources.length,
+                sources: publicSources,
+                sources_truncated: group.sources.length > publicSources.length,
+            };
+        });
+        if (pin) this.assertActiveWorkflow(pin);
+        const nextOffset = offset + images.length;
         return {
-            node_id: node.id,
-            node_type: node.comfyClass || node.type,
-            title: node.title,
-            image,
+            images,
+            total_count: grouped.length,
+            offset,
+            limit,
+            has_more: nextOffset < grouped.length,
+            next_offset: nextOffset < grouped.length ? nextOffset : null,
+            deduplicated: true,
         };
     }
 
@@ -2302,7 +3018,7 @@ export class FL_API {
         const previousImage = parseImageWidgetRef(imageWidget.value);
 
         const pendingEntry = [...this.pendingMaskReviews.entries()].find(
-            ([, value]) => nodeIdsEqual(value.nodeId, node.id)
+            ([, value]) => typedValuesEqual(value.nodeId, node.id)
         );
         if (pendingEntry) {
             this._releaseMaskReviewPreview(pendingEntry[1]);
@@ -2330,8 +3046,17 @@ export class FL_API {
         };
     }
 
-    async editNodeMask(nodeId, regions, coordinateSpace = "pixels", clearExisting = false) {
-        const node = this._findNode(nodeId);
+    async editNodeMask(
+        nodeId,
+        regions,
+        coordinateSpace = "pixels",
+        clearExisting = false,
+        exactContext = null,
+    ) {
+        const workflowPin = exactContext?.workflowPin || null;
+        const node = workflowPin
+            ? this._workflowNodeFromSerializedId(nodeId, workflowPin)
+            : this._findNode(nodeId);
         if (!node) {
             throw new Error(`Node not found: ${nodeId}`);
         }
@@ -2340,31 +3065,56 @@ export class FL_API {
             throw new Error(`Node ${nodeId} has no image widget to receive the edited mask`);
         }
 
+        // In an exact workflow transaction `nodeId` is the canonical serialized
+        // ID. The live LiteGraph node may expose a string projection for that
+        // same numeric ID, so pending review authority must never be keyed by
+        // or return the runtime node.id.
+        const reviewNodeId = workflowPin ? nodeId : node.id;
         const existingReviewEntry = [...this.pendingMaskReviews.entries()].find(
-            ([, value]) => nodeIdsEqual(value.nodeId, node.id)
+            ([, value]) => typedValuesEqual(value.nodeId, reviewNodeId)
         );
         const existingReview = existingReviewEntry?.[1];
         const originalImage = existingReview?.originalImage
-            || this.getNodeImageRef(nodeId).image;
+            || this.getNodeImageRef(nodeId, workflowPin).image;
         const source = existingReview?.image || originalImage;
-        const [rgbImage, alphaImage] = await Promise.all([
-            this._loadComfyImage(source, "rgb"),
-            this._loadComfyImage(source, "a"),
-        ]);
-        if (rgbImage.width !== alphaImage.width || rgbImage.height !== alphaImage.height) {
-            throw new Error("Image RGB and alpha dimensions do not match");
+        const committedImage = this.getNodeImageRef(
+            nodeId,
+            workflowPin,
+            { includePending: false },
+        ).image;
+        if (!exactContext?.expectedSourceAttestation) {
+            throw maskSourcePreconditionError(
+                "An exact source-byte attestation is required before editing a mask.",
+            );
         }
+        // This runs under ToolExecutor's shared canvas mutation lock. Fetch one
+        // source blob, hash those exact bytes before drawing, decode it once,
+        // and derive both color and alpha from that single bitmap.
+        const {
+            blob: sourceBlob,
+            image: sourceImage,
+            attestation: sourceAttestation,
+        } = (
+            await this._loadComfyImageExact(source, exactContext.expectedSourceAttestation)
+        );
+        const sourceWidth = sourceImage.width;
+        const sourceHeight = sourceImage.height;
 
         const maskCanvas = document.createElement("canvas");
-        maskCanvas.width = rgbImage.width;
-        maskCanvas.height = rgbImage.height;
+        maskCanvas.width = sourceImage.width;
+        maskCanvas.height = sourceImage.height;
         const maskContext = maskCanvas.getContext("2d");
         const alphaCanvas = document.createElement("canvas");
-        alphaCanvas.width = alphaImage.width;
-        alphaCanvas.height = alphaImage.height;
+        alphaCanvas.width = sourceImage.width;
+        alphaCanvas.height = sourceImage.height;
         const alphaContext = alphaCanvas.getContext("2d");
-        alphaContext.drawImage(alphaImage, 0, 0);
-        const sourceAlpha = alphaContext.getImageData(0, 0, alphaImage.width, alphaImage.height);
+        alphaContext.drawImage(sourceImage, 0, 0);
+        const sourceAlpha = alphaContext.getImageData(
+            0,
+            0,
+            sourceImage.width,
+            sourceImage.height,
+        );
         const maskPixels = maskContext.createImageData(maskCanvas.width, maskCanvas.height);
         for (let index = 0; index < maskPixels.data.length; index += 4) {
             maskPixels.data[index] = 255;
@@ -2384,20 +3134,7 @@ export class FL_API {
             const regionContext = regionCanvas.getContext("2d");
             regionContext.fillStyle = "white";
             regionContext.filter = region.feather > 0 ? `blur(${region.feather}px)` : "none";
-            regionContext.beginPath();
-            if (region.shape === "ellipse") {
-                regionContext.ellipse(
-                    region.x + region.width / 2,
-                    region.y + region.height / 2,
-                    region.width / 2,
-                    region.height / 2,
-                    0,
-                    0,
-                    Math.PI * 2
-                );
-            } else {
-                regionContext.rect(region.x, region.y, region.width, region.height);
-            }
+            drawMaskRegionPath(regionContext, region);
             regionContext.fill();
 
             maskContext.save();
@@ -2410,40 +3147,31 @@ export class FL_API {
 
         const editedMask = maskContext.getImageData(0, 0, maskCanvas.width, maskCanvas.height);
         const maskSummary = summarizeMaskPixels(editedMask);
-        const reviewCanvas = document.createElement("canvas");
-        reviewCanvas.width = rgbImage.width;
-        reviewCanvas.height = rgbImage.height;
-        const reviewContext = reviewCanvas.getContext("2d");
-        reviewContext.drawImage(rgbImage, 0, 0);
-        const highlightCanvas = document.createElement("canvas");
-        highlightCanvas.width = rgbImage.width;
-        highlightCanvas.height = rgbImage.height;
-        const highlightContext = highlightCanvas.getContext("2d");
-        highlightContext.fillStyle = "#ff00a8";
-        highlightContext.fillRect(0, 0, highlightCanvas.width, highlightCanvas.height);
-        highlightContext.globalCompositeOperation = "destination-in";
-        highlightContext.drawImage(maskCanvas, 0, 0);
-        reviewContext.globalAlpha = 0.62;
-        reviewContext.drawImage(highlightCanvas, 0, 0);
-        const uploadCanvas = document.createElement("canvas");
-        uploadCanvas.width = rgbImage.width;
-        uploadCanvas.height = rgbImage.height;
-        const uploadContext = uploadCanvas.getContext("2d");
-        uploadContext.drawImage(rgbImage, 0, 0);
-        const uploadPixels = uploadContext.getImageData(0, 0, uploadCanvas.width, uploadCanvas.height);
-        for (let index = 0; index < uploadPixels.data.length; index += 4) {
-            uploadPixels.data[index + 3] = 255 - editedMask.data[index + 3];
+        const outputAlphaCanvas = document.createElement("canvas");
+        outputAlphaCanvas.width = sourceWidth;
+        outputAlphaCanvas.height = sourceHeight;
+        const outputAlphaContext = outputAlphaCanvas.getContext("2d");
+        const outputAlphaPixels = outputAlphaContext.createImageData(sourceWidth, sourceHeight);
+        for (let index = 0; index < outputAlphaPixels.data.length; index += 4) {
+            outputAlphaPixels.data[index] = 255;
+            outputAlphaPixels.data[index + 1] = 255;
+            outputAlphaPixels.data[index + 2] = 255;
+            outputAlphaPixels.data[index + 3] = 255 - editedMask.data[index + 3];
         }
-        uploadContext.putImageData(uploadPixels, 0, 0);
+        outputAlphaContext.putImageData(outputAlphaPixels, 0, 0);
+        const alphaBlob = await this._canvasToBlob(outputAlphaCanvas);
+        sourceImage.close?.();
 
-        const blob = await this._canvasToBlob(uploadCanvas);
-        const filename = `fl-mcp-mask-${Date.now()}-${crypto.randomUUID().slice(0, 8)}.png`;
-        const formData = new FormData();
-        formData.append("image", blob, filename);
-        formData.append("type", "input");
-        formData.append("subfolder", "fl_mcp_masks");
-        formData.append("original_ref", JSON.stringify(source));
-        const response = await api.fetchApi("/upload/mask", {
+        // Canvas is allowed to construct alpha, but never the execution RGB:
+        // drawing transparent source pixels would premultiply and destroy their
+        // hidden color. The Comfy route composes this alpha over the same exact
+        // immutable source Blob that was hashed above.
+        const formData = buildExactMaskComposeFormData(
+            sourceBlob,
+            alphaBlob,
+            sourceAttestation,
+        );
+        const response = await api.fetchApi("/fl_mcp/mask/compose", {
             method: "POST",
             body: formData,
         });
@@ -2454,28 +3182,71 @@ export class FL_API {
             );
         }
         const uploaded = await response.json();
-        if (!uploaded?.name) {
-            throw new Error("Mask upload response did not include a filename");
+        if (
+            !uploaded?.name
+            || uploaded.source_sha256 !== sourceAttestation.sha256
+            || uploaded.width !== sourceWidth
+            || uploaded.height !== sourceHeight
+        ) {
+            throw new Error("Mask compose response did not attest the exact full-size source");
         }
         const image = {
             filename: uploaded.name,
             subfolder: uploaded.subfolder || "",
             type: uploaded.type || "input",
         };
+        // Review the immutable composed file's RGB channel. It makes a cleared
+        // old mask visible again without letting alpha premultiplication turn
+        // its recovered pixels black; magenta remains presentation-only.
+        const reviewBaseImage = await this._loadComfyImageChannel(image, "rgb");
+        const reviewCanvas = document.createElement("canvas");
+        reviewCanvas.width = sourceWidth;
+        reviewCanvas.height = sourceHeight;
+        const reviewContext = reviewCanvas.getContext("2d");
+        reviewContext.drawImage(reviewBaseImage, 0, 0);
+        reviewBaseImage.close?.();
+        const highlightCanvas = document.createElement("canvas");
+        highlightCanvas.width = sourceWidth;
+        highlightCanvas.height = sourceHeight;
+        const highlightContext = highlightCanvas.getContext("2d");
+        highlightContext.fillStyle = "#ff00a8";
+        highlightContext.fillRect(0, 0, highlightCanvas.width, highlightCanvas.height);
+        highlightContext.globalCompositeOperation = "destination-in";
+        highlightContext.drawImage(maskCanvas, 0, 0);
+        reviewContext.globalAlpha = 0.62;
+        reviewContext.drawImage(highlightCanvas, 0, 0);
         const reviewPreview = await this._canvasToImage(reviewCanvas);
         const reviewToken = crypto.randomUUID();
+        if (exactContext) {
+            await this.assertWorkflowMutationGuard(exactContext.mutationGuard);
+            const currentSource = this.getNodeImageRef(nodeId, workflowPin).image;
+            if (!(
+                currentSource?.filename === exactContext.expectedSourceImage?.filename
+                && (currentSource?.subfolder || "")
+                    === (exactContext.expectedSourceImage?.subfolder || "")
+                && (currentSource?.type || "input")
+                    === (exactContext.expectedSourceImage?.type || "input")
+            )) {
+                throw new Error("The exact mask source image changed before preview creation.");
+            }
+        }
         if (this.pendingMaskReviews.size === 0) {
             this.maskReviewAutoQueueState = this._pauseAutoQueueForMaskReview();
         }
         if (existingReviewEntry) {
             this._releaseMaskReviewPreview(existingReview);
         }
-        this.pendingMaskReviews.set(String(node.id), {
+        this.pendingMaskReviews.set(typedNodeKey(reviewNodeId), {
             token: reviewToken,
-            nodeId: node.id,
+            nodeId: reviewNodeId,
             image,
             originalImage,
+            committedImage,
             previewUrl: reviewPreview.url,
+            workflowIdentity: workflowPin?.identity || null,
+            graphHash: exactContext?.mutationGuard?.expectedGraphHash || null,
+            sourceImage: structuredClone(source),
+            sourceAttestation: structuredClone(sourceAttestation),
         });
         node.imgs = [reviewPreview.image];
         node.imageIndex = 0;
@@ -2485,10 +3256,11 @@ export class FL_API {
 
         return {
             success: true,
-            node_id: node.id,
+            node_id: reviewNodeId,
             source_image: source,
             image,
-            image_size: { width: rgbImage.width, height: rgbImage.height },
+            image_size: { width: sourceWidth, height: sourceHeight },
+            source_attestation: sourceAttestation,
             coordinate_space: coordinateSpace,
             clear_existing: clearExisting,
             regions: normalizedRegions,
@@ -2499,9 +3271,9 @@ export class FL_API {
         };
     }
 
-    confirmMaskReview(nodeId, reviewToken) {
+    async confirmMaskReview(nodeId, reviewToken) {
         const pendingEntry = [...this.pendingMaskReviews.entries()].find(
-            ([, value]) => nodeIdsEqual(value.nodeId, nodeId)
+            ([, value]) => typedValuesEqual(value.nodeId, nodeId)
         );
         const pending = pendingEntry?.[1];
         if (!pending) {
@@ -2510,25 +3282,164 @@ export class FL_API {
         if (pending.token !== reviewToken) {
             throw new Error("This mask review is stale; inspect the latest mask before approving it");
         }
-        const node = this._findNode(pending.nodeId);
+        const workflowPin = pending.workflowIdentity
+            ? this.pinActiveWorkflow(pending.workflowIdentity)
+            : null;
+        let confirmGuard = null;
+        if (workflowPin && pending.graphHash) {
+            confirmGuard = await this.createWorkflowMutationGuard(workflowPin);
+            if (confirmGuard.expectedGraphHash !== pending.graphHash) {
+                throw new Error(
+                    "The workflow changed after mask editing; inspect and edit the mask again.",
+                );
+            }
+        }
+        const node = workflowPin
+            ? this._workflowNodeFromSerializedId(pending.nodeId, workflowPin)
+            : this._findNode(pending.nodeId);
         if (!node) {
             throw new Error(`Node not found: ${pending.nodeId}`);
         }
-        this._assignImageToNode(node, pending.image);
-        this._releaseMaskReviewPreview(pending);
+        if (workflowPin) {
+            const currentCommitted = this.getNodeImageRef(
+                pending.nodeId,
+                workflowPin,
+                { includePending: false },
+            ).image;
+            if (!(
+                currentCommitted?.filename === pending.committedImage?.filename
+                && (currentCommitted?.subfolder || "")
+                    === (pending.committedImage?.subfolder || "")
+                && (currentCommitted?.type || "input")
+                    === (pending.committedImage?.type || "input")
+            )) {
+                throw new Error(
+                    "The mask target source changed after editing; inspect and edit it again.",
+                );
+            }
+        }
+        let committedGraphHash = pending.graphHash;
+        try {
+            this._assignImageToNode(node, pending.image);
+            const committed = this.getNodeImageRef(
+                pending.nodeId,
+                workflowPin,
+                { includePending: false },
+            ).image;
+            if (!(
+                committed?.filename === pending.image?.filename
+                && (committed?.subfolder || "") === (pending.image?.subfolder || "")
+                && (committed?.type || "input") === (pending.image?.type || "input")
+            )) {
+                throw new Error("The approved mask image did not retain its exact value.");
+            }
+            if (confirmGuard) {
+                committedGraphHash = await this.acceptWorkflowMutationGuard(confirmGuard);
+            }
+        } catch (assignmentError) {
+            let rollbackComplete = false;
+            try {
+                this._assignImageToNode(node, pending.committedImage);
+                const restoredImage = this.getNodeImageRef(
+                    pending.nodeId,
+                    workflowPin,
+                    { includePending: false },
+                ).image;
+                const restoredGuard = workflowPin
+                    ? await this.createWorkflowMutationGuard(workflowPin)
+                    : null;
+                rollbackComplete = Boolean(
+                    restoredImage?.filename === pending.committedImage?.filename
+                    && (restoredImage?.subfolder || "")
+                        === (pending.committedImage?.subfolder || "")
+                    && (restoredImage?.type || "input")
+                        === (pending.committedImage?.type || "input")
+                    && (!restoredGuard || restoredGuard.expectedGraphHash === pending.graphHash)
+                );
+            } catch (_) {
+                rollbackComplete = false;
+            }
+            if (!rollbackComplete) {
+                const compromised = new Error(
+                    "Mask approval failed and the original source could not be restored exactly.",
+                );
+                compromised.code = "workflow_state_compromised";
+                compromised.details = {
+                    workflow_identity: pending.workflowIdentity,
+                    mutation_quarantined: true,
+                    recovery: "reload_or_reopen_workflow",
+                    retryable: false,
+                };
+                throw compromised;
+            }
+            throw assignmentError;
+        }
+        const cleanupWarnings = [];
+        try {
+            this._releaseMaskReviewPreview(pending);
+        } catch (error) {
+            cleanupWarnings.push({
+                phase: "release_mask_preview",
+                message: String(error?.message || error),
+            });
+        }
         this.pendingMaskReviews.delete(pendingEntry[0]);
+        // Notify the committed widget change while mask review still owns the
+        // auto-queue pause. Restoring an enabled prior state before this call
+        // could queue the workflow immediately on approval.
+        try {
+            this._markGraphChanged();
+        } catch (error) {
+            cleanupWarnings.push({
+                phase: "notify_graph_changed",
+                message: String(error?.message || error),
+            });
+        }
         if (this.pendingMaskReviews.size === 0) {
-            this._restoreAutoQueueAfterMaskReview(this.maskReviewAutoQueueState);
+            try {
+                this._restoreAutoQueueAfterMaskReview(this.maskReviewAutoQueueState);
+            } catch (error) {
+                // The mask commit is already verified. Preserve that success and
+                // leave auto-queue fail-safe disabled rather than reporting an
+                // unknown mutation outcome.
+                try {
+                    this._pauseAutoQueueForMaskReview();
+                } catch (_) {
+                    // Best effort only; surface the original cleanup error below.
+                }
+                cleanupWarnings.push({
+                    phase: "restore_auto_queue",
+                    message: String(error?.message || error),
+                });
+            }
             this.maskReviewAutoQueueState = null;
         }
-        this._markGraphChanged();
         return {
             success: true,
             node_id: pending.nodeId,
             image: pending.image,
             review_token: pending.token,
             approved: true,
+            queued: false,
+            workflow_identity: pending.workflowIdentity,
+            graph_hash: committedGraphHash,
+            ...(cleanupWarnings.length > 0 ? { cleanup_warnings: cleanupWarnings } : {}),
             message: "The user approved this mask for workflow execution.",
+        };
+    }
+
+    getPendingMaskReviewReceipt(nodeId) {
+        const pending = [...this.pendingMaskReviews.values()].find(
+            value => typedValuesEqual(value.nodeId, nodeId),
+        );
+        if (!pending) return null;
+        return {
+            node_id: pending.nodeId,
+            review_token: pending.token,
+            image: structuredClone(pending.image),
+            source_image: structuredClone(pending.sourceImage),
+            workflow_identity: pending.workflowIdentity,
+            graph_hash: pending.graphHash,
         };
     }
 
@@ -3716,7 +4627,93 @@ export class FL_API {
      * @param {number|null} batchCount - Batch count (null for current)
      * @returns {object} Queue result with prompt_id, queue_number, and node_errors
      */
-    async queueWorkflow(batchCount = null) {
+    async _boundedQueueRecoveryJson(path, maxBytes = 8 * 1024 * 1024) {
+        const response = await api.fetchApi(path, { cache: "no-store" });
+        if (!response.ok) {
+            throw new Error(`Queue recovery read failed (${response.status}).`);
+        }
+        const declared = Number(response.headers.get("content-length"));
+        if (Number.isFinite(declared) && declared > maxBytes) {
+            throw new Error("Queue recovery response exceeds the byte limit.");
+        }
+        if (!response.body?.getReader) {
+            throw new Error("Queue recovery requires a bounded response stream.");
+        }
+        const reader = response.body.getReader();
+        const chunks = [];
+        let total = 0;
+        try {
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                if (!(value instanceof Uint8Array)) {
+                    throw new Error("Queue recovery returned an invalid byte stream.");
+                }
+                total += value.byteLength;
+                if (total > maxBytes) {
+                    throw new Error("Queue recovery response exceeds the byte limit.");
+                }
+                chunks.push(value);
+            }
+        } finally {
+            reader.releaseLock();
+        }
+        const bytes = new Uint8Array(total);
+        let offset = 0;
+        for (const chunk of chunks) {
+            bytes.set(chunk, offset);
+            offset += chunk.byteLength;
+        }
+        return JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
+    }
+
+    async recoverQueuedOperation(operationId, operationRequestHash, { promptId = null } = {}) {
+        let queue;
+        let history;
+        try {
+            [queue, history] = await Promise.all([
+                this._boundedQueueRecoveryJson("/queue"),
+                this._boundedQueueRecoveryJson(
+                    promptId
+                        ? `/history/${encodeURIComponent(promptId)}`
+                        : "/history?max_items=100",
+                ),
+            ]);
+        } catch (cause) {
+            const error = new Error(
+                "The prior queue outcome cannot be checked safely; it was not queued again.",
+                { cause },
+            );
+            error.code = "queue_recovery_unavailable";
+            throw error;
+        }
+        const recovered = await recoverQueueOperationFromPayloads(
+            { queue, history },
+            { operationId, operationRequestHash },
+        );
+        if (!recovered || (promptId && recovered.prompt_id !== promptId)) {
+            const error = new Error("No matching queued execution exists for this operation.");
+            error.code = "narrow_edit_operation_not_found";
+            throw error;
+        }
+        return recovered;
+    }
+
+    async attestQueuedOperation(operationId, operationRequestHash, promptId) {
+        try {
+            const recovered = await this.recoverQueuedOperation(
+                operationId,
+                operationRequestHash,
+                { promptId },
+            );
+            return recovered.prompt_id === promptId;
+        } catch {
+            return false;
+        }
+    }
+
+    async queueWorkflow(batchCount = null, operation = null) {
+        let queueSubmissionAttempted = false;
         try {
             if (this.pendingMaskReviews.size > 0) {
                 const pending = this.pendingMaskReviews.values().next().value;
@@ -3731,7 +4728,13 @@ export class FL_API {
             }
 
             const effectiveBatchCount = queueSettings?.batchCount || parseInt(app.ui?.batchCount?.value || "1", 10) || 1;
+            if (effectiveBatchCount !== 1) {
+                throw new Error(
+                    "Ren queues exactly one workflow at a time so each execution has one auditable provenance record. Set batch count to 1 and retry.",
+                );
+            }
             let queueResult = null;
+            let executionProvenance = null;
 
             // Modern ComfyUI injects the signed-in user's auth token in
             // app.queuePrompt(), immediately before it calls api.queuePrompt().
@@ -3746,38 +4749,97 @@ export class FL_API {
                 if (app.processingQueue) {
                     throw new Error("ComfyUI is still preparing another queue request. Try again shortly.");
                 }
-                const originalQueuePrompt = api.queuePrompt;
-                const capturedResults = [];
-                let capturedError = null;
-                api.queuePrompt = async (...args) => {
-                    try {
-                        const result = await originalQueuePrompt.apply(api, args);
-                        capturedResults.push(result);
-                        return result;
-                    } catch (error) {
-                        capturedError = error;
-                        throw error;
-                    }
+                const originalGraphToPrompt = app.graphToPrompt;
+                let renQueueRequestActive = false;
+                const graphToPromptWithProvenance = async (...args) => {
+                    const prompt = await originalGraphToPrompt.apply(app, args);
+                    if (!renQueueRequestActive) return prompt;
+                    const prepared = await prepareExecutionSubmission(prompt, operation);
+                    executionProvenance = prepared.provenance;
+                    return prepared.submission;
                 };
+                app.graphToPrompt = graphToPromptWithProvenance;
                 try {
-                    const accepted = await app.queuePrompt(0, effectiveBatchCount);
-                    if (capturedError) throw capturedError;
-                    queueResult = capturedResults.at(-1) || null;
-                    if (!accepted || !queueResult) {
+                    const captured = await captureAuthenticatedQueue(
+                        api,
+                        () => app.queuePrompt(0, effectiveBatchCount),
+                        {
+                            onRequestActiveChange: active => {
+                                renQueueRequestActive = active;
+                            },
+                            onSubmitting: () => {
+                                queueSubmissionAttempted = true;
+                            },
+                            shouldCapture: (args, { requestActive }) => (
+                                requestActive
+                                && submissionCarriesExecutionProvenance(
+                                    args[1],
+                                    executionProvenance,
+                                )
+                            ),
+                            prepare: async args => ({
+                                args,
+                                metadata: executionProvenanceFromSubmission(args[1]),
+                            }),
+                        },
+                    );
+                    queueResult = captured.result;
+                    executionProvenance = captured.metadata;
+                    if (
+                        typeof queueResult?.prompt_id !== "string"
+                        && queueResult?.node_errors
+                        && Object.keys(queueResult.node_errors).length
+                    ) {
+                        return {
+                            queued: false,
+                            batch_count: effectiveBatchCount,
+                            prompt_id: null,
+                            queue_number: null,
+                            node_errors: { redacted_validation_failure: true },
+                        };
+                    }
+                    if (
+                        !captured.accepted
+                        || typeof queueResult?.prompt_id !== "string"
+                        || queueResult.prompt_id.length === 0
+                        || !executionProvenance
+                    ) {
                         throw new Error("ComfyUI did not accept the workflow for queueing.");
                     }
                 } finally {
-                    api.queuePrompt = originalQueuePrompt;
+                    renQueueRequestActive = false;
+                    if (app.graphToPrompt === graphToPromptWithProvenance) {
+                        app.graphToPrompt = originalGraphToPrompt;
+                    }
                 }
             } else {
                 const prompt = await app.graphToPrompt();
+                const prepared = await prepareExecutionSubmission(prompt, operation);
                 for (let i = 0; i < effectiveBatchCount; i++) {
-                    queueResult = await api.queuePrompt(0, prompt);
+                    queueSubmissionAttempted = true;
+                    queueResult = await api.queuePrompt(0, prepared.submission);
                 }
+                executionProvenance = prepared.provenance;
+            }
+
+            if (
+                typeof queueResult?.prompt_id !== "string"
+                && queueResult?.node_errors
+                && Object.keys(queueResult.node_errors).length
+            ) {
+                return {
+                    queued: false,
+                    batch_count: effectiveBatchCount,
+                    prompt_id: null,
+                    queue_number: null,
+                    node_errors: { redacted_validation_failure: true },
+                };
+            }
+            if (typeof queueResult?.prompt_id !== "string" || queueResult.prompt_id.length === 0) {
+                throw new Error("ComfyUI did not return an accepted prompt ID.");
             }
 
             console.log(`[FL_API] Queued workflow (batch: ${effectiveBatchCount})`);
-            console.log(`[FL_API] Queue result:`, queueResult);
             
             // Return comprehensive queue information
             return { 
@@ -3785,10 +4847,59 @@ export class FL_API {
                 batch_count: effectiveBatchCount,
                 prompt_id: queueResult.prompt_id,
                 queue_number: queueResult.number,
-                node_errors: queueResult.node_errors || {}
+                node_errors: queueResult.node_errors
+                    && Object.keys(queueResult.node_errors).length
+                    ? { redacted_validation_warning: true }
+                    : {},
+                execution_provenance: executionProvenance,
             };
         } catch (error) {
-            console.error("[FL_API] queueWorkflow error:", error);
+            const knownPromptRejection = (
+                queueSubmissionAttempted
+                && error?.status === 400
+                && error?.response
+                && typeof error.response === "object"
+                && (
+                    error.response.error
+                    || (
+                        error.response.node_errors
+                        && typeof error.response.node_errors === "object"
+                    )
+                )
+                && typeof error.response.prompt_id !== "string"
+            );
+            if (knownPromptRejection) {
+                return {
+                    queued: false,
+                    batch_count: 1,
+                    prompt_id: null,
+                    queue_number: null,
+                    node_errors: { redacted_validation_failure: true },
+                };
+            }
+            console.error("[FL_API] queueWorkflow failed with a redacted error code.");
+            if (queueSubmissionAttempted && operation) {
+                try {
+                    return await this.recoverQueuedOperation(
+                        operation.operationId,
+                        operation.operationRequestHash,
+                    );
+                } catch (recoveryError) {
+                    if (recoveryError?.code !== "narrow_edit_operation_not_found") {
+                        throw recoveryError;
+                    }
+                    const unknown = new Error(
+                        "The queue response was lost and no accepted execution is visible yet. "
+                        + "The operation is tombstoned and will not be queued again automatically.",
+                        { cause: error },
+                    );
+                    unknown.code = "queue_outcome_unknown";
+                    throw unknown;
+                }
+            }
+            if (!queueSubmissionAttempted && !error?.code) {
+                error.code = "queue_submission_not_started";
+            }
             throw error;
         }
     }
@@ -4537,20 +5648,116 @@ export class FL_API {
         }
     }
 
-    async _loadComfyImage(ref, channel) {
+    async _loadComfyImageExact(ref, expectedAttestation) {
+        const expected = expectedAttestation || {};
+        if (
+            !SHA256_PATTERN.test(String(expected.sha256 || ""))
+            || !Number.isSafeInteger(expected.size_bytes)
+            || expected.size_bytes <= 0
+            || !Number.isSafeInteger(expected.width)
+            || expected.width <= 0
+            || !Number.isSafeInteger(expected.height)
+            || expected.height <= 0
+        ) {
+            throw maskSourcePreconditionError(
+                "The expected mask source byte attestation is invalid.",
+            );
+        }
+        const params = new URLSearchParams({
+            filename: ref.filename,
+            subfolder: ref.subfolder || "",
+            type: ref.type || "input",
+        });
+        params.set("rand", globalThis.crypto?.randomUUID?.() || String(Date.now()));
+        // Exactly one authenticated source GET. Both the digest and decoded
+        // bitmap below are derived from this same immutable Blob instance.
+        const response = await api.fetchApi(`/view?${params.toString()}`, {
+            cache: "no-store",
+        });
+        if (!response.ok) {
+            throw maskSourcePreconditionError(
+                `Failed to load the exact mask source (${response.status}).`,
+            );
+        }
+        const blob = await response.blob();
+        if (blob.size !== expected.size_bytes) {
+            throw maskSourcePreconditionError(
+                "The mask source byte size changed after inspection.",
+            );
+        }
+        const sha256 = await sha256BlobHex(blob);
+        if (sha256 !== expected.sha256) {
+            throw maskSourcePreconditionError(
+                "The mask source bytes changed after inspection.",
+            );
+        }
+        const image = await createImageBitmap(blob);
+        if (image.width !== expected.width || image.height !== expected.height) {
+            image.close?.();
+            throw maskSourcePreconditionError(
+                "The decoded mask source dimensions changed after inspection.",
+            );
+        }
+        return {
+            blob,
+            image,
+            attestation: {
+                sha256,
+                size_bytes: blob.size,
+                width: image.width,
+                height: image.height,
+            },
+        };
+    }
+
+    async _loadComfyImageChannel(ref, channel = "rgba") {
+        if (!["rgb", "rgba"].includes(channel)) {
+            throw new Error(`Unsupported ComfyUI image channel: ${channel}`);
+        }
         const params = new URLSearchParams({
             filename: ref.filename,
             subfolder: ref.subfolder || "",
             type: ref.type || "input",
             channel,
         });
-        params.set("rand", String(Date.now()));
-        const response = await api.fetchApi(`/view?${params.toString()}`);
+        params.set("rand", globalThis.crypto?.randomUUID?.() || String(Date.now()));
+        const response = await api.fetchApi(`/view?${params.toString()}`, {
+            cache: "no-store",
+        });
         if (!response.ok) {
-            throw new Error(`Failed to load ${channel} image channel (${response.status})`);
+            throw new Error(`Failed to load the composed mask preview (${response.status}).`);
         }
-        const blob = await response.blob();
-        return await createImageBitmap(blob);
+        return await createImageBitmap(await response.blob());
+    }
+
+    /**
+     * Re-attest one reference image from a single immutable browser snapshot.
+     * The decoded pixels are closed immediately and never enter graph or log state.
+     */
+    async verifyComfyImageExact(ref, expectedAttestation) {
+        let snapshot = null;
+        try {
+            if (
+                !ref
+                || typeof ref.filename !== "string"
+                || !ref.filename
+                || (ref.subfolder !== undefined && typeof ref.subfolder !== "string")
+                || (ref.type !== undefined && typeof ref.type !== "string")
+            ) {
+                throw new Error("The expected reference image is invalid.");
+            }
+            snapshot = await this._loadComfyImageExact(ref, expectedAttestation);
+            return structuredClone(snapshot.attestation);
+        } catch (cause) {
+            const error = new Error(
+                "The reference image bytes no longer match the inspected snapshot.",
+            );
+            error.code = "reference_image_precondition_failed";
+            error.cause = cause;
+            throw error;
+        } finally {
+            snapshot?.image?.close?.();
+        }
     }
 
     restoreNestedImageReferences(nodes = app.graph?._nodes || []) {
@@ -4563,6 +5770,20 @@ export class FL_API {
         }
         if (restored > 0) this._markCanvasDirty();
         return restored;
+    }
+
+    hydrateNestedImagePreviews(nodes = app.graph?._nodes || []) {
+        let hydrated = 0;
+        for (const node of nodes) {
+            const image = nestedImageRefForNode(node);
+            if (!image) continue;
+            // Workflow loading already restored the canonical widget and
+            // serialized node state. Only hydrate LiteGraph's presentation
+            // cache here so rollback hashes cannot be changed by preview work.
+            this._loadNodeImagePreview(node, image);
+            hydrated++;
+        }
+        return hydrated;
     }
 
     _assignImageToNode(node, image, { notify = true } = {}) {
@@ -4599,7 +5820,6 @@ export class FL_API {
             type: ref.type || "input",
         });
         const preview = new Image();
-        let usingOriginalFallback = false;
         preview.onload = () => {
             // Never attach an incomplete or failed image to LiteGraph. Some
             // ComfyUI renderers retain stale canvas frames when drawing one.
@@ -4608,20 +5828,12 @@ export class FL_API {
             this._markCanvasDirty();
         };
         preview.onerror = () => {
-            if (usingOriginalFallback) {
-                console.warn(`[FL_API] Image preview failed for node ${node.id}`);
-                return;
-            }
-            // During plugin upgrades the refreshed frontend can briefly run
-            // against an older Python process without the thumbnail route.
-            usingOriginalFallback = true;
-            const originalParams = new URLSearchParams(params);
-            originalParams.set("rand", String(Date.now()));
-            preview.src = api.apiURL(`/view?${originalParams.toString()}`);
+            console.warn(`[FL_API] Image preview failed for node ${node.id}`);
         };
-        // Canvas rendering uses a bounded cached preview. The original path
-        // remains in the widget value above and is what graphToPrompt executes.
-        preview.src = api.apiURL(`/fl_mcp/image/thumbnail?${params.toString()}`);
+        // Canvas nodes need enough source detail for mask review. Chat cards
+        // keep using the separate bounded /fl_mcp/image/thumbnail endpoint.
+        // The canonical widget reference remains the execution authority.
+        preview.src = api.apiURL(`/view?${params.toString()}`);
     }
 
     _releaseMaskReviewPreview(review) {

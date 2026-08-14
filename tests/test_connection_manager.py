@@ -251,3 +251,43 @@ async def test_graph_patch_contract_revision_guard_fails_before_forwarding():
         "advertised_contract_revision": 2,
         "tool_contract_manifest_hash": canonical_tool_contract_manifest_hash(revisions),
     }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "tool_name",
+    [
+        "edit_node_mask",
+        "confirm_mask_review",
+        "get_node_image_ref",
+        "get_selected_nodes",
+        "queue_workflow",
+        "set_node_values_exact",
+    ],
+)
+async def test_exact_edit_contract_revision_is_required_before_forwarding(tool_name):
+    manager = ConnectionManager()
+    socket = FakeWebSocket()
+    tools = [tool_name]
+    revisions = {tool_name: 1}
+    await manager.connect(
+        socket,
+        "session",
+        "frontend",
+        supported_tools=tools,
+        tool_manifest_hash=canonical_tool_manifest_hash(tools),
+        tool_contract_revisions=revisions,
+        tool_contract_manifest_hash=canonical_tool_contract_manifest_hash(revisions),
+    )
+
+    failure = manager.frontend_tool_capability_failure("session", tool_name)
+    assert failure is not None
+    assert failure["error_code"] == "frontend_bridge_outdated"
+    expected_revision = {
+        "edit_node_mask": 5,
+        "confirm_mask_review": 3,
+        "set_node_values_exact": 4,
+        "queue_workflow": 3,
+    }.get(tool_name, 2)
+    assert failure["error_details"]["required_contract_revision"] == expected_revision
+    assert failure["error_details"]["advertised_contract_revision"] == 1

@@ -33,6 +33,14 @@ test("browser bridge advertises its instantiated ToolExecutor before connecting"
     assert.match(executor, /getSupportedTools\(\)\s*\{\s*return Object\.keys\(this\.toolHandlers\)\.sort\(\)/s);
     assert.match(executor, /getToolContractRevisions\(\)/);
     assert.match(executor, /"apply_workflow_graph_patch": withToolContractRevision\([\s\S]*?,\s*3,/);
+    assert.match(executor, /"edit_node_mask": withToolContractRevision\([\s\S]*?,\s*5,/);
+    assert.match(executor, /"confirm_mask_review": withToolContractRevision\([\s\S]*?,\s*3,/);
+    assert.match(executor, /"set_node_values_exact": withToolContractRevision\([\s\S]*?,\s*4,/);
+    assert.match(executor, /"queue_workflow": withToolContractRevision\([\s\S]*?,\s*3,/);
+    assert.match(executor, /"recover_narrow_operation":/);
+    assert.match(executor, /"get_node_image_ref": withToolContractRevision\([\s\S]*?,\s*2,/);
+    assert.match(executor, /"get_canvas_image_refs": withToolContractRevision\([\s\S]*?,\s*1,/);
+    assert.match(executor, /"get_selected_nodes": withToolContractRevision\([\s\S]*?,\s*2,/);
     assert.doesNotMatch(extension, /supportedTools:\s*\[/);
 });
 
@@ -318,7 +326,8 @@ test("mask edits show a live preview and block queueing until review", async () 
     assert.match(api, /node\.imgs = \[reviewPreview\.image\]/);
     assert.match(api, /previewUrl: reviewPreview\.url/);
     assert.match(api, /this\._assignImageToNode\(node, pending\.image\)/);
-    assert.match(api, /preview\.src = api\.apiURL\(`\/fl_mcp\/image\/thumbnail\?/);
+    assert.match(api, /preview\.src = api\.apiURL\(`\/view\?/);
+    assert.doesNotMatch(api, /preview\.src = api\.apiURL\(`\/fl_mcp\/image\/thumbnail\?/);
     assert.match(api, /_releaseMaskReviewPreview/);
     assert.match(api, /discardMaskReviews\(\)/);
     assert.doesNotMatch(editImplementation, /_assignImageToNode/);
@@ -327,12 +336,49 @@ test("mask edits show a live preview and block queueing until review", async () 
     assert.match(previewImplementation, /catch \(error\)[\s\S]*URL\.revokeObjectURL\(url\)/);
     assert.match(api, /app\.canvas\?\.centerOnNode\?\.\(node\)/);
     assert.match(api, /this\.pendingMaskReviews/);
+    assert.match(api, /drawMaskRegionPath\(regionContext, region\)/);
+    assert.match(api, /await this\._loadComfyImageExact\(source, exactContext\.expectedSourceAttestation\)/);
+    assert.match(api, /const sha256 = await sha256BlobHex\(blob\)/);
+    assert.match(api, /image\.width !== expected\.width \|\| image\.height !== expected\.height/);
+    assert.match(api, /return \{\s*blob,\s*image,\s*attestation:/s);
+    assert.doesNotMatch(editImplementation, /_loadComfyImage\(source, "rgb"\)/);
+    assert.doesNotMatch(editImplementation, /_loadComfyImage\(source, "a"\)/);
+    assert.match(editImplementation, /buildExactMaskComposeFormData\(\s*sourceBlob,\s*alphaBlob,\s*sourceAttestation/s);
+    assert.match(editImplementation, /api\.fetchApi\("\/fl_mcp\/mask\/compose"/);
+    assert.match(editImplementation, /_loadComfyImageChannel\(image, "rgb"\)/);
+    assert.doesNotMatch(editImplementation, /uploadContext\.drawImage\(sourceImage/);
+    assert.doesNotMatch(editImplementation, /api\.fetchApi\("\/upload\/image"/);
+    assert.doesNotMatch(editImplementation, /api\.fetchApi\("\/upload\/mask"/);
+    assert.match(editImplementation, /image_size: \{ width: sourceWidth, height: sourceHeight \}/);
     assert.match(api, /Mask review required for node/);
     assert.match(api, /_pauseAutoQueueForMaskReview/);
     assert.match(executor, /confirm_mask_review/);
     assert.match(extension, /toolExecutor\.flApi\.discardMaskReviews\(\)/);
     assert.match(panel, /this\.discardMaskReviews\?\.\(\)/);
     assert.match(prompt, /Never queue until the latest mask is approved/);
+    assert.match(prompt, /not proof or an expectation that a mask already exists/);
+    assert.match(prompt, /an empty mask is valid and expected before the first paint/);
+    assert.match(prompt, /Stop immediately on a classified failed step/);
+    assert.match(prompt, /do not invoke GraphPatch, a planner, or diagnostic tools/);
+});
+
+
+test("mask confirmation verifies the commit before restoring auto-queue", async () => {
+    const api = await readFile(new URL("web/js/fl_api.js", root), "utf8");
+    const start = api.indexOf("async confirmMaskReview(");
+    const end = api.indexOf("\n    discardMaskReviews()", start);
+    assert.ok(start >= 0 && end > start);
+    const confirm = api.slice(start, end);
+    assert.match(confirm, /includePending: false/);
+    assert.match(confirm, /did not retain its exact value/);
+    assert.match(confirm, /workflow_state_compromised/);
+    assert.match(api, /pendingMaskReviews\.set\(typedNodeKey\(reviewNodeId\)/);
+    assert.match(api, /typedValuesEqual\(value\.nodeId, nodeId\)/);
+    assert.ok(confirm.indexOf("this._markGraphChanged()") >= 0);
+    assert.ok(
+        confirm.indexOf("this._markGraphChanged()")
+        < confirm.indexOf("this._restoreAutoQueueAfterMaskReview"),
+    );
 });
 
 
@@ -418,8 +464,9 @@ test("chat accepts local images and can place them into a selected image node", 
     assert.match(api, /formData\.append\("image", file,/);
     assert.match(api, /placeChatImageInNode/);
     assert.match(api, /restoreNestedImageReferences/);
+    assert.match(api, /hydrateNestedImagePreviews/);
     assert.match(api, /optionValues\.push\(widgetValue\)/);
-    assert.match(api, /\/fl_mcp\/image\/thumbnail\?/);
+    assert.doesNotMatch(api, /api\.apiURL\(`\/fl_mcp\/image\/thumbnail\?/);
     assert.match(api, /preview\.onload = \(\) => \{[\s\S]*node\.imgs = \[preview\]/);
     assert.match(api, /preview\.onerror = \(\) =>/);
     assert.match(api, /preview\.src = api\.apiURL\(`\/view\?/);
@@ -521,11 +568,20 @@ test("deterministic workflow planning has clear human tool activity", async () =
 
 test("workflow queueing preserves ComfyUI frontend authentication", async () => {
     const api = await readFile(new URL("web/js/fl_api.js", root), "utf8");
+    const capture = await readFile(new URL("web/js/queue_capture.js", root), "utf8");
 
-    assert.match(api, /await app\.queuePrompt\(0, effectiveBatchCount\)/);
-    assert.match(api, /const originalQueuePrompt = api\.queuePrompt/);
-    assert.match(api, /api\.queuePrompt = originalQueuePrompt/);
+    assert.match(api, /\(\) => app\.queuePrompt\(0, effectiveBatchCount\)/);
+    assert.match(api, /onSubmitting: \(\) =>/);
+    assert.match(api, /captureAuthenticatedQueue\(/);
+    assert.match(capture, /const originalQueuePrompt = api\.queuePrompt/);
+    assert.match(capture, /api\.queuePrompt === captureQueuePrompt/);
     assert.match(api, /partner\/API nodes report "Please login first"/);
+    assert.match(api, /effectiveBatchCount !== 1/);
+    assert.match(api, /exactly one workflow at a time/);
+    assert.match(api, /if \(!renQueueRequestActive\) return prompt/);
+    assert.match(api, /onRequestActiveChange: active =>/);
+    assert.match(api, /shouldCapture: \(args, \{ requestActive \}\) =>/);
+    assert.match(capture, /accepted: capturedAccepted \|\| Boolean\(outerAccepted\)/);
 });
 
 

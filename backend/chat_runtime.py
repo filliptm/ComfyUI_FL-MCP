@@ -32,6 +32,7 @@ from config import (
 from config import (
     settings as bridge_settings,
 )
+from version import RUNTIME_BUILD_ID
 
 logger = logging.getLogger(__name__)
 PROMPT_PATH = Path(__file__).with_name("chat_prompt.md")
@@ -113,6 +114,22 @@ WEB_IMAGE_INTENT_PATTERNS = (
     re.compile(r"\b(?:image|photo|picture|visual)\s+search\b", re.IGNORECASE),
     re.compile(r"\bvisual\s+references?\b", re.IGNORECASE),
     re.compile(r"\bwhat\b.{0,100}\blooks?\s+like\b", re.IGNORECASE),
+)
+
+CANVAS_IMAGE_INSPECTION_ACTION = re.compile(
+    r"\b(?:analy[sz](?:e|ing)?|inspect(?:ing)?|identify(?:ing)?|describe|"
+    r"compare|examine|review|view|look\s+at|tell\s+me\s+what|show|display|"
+    r"list|what)\b",
+    re.IGNORECASE,
+)
+CANVAS_IMAGE_VISUAL_NOUN = re.compile(
+    r"\b(?:images?|photos?|pictures?|references?|vehicles?|cars?|trucks?|"
+    r"tanks?|them\s+all)\b",
+    re.IGNORECASE,
+)
+CANVAS_IMAGE_STRONG_SCOPE = re.compile(
+    r"\b(?:canvas|canavs|cnavas|canavas|already\s+(?:loaded|open))\b",
+    re.IGNORECASE,
 )
 
 NODE_KNOWLEDGE_INTENT_PATTERNS = (
@@ -206,6 +223,757 @@ REFINEMENT_MASK_TOOLS = {
     "edit_node_mask",
     "confirm_mask_review",
 }
+
+MASK_LANE_STATE_KEY = "maskLane"
+PROMPT_VALUE_LANE_STATE_KEY = "promptValueLane"
+MASK_LANE_HISTORY_LIMIT = 16
+PROMPT_VALUE_CORRECTION_TURN_LIMIT = 2
+PROMPT_VALUE_TOOLS = {"update_connected_prompt"}
+PROMPT_REFERENCE_TOOLS = {"view_prompt_reference_image"}
+CANVAS_IMAGE_INSPECTION_TOOLS = {"view_canvas_images"}
+CANVAS_IMAGE_READ_ONLY_TOOLS = {
+    "view_canvas_images",
+    "workflow_get_current_json",
+    "workflow_overview",
+    "find_node",
+    "get_node_slots",
+}
+PROMPT_CONTEXT_INSPECTION_TOOLS = {
+    "view_canvas_images",
+    "view_node_mask",
+    "view_prompt_reference_image",
+}
+PROMPT_WORD_PATTERN = (
+    r"(?:prompts?|pormots?|promots?|promts?|prmopts?|promtps?|pronmpts?)"
+)
+PROMPT_VALUE_ACTION_PATTERN = (
+    r"(?:add(?:ed|ing)?|append(?:ed|ing)?|remov(?:e|ed|ing)|"
+    r"adjust(?:ed|ing)?|adjsut(?:ed|ing)?|djust(?:ed|ing)?|"
+    r"chang(?:e|ed|ing)|edit(?:ed|ing)?|modif(?:y|ied|ying)|"
+    r"rewrit(?:e|ten|ing)|revis(?:e|ed|ing)|updat(?:e|ed|ing)|"
+    r"fix(?:ed|ing)?|correct(?:ed|ing)?|tweak(?:ed|ing)?|"
+    r"refin(?:e|ed|ing)|improv(?:e|ed|ing)|reword(?:ed|ing)?|"
+    r"adapt(?:ed|ing)?|set(?:ting)?|replac(?:e|ed|ing))"
+)
+PROMPT_VALUE_NEGATABLE_ACTION_PATTERN = (
+    rf"(?:{PROMPT_VALUE_ACTION_PATTERN}|apply(?:ing)?|use|using)"
+)
+
+
+def _visible_user_text(message: str) -> str:
+    return str(message or "").split(
+        "\n\nThe user attached ComfyUI input image(s)",
+        1,
+    )[0].casefold().replace("’", "'").replace("‘", "'")
+
+
+def _message_has_attachment_context(message: str) -> bool:
+    return "\n\nThe user attached ComfyUI input image(s)" in str(message or "")
+
+
+def canvas_image_inspection_requested(message: str) -> bool:
+    """Return whether this turn explicitly asks to inspect images already on the canvas."""
+
+    visible = _visible_user_text(message)
+    if re.search(r"\b(?:view_canvas_images|canvas\s+image\s+viewer)\b", visible):
+        return True
+    action = CANVAS_IMAGE_INSPECTION_ACTION.search(visible)
+    if not action or re.search(
+        r"\b(?:do\s+not|don't|dont|without)\b.{0,30}"
+        r"\b(?:analy[sz]e|inspect|identify|describe|compare|examine|review|view)\b",
+        visible,
+    ):
+        return False
+    visual = CANVAS_IMAGE_VISUAL_NOUN.search(visible)
+    if not visual:
+        return False
+    if CANVAS_IMAGE_STRONG_SCOPE.search(visible) or re.search(r"\bimage_[1-9]\d*\b", visible):
+        return True
+    broad_visual_set = re.search(
+        r"\b(?:all|every)\b.{0,50}\b(?:images?|photos?|pictures?|references?|"
+        r"vehicles?|cars?|trucks?|tanks?)\b"
+        r"|\b(?:images?|photos?|pictures?|references?|vehicles?|cars?|trucks?|"
+        r"tanks?)\b.{0,50}\b(?:all|every)\b",
+        visible,
+    )
+    external_context = re.search(
+        r"\b(?:attached|attachment|output|result|generated|rendered|history|web|"
+        r"internet|online)\b",
+        visible,
+    )
+    return bool(broad_visual_set and not external_context)
+
+
+def canvas_mutation_explicitly_denied(message: str) -> bool:
+    """Recognize an explicit read-only constraint on a canvas-inspection turn."""
+
+    visible = _visible_user_text(message)
+    return bool(
+        re.search(
+            r"\b(?:do\s+not|don't|dont|without)\b.{0,40}"
+            r"\b(?:modify|modifying|change|changing|edit|editing|mutate|mutating)\b"
+            r".{0,30}\b(?:the\s+)?(?:canvas|workflow|graph)\b",
+            visible,
+        )
+        or re.search(
+            r"\b(?:read[ -]?only|inspection only|no canvas changes?)\b",
+            visible,
+        )
+    )
+
+
+def explicit_topology_change_requested(message: str) -> bool:
+    """Keep explicit node/edge construction in the GraphPatch lane."""
+
+    visible = _visible_user_text(message)
+    return bool(
+        re.search(
+            r"\b(?:add|append|create|build|insert|remove|delete|replace|connect|"
+            r"disconnect|rewire)\b.{0,100}\b(?:nodes?|edges?|links?|sockets?|"
+            r"inputs?|outputs?|branch|chain|graph|pipeline)\b",
+            visible,
+        )
+        or re.search(
+            r"\b(?:nodes?|edges?|links?|sockets?|inputs?|outputs?|branch|chain|"
+            r"graph|pipeline)\b.{0,100}\b(?:connect|disconnect|rewire)\b",
+            visible,
+        )
+    )
+
+
+def mask_edit_requested(message: str) -> bool:
+    """Recognize visual mask work without requiring canvas or node vocabulary."""
+
+    if explicit_topology_change_requested(message):
+        return False
+    visible = _visible_user_text(message)
+    return bool(
+        re.search(
+            r"\b(?:mask(?:ed|ing|s)?|inpaint(?:ed|ing)?|paint(?:ed|ing)?|"
+            r"erase|erasing|face[ -]?swap)\b",
+            visible,
+        )
+        or re.search(
+            r"\b(?:draw|make|change|adjust|redo|refine)\b.{0,60}\bmask\b",
+            visible,
+        )
+    )
+
+
+def prompt_value_edit_requested(message: str) -> bool:
+    """Recognize prompt-text changes without treating them as graph topology."""
+
+    if explicit_topology_change_requested(message):
+        return False
+    visible = _visible_user_text(message)
+    preserved_prompt_delta = re.search(
+        rf"\b(?:keep|preserve|retain|leave)\b.{{0,50}}"
+        rf"\b{PROMPT_WORD_PATTERN}\b.{{0,50}}"
+        rf"\b(?:and|but|except)\b.{{0,20}}"
+        rf"(?P<delta>(?!(?:do\s+not|don'?t|dont|never)\b)"
+        rf"\b{PROMPT_VALUE_ACTION_PATTERN}\b\s+(?!nothing\b)\S+)",
+        visible,
+    )
+    negated_replace_delta = re.search(
+        rf"\b(?:do\s+not|don'?t|dont|never)\s+(?:replace|rewrite)\b"
+        rf".{{0,30}}\b{PROMPT_WORD_PATTERN}\b.{{0,20}}[;,.]?\s*"
+        rf"(?P<delta>(?!(?:do\s+not|don'?t|dont|never)\b)"
+        rf"\b{PROMPT_VALUE_ACTION_PATTERN}\b\s+(?!nothing\b)\S+)",
+        visible,
+    )
+    preservation_noop = re.search(
+        rf"\b(?:keep|preserve|retain|leave)\b.{{0,50}}"
+        rf"\b{PROMPT_WORD_PATTERN}\b.{{0,50}}"
+        rf"\b(?:and|but|except)\b.{{0,20}}"
+        rf"(?:do\s+not|don'?t|dont|never)\s+"
+        rf"{PROMPT_VALUE_ACTION_PATTERN}\b",
+        visible,
+    ) or re.search(
+        rf"\b(?:keep|preserve|retain|leave)\b.{{0,50}}"
+        rf"\b{PROMPT_WORD_PATTERN}\b.{{0,50}}"
+        rf"\b(?:and|but|except)\b.{{0,20}}"
+        rf"{PROMPT_VALUE_ACTION_PATTERN}\s+(?:nothing|anything)\b",
+        visible,
+    )
+    negated_replace_noop = re.search(
+        rf"\b(?:do\s+not|don'?t|dont|never)\s+(?:replace|rewrite)\b"
+        rf".{{0,30}}\b{PROMPT_WORD_PATTERN}\b.{{0,20}}[;,.]?\s*"
+        rf"(?:do\s+not|don'?t|dont|never)\s+"
+        rf"{PROMPT_VALUE_ACTION_PATTERN}\b",
+        visible,
+    )
+    if (
+        preserved_prompt_delta or negated_replace_delta
+    ) and not (preservation_noop or negated_replace_noop):
+        return True
+    if re.search(r"\bnot\s+now\b", visible) and re.search(
+        rf"\b{PROMPT_WORD_PATTERN}\b", visible
+    ):
+        return False
+    if re.search(
+        rf"\b{PROMPT_WORD_PATTERN}\b.{{0,30}}"
+        r"\b(?:stays?|remains?)\b.{{0,12}}\b(?:the\s+same|unchanged)\b",
+        visible,
+    ):
+        return False
+    action_matches = list(
+        re.finditer(rf"\b{PROMPT_VALUE_ACTION_PATTERN}\b", visible)
+    )
+    prompt_matches = list(re.finditer(rf"\b{PROMPT_WORD_PATTERN}\b", visible))
+    if not action_matches or not prompt_matches:
+        return False
+
+    negation = re.compile(
+        r"\b(?:do\s+not|don'?t|dont|never|without|refrain\s+from|"
+        r"hold\s+off\s+on|not\s+now)\b"
+    )
+    clause_boundary = re.compile(
+        rf"[,;.!?]|\b(?:but|except|instead|then|while|whereas)\b|"
+        rf"\band\b(?=\s+(?:(?:do\s+not|don'?t|dont|never)\s+)?"
+        rf"(?:{PROMPT_VALUE_ACTION_PATTERN}|show|give|display|tell|provide|print)\b)"
+    )
+    clause_boundaries = list(clause_boundary.finditer(visible))
+    for action_match in action_matches:
+        clause_start = 0
+        clause_end = len(visible)
+        for boundary in clause_boundaries:
+            if boundary.end() <= action_match.start():
+                clause_start = boundary.end()
+                continue
+            if boundary.start() >= action_match.end():
+                clause_end = boundary.start()
+                break
+        candidates = [
+            prompt_match
+            for prompt_match in prompt_matches
+            if clause_start <= prompt_match.start() < clause_end
+            and abs(prompt_match.start() - action_match.end()) <= 100
+        ]
+        if not candidates:
+            continue
+        prompt_match = min(
+            candidates,
+            key=lambda candidate: abs(candidate.start() - action_match.end()),
+        )
+        span_start = min(action_match.start(), prompt_match.start())
+        span_end = max(action_match.end(), prompt_match.end())
+        clause_prefix = visible[clause_start:action_match.start()]
+        immediate_prefix = visible[max(clause_start, action_match.start() - 20):action_match.start()]
+        if negation.search(clause_prefix):
+            continue
+        if re.search(
+            r"\b(?:do\s+not|don'?t|dont|never)\s*$",
+            immediate_prefix.rstrip(),
+        ):
+            continue
+        between = visible[span_start:span_end]
+        if re.search(
+            rf"\b{PROMPT_VALUE_ACTION_PATTERN}\b.{{0,60}}"
+            rf"\b(?:mask|image(?:[ _-]?\d+)?|photo|picture|canvas)\b"
+            r".{0,60}\b(?:and|then)\b.{0,20}"
+            r"\b(?:show|give|display|tell|provide|print)\b.{0,40}"
+            rf"\b{PROMPT_WORD_PATTERN}\b",
+            between,
+        ):
+            continue
+        if re.search(
+            rf"\b{PROMPT_VALUE_ACTION_PATTERN}\b.{{0,60}}"
+            rf"\b(?:mask|image(?:[ _-]?\d+)?|photo|picture|canvas)\b"
+            r".{0,60}\b(?:using|according\s+to|based\s+on|following|"
+            r"guided\s+by|from)\b.{0,30}"
+            rf"\b{PROMPT_WORD_PATTERN}\b",
+            between,
+        ):
+            continue
+        return True
+    return False
+
+
+def prompt_value_edit_denied(message: str) -> bool:
+    """Recognize an explicit request to keep prompt text unchanged."""
+
+    visible = _visible_user_text(message)
+    return bool(
+        re.search(
+            rf"\b(?:do\s+not|don'?t|dont|never|without|refrain\s+from|"
+            rf"hold\s+off\s+on)\b.{{0,40}}"
+            rf"\b{PROMPT_VALUE_NEGATABLE_ACTION_PATTERN}\b.{{0,40}}"
+            rf"\b{PROMPT_WORD_PATTERN}\b",
+            visible,
+        )
+        or re.search(
+            rf"\b{PROMPT_VALUE_ACTION_PATTERN}\b.{{0,80}}"
+            rf"\b(?:mask|image(?:[ _-]?\d+)?|photo|picture|canvas)\b"
+            r".{0,80}\b(?:leave|keep)\b.{{0,40}}"
+            rf"\b{PROMPT_WORD_PATTERN}\b.{{0,30}}"
+            r"\b(?:alone|unchanged|as[ -]?is)\b",
+            visible,
+        )
+        or re.search(
+            rf"\b(?:leave|keep)\b.{{0,40}}\b{PROMPT_WORD_PATTERN}\b"
+            r"(?:.{0,30}\b(?:alone|unchanged|as[ -]?is)\b)?",
+            visible,
+        )
+        or re.search(
+            rf"\b(?:preserve|retain)\b.{{0,40}}\b{PROMPT_WORD_PATTERN}\b",
+            visible,
+        )
+        or re.search(
+            rf"\b(?:do\s+not|don'?t|dont|never)\s+touch\b.{{0,40}}"
+            rf"\b{PROMPT_WORD_PATTERN}\b",
+            visible,
+        )
+        or re.search(
+            rf"\bno\b.{{0,20}}\b{PROMPT_WORD_PATTERN}\b.{{0,20}}"
+            r"\b(?:changes?|edits?|updates?)\b",
+            visible,
+        )
+        or re.search(
+            rf"\b{PROMPT_WORD_PATTERN}\b.{{0,30}}"
+            r"\b(?:stays?|remains?)\b(?:.{0,12}\b(?:the\s+same|unchanged)\b)?",
+            visible,
+        )
+        or re.search(
+            rf"\b{PROMPT_WORD_PATTERN}\b.{{0,40}}"
+            r"\b(?:alone|unchanged|as[ -]?is)\b",
+            visible,
+        )
+        or re.search(
+            rf"\b{PROMPT_WORD_PATTERN}\b.{{0,80}}"
+            r"\b(?:don'?t|dont|do\s+not|never)\b.{{0,20}}"
+            r"\b(?:add|apply|change|edit|update|use)\b"
+            r"(?:\s+(?:it|that|this))?",
+            visible,
+        )
+        or re.search(
+            rf"\b{PROMPT_WORD_PATTERN}\b.{{0,80}}"
+            r"\b(?:don'?t|dont|do\s+not|never)\s+"
+            r"(?:add|apply|change|edit|update|use)\s+(?:it|that|this)\b",
+            visible,
+        )
+        or re.search(
+            rf"\b(?:show|give|display|tell|provide|print)\b.{{0,60}}"
+            rf"\b{PROMPT_WORD_PATTERN}\b",
+            visible,
+        )
+        is not None
+    )
+
+
+def prompt_reference_image_requested(message: str) -> bool:
+    """Recognize a prompt edit whose requested identity is carried by image2."""
+
+    visible = _visible_user_text(message)
+    return bool(
+        re.search(r"\bimage[ _-]?2\b", visible)
+        or re.search(r"\b(?:new|character|identity)\b.{0,80}\breference(?:d)? image\b", visible)
+        or re.search(r"\breference(?:d)? (?:character|image)\b", visible)
+    )
+
+
+def prompt_draft_continuation_requested(message: str) -> bool:
+    """Recognize a deictic request to apply the immediately preceding draft."""
+
+    if explicit_topology_change_requested(message):
+        return False
+    visible = " ".join(_visible_user_text(message).split())
+    if re.search(
+        r"\b(?:do\s+not|don'?t|dont|never|without|refrain\s+from|"
+        r"hold\s+off\s+on|not\s+now)\b.{0,40}"
+        r"\b(?:add(?:ing)?|apply(?:ing)?|set(?:ting)?|use|using)\b",
+        visible,
+    ):
+        return False
+    return bool(
+        re.search(
+            rf"\b(?:add|apply|set|use)\b.{{0,40}}"
+            rf"\b(?:the|this|that)\s+{PROMPT_WORD_PATTERN}\b"
+            r"(?:\s+(?:now|please|pls|go ahead))?\s*[.!?]*$",
+            visible,
+        )
+    )
+
+
+def mask_lane_continuation_requested(message: str) -> bool:
+    """Recognize bounded replies that continue, rather than replace, mask work."""
+
+    if _message_has_attachment_context(message) and not _visible_user_text(message).strip():
+        return True
+    visible = " ".join(_visible_user_text(message).split())
+    if not visible:
+        return False
+    return bool(
+        re.search(
+            r"\b(?:again|retry|continue|attached|attachment|go ahead|do it|"
+            r"yourself|fix it|looks? good|cool|yes|yep|nope)\b",
+            visible,
+        )
+        or re.search(
+            r"\b(?:original|source|reference) image\b.{0,50}"
+            r"\b(?:missing|not there|wrong|attached)\b",
+            visible,
+        )
+    )
+
+
+def prompt_value_retry_requested(message: str) -> bool:
+    """Recognize a terse retry that may reuse the prior prompt-reference lane."""
+
+    visible = " ".join(_visible_user_text(message).split()).strip(" .!?")
+    return bool(
+        re.fullmatch(
+            r"(?:ok\s+|please\s+|pls\s+)?(?:retry|try again|continue|go ahead|"
+            r"do it again|do it)",
+            visible,
+        )
+    )
+
+
+def prompt_value_correction_requested(message: str) -> bool:
+    """Recognize a bounded prompt correction without borrowing mask keywords."""
+
+    if mask_edit_requested(message):
+        return False
+    visible = " ".join(_visible_user_text(message).split())
+    if not visible:
+        return False
+    prompt_word = rf"\b{PROMPT_WORD_PATTERN}\b"
+    if re.search(prompt_word, visible) and re.search(
+        r"\b(?:not|wrong|incorrect|unchanged|missing|failed|didn'?t|doesn'?t|"
+        r"isn'?t|wasn'?t)\b",
+        visible,
+    ):
+        return True
+    if re.search(
+        r"^(?:it|this|that)\b.{0,180}\b(?:focus(?:ed)?|center(?:ed|d)?|"
+        r"centre(?:d)?|centerd|mainly|exclusively|instead|preserv(?:e|ed|ing))\b",
+        visible,
+    ):
+        return True
+    return bool(
+        re.search(
+            r"\b(?:focus(?:ed)?|center(?:ed|d)?|centre(?:d)?|centerd|mainly|"
+            r"exclusively|instead)\b",
+            visible,
+        )
+        or re.search(
+            r"\b(?:no|not|without|exclude|excluding|avoid)\b.{1,100}"
+            r"\b(?:anything|anyone|people|person|woman|women|man|men|girl|boy|"
+            r"subject|character|background)\b",
+            visible,
+        )
+    )
+
+
+def _assistant_prompt_lane_state(item: dict[str, Any]) -> dict[str, bool] | None:
+    """Return an active or successfully completed prompt lane, skipping inactive noise."""
+
+    metadata = item.get("metadata") or {}
+    stored = metadata.get(PROMPT_VALUE_LANE_STATE_KEY)
+    if isinstance(stored, dict) and stored.get("active") is True:
+        return {
+            "active": True,
+            "referenceImage": bool(stored.get("referenceImage")),
+            "combinedMask": False,
+        }
+
+    combined_mask_lane = metadata.get(MASK_LANE_STATE_KEY)
+    if (
+        isinstance(combined_mask_lane, dict)
+        and combined_mask_lane.get("active") is True
+        and combined_mask_lane.get("promptValueEdit") is True
+    ):
+        return {
+            "active": True,
+            "referenceImage": bool(combined_mask_lane.get("promptReferenceImage")),
+            "combinedMask": True,
+        }
+
+    successful_steps = [
+        step
+        for step in metadata.get("toolSteps") or []
+        if isinstance(step, dict)
+        and step.get("status") in {"done", "success", "succeeded", "completed"}
+    ]
+    if not any(step.get("name") == "update_connected_prompt" for step in successful_steps):
+        return None
+    return {
+        "active": True,
+        "referenceImage": bool(
+            isinstance(stored, dict) and stored.get("referenceImage")
+        )
+        or any(
+            step.get("name") == "view_prompt_reference_image"
+            for step in successful_steps
+        ),
+        "combinedMask": False,
+    }
+
+
+def _assistant_completed_prompt_context_inspection(item: dict[str, Any]) -> bool:
+    """Allow one bounded read-only inspection between a prompt edit and correction."""
+
+    metadata = item.get("metadata") or {}
+    successful_names = {
+        str(step.get("name") or "")
+        for step in metadata.get("toolSteps") or []
+        if isinstance(step, dict)
+        and step.get("status") in {"done", "success", "succeeded", "completed"}
+    }
+    return bool(successful_names) and successful_names <= PROMPT_CONTEXT_INSPECTION_TOOLS
+
+
+def _immediate_reference_prompt_draft_handoff(
+    messages: list[dict[str, Any]],
+    latest_user_message: str,
+) -> bool:
+    """Bind a deictic apply request to one immediately preceding image draft."""
+
+    if not prompt_draft_continuation_requested(latest_user_message):
+        return False
+    prior = list(messages)
+    if (
+        prior
+        and prior[-1].get("role") == "user"
+        and message_content_for_model(prior[-1]) == latest_user_message
+    ):
+        prior.pop()
+    if len(prior) < 2:
+        return False
+    assistant_item = prior[-1]
+    user_item = prior[-2]
+    if assistant_item.get("role") != "assistant" or user_item.get("role") != "user":
+        return False
+    if str(assistant_item.get("status") or "complete") != "complete":
+        return False
+    assistant_content = message_content_for_model(assistant_item).strip()
+    if not assistant_content or not re.search(
+        rf"\b(?:{PROMPT_WORD_PATTERN}|draft|refin(?:e|ed))\b",
+        _visible_user_text(assistant_content),
+    ):
+        return False
+    if re.search(
+        r"\b(?:can(?:not|'t)|could(?:not|n't)|unable|failed|failure|"
+        r"did(?: not|n't)|was(?: not|n't) able)\b.{0,80}"
+        rf"\b(?:{PROMPT_WORD_PATTERN}|draft|refin(?:e|ed))\b",
+        _visible_user_text(assistant_content),
+    ):
+        return False
+    prior_user_content = message_content_for_model(user_item)
+    if not prompt_reference_image_requested(prior_user_content):
+        return False
+    if re.search(
+        r"\b(?:do\s+not|don'?t|dont|never|without)\b.{0,50}"
+        r"\b(?:use|using|from|reference|image[ _-]?2)\b",
+        _visible_user_text(prior_user_content),
+    ):
+        return False
+    if not re.search(
+        rf"\b(?:{PROMPT_WORD_PATTERN}|draft|refin(?:e|ed))\b",
+        _visible_user_text(prior_user_content),
+    ):
+        return False
+
+    inspection_steps = [
+        step
+        for step in (assistant_item.get("metadata") or {}).get("toolSteps") or []
+        if isinstance(step, dict)
+    ]
+    if not inspection_steps or any(
+        step.get("status") not in {"done", "success", "succeeded", "completed"}
+        or tool_result_is_error(step.get("result"))
+        for step in inspection_steps
+    ):
+        return False
+    inspection_names = {str(step.get("name") or "") for step in inspection_steps}
+    return bool(inspection_names) and inspection_names <= {
+        "view_chat_image",
+        "view_prompt_reference_image",
+    }
+
+
+def _new_mask_lane_state(message: str) -> dict[str, bool]:
+    attachment_available = _message_has_attachment_context(message)
+    return {
+        "active": True,
+        "promptValueEdit": prompt_value_edit_requested(message),
+        "promptReferenceImage": prompt_reference_image_requested(message),
+        "attachmentAvailable": attachment_available,
+    }
+
+
+def _inactive_mask_lane_state() -> dict[str, bool]:
+    return {
+        "active": False,
+        "promptValueEdit": False,
+        "promptReferenceImage": False,
+        "attachmentAvailable": False,
+    }
+
+
+def derive_mask_lane_state(
+    messages: list[dict[str, Any]],
+    latest_user_message: str,
+) -> dict[str, bool]:
+    """Derive one small persisted mask lane across terse follow-up turns."""
+
+    if mask_edit_requested(latest_user_message):
+        return _new_mask_lane_state(latest_user_message)
+    if not mask_lane_continuation_requested(latest_user_message):
+        return _inactive_mask_lane_state()
+
+    inherited: dict[str, bool] | None = None
+    history = messages[-MASK_LANE_HISTORY_LIMIT:]
+    for index in range(len(history) - 1, -1, -1):
+        item = history[index]
+        if item.get("role") == "assistant":
+            stored = (item.get("metadata") or {}).get(MASK_LANE_STATE_KEY)
+            if isinstance(stored, dict):
+                if stored.get("active") is True:
+                    inherited = {
+                        "active": True,
+                        "promptValueEdit": bool(stored.get("promptValueEdit")),
+                        "promptReferenceImage": bool(stored.get("promptReferenceImage")),
+                        "attachmentAvailable": bool(stored.get("attachmentAvailable")),
+                    }
+                    # A newly fixed bounded typo must also repair the immediately
+                    # following retry. Older assistant metadata was derived by the
+                    # previous parser and may have omitted the prompt tool even
+                    # though the preceding combined request explicitly asked for
+                    # it. Only upgrade that one bit from the adjacent user request;
+                    # never infer it for a genuine mask-only reference task.
+                    if not inherited["promptValueEdit"]:
+                        for prior in reversed(history[:index]):
+                            if prior.get("role") == "assistant":
+                                break
+                            if prior.get("role") != "user":
+                                continue
+                            prior_content = message_content_for_model(prior)
+                            if (
+                                mask_edit_requested(prior_content)
+                                and prompt_value_edit_requested(prior_content)
+                            ):
+                                inherited["promptValueEdit"] = True
+                            break
+                break
+            continue
+        if item.get("role") != "user":
+            continue
+        content = message_content_for_model(item)
+        if content == latest_user_message:
+            continue
+        if mask_edit_requested(content):
+            inherited = _new_mask_lane_state(content)
+            break
+        if not mask_lane_continuation_requested(content):
+            break
+
+    if inherited is None:
+        return _inactive_mask_lane_state()
+    if prompt_value_edit_denied(latest_user_message):
+        inherited["promptValueEdit"] = False
+    if _message_has_attachment_context(latest_user_message):
+        inherited["attachmentAvailable"] = True
+    return inherited
+
+
+def _mask_lane_tools(message: str, state: dict[str, bool]) -> set[str]:
+    selected = set(REFINEMENT_MASK_TOOLS)
+    if state.get("promptValueEdit"):
+        selected.update(PROMPT_VALUE_TOOLS)
+    if state.get("promptReferenceImage"):
+        selected.update(PROMPT_REFERENCE_TOOLS)
+    if state.get("attachmentAvailable"):
+        selected.update({"view_chat_image", "place_chat_image_in_node"})
+    if canvas_image_inspection_requested(message):
+        selected.update(CANVAS_IMAGE_INSPECTION_TOOLS)
+    selected.update(_graph_compiler_optional_tools(message) & REFINEMENT_EXECUTION_TOOLS)
+    return selected
+
+
+def derive_prompt_value_lane_state(
+    messages: list[dict[str, Any]],
+    latest_user_message: str,
+) -> dict[str, bool]:
+    """Persist a prompt-only value-edit lane across two corrective reply turns."""
+
+    direct_edit = (
+        prompt_value_edit_requested(latest_user_message)
+        and not mask_edit_requested(latest_user_message)
+    )
+    correction = prompt_value_correction_requested(latest_user_message)
+    retry = prompt_value_retry_requested(latest_user_message)
+    if direct_edit and not correction:
+        return {
+            "active": True,
+            "referenceImage": (
+                prompt_reference_image_requested(latest_user_message)
+                or _immediate_reference_prompt_draft_handoff(
+                    messages,
+                    latest_user_message,
+                )
+            ),
+        }
+    if not (direct_edit or correction or retry):
+        return {"active": False, "referenceImage": False}
+
+    correction_turns = 0
+    skipped_latest = False
+    pending_context_inspection = False
+    for item in reversed(messages[-MASK_LANE_HISTORY_LIMIT:]):
+        if item.get("role") == "assistant":
+            stored = _assistant_prompt_lane_state(item)
+            if stored is not None:
+                if retry and stored.get("combinedMask") is True:
+                    continue
+                return {
+                    "active": True,
+                    "referenceImage": (
+                        prompt_reference_image_requested(latest_user_message)
+                        or (retry and stored["referenceImage"])
+                    ),
+                }
+            pending_context_inspection = _assistant_completed_prompt_context_inspection(
+                item
+            )
+            continue
+        if item.get("role") != "user":
+            continue
+        content = message_content_for_model(item)
+        if not skipped_latest and content == latest_user_message:
+            skipped_latest = True
+            continue
+        if pending_context_inspection:
+            pending_context_inspection = False
+            correction_turns += 1
+            if correction_turns <= PROMPT_VALUE_CORRECTION_TURN_LIMIT:
+                continue
+            break
+        if prompt_value_edit_requested(content) and not mask_edit_requested(content):
+            if prompt_value_correction_requested(content):
+                correction_turns += 1
+                if correction_turns <= PROMPT_VALUE_CORRECTION_TURN_LIMIT:
+                    continue
+                break
+            return {
+                "active": True,
+                "referenceImage": (
+                    prompt_reference_image_requested(latest_user_message)
+                    or (retry and prompt_reference_image_requested(content))
+                ),
+            }
+        if prompt_value_correction_requested(content) or prompt_value_retry_requested(content):
+            correction_turns += 1
+            if correction_turns <= PROMPT_VALUE_CORRECTION_TURN_LIMIT:
+                continue
+        break
+
+    if direct_edit:
+        return {
+            "active": True,
+            "referenceImage": prompt_reference_image_requested(latest_user_message),
+        }
+    return {"active": False, "referenceImage": False}
 
 
 def _graph_compiler_optional_tools(message: str) -> set[str]:
@@ -636,6 +1404,107 @@ def _tool_checkpoint(message: dict[str, Any]) -> str:
     return ", ".join(summaries)
 
 
+def _structured_tool_result(step: dict[str, Any]) -> dict[str, Any] | None:
+    result = step.get("result")
+    if tool_result_is_error(result):
+        return None
+    if isinstance(result, str):
+        try:
+            result = json.loads(result)
+        except json.JSONDecodeError:
+            return None
+    if not isinstance(result, dict):
+        return None
+    structured = result.get("structuredContent")
+    if isinstance(structured, dict):
+        return structured
+    return result
+
+
+def _safe_image_reference(value: Any) -> dict[str, str] | None:
+    if not isinstance(value, dict):
+        return None
+    reference = {
+        key: str(value[key])
+        for key in ("filename", "subfolder", "type")
+        if value.get(key) not in (None, "")
+    }
+    return reference or None
+
+
+def _bounded_lane_facts(message: dict[str, Any]) -> str:
+    """Retain safe mask/prompt locators across rollover without authority tokens."""
+
+    steps = (message.get("metadata") or {}).get("toolSteps") or []
+    for step in reversed(steps):
+        if not isinstance(step, dict) or step.get("status") != "done":
+            continue
+        name = str(step.get("name") or "")
+        if name not in {
+            "view_node_mask",
+            "edit_node_mask",
+            "confirm_mask_review",
+            "view_prompt_reference_image",
+            "update_connected_prompt",
+        }:
+            continue
+        result = _structured_tool_result(step)
+        if not result or result.get("success") is False:
+            continue
+        if name in {"update_connected_prompt", "view_prompt_reference_image"}:
+            facts = {
+                "kind": "prompt",
+                "node_id": result.get("node_id") or result.get("producer_node_id"),
+                "title": result.get("title") or result.get("producer_title"),
+                "widget": result.get("widget") or result.get("widget_name"),
+                "reference_node_id": result.get("reference_node_id"),
+                "consumer_node_id": result.get("consumer_node_id"),
+                "image": _safe_image_reference(result.get("image")),
+                "workflow_hash": result.get("workflow_hash"),
+                "graph_hash": result.get("graph_hash"),
+            }
+        else:
+            facts = {
+                "kind": "mask",
+                "node_id": result.get("node_id"),
+                "title": result.get("title"),
+                "image": _safe_image_reference(result.get("image")),
+                "source_image": _safe_image_reference(result.get("source_image")),
+                "original_size": result.get("originalSize") or result.get("image_size"),
+                "workflow_hash": result.get("workflow_hash"),
+                "graph_hash": result.get("graph_hash"),
+                "approved": result.get("approved"),
+            }
+        facts = {key: value for key, value in facts.items() if value not in (None, {}, "")}
+        return _bounded_context_text(
+            json.dumps(facts, ensure_ascii=False, separators=(",", ":")),
+            700,
+        )
+    return ""
+
+
+def _mask_lane_checkpoint(message: dict[str, Any]) -> str:
+    state = (message.get("metadata") or {}).get(MASK_LANE_STATE_KEY)
+    if not isinstance(state, dict) or state.get("active") is not True:
+        return ""
+    return (
+        "mask_lane=active"
+        f",prompt_value={str(bool(state.get('promptValueEdit'))).lower()}"
+        f",prompt_reference={str(bool(state.get('promptReferenceImage'))).lower()}"
+        f",attachment={str(bool(state.get('attachmentAvailable'))).lower()}"
+    )
+
+
+def _prompt_value_lane_checkpoint(message: dict[str, Any]) -> str:
+    state = (message.get("metadata") or {}).get(PROMPT_VALUE_LANE_STATE_KEY)
+    if not isinstance(state, dict) or state.get("active") is not True:
+        return ""
+    return (
+        "prompt_value_lane=active"
+        f",reference={str(bool(state.get('referenceImage'))).lower()}"
+    )
+
+
 def build_conversation_checkpoint(
     messages: list[dict[str, Any]],
     *,
@@ -661,6 +1530,15 @@ def build_conversation_checkpoint(
         line = f"- {role} [{status}]: {excerpt or '(no text)'}"
         if tools:
             line += f" | tools: {tools}"
+        mask_lane = _mask_lane_checkpoint(message)
+        if mask_lane:
+            line += f" | {mask_lane}"
+        prompt_value_lane = _prompt_value_lane_checkpoint(message)
+        if prompt_value_lane:
+            line += f" | {prompt_value_lane}"
+        lane_facts = _bounded_lane_facts(message)
+        if lane_facts:
+            line += f" | lane_facts={lane_facts}"
         if len(line) + 1 > remaining:
             omitted += 1
             continue
@@ -672,33 +1550,77 @@ def build_conversation_checkpoint(
     return _bounded_context_text("\n".join(lines), max_chars)
 
 
-def _usage_token_high_watermark(value: Any) -> int:
-    """Return the largest reported token counter in nested provider metadata."""
-    if isinstance(value, dict):
-        values = [
-            _usage_token_high_watermark(item)
-            for key, item in value.items()
-            if "token" in str(key).lower() or isinstance(item, (dict, list))
-        ]
-        return max(values, default=0)
-    if isinstance(value, list):
-        return max((_usage_token_high_watermark(item) for item in value), default=0)
-    if isinstance(value, (int, float)) and value >= 0:
-        return int(value)
-    return 0
+def _current_context_tokens(value: Any) -> int:
+    """Read current-turn input/context usage, never historical cumulative totals."""
+
+    if not isinstance(value, dict):
+        return 0
+    if isinstance(value.get("last"), dict):
+        value = value["last"]
+    current_keys = {
+        "inputtokens",
+        "input_tokens",
+        "prompttokens",
+        "prompt_tokens",
+        "contexttokens",
+        "context_tokens",
+    }
+    values = [
+        int(item)
+        for key, item in value.items()
+        if str(key).casefold() in current_keys
+        and isinstance(item, (int, float))
+        and item >= 0
+    ]
+    return max(values, default=0)
+
+
+def _provider_thread_id(message: dict[str, Any]) -> tuple[str, str] | None:
+    metadata = message.get("metadata") or {}
+    for key in ("codexThreadId", "claudeSessionId"):
+        value = metadata.get(key)
+        if value:
+            return key, str(value)
+    return None
+
+
+def current_provider_thread_messages(
+    messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Return only messages belonging to the currently resumable native thread."""
+
+    current = next(
+        (
+            _provider_thread_id(message)
+            for message in reversed(messages)
+            if _provider_thread_id(message) is not None
+        ),
+        None,
+    )
+    if current is None:
+        return messages
+
+    start = 0
+    for index in range(len(messages) - 1, -1, -1):
+        thread = _provider_thread_id(messages[index])
+        if thread is not None and thread != current:
+            start = index + 1
+            break
+    return messages[start:]
 
 
 def conversation_needs_compaction(messages: list[dict[str, Any]]) -> bool:
     """Detect large local histories or native threads near a costly context size."""
+    active_messages = current_provider_thread_messages(messages)
     context_size = sum(
         len(_message_for_context(message)["content"]) + 64
-        for message in messages
+        for message in active_messages
         if message.get("role") in {"user", "assistant"}
     )
     provider_tokens = max(
         (
-            _usage_token_high_watermark((message.get("metadata") or {}).get("usage"))
-            for message in messages
+            _current_context_tokens((message.get("metadata") or {}).get("usage"))
+            for message in active_messages
         ),
         default=0,
     )
@@ -758,20 +1680,71 @@ def compact_messages_for_model(
 def native_prompt_with_compaction(
     messages: list[dict[str, Any]],
     latest_user_message: str,
+    *,
+    force: bool = False,
+    rollover_reason: str = "context_limit",
 ) -> tuple[str, bool]:
     """Prepare a bounded prompt when rolling over a native Claude/Codex thread."""
-    if not conversation_needs_compaction(messages):
+    if not force and not conversation_needs_compaction(messages):
         return latest_user_message, False
     compacted, _ = compact_messages_for_model(messages, force=True)
     prior = compacted[:-1] if compacted else []
+    reason = (
+        "because the exact Ren tool surface changed"
+        if rollover_reason == "tool_surface_changed"
+        else "to keep this long chat responsive"
+    )
     sections = [
-        "The provider thread was rolled over to keep this long chat responsive.",
+        f"The provider thread was rolled over {reason}.",
         "Use this bounded conversation context, then handle the current request.",
     ]
+    if rollover_reason == "tool_surface_changed":
+        sections.append(
+            "The current Ren tool surface is authoritative. Ignore earlier claims "
+            "or discovery results about which tools are available."
+        )
     for item in prior:
         sections.append(f"\n[{item['role']}]\n{item['content']}")
     sections.append(f"\n[current user request]\n{latest_user_message}")
     return _bounded_context_text("\n".join(sections), CONTEXT_MAX_CHARS), True
+
+
+REN_TOOL_SURFACE_KEY = "renToolSurface"
+
+
+def canonical_ren_tool_surface(tool_names: set[str]) -> dict[str, Any]:
+    """Return the exact sorted Ren tool set bound to one native provider thread."""
+
+    return {
+        "buildId": RUNTIME_BUILD_ID,
+        "tools": sorted(tool_names),
+    }
+
+
+def resumable_provider_thread(
+    messages: list[dict[str, Any]],
+    *,
+    thread_key: str,
+    tool_surface: dict[str, Any],
+) -> tuple[str | None, bool]:
+    """Resume only a native thread created with the same exact Ren MCP catalog."""
+
+    prior = next(
+        (
+            item
+            for item in reversed(messages)
+            if item.get("role") == "assistant"
+            and item.get("metadata", {}).get(thread_key)
+        ),
+        None,
+    )
+    if prior is None:
+        return None, False
+    metadata = prior.get("metadata") or {}
+    thread_id = str(metadata[thread_key])
+    if metadata.get(REN_TOOL_SURFACE_KEY) != tool_surface:
+        return None, True
+    return thread_id, False
 
 INTENT_TOOL_GROUPS = {
     "debug": {
@@ -884,6 +1857,82 @@ def tool_result_content(content: Any) -> str:
     return json.dumps(content, ensure_ascii=False, separators=(",", ":"))
 
 
+def tool_result_is_error(content: Any) -> bool:
+    """Classify explicit MCP/tool failures instead of displaying them as done."""
+
+    value = content
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError:
+            return bool(re.match(
+                r"\s*(?:error calling tool|error:|\d+\s+validation errors?\s+for\s+call\[)",
+                value,
+                re.IGNORECASE,
+            ))
+    if hasattr(value, "model_dump"):
+        value = value.model_dump(mode="json", by_alias=True)
+    if isinstance(value, list):
+        return any(tool_result_is_error(item) for item in value)
+    if not isinstance(value, dict):
+        return False
+    if value.get("type") == "text":
+        text = str(value.get("text") or "")
+        if re.match(r"\s*(?:error calling tool|error:)", text, re.IGNORECASE):
+            return True
+        stripped = text.lstrip()
+        if stripped.startswith(("{", "[")):
+            try:
+                return tool_result_is_error(json.loads(stripped))
+            except json.JSONDecodeError:
+                return False
+        return False
+    if (
+        value.get("isError") is True
+        or value.get("is_error") is True
+        or value.get("success") is False
+    ):
+        return True
+    if value.get("error") not in (None, "", False):
+        return True
+    structured = value.get("structuredContent")
+    if isinstance(structured, dict) and (
+        structured.get("success") is False
+        or structured.get("error") not in (None, "", False)
+    ):
+        return True
+    blocks = value.get("content")
+    if isinstance(blocks, list):
+        return tool_result_is_error(blocks)
+    return False
+
+
+def tool_result_needs_choice(content: Any) -> bool:
+    """Recognize a semantic choice stop without presenting it as a tool crash."""
+
+    value = content
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError:
+            return False
+    if hasattr(value, "model_dump"):
+        value = value.model_dump(mode="json", by_alias=True)
+    if isinstance(value, list):
+        return any(tool_result_needs_choice(item) for item in value)
+    if not isinstance(value, dict):
+        return False
+    if value.get("needs_choice") is True:
+        return True
+    structured = value.get("structuredContent")
+    if isinstance(structured, dict) and structured.get("needs_choice") is True:
+        return True
+    if value.get("type") == "text":
+        return tool_result_needs_choice(value.get("text"))
+    blocks = value.get("content")
+    return isinstance(blocks, list) and tool_result_needs_choice(blocks)
+
+
 def model_settings_for_provider(settings: dict[str, Any]) -> dict[str, Any]:
     model_settings: dict[str, Any] = {
         "temperature": settings["temperature"],
@@ -918,16 +1967,71 @@ def install_codex_approval_handler(codex: Any, handler: Callable[..., Any]) -> N
     sync_client._approval_handler = handler
 
 
+class ProviderToolSurfaceMismatch(RuntimeError):
+    """The provider did not expose the exact Ren tools selected for this turn."""
+
+    code = "provider_tool_surface_mismatch"
+
+
+def require_provider_tool_surface(
+    expected: set[str],
+    exposed: set[str],
+    *,
+    provider: str,
+    exact: bool = True,
+) -> None:
+    """Fail before inference when provider tool discovery is stale or incomplete."""
+
+    missing = sorted(expected - exposed)[:16]
+    unexpected = sorted(exposed - expected)[:16] if exact else []
+    if not missing and not unexpected:
+        return
+    facts = []
+    if missing:
+        facts.append(f"missing={','.join(missing)}")
+    if unexpected:
+        facts.append(f"unexpected={','.join(unexpected)}")
+    raise ProviderToolSurfaceMismatch(
+        "provider_tool_surface_mismatch: "
+        f"{provider} exposed a different Ren tool surface ({'; '.join(facts)}). "
+        "No model turn or canvas action was started."
+    )
+
+
+def prepare_provider_tools(
+    tool_definitions: list[Any],
+    allowed_tools: set[str],
+    *,
+    provider: str = "pydantic",
+) -> list[Any]:
+    """Validate MCP discovery, then return only this turn's selected tools."""
+
+    exposed = {str(definition.name) for definition in tool_definitions}
+    require_provider_tool_surface(
+        allowed_tools,
+        exposed,
+        provider=provider,
+        exact=False,
+    )
+    return [
+        definition
+        for definition in tool_definitions
+        if definition.name in allowed_tools
+    ]
+
+
 async def wait_for_claude_mcp(
     client: Any,
     *,
     server_name: str = "ren",
+    expected_tools: set[str] | None = None,
     timeout: float = 15,
 ) -> None:
     """Wait until Claude Code has discovered Ren's MCP tools."""
     deadline = asyncio.get_running_loop().time() + timeout
     last_status = "pending"
     last_error = None
+    last_surface_error: ProviderToolSurfaceMismatch | None = None
     while True:
         response = await client.get_mcp_status()
         servers = response.get("mcpServers", []) if isinstance(response, dict) else []
@@ -943,7 +2047,24 @@ async def wait_for_claude_mcp(
             last_status = str(server.get("status") or "pending")
             last_error = server.get("error")
             if last_status == "connected":
-                return
+                if expected_tools is None:
+                    return
+                exposed = set()
+                for tool in server.get("tools") or []:
+                    if not isinstance(tool, dict) or not tool.get("name"):
+                        continue
+                    raw_name = str(tool["name"])
+                    exposed.add(claude_tool_name(raw_name) or raw_name)
+                try:
+                    require_provider_tool_surface(
+                        expected_tools,
+                        exposed,
+                        provider="claude",
+                    )
+                except ProviderToolSurfaceMismatch as exc:
+                    last_surface_error = exc
+                else:
+                    return
             if last_status in {"failed", "needs-auth", "disabled"}:
                 detail = f": {last_error}" if last_error else ""
                 raise RuntimeError(
@@ -951,6 +2072,8 @@ async def wait_for_claude_mcp(
                     f"({last_status}){detail}"
                 )
         if asyncio.get_running_loop().time() >= deadline:
+            if last_surface_error is not None:
+                raise last_surface_error
             detail = f": {last_error}" if last_error else ""
             raise RuntimeError(
                 f"Claude Code timed out waiting for the Ren MCP server "
@@ -964,30 +2087,76 @@ async def wait_for_codex_mcp_status(
     status_params: dict[str, Any],
     response_model: Any,
     *,
+    expected_tools: set[str] | None = None,
     timeout: float = 30,
 ) -> Any:
     """Bound Codex MCP discovery so a broken provider cannot freeze the chat."""
-    try:
-        return await asyncio.wait_for(
-            client.request(
-                "mcpServerStatus/list",
-                status_params,
-                response_model=response_model,
-            ),
-            timeout=timeout,
+    deadline = asyncio.get_running_loop().time() + timeout
+    last_surface_error: ProviderToolSurfaceMismatch | None = None
+    while True:
+        remaining = max(0, deadline - asyncio.get_running_loop().time())
+        try:
+            response = await asyncio.wait_for(
+                client.request(
+                    "mcpServerStatus/list",
+                    status_params,
+                    response_model=response_model,
+                ),
+                timeout=remaining,
+            )
+        except TimeoutError as exc:
+            if last_surface_error is not None:
+                raise last_surface_error from exc
+            raise RuntimeError(
+                "Codex timed out while connecting to the Ren MCP tools. "
+                "Stop the response and retry."
+            ) from exc
+        if expected_tools is None:
+            return response
+        ren_status = next(
+            (item for item in response.data if item.name == "ren"),
+            None,
         )
-    except TimeoutError as exc:
-        raise RuntimeError(
-            "Codex timed out while connecting to the Ren MCP tools. "
-            "Stop the response and retry."
-        ) from exc
+        try:
+            require_provider_tool_surface(
+                expected_tools,
+                set(ren_status.tools) if ren_status is not None else set(),
+                provider="codex",
+            )
+        except ProviderToolSurfaceMismatch as exc:
+            last_surface_error = exc
+        else:
+            return response
+        if asyncio.get_running_loop().time() >= deadline:
+            raise last_surface_error from None
+        await asyncio.sleep(0.1)
 
 
-def tools_for_message(message: str, search_mode: str = "off") -> set[str]:
+def tools_for_message(
+    message: str,
+    search_mode: str = "off",
+    *,
+    mask_lane_state: dict[str, bool] | None = None,
+    prompt_value_lane_state: dict[str, bool] | None = None,
+) -> set[str]:
     text = message.lower()
     branch_intent = workflow_branch_intent(message)
+    canvas_inspection = canvas_image_inspection_requested(message)
     graph_change_requested = workflow_graph_change_requested(message)
+    if canvas_inspection and canvas_mutation_explicitly_denied(message):
+        graph_change_requested = False
+    mask_lane = mask_lane_state or (
+        _new_mask_lane_state(message)
+        if mask_edit_requested(message)
+        else {"active": False}
+    )
+    prompt_value_lane = prompt_value_lane_state or {
+        "active": prompt_value_edit_requested(message) and not mask_edit_requested(message),
+        "referenceImage": prompt_reference_image_requested(message),
+    }
     selected = set(CORE_CHAT_TOOLS)
+    if canvas_inspection:
+        selected.update(CANVAS_IMAGE_INSPECTION_TOOLS)
     debug_requested = any(
         word in text
         for word in (
@@ -1030,6 +2199,21 @@ def tools_for_message(message: str, search_mode: str = "off") -> set[str]:
         if branch_intent in {"clone", "replace", "remove"}:
             selected.update(_graph_compiler_optional_tools(message))
         return selected
+    if prompt_value_lane.get("active") and not explicit_topology_change_requested(message):
+        prompt_tools = set(PROMPT_VALUE_TOOLS)
+        if prompt_value_lane.get("referenceImage"):
+            prompt_tools.update(PROMPT_REFERENCE_TOOLS)
+        if canvas_image_inspection_requested(message):
+            prompt_tools.update(CANVAS_IMAGE_INSPECTION_TOOLS)
+        if _message_has_attachment_context(message):
+            prompt_tools.add("view_chat_image")
+        return prompt_tools
+    if mask_lane.get("active") and not explicit_topology_change_requested(message):
+        return _mask_lane_tools(message, mask_lane)
+    if canvas_inspection and not graph_change_requested:
+        # Pixel inspection and node-to-input mapping need a small read-only
+        # surface. Do not expose queueing or canvas mutation for this lane.
+        return set(CANVAS_IMAGE_READ_ONLY_TOOLS)
     if graph_change_requested:
         # Empty-canvas builds and existing-graph edits use the same arbitrary-DAG
         # compiler, schema guards, transaction, rollback, and two-call surface.
@@ -1041,6 +2225,11 @@ def tools_for_message(message: str, search_mode: str = "off") -> set[str]:
             selected.update({"web_search", "web_fetch_page"})
         else:
             selected.difference_update({"web_search", "web_fetch_page"})
+        # A combined inspect-then-edit request needs both the exact visual reader
+        # and the compiler pair. Never let the graph lane erase an explicitly
+        # requested read-only canvas capability.
+        if canvas_inspection:
+            selected.update(CANVAS_IMAGE_INSPECTION_TOOLS)
     return selected
 
 
@@ -1237,6 +2426,19 @@ def workflow_context_environment(workflow: dict[str, Any] | None) -> dict[str, s
         "FL_MCP_WORKFLOW_NAME": str((workflow or {}).get("name") or ""),
         "FL_MCP_WORKFLOW_PATH": str((workflow or {}).get("path") or ""),
     }
+
+
+def prompt_reference_environment(
+    mask_lane_state: dict[str, bool] | None,
+    prompt_value_lane_state: dict[str, bool] | None,
+) -> dict[str, str]:
+    """Bind reference-dependent prompt writes outside model-controlled arguments."""
+
+    required = bool(
+        (mask_lane_state or {}).get("promptReferenceImage")
+        or (prompt_value_lane_state or {}).get("referenceImage")
+    )
+    return {"FL_MCP_PROMPT_REFERENCE_REQUIRED": "1" if required else "0"}
 
 
 def web_search_environment(
@@ -1583,8 +2785,14 @@ class ChatRuntime:
                 tool_id = payload.get("toolCallId")
                 for step in reversed(state.tool_steps):
                     if step.get("id") == tool_id:
-                        step["status"] = "done"
-                        step["result"] = payload.get("content")
+                        result = payload.get("content")
+                        if tool_result_needs_choice(result):
+                            step["status"] = "needs_choice"
+                        else:
+                            step["status"] = (
+                                "failed" if tool_result_is_error(result) else "done"
+                            )
+                        step["result"] = result
                         break
             elif event_type in {"RUN_FINISHED", "RUN_ERROR"}:
                 terminal_status = "finished" if event_type == "RUN_FINISHED" else "failed"
@@ -1789,28 +2997,34 @@ class ChatRuntime:
                 ren_instructions(str(settings.get("search_mode") or "off"))
                 + workflow_context_instructions(state.workflow)
             )
+            messages = self.store.list_messages(state.conversation_id)
             latest_user_item = next(
                 (
                     item
-                    for item in reversed(self.store.list_messages(state.conversation_id))
+                    for item in reversed(messages)
                     if item["role"] == "user"
                 ),
                 {},
             )
             latest_user_message = message_content_for_model(latest_user_item)
+            mask_lane_state = derive_mask_lane_state(messages, latest_user_message)
+            prompt_value_lane_state = derive_prompt_value_lane_state(
+                messages,
+                latest_user_message,
+            )
+            state.provider_metadata[MASK_LANE_STATE_KEY] = mask_lane_state
+            state.provider_metadata[PROMPT_VALUE_LANE_STATE_KEY] = prompt_value_lane_state
             allowed_tools = tools_for_message(
                 latest_user_message,
                 str(settings.get("search_mode") or "off"),
+                mask_lane_state=mask_lane_state,
+                prompt_value_lane_state=prompt_value_lane_state,
             )
             retry_approval_grants: set[str] = set()
 
             async def prepare_tools(ctx, tool_definitions):
                 del ctx
-                return [
-                    definition
-                    for definition in tool_definitions
-                    if definition.name in allowed_tools
-                ]
+                return prepare_provider_tools(tool_definitions, allowed_tools)
 
             async def process_tool_call(ctx, call_tool, tool_name, tool_args):
                 del ctx
@@ -1887,6 +3101,8 @@ class ChatRuntime:
                 "FL_MCP_WS_URL": self._ws_url(),
                 "FL_MCP_CLIENT_ID": f"embedded-chat-{state.run_id}",
                 **workflow_context_environment(state.workflow),
+                **prompt_reference_environment(mask_lane_state, prompt_value_lane_state),
+                "FL_MCP_ALLOWED_TOOLS": ",".join(sorted(allowed_tools)),
                 **web_search_environment(
                     settings,
                     str(latest_user_item.get("content") or ""),
@@ -1913,8 +3129,7 @@ class ChatRuntime:
                 model_settings=model_settings,
                 prepare_tools=prepare_tools,
             )
-            stored_messages = self.store.list_messages(state.conversation_id)
-            messages, context_compacted = compact_messages_for_model(stored_messages)
+            messages, context_compacted = compact_messages_for_model(messages)
             if context_compacted:
                 state.provider_metadata["contextCompacted"] = True
             run_input = RunAgentInput.model_validate({
@@ -1986,7 +3201,11 @@ class ChatRuntime:
                 await self.publish(state, {
                     "type": "RUN_ERROR",
                     "message": error_message,
-                    "code": "chat_run_failed",
+                    "code": getattr(exc, "code", None) or (
+                        "provider_tool_surface_mismatch"
+                        if "provider_tool_surface_mismatch:" in str(exc)
+                        else "chat_run_failed"
+                    ),
                 })
         finally:
             state.done = True
@@ -2047,28 +3266,44 @@ class ChatRuntime:
             {},
         )
         latest_user_message = message_content_for_model(latest_user_item)
-        provider_user_message, context_compacted = native_prompt_with_compaction(
+        mask_lane_state = derive_mask_lane_state(messages, latest_user_message)
+        prompt_value_lane_state = derive_prompt_value_lane_state(
             messages,
             latest_user_message,
         )
+        state.provider_metadata[MASK_LANE_STATE_KEY] = mask_lane_state
+        state.provider_metadata[PROMPT_VALUE_LANE_STATE_KEY] = prompt_value_lane_state
         allowed_tools = tools_for_message(
             latest_user_message,
             str(settings.get("search_mode") or "off"),
+            mask_lane_state=mask_lane_state,
+            prompt_value_lane_state=prompt_value_lane_state,
         )
-        claude_session_id = next(
-            (
-                str(item["metadata"]["claudeSessionId"])
-                for item in reversed(messages)
-                if item["role"] == "assistant"
-                and item.get("metadata", {}).get("claudeSessionId")
+        ren_tool_surface = canonical_ren_tool_surface(allowed_tools)
+        state.provider_metadata[REN_TOOL_SURFACE_KEY] = ren_tool_surface
+        claude_session_id, tool_surface_changed = resumable_provider_thread(
+            messages,
+            thread_key="claudeSessionId",
+            tool_surface=ren_tool_surface,
+        )
+        provider_user_message, context_compacted = native_prompt_with_compaction(
+            messages,
+            latest_user_message,
+            force=tool_surface_changed,
+            rollover_reason=(
+                "tool_surface_changed" if tool_surface_changed else "context_limit"
             ),
-            None,
         )
         if context_compacted:
             claude_session_id = None
             state.provider_metadata.update({
                 "contextCompacted": True,
                 "providerThreadRolledOver": True,
+                "providerThreadRolloverReason": (
+                    "tool_surface_changed"
+                    if tool_surface_changed
+                    else "context_limit"
+                ),
             })
         environment = claude_subscription.cli_environment()
         environment.update({
@@ -2077,6 +3312,7 @@ class ChatRuntime:
             "FL_MCP_WS_URL": self._ws_url(),
             "FL_MCP_CLIENT_ID": f"embedded-claude-{state.run_id}",
             **workflow_context_environment(state.workflow),
+            **prompt_reference_environment(mask_lane_state, prompt_value_lane_state),
             "FL_MCP_ALLOWED_TOOLS": ",".join(sorted(allowed_tools)),
             **web_search_environment(
                 settings,
@@ -2246,7 +3482,7 @@ class ChatRuntime:
             interrupt = getattr(client, "interrupt", None)
             if callable(interrupt):
                 state.cancel_callback = interrupt
-            await wait_for_claude_mcp(client)
+            await wait_for_claude_mcp(client, expected_tools=allowed_tools)
             session_id = (
                 captured_session_id
                 or (state.run_id if context_compacted else state.conversation_id)
@@ -2342,10 +3578,16 @@ class ChatRuntime:
                             isinstance(block, ToolResultBlock)
                             and block.tool_use_id in seen_tool_ids
                         ):
+                            result_content: Any = block.content
+                            if block.is_error is True:
+                                result_content = {
+                                    "isError": True,
+                                    "content": block.content,
+                                }
                             await self.publish(state, {
                                 "type": "TOOL_CALL_RESULT",
                                 "toolCallId": block.tool_use_id,
-                                "content": tool_result_content(block.content),
+                                "content": tool_result_content(result_content),
                             })
                 elif isinstance(message, ResultMessage):
                     result_message = message
@@ -2455,28 +3697,44 @@ class ChatRuntime:
             {},
         )
         latest_user_message = message_content_for_model(latest_user_item)
-        provider_user_message, context_compacted = native_prompt_with_compaction(
+        mask_lane_state = derive_mask_lane_state(messages, latest_user_message)
+        prompt_value_lane_state = derive_prompt_value_lane_state(
             messages,
             latest_user_message,
         )
+        state.provider_metadata[MASK_LANE_STATE_KEY] = mask_lane_state
+        state.provider_metadata[PROMPT_VALUE_LANE_STATE_KEY] = prompt_value_lane_state
         allowed_tools = tools_for_message(
             latest_user_message,
             str(settings.get("search_mode") or "off"),
+            mask_lane_state=mask_lane_state,
+            prompt_value_lane_state=prompt_value_lane_state,
         )
-        codex_thread_id = next(
-            (
-                str(item["metadata"]["codexThreadId"])
-                for item in reversed(messages)
-                if item["role"] == "assistant"
-                and item.get("metadata", {}).get("codexThreadId")
+        ren_tool_surface = canonical_ren_tool_surface(allowed_tools)
+        state.provider_metadata[REN_TOOL_SURFACE_KEY] = ren_tool_surface
+        codex_thread_id, tool_surface_changed = resumable_provider_thread(
+            messages,
+            thread_key="codexThreadId",
+            tool_surface=ren_tool_surface,
+        )
+        provider_user_message, context_compacted = native_prompt_with_compaction(
+            messages,
+            latest_user_message,
+            force=tool_surface_changed,
+            rollover_reason=(
+                "tool_surface_changed" if tool_surface_changed else "context_limit"
             ),
-            None,
         )
         if context_compacted:
             codex_thread_id = None
             state.provider_metadata.update({
                 "contextCompacted": True,
                 "providerThreadRolledOver": True,
+                "providerThreadRolloverReason": (
+                    "tool_surface_changed"
+                    if tool_surface_changed
+                    else "context_limit"
+                ),
             })
         mcp_environment = {
             "FL_MCP_MODE": "subprocess",
@@ -2484,6 +3742,7 @@ class ChatRuntime:
             "FL_MCP_WS_URL": self._ws_url(),
             "FL_MCP_CLIENT_ID": f"embedded-codex-{state.run_id}",
             **workflow_context_environment(state.workflow),
+            **prompt_reference_environment(mask_lane_state, prompt_value_lane_state),
             "FL_MCP_ALLOWED_TOOLS": ",".join(sorted(allowed_tools)),
             **web_search_environment(
                 settings,
@@ -2730,6 +3989,7 @@ class ChatRuntime:
                 codex._client,
                 status_params,
                 ListMcpServerStatusResponse,
+                expected_tools=allowed_tools,
             )
             unexpected_servers = [
                 item.name
