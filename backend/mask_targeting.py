@@ -632,7 +632,10 @@ def _is_safe_image_route_node(node: Mapping[str, Any]) -> bool:
     normalized = _normalized_role_name(_node_type(node))
     return any(
         marker in normalized
-        for marker in ("resize", "rescale", "scaleimage", "padimage", "imagepad", "reroute", "batch")
+        for marker in (
+            "resize", "rescale", "scaleimage", "imagescale", "imageupscale",
+            "padimage", "imagepad", "reroute", "batch",
+        )
     )
 
 

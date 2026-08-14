@@ -361,6 +361,21 @@ def test_face_swap_reference_traces_resize_to_load_image_and_downstream_prompt()
     assert mask.reason == "unique_topology_mask_source"
 
 
+@pytest.mark.parametrize(
+    "resize_node_type",
+    ["ImageScale", "ImageScaleBy", "ImageUpscaleWithModel", "ImageUpscale"],
+)
+def test_reference_trace_recognizes_native_comfyui_resize_nodes(resize_node_type):
+    graph = face_swap_resize_graph()
+    resize = next(node for node in graph["nodes"] if node["id"] == 13)
+    resize["type"] = resize_node_type
+
+    reference = resolve_reference_image_producer(graph)
+    assert reference.target is not None
+    assert reference.target.producer_node_id == 10
+    assert reference.target.route_node_ids == (10, 13, 11)
+
+
 def test_reference_trace_rejects_multi_image_upstream_and_cycles():
     graph = face_swap_resize_graph()
     resize = next(node for node in graph["nodes"] if node["id"] == 13)

@@ -1727,6 +1727,39 @@ def test_adding_a_prompt_node_remains_an_explicit_topology_change():
     assert "compile_workflow_refinement_spec" in tools_for_message(request, "free")
 
 
+@pytest.mark.parametrize(
+    "phrase",
+    (
+        "add a prompt to this node",
+        "can you add a prompt saying a red car to this node",
+        "add some text to the prompt on this node",
+        "replace the prompt on this node",
+        "remove the mask from this node",
+    ),
+)
+def test_adding_a_value_to_an_existing_node_is_not_a_topology_change(phrase):
+    assert explicit_topology_change_requested(phrase) is False
+
+
+def test_prompt_edit_referencing_a_node_by_preposition_keeps_prompt_tool():
+    request = "add a prompt to this node"
+    assert prompt_value_edit_requested(request) is True
+    tools = tools_for_message(request, "free")
+    assert "update_connected_prompt" in tools
+    assert not ({
+        "plan_workflow",
+        "compile_workflow_refinement_spec",
+        "apply_workflow_graph_patch",
+    } & tools)
+
+
+def test_combined_mask_edit_and_casual_output_check_keeps_view_output_image():
+    request = "add coverage to the mask on this node and check the output"
+    tools = tools_for_message(request, "free")
+    assert "view_output_image" in tools
+    assert "edit_node_mask" in tools
+
+
 def test_intent_tool_filter_keeps_core_and_adds_narrow_groups():
     basic = tools_for_message("Inspect the open graph")
     assert "workflow_overview" in basic

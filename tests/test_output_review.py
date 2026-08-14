@@ -1498,22 +1498,38 @@ def test_derive_prompt_update_is_literal_and_preserves_untouched_text(
     ) == expected
 
 
-@pytest.mark.parametrize(
-    ("current", "operand", "match"),
-    [
-        ("unchanged", "missing", "absent"),
-        ("x x", "x", "ambiguous"),
-        ("only", "only", "cannot be empty"),
-    ],
-)
-def test_derive_prompt_remove_exact_fails_closed(current, operand, match):
-    with pytest.raises(ValueError, match=match):
+def test_derive_prompt_remove_exact_absent_operand_fails_closed():
+    with pytest.raises(ValueError, match="absent") as excinfo:
         mcp_server._derive_prompt_update(
-            current,
+            "unchanged",
             operation="remove_exact",
-            operand=operand,
+            operand="missing",
             separator=" ",
         )
+    assert not isinstance(excinfo.value, mcp_server.PromptUpdateRecoverable)
+
+
+def test_derive_prompt_remove_exact_ambiguous_match_is_recoverable():
+    with pytest.raises(mcp_server.PromptUpdateRecoverable, match="ambiguous") as excinfo:
+        mcp_server._derive_prompt_update(
+            "x x",
+            operation="remove_exact",
+            operand="x",
+            separator=" ",
+        )
+    assert excinfo.value.code == "remove_exact_operand_ambiguous"
+    assert excinfo.value.details == {"occurrence_count": 2}
+
+
+def test_derive_prompt_remove_exact_empty_result_is_recoverable():
+    with pytest.raises(mcp_server.PromptUpdateRecoverable, match="would leave the prompt empty") as excinfo:
+        mcp_server._derive_prompt_update(
+            "only",
+            operation="remove_exact",
+            operand="only",
+            separator=" ",
+        )
+    assert excinfo.value.code == "remove_exact_result_empty"
 
 
 def test_derive_prompt_update_rejects_oversized_result_before_mutation():

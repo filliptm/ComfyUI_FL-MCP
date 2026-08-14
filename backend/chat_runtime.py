@@ -322,20 +322,35 @@ def canvas_mutation_explicitly_denied(message: str) -> bool:
     )
 
 
+_TOPOLOGY_MUTATION_VERB_PATTERN = (
+    r"(?:add|append|create|build|insert|remove|delete|replace|connect|"
+    r"disconnect|rewire)"
+)
+_TOPOLOGY_GRAPH_NOUN_PATTERN = (
+    r"(?:nodes?|edges?|links?|sockets?|inputs?|outputs?|branch|chain|graph|pipeline)"
+)
+# A graph noun immediately after one of these prepositions names an existing
+# node as a location/target ("add a prompt to this node"), not something being
+# constructed ("add a node"). Only a bare/direct-object graph noun counts as
+# topology construction.
+_TOPOLOGY_NOUN_AS_TARGET_PREFIX_PATTERN = (
+    r"(?:to|on|onto|into|for|at|from|of|in)\s+(?:the|this|that|a|an)?\s*$"
+)
+
+
 def explicit_topology_change_requested(message: str) -> bool:
     """Keep explicit node/edge construction in the GraphPatch lane."""
 
     visible = _visible_user_text(message)
+    for verb_match in re.finditer(rf"\b{_TOPOLOGY_MUTATION_VERB_PATTERN}\b", visible):
+        window = visible[verb_match.end():verb_match.end() + 100]
+        for noun_match in re.finditer(rf"\b{_TOPOLOGY_GRAPH_NOUN_PATTERN}\b", window):
+            preceding = window[:noun_match.start()]
+            if not re.search(_TOPOLOGY_NOUN_AS_TARGET_PREFIX_PATTERN, preceding):
+                return True
     return bool(
         re.search(
-            r"\b(?:add|append|create|build|insert|remove|delete|replace|connect|"
-            r"disconnect|rewire)\b.{0,100}\b(?:nodes?|edges?|links?|sockets?|"
-            r"inputs?|outputs?|branch|chain|graph|pipeline)\b",
-            visible,
-        )
-        or re.search(
-            r"\b(?:nodes?|edges?|links?|sockets?|inputs?|outputs?|branch|chain|"
-            r"graph|pipeline)\b.{0,100}\b(?:connect|disconnect|rewire)\b",
+            rf"\b{_TOPOLOGY_GRAPH_NOUN_PATTERN}\b.{{0,100}}\b(?:connect|disconnect|rewire)\b",
             visible,
         )
     )
@@ -996,7 +1011,8 @@ def _graph_compiler_optional_tools(message: str) -> set[str]:
     execution_requested = bool(
         re.search(
             r"\b(?:run|queue|execute|render)\b"
-            r"|\b(?:review|inspect|validate)\b.{0,40}\b(?:output|result)\b",
+            r"|\b(?:review|inspect|validate|check|examine)\b.{0,40}\b(?:output|result)\b"
+            r"|\blook(?:ing)?\s+at\b.{0,40}\b(?:output|result)\b",
             visible,
         )
     ) and not execution_denied

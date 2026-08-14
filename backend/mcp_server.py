@@ -3083,6 +3083,12 @@ async def update_connected_prompt(
             operand=request.prompt,
             separator=request.separator,
         )
+    except PromptUpdateRecoverable as exc:
+        release_precommit_claim()
+        return {
+            "success": False,
+            "error": {"code": exc.code, "message": str(exc), **exc.details},
+        }
     except Exception:
         release_precommit_claim()
         raise
@@ -3412,6 +3418,16 @@ def _bounded_connected_prompt(value: str, *, label: str, allow_empty: bool) -> s
     return value
 
 
+class PromptUpdateRecoverable(ValueError):
+    """A remove_exact ambiguity or empty result the caller can surface as a
+    structured, actionable response instead of a raw tool failure."""
+
+    def __init__(self, code: str, message: str, **details: Any) -> None:
+        super().__init__(message)
+        self.code = code
+        self.details = details
+
+
 def _derive_prompt_update(
     current: str,
     *,
@@ -3441,11 +3457,20 @@ def _derive_prompt_update(
         if occurrences == 0:
             raise ValueError("remove_exact operand is absent from the current prompt")
         if occurrences != 1:
-            raise ValueError(
+            raise PromptUpdateRecoverable(
+                "remove_exact_operand_ambiguous",
                 "remove_exact operand is ambiguous in the current prompt; provide a "
-                "longer exact literal"
+                "longer exact literal that matches only one occurrence.",
+                occurrence_count=occurrences,
             )
         updated = current.replace(operand, "", 1)
+        if not updated:
+            raise PromptUpdateRecoverable(
+                "remove_exact_result_empty",
+                "Removing that text would leave the prompt empty. Use operation="
+                "\"replace\" with the full desired prompt instead, or append/prepend "
+                "additional text.",
+            )
     else:
         raise ValueError("unsupported connected prompt operation")
 
