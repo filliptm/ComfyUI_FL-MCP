@@ -11,6 +11,9 @@ Keep the project focused on being a reliable MCP server and ComfyUI bridge.
 - Never store provider credentials in conversation or settings files.
 - Add tests for new tool schemas, routing behavior, and safety gates.
 - Any new third-party import lands in both `pyproject.toml` and `requirements.txt` in the same commit that introduces it. A dependency that's merely present transitively (e.g. because ComfyUI's own environment happens to have it) is not a substitute for declaring it.
+- Run `git fetch && git status` before starting new work, and confirm your branch isn't behind the remote's default branch. Building on a stale base risks silently re-implementing something another session already finished and merged.
+- Keep individual commits reviewable — a rough ceiling of 500-1000 changed lines without an explicit justification in the commit message. A feature that's naturally larger than that should land as a sequence of small, single-purpose commits rather than one unreviewable diff.
+- Before adding a new "generation" of an existing tool, chat lane, or compiler (a second implementation of something a tool already does), retire or explicitly deprecate the old one in the same change. Never leave two live, undocumented, overlapping implementations of the same capability both reachable by the model at once — that is a direct, recurring cause of tool-selection confusion in this project's history (see `docs/2026-08-ren-regression-forensic-report.md`).
 
 ## Running the test suite
 
