@@ -35,7 +35,7 @@ flowchart LR
 
 ## Highlights
 
-- **135 MCP tools** for workflow inspection, graph editing, queue control, Manager v4, model discovery, filesystem inspection, custom node development, and diagnostics.
+- **136 MCP tools** for workflow inspection, graph editing, queue control, Manager v4, model discovery, filesystem inspection, custom node development, and diagnostics.
 - **Built-in MCP chat**, powered by Ren, with streaming responses, persistent conversation history, chronological tool activity, and approval cards.
 - **Bring your own model** through LM Studio, Ollama, OpenAI, OpenRouter, Anthropic, Claude Code, Codex, or a custom OpenAI-compatible endpoint.
 - **Use existing subscriptions** from Claude Code or Codex without copying OAuth credentials into FL-MCP.
@@ -323,7 +323,7 @@ these gates, save, and restart ComfyUI.
 
 ## Tool Inventory
 
-FL-MCP currently exposes **135 tools**.
+FL-MCP currently exposes **136 tools**.
 
 <details open>
 <summary><strong>Capability and Utility Tools</strong></summary>
@@ -489,7 +489,7 @@ or stale records are discovery aids and can never authorize a build.
 | `compile_workflow_refinement_spec` | Resolves a semantic build or refinement against the active canvas and all locally loaded native, partner, and custom nodes, then returns one ready-to-apply GraphPatch v2 |
 | `apply_workflow_graph_patch` | Recompiles and atomically applies the exact root-v2 or scoped-v3 arbitrary-DAG patch without queueing, preserving unrelated graph and workflow state |
 | `compile_workflow_spec` *(legacy compatibility)* | Resolves a complete semantic request, canonicalizes dynamic inputs, binds trusted chat images, fills stable defaults, and returns one ready-to-apply valid plan |
-| `resolve_workflow_spec` | Deterministically resolves semantic roles to exact locally loaded classes with catalog pinning and origin guardrails |
+| `resolve_workflow_spec` *(legacy compatibility)* | Deterministically resolves semantic roles to exact locally loaded classes with catalog pinning and origin guardrails |
 | `plan_workflow` *(legacy compatibility)* | Dry-runs a catalog-pinned workflow plan and validates exact node schemas, values, and connections |
 | `apply_workflow_plan` *(legacy compatibility)* | Recompiles and atomically applies an exact valid plan without queueing |
 | `plan_workflow_refinement` *(legacy compatibility)* | Plans a catalog- and graph-pinned linear edit or terminal append, including exact retained-source side inputs |

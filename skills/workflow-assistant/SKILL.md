@@ -30,7 +30,7 @@ This skill is workflow-first. It borrows the old Ren Agent's operating disciplin
    - Keep the same application ID for retries so the idempotency ledger cannot duplicate work.
    - Root GraphPatch v2 and scoped GraphPatch v3 may create, update, connect, disconnect, remove, attach, and lay out arbitrary acyclic branches with fan-in, fan-out, multiple sinks, dynamic inputs, and explicit widget-to-input conversion.
    - It pins workflow, graph, catalog, and schemas; preserves unrelated state; visibly applies mutations in deterministic order; verifies the exact final graph; fully rolls back on failure; and never queues.
-   - Do not fall back to `create_nodes`, `set_node_values`, `connect_nodes_batch`, `remove_nodes`, or legacy workflow planners after a GraphPatch validation/application failure.
+   - Do not fall back to `create_nodes`, `set_node_values`, `connect_nodes_batch`, `remove_nodes`, or the legacy `compile_workflow_spec`/`resolve_workflow_spec`/`plan_workflow`/`apply_workflow_plan` compilers after a GraphPatch validation/application failure.
 4. Trust exact verification.
    - A successful application already verifies the graph, node facts, attachments, layout, and unrelated workflow envelope. Do not add redundant overview/JSON/slot/value/layout reads.
    - Inspect again only when the result reports a mismatch, the user explicitly asks for a visual check, or a later execution/output review requires it.

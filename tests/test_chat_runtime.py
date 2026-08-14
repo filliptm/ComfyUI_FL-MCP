@@ -11,6 +11,7 @@ from chat_runtime import (
     BRANCH_MUTATION_TOOLS,
     BRANCH_NAVIGATION_TOOLS,
     CONTEXT_MAX_CHARS,
+    CORE_CHAT_TOOLS,
     REFINEMENT_COMPILER_TOOLS,
     ActiveRun,
     ChatRuntime,
@@ -1784,6 +1785,12 @@ def test_intent_tool_filter_keeps_core_and_adds_narrow_groups():
     assert "web_search" not in basic
     assert "web_fetch_page" not in basic
     assert "manager_queue_action" not in basic
+    # Gen 2 (plan_workflow_refinement/apply_workflow_refinement) is fully
+    # superseded by compile_workflow_refinement_spec/apply_workflow_graph_patch
+    # and must never be offered by default alongside it.
+    assert "plan_workflow_refinement" not in basic
+    assert "apply_workflow_refinement" not in basic
+    assert not (CORE_CHAT_TOOLS & {"plan_workflow_refinement", "apply_workflow_refinement"})
 
     free_web = tools_for_message("Research current ComfyUI nodes", "free")
     assert "web_search" in free_web

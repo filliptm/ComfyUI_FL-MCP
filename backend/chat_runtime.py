@@ -175,8 +175,6 @@ CORE_CHAT_TOOLS = {
     "resolve_workflow_spec",
     "plan_workflow",
     "apply_workflow_plan",
-    "plan_workflow_refinement",
-    "apply_workflow_refinement",
     "compile_workflow_refinement_spec",
     "apply_workflow_graph_patch",
     "registry_search_packages",
@@ -2327,8 +2325,10 @@ def registry_discovery_instructions() -> str:
         "is sufficient unless the "
         "result reports a mismatch. These are the normal two workflow-building calls. Do "
         "not separately call workflow JSON, overview, catalog status, node search/details, "
-        "values, slots, layout, legacy compiler/planner, attachment placement, or low-level "
-        "create/connect/remove tools around them. If `needs_choice=true`, present the "
+        "values, slots, layout, `compile_workflow_spec`/`resolve_workflow_spec`/"
+        "`plan_workflow`/`apply_workflow_plan` (legacy fallback compilers), attachment "
+        "placement, or low-level create/connect/remove tools around them. If "
+        "`needs_choice=true`, present the "
         "ranked node, endpoint, or route candidates and wait; never accept an alphabetical "
         "guess. Partner review "
         "facts returned by the compiler are sufficient for a build-only request; do not "
