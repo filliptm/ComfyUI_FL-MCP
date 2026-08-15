@@ -1761,6 +1761,22 @@ def test_combined_mask_edit_and_casual_output_check_keeps_view_output_image():
     assert "edit_node_mask" in tools
 
 
+@pytest.mark.parametrize(
+    "phrase",
+    (
+        "pls the prompt shoulfd highligth a much more poink sand this is way to less pink",
+        "the prompt should highlight the sand more",
+        "can you emphasize the pink more in the prompt",
+        "boost the pink in the prompt",
+        "increase the saturation described in the prompt",
+        "there's way too little pink in the prompt",
+    ),
+)
+def test_prompt_intensity_phrasing_without_a_core_edit_verb_still_exposes_prompt_tool(phrase):
+    assert prompt_value_edit_requested(phrase) is True
+    assert "update_connected_prompt" in tools_for_message(phrase, "free")
+
+
 def test_intent_tool_filter_keeps_core_and_adds_narrow_groups():
     basic = tools_for_message("Inspect the open graph")
     assert "workflow_overview" in basic

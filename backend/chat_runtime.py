@@ -251,7 +251,12 @@ PROMPT_VALUE_ACTION_PATTERN = (
     r"rewrit(?:e|ten|ing)|revis(?:e|ed|ing)|updat(?:e|ed|ing)|"
     r"fix(?:ed|ing)?|correct(?:ed|ing)?|tweak(?:ed|ing)?|"
     r"refin(?:e|ed|ing)|improv(?:e|ed|ing)|reword(?:ed|ing)?|"
-    r"adapt(?:ed|ing)?|set(?:ting)?|replac(?:e|ed|ing))"
+    r"adapt(?:ed|ing)?|set(?:ting)?|replac(?:e|ed|ing)|"
+    r"highlight(?:ed|ing)?|emphasi[sz](?:e|ed|ing)|boost(?:ed|ing)?|"
+    r"intensif(?:y|ied|ying)|increas(?:e|ed|ing)|decreas(?:e|ed|ing)|"
+    r"enhanc(?:e|ed|ing)|amplif(?:y|ied|ying)|strengthen(?:ed|ing)?|"
+    r"much\s+more|much\s+less|(?:too|to)\s+(?:much|many|little|few)|"
+    r"way\s+too\s+(?:much|many|little|few))"
 )
 PROMPT_VALUE_NEGATABLE_ACTION_PATTERN = (
     rf"(?:{PROMPT_VALUE_ACTION_PATTERN}|apply(?:ing)?|use|using)"
