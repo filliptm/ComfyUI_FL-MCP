@@ -648,6 +648,46 @@ def prompt_value_edit_denied(message: str) -> bool:
     )
 
 
+def _prompt_value_tool_candidate(message: str) -> bool:
+    """Widen the default toolset with update_connected_prompt for a message
+    that plausibly wants a prompt edit but isn't confident enough for the
+    narrow prompt_value_edit_requested lane (e.g. "make it more detailed" -
+    no recognized action verb - or an unenumerated typo of a descriptive
+    word, neither of which a closed verb list can ever fully enumerate).
+
+    This only ever adds to the broad CORE_CHAT_TOOLS-based default set; it
+    never narrows or replaces it, so a false positive here costs nothing -
+    the tool sits alongside the ~35 other default tools and chat_prompt.md
+    governs whether Ren actually calls it. The alternative (growing
+    PROMPT_VALUE_ACTION_PATTERN to catch every possible edit verb) is an
+    open-set problem that keeps recurring; the negative signals reused here
+    (negation, preservation, reference-only use, read-only verbs) are a
+    closed, already-tested set, so gating on those is the safer lever.
+    """
+
+    if explicit_topology_change_requested(message):
+        return False
+    visible = _visible_user_text(message)
+    if not re.search(rf"\b{PROMPT_WORD_PATTERN}\b", visible):
+        return False
+    if prompt_value_edit_denied(message):
+        return False
+    # The prompt can also be named as reference material for editing
+    # something else ("edit image_1 using the prompt") rather than as the
+    # edit target itself. prompt_value_edit_denied doesn't cover this case -
+    # it's only handled inside prompt_value_edit_requested's clause-scoped
+    # check - so it needs its own guard here too.
+    if re.search(
+        rf"\b(?:mask|image(?:[ _-]?\d+)?|photo|picture|canvas)\b"
+        r".{0,60}\b(?:using|according\s+to|based\s+on|following|"
+        r"guided\s+by|from)\b.{0,30}"
+        rf"\b{PROMPT_WORD_PATTERN}\b",
+        visible,
+    ):
+        return False
+    return True
+
+
 def prompt_reference_image_requested(message: str) -> bool:
     """Recognize a prompt edit whose requested identity is carried by image2."""
 
@@ -2246,6 +2286,8 @@ def tools_for_message(
     selected = set(CORE_CHAT_TOOLS)
     if canvas_inspection:
         selected.update(CANVAS_IMAGE_INSPECTION_TOOLS)
+    if _prompt_value_tool_candidate(message):
+        selected.update(PROMPT_VALUE_TOOLS)
     debug_requested = any(
         word in text
         for word in (

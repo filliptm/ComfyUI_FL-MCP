@@ -1802,6 +1802,47 @@ def test_prompt_typo_fuzzy_match_never_folds_real_unrelated_words(word):
     assert chat_runtime_module._canonicalize_prompt_typos(word) == word
 
 
+@pytest.mark.parametrize(
+    "phrase",
+    (
+        "pls make the promot more detaoeld",
+        "make the prompt more detailed",
+        "can you make it more colorful in the prompt",
+    ),
+)
+def test_unrecognized_edit_phrasing_still_widens_default_toolset(phrase):
+    # "make X more Y" has no recognized action verb, so the narrow
+    # prompt_value_edit_requested lane correctly stays closed here - but the
+    # default toolset should still be widened to include the tool rather
+    # than leaving it entirely unreachable, since a closed verb list can
+    # never enumerate every natural phrasing.
+    assert prompt_value_edit_requested(phrase) is False
+    assert "update_connected_prompt" in tools_for_message(phrase, "free")
+
+
+def test_prompt_mention_alongside_other_intent_never_narrows_the_default_toolset():
+    # Widening the default toolset for an unrecognized prompt mention must
+    # never come at the cost of other default tools - unlike the narrow
+    # prompt_value_edit_requested lane (an early-return that replaces the
+    # toolset), this path only adds to it.
+    tools = tools_for_message("queue the workflow with the current prompt", "free")
+    assert "update_connected_prompt" in tools
+    assert "queue_workflow" in tools
+
+
+@pytest.mark.parametrize(
+    "phrase",
+    (
+        "edit image_1 using the prompt",
+        "refine image_1 using the prompt",
+        "edit the image according to the prompt",
+        "update the image based on the prompt",
+    ),
+)
+def test_reference_only_prompt_mention_does_not_widen_default_toolset(phrase):
+    assert "update_connected_prompt" not in tools_for_message(phrase, "free")
+
+
 def test_intent_tool_filter_keeps_core_and_adds_narrow_groups():
     basic = tools_for_message("Inspect the open graph")
     assert "workflow_overview" in basic
