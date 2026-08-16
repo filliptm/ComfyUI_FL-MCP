@@ -174,6 +174,62 @@ def test_stale_same_project_daemon_is_shutdown_before_subprocess_launch(
     ]
 
 
+@pytest.mark.parametrize("launch_mode", ["auto", "subprocess"])
+def test_stale_same_project_embedded_backend_is_shutdown_before_subprocess_launch(
+    monkeypatch,
+    launch_mode,
+):
+    # "embedded" is what a subprocess-launched backend reports when
+    # FL_MCP_MODE is unset - e.g. one left running by a ComfyUI restart that
+    # didn't actually terminate its child process. It must be replaced the
+    # same way a stale daemon is, not silently left serving old code.
+    runner = server_runner.ServerRunner(
+        BACKEND_DIR,
+        launch_mode=launch_mode,
+        auto_start=False,
+    )
+    events = []
+    monkeypatch.setattr(runner, "is_port_in_use", lambda: True)
+    monkeypatch.setattr(
+        runner,
+        "_probe_backend",
+        lambda: {
+            "reusable": False,
+            "is_fl_mcp": True,
+            "same_project": True,
+            "mode": "embedded",
+        },
+    )
+    monkeypatch.setattr(
+        runner,
+        "_request_json",
+        lambda method, path: events.append((method, path)) or {"success": True},
+    )
+    monkeypatch.setattr(
+        runner,
+        "_wait_for_port_to_close",
+        lambda: events.append(("wait", "port-close")) or True,
+    )
+    monkeypatch.setattr(
+        runner,
+        "_remove_daemon_pid_file",
+        lambda: events.append(("remove", "daemon-pid")),
+    )
+    monkeypatch.setattr(
+        runner,
+        "_launch_as_subprocess",
+        lambda: events.append(("launch", "subprocess")) or True,
+    )
+
+    assert runner.start() is True
+    assert events == [
+        ("POST", "/api/mcp/shutdown"),
+        ("wait", "port-close"),
+        ("remove", "daemon-pid"),
+        ("launch", "subprocess"),
+    ]
+
+
 def test_legacy_daemon_is_owned_only_when_local_pid_matches(tmp_path, monkeypatch):
     backend_dir = tmp_path / "project" / "backend"
     backend_dir.mkdir(parents=True)

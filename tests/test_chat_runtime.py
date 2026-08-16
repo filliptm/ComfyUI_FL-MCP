@@ -11,28 +11,47 @@ from chat_runtime import (
     BRANCH_MUTATION_TOOLS,
     BRANCH_NAVIGATION_TOOLS,
     CONTEXT_MAX_CHARS,
+    CORE_CHAT_TOOLS,
     REFINEMENT_COMPILER_TOOLS,
     ActiveRun,
     ChatRuntime,
     PendingApproval,
+    ProviderToolSurfaceMismatch,
     approval_fingerprint,
     bridge_settings,
+    build_conversation_checkpoint,
+    canvas_image_inspection_requested,
+    canvas_mutation_explicitly_denied,
+    canonical_ren_tool_surface,
     claude_tool_name,
     codex_tool_name,
     compact_messages_for_model,
     compiler_first_workflow_requested,
     conversation_needs_compaction,
+    derive_mask_lane_state,
+    derive_prompt_value_lane_state,
+    explicit_topology_change_requested,
     explicit_web_research_requested,
     install_codex_approval_handler,
+    mask_edit_requested,
     message_content_for_model,
     native_prompt_with_compaction,
     normalize_approval_decision,
     normalize_assistant_timeline,
     normalize_chat_attachments,
+    prepare_provider_tools,
+    prompt_draft_continuation_requested,
+    prompt_reference_environment,
+    prompt_reference_image_requested,
+    prompt_value_edit_requested,
+    resumable_provider_thread,
     registry_discovery_instructions,
     ren_instructions,
+    require_provider_tool_surface,
     should_request_approval,
     tool_result_content,
+    tool_result_is_error,
+    tool_result_needs_choice,
     tools_for_message,
     wait_for_claude_mcp,
     wait_for_codex_mcp_status,
@@ -126,7 +145,7 @@ def test_provider_usage_rolls_native_thread_into_bounded_prompt():
             "role": "assistant",
             "content": "Previous result",
             "status": "complete",
-            "metadata": {"usage": {"total": {"totalTokens": 70_000}}},
+            "metadata": {"usage": {"last": {"inputTokens": 70_000}}},
         },
         {
             "id": "user-new",
@@ -147,6 +166,108 @@ def test_provider_usage_rolls_native_thread_into_bounded_prompt():
     assert "provider thread was rolled over" in prompt
     assert prompt.endswith("Continue with the selected nodes")
     assert len(prompt) <= CONTEXT_MAX_CHARS
+
+
+def test_native_rollover_uses_only_current_thread_input_context():
+    messages = [
+        {
+            "role": "assistant",
+            "content": "old thread",
+            "metadata": {
+                "codexThreadId": "old",
+                "usage": {
+                    "last": {"inputTokens": 80_000},
+                    "total": {"totalTokens": 280_000},
+                },
+            },
+        },
+        {
+            "role": "assistant",
+            "content": "new thread",
+            "metadata": {
+                "codexThreadId": "new",
+                "providerThreadRolledOver": True,
+                "usage": {
+                    "last": {"inputTokens": 32_000},
+                    "total": {"totalTokens": 310_000},
+                },
+            },
+        },
+        {"role": "user", "content": "retry", "metadata": {}},
+    ]
+
+    assert conversation_needs_compaction(messages) is False
+    messages[1]["metadata"]["usage"]["last"]["inputTokens"] = 70_000
+    assert conversation_needs_compaction(messages) is True
+
+
+def test_checkpoint_preserves_bounded_mask_and_prompt_locators_without_tokens():
+    messages = [
+        {
+            "role": "assistant",
+            "content": "Mask inspected.",
+            "status": "complete",
+            "metadata": {
+                "maskLane": {
+                    "active": True,
+                    "promptValueEdit": True,
+                    "promptReferenceImage": True,
+                    "attachmentAvailable": False,
+                },
+                "toolSteps": [{
+                    "name": "edit_node_mask",
+                    "status": "done",
+                    "result": json.dumps({
+                        "structuredContent": {
+                            "success": True,
+                            "node_id": "1",
+                            "title": "LOAD & MASK IMAGE",
+                            "source_image": {
+                                "filename": "source.png",
+                                "subfolder": "",
+                                "type": "input",
+                            },
+                            "image_size": {"width": 3584, "height": 1536},
+                            "review_token": "must-not-survive-rollover",
+                            "graph_hash": "graph-123",
+                        },
+                    }),
+                }],
+            },
+        },
+        {
+            "role": "assistant",
+            "content": "Prompt updated.",
+            "status": "complete",
+            "metadata": {
+                "promptValueLane": {"active": True, "referenceImage": True},
+                "toolSteps": [{
+                    "name": "update_connected_prompt",
+                    "status": "done",
+                    "result": json.dumps({
+                        "structuredContent": {
+                            "success": True,
+                            "producer_node_id": "34",
+                            "producer_title": "Face Prompt",
+                            "widget_name": "value",
+                            "workflow_hash": "workflow-456",
+                        },
+                    }),
+                }],
+            },
+        },
+    ]
+
+    checkpoint = build_conversation_checkpoint(messages)
+
+    assert "mask_lane=active" in checkpoint
+    assert '"node_id":"1"' in checkpoint
+    assert '"filename":"source.png"' in checkpoint
+    assert '"graph_hash":"graph-123"' in checkpoint
+    assert "prompt_value_lane=active,reference=true" in checkpoint
+    assert '"node_id":"34"' in checkpoint
+    assert '"workflow_hash":"workflow-456"' in checkpoint
+    assert "must-not-survive-rollover" not in checkpoint
 
 
 @pytest.mark.asyncio
@@ -462,6 +583,1266 @@ async def test_global_bypass_does_not_release_mandatory_mask_review(tmp_path):
     assert "mask-review-1" in runtime.approvals
 
 
+def test_recorded_typo_heavy_mask_request_uses_exact_bounded_lane():
+    request = (
+        "hey, we want that theface of the bue haired girl in image_1 is masked "
+        "so that we cna replaxce it with the frefernce of image_2 showing the "
+        "women coverd in dust, we wnat to reinfiorece and do a face swap so "
+        "that the she has the right facual identeity, pks adjust the prompt and "
+        "raw the mask"
+    )
+
+    assert mask_edit_requested(request) is True
+    assert prompt_value_edit_requested(request) is True
+    assert explicit_topology_change_requested(request) is False
+    assert tools_for_message(request, "free") == {
+        "view_prompt_reference_image",
+        "update_connected_prompt",
+        "view_node_mask",
+        "edit_node_mask",
+        "confirm_mask_review",
+    }
+
+
+def test_recorded_missing_initial_adjust_typo_keeps_complete_combined_lane():
+    request = (
+        "pls create a mask on the vest of the blue haired girl in the right "
+        "in image1. And djust the prompt accordingly that the leopard vest "
+        "with the bue powder spr4inkeld across it shown in image_2 replaces "
+        "the old vest shown in image_1 image1 is the main edit source and "
+        "source of trtuthn"
+    )
+
+    assert mask_edit_requested(request) is True
+    assert prompt_value_edit_requested(request) is True
+    assert prompt_reference_image_requested(request) is True
+    state = derive_mask_lane_state(
+        [{"role": "user", "content": request, "metadata": {}}],
+        request,
+    )
+    assert state == {
+        "active": True,
+        "promptValueEdit": True,
+        "promptReferenceImage": True,
+        "attachmentAvailable": False,
+    }
+    assert tools_for_message(request, "free", mask_lane_state=state) == {
+        "view_prompt_reference_image",
+        "update_connected_prompt",
+        "view_node_mask",
+        "edit_node_mask",
+        "confirm_mask_review",
+    }
+
+
+def test_canvas_image_analysis_remains_available_inside_prompt_lane():
+    request = (
+        "Analyze every vehicle in all images already on the canvas, then adjust "
+        "the prompt while keeping image_1 as the main source of truth."
+    )
+
+    assert canvas_image_inspection_requested(request) is True
+    assert prompt_value_edit_requested(request) is True
+    assert tools_for_message(request, "free") == {
+        "view_canvas_images",
+        "update_connected_prompt",
+    }
+
+    analysis_only = "pls analyze them all, they are already in the canvas"
+    assert canvas_image_inspection_requested(analysis_only) is True
+    assert "view_canvas_images" in tools_for_message(analysis_only, "free")
+
+    assert canvas_image_inspection_requested("can u inspect the image son the canavs?")
+    assert canvas_image_inspection_requested("Call view_canvas_images now")
+    assert canvas_image_inspection_requested("Show me all images on the canvas")
+    assert canvas_image_inspection_requested("What images are on the canvas?")
+    assert not canvas_image_inspection_requested(
+        "Review the final output image for distortion"
+    )
+    assert not canvas_image_inspection_requested(
+        "Inspect the attached image, then queue this workflow"
+    )
+
+    live_read_only_request = (
+        "Inspect every image currently on the canvas, including disconnected image "
+        "nodes. Use the canvas image viewer and page until has_more=false. Return "
+        "each node ID, filename, visual contents, and its Nano Banana image_N mapping "
+        "when connected. Do not modify the canvas."
+    )
+    assert canvas_image_inspection_requested(live_read_only_request) is True
+    assert canvas_mutation_explicitly_denied(live_read_only_request) is True
+    assert tools_for_message(live_read_only_request, "free") == {
+        "view_canvas_images",
+        "workflow_get_current_json",
+        "workflow_overview",
+        "find_node",
+        "get_node_slots",
+    }
+    assert workflow_graph_change_requested(live_read_only_request) is True
+    assert "queue_workflow" not in tools_for_message(live_read_only_request, "free")
+    assert "apply_workflow_graph_patch" not in tools_for_message(
+        live_read_only_request,
+        "free",
+    )
+
+    combined_inspect_and_build = (
+        "Inspect all canvas images, then add a SaveImage node after the output."
+    )
+    assert tools_for_message(combined_inspect_and_build, "free") == {
+        "view_canvas_images",
+        "compile_workflow_refinement_spec",
+        "apply_workflow_graph_patch",
+    }
+
+    attachment_edit = (
+        "Adjust the prompt to match this attached texture."
+        "\n\nThe user attached ComfyUI input image(s) to this message. "
+        "Use view_chat_image with the attachment reference."
+    )
+    assert tools_for_message(attachment_edit, "free") == {
+        "view_chat_image",
+        "update_connected_prompt",
+    }
+
+
+def test_native_provider_resume_requires_exact_current_ren_tool_surface():
+    narrow = canonical_ren_tool_surface({"update_connected_prompt"})
+    broad = canonical_ren_tool_surface({
+        "update_connected_prompt",
+        "view_canvas_images",
+    })
+    messages = [{
+        "role": "assistant",
+        "content": "Ready.",
+        "metadata": {
+            "codexThreadId": "thread-narrow",
+            "renToolSurface": narrow,
+        },
+    }]
+
+    assert resumable_provider_thread(
+        messages,
+        thread_key="codexThreadId",
+        tool_surface=narrow,
+    ) == ("thread-narrow", False)
+    assert resumable_provider_thread(
+        messages,
+        thread_key="codexThreadId",
+        tool_surface=broad,
+    ) == (None, True)
+
+    messages[0]["metadata"].pop("renToolSurface")
+    assert resumable_provider_thread(
+        messages,
+        thread_key="codexThreadId",
+        tool_surface=narrow,
+    ) == (None, True)
+
+
+def test_tool_surface_rollover_injects_bounded_authoritative_context():
+    messages = [
+        {"role": "user", "content": "Adjust the prompt.", "metadata": {}},
+        {
+            "role": "assistant",
+            "content": "Only prompt updating is available.",
+            "metadata": {"codexThreadId": "old"},
+        },
+        {
+            "role": "user",
+            "content": "Analyze all images already on the canvas.",
+            "metadata": {},
+        },
+    ]
+
+    prompt, compacted = native_prompt_with_compaction(
+        messages,
+        "Analyze all images already on the canvas.",
+        force=True,
+        rollover_reason="tool_surface_changed",
+    )
+
+    assert compacted is True
+    assert "current Ren tool surface is authoritative" in prompt
+    assert "ignore earlier claims" in prompt.lower()
+    assert "Analyze all images already on the canvas." in prompt
+
+
+def test_retry_repairs_stale_combined_lane_metadata_from_exact_prior_request():
+    request = (
+        "Create a mask on the vest in image1 and djust the prompt accordingly "
+        "using the vest in image_2."
+    )
+    messages = [
+        {"role": "user", "content": request, "metadata": {}},
+        {
+            "role": "assistant",
+            "content": "The prompt-update tool was unavailable.",
+            "metadata": {
+                "maskLane": {
+                    "active": True,
+                    "promptValueEdit": False,
+                    "promptReferenceImage": True,
+                    "attachmentAvailable": False,
+                },
+                "toolSteps": [
+                    {"name": "view_prompt_reference_image", "status": "done"},
+                ],
+            },
+        },
+        {"role": "user", "content": "retry", "metadata": {}},
+    ]
+
+    state = derive_mask_lane_state(messages, "retry")
+    assert state["promptValueEdit"] is True
+    assert tools_for_message("retry", "free", mask_lane_state=state) == {
+        "view_prompt_reference_image",
+        "update_connected_prompt",
+        "view_node_mask",
+        "edit_node_mask",
+        "confirm_mask_review",
+    }
+
+    mask_only = [
+        {
+            "role": "user",
+            "content": "Mask the vest in image1 using image_2 as reference.",
+            "metadata": {},
+        },
+        {
+            "role": "assistant",
+            "content": "Ready to continue.",
+            "metadata": {
+                "maskLane": {
+                    "active": True,
+                    "promptValueEdit": False,
+                    "promptReferenceImage": True,
+                    "attachmentAvailable": False,
+                },
+            },
+        },
+        {"role": "user", "content": "retry", "metadata": {}},
+    ]
+    assert derive_mask_lane_state(mask_only, "retry")["promptValueEdit"] is False
+
+    no_reference = [
+        {
+            "role": "user",
+            "content": "Mask the vest and djust the prompt accordingly.",
+            "metadata": {},
+        },
+        {
+            "role": "assistant",
+            "content": "The prompt-update tool was unavailable.",
+            "metadata": {
+                "maskLane": {
+                    "active": True,
+                    "promptValueEdit": False,
+                    "promptReferenceImage": False,
+                    "attachmentAvailable": False,
+                },
+            },
+        },
+        {"role": "user", "content": "retry", "metadata": {}},
+    ]
+    assert derive_mask_lane_state(no_reference, "retry")["promptValueEdit"] is True
+
+
+@pytest.mark.parametrize(
+    "latest",
+    (
+        "retry, don't update the prompt",
+        "retry but leave the prompt alone",
+        "retry; give me the prompt here, don't add it",
+        "retry; show me the prompt only",
+        "retry but preserve the prompt",
+        "retry but keep the prompt",
+        "retry; do not touch the prompt",
+        "retry, no prompt changes",
+        "retry; prompt stays the same",
+    ),
+)
+def test_mask_retry_explicit_prompt_denial_narrows_stored_lane(latest):
+    messages = [
+        {
+            "role": "user",
+            "content": "Mask the vest and djust the prompt using image_2.",
+            "metadata": {},
+        },
+        {
+            "role": "assistant",
+            "content": "The prompt tool was unavailable.",
+            "metadata": {
+                "maskLane": {
+                    "active": True,
+                    "promptValueEdit": False,
+                    "promptReferenceImage": True,
+                    "attachmentAvailable": False,
+                },
+            },
+        },
+        {"role": "user", "content": latest, "metadata": {}},
+    ]
+    state = derive_mask_lane_state(messages, latest)
+    assert state["promptValueEdit"] is False
+    assert "update_connected_prompt" not in tools_for_message(
+        latest,
+        "free",
+        mask_lane_state=state,
+    )
+
+    messages[-2]["metadata"]["maskLane"]["promptValueEdit"] = True
+    state = derive_mask_lane_state(messages, latest)
+    assert state["promptValueEdit"] is False
+
+
+@pytest.mark.parametrize(
+    "message",
+    (
+        "Draw a mask over her face.",
+        "Paint the face mask again.",
+        "Inpaint only the damaged cheek.",
+        "Do a face swap using the current references.",
+    ),
+)
+def test_natural_mask_intent_does_not_expose_graph_or_legacy_planners(message):
+    assert mask_edit_requested(message) is True
+    assert tools_for_message(message, "free") == {
+        "view_node_mask",
+        "edit_node_mask",
+        "confirm_mask_review",
+    }
+
+
+def test_explicit_mask_topology_stays_in_graphpatch_lane():
+    request = "Create a mask node and connect it to the inpaint input."
+
+    assert explicit_topology_change_requested(request) is True
+    assert mask_edit_requested(request) is False
+    tools = tools_for_message(request, "free")
+    assert {
+        "compile_workflow_refinement_spec",
+        "apply_workflow_graph_patch",
+    } <= tools
+    assert "update_connected_prompt" not in tools
+    assert "plan_workflow" not in tools
+
+
+def test_mask_lane_survives_terse_and_attachment_followups_without_core_tools():
+    original = "Please adjust the prompt for image2 and draw the face mask."
+    stored_state = {
+        "active": True,
+        "promptValueEdit": True,
+        "promptReferenceImage": True,
+        "attachmentAvailable": False,
+    }
+    messages = [
+        {"role": "user", "content": original, "metadata": {}},
+        {
+            "role": "assistant",
+            "content": "I need the original image.",
+            "metadata": {"maskLane": stored_state},
+        },
+        {"role": "user", "content": "ok do it agin", "metadata": {}},
+    ]
+
+    state = derive_mask_lane_state(messages, "ok do it agin")
+    assert state == stored_state
+    assert tools_for_message("ok do it agin", mask_lane_state=state) == {
+        "view_prompt_reference_image",
+        "update_connected_prompt",
+        "view_node_mask",
+        "edit_node_mask",
+        "confirm_mask_review",
+    }
+
+    attached = (
+        "\n\nThe user attached ComfyUI input image(s) to this message. "
+        "Use view_chat_image with the attachment reference."
+    )
+    state = derive_mask_lane_state(messages, attached)
+    assert state["attachmentAvailable"] is True
+    assert tools_for_message(attached, mask_lane_state=state) == {
+        "view_prompt_reference_image",
+        "update_connected_prompt",
+        "view_node_mask",
+        "edit_node_mask",
+        "confirm_mask_review",
+        "view_chat_image",
+        "place_chat_image_in_node",
+    }
+    assert derive_mask_lane_state(messages, "What is the queue status?")["active"] is False
+
+
+def test_prompt_only_reference_edit_uses_one_shot_value_lane_and_persists():
+    request = (
+        "ps adjust the prompt accodingy to the new refneced chxracter which is "
+        "placed in image2"
+    )
+
+    assert prompt_value_edit_requested(request) is True
+    assert mask_edit_requested(request) is False
+    assert workflow_graph_change_requested(request) is False
+    assert tools_for_message(request, "free") == {
+        "view_prompt_reference_image",
+        "update_connected_prompt",
+    }
+
+    messages = [
+        {"role": "user", "content": request, "metadata": {}},
+        {
+            "role": "assistant",
+            "content": "The prompt target was ambiguous.",
+            "metadata": {
+                "promptValueLane": {"active": True, "referenceImage": True},
+            },
+        },
+        {"role": "user", "content": "retry", "metadata": {}},
+    ]
+    state = derive_prompt_value_lane_state(messages, "retry")
+    assert state == {"active": True, "referenceImage": True}
+    retry_tools = tools_for_message("retry", prompt_value_lane_state=state)
+    assert retry_tools == {
+        "view_prompt_reference_image",
+        "update_connected_prompt",
+    }
+    assert not ({"plan_workflow", "compile_workflow_refinement_spec"} & retry_tools)
+
+
+def test_typo_and_deictic_prompt_corrections_skip_inactive_lane_metadata():
+    original = "Adjust the prompt to use the identity from image2."
+    typo_correction = "the pormot is not adjusted?"
+    deictic_correction = (
+        "it shoud mainly be centerd around the guy no blond women or anything"
+    )
+    inactive_lane = {"active": False, "referenceImage": False}
+
+    first_messages = [
+        {"role": "user", "content": original, "metadata": {}},
+        {
+            "role": "assistant",
+            "content": "The reference-aware prompt was updated.",
+            "metadata": {
+                "promptValueLane": inactive_lane,
+                "maskLane": {
+                    "active": True,
+                    "promptValueEdit": True,
+                    "promptReferenceImage": True,
+                },
+            },
+        },
+        {"role": "user", "content": typo_correction, "metadata": {}},
+    ]
+    typo_state = derive_prompt_value_lane_state(first_messages, typo_correction)
+    assert prompt_value_edit_requested(typo_correction) is True
+    assert typo_state == {"active": True, "referenceImage": False}
+    assert tools_for_message(
+        typo_correction,
+        "free",
+        prompt_value_lane_state=typo_state,
+    ) == {"update_connected_prompt"}
+
+    second_messages = [
+        *first_messages[:-1],
+        {"role": "user", "content": typo_correction, "metadata": {}},
+        {
+            "role": "assistant",
+            "content": "The prompt tool was unavailable.",
+            "metadata": {"promptValueLane": inactive_lane},
+        },
+        {"role": "user", "content": deictic_correction, "metadata": {}},
+    ]
+    deictic_state = derive_prompt_value_lane_state(
+        second_messages,
+        deictic_correction,
+    )
+    assert prompt_value_edit_requested(deictic_correction) is False
+    assert deictic_state == {"active": True, "referenceImage": False}
+    assert tools_for_message(
+        deictic_correction,
+        "free",
+        prompt_value_lane_state=deictic_state,
+    ) == {"update_connected_prompt"}
+
+
+def test_recorded_action_typo_after_read_only_analysis_routes_one_safe_tool():
+    successful_update = {
+        "role": "assistant",
+        "content": "The coat prompt was updated.",
+        "metadata": {
+            "contextCompacted": True,
+            "providerThreadRolledOver": True,
+            "promptValueLane": {"active": False, "referenceImage": False},
+            "maskLane": {
+                "active": True,
+                "promptValueEdit": True,
+                "promptReferenceImage": False,
+                "attachmentAvailable": False,
+            },
+            "toolSteps": [{
+                "name": "update_connected_prompt",
+                "status": "done",
+            }],
+        },
+    }
+    texture_analysis = (
+        "its not leather its ike fuzzy curodury, analyze the texture more "
+        "specific and tell me what you see"
+    )
+    latest = "adjsut the prompt"
+    messages = [
+        {
+            "role": "user",
+            "content": "we still dont have reach the exact texture of he coat",
+            "metadata": {},
+        },
+        successful_update,
+        {"role": "user", "content": texture_analysis, "metadata": {}},
+        {
+            "role": "assistant",
+            "content": "The material looks like wide-wale corduroy.",
+            "metadata": {
+                "promptValueLane": {"active": False, "referenceImage": False},
+                "maskLane": {
+                    "active": False,
+                    "promptValueEdit": False,
+                    "promptReferenceImage": False,
+                    "attachmentAvailable": False,
+                },
+                "toolSteps": [{"name": "view_node_mask", "status": "done"}],
+            },
+        },
+        {"role": "user", "content": latest, "metadata": {}},
+    ]
+
+    assert prompt_value_edit_requested(latest) is True
+    state = derive_prompt_value_lane_state(messages, latest)
+    assert state == {"active": True, "referenceImage": False}
+    selected = tools_for_message(
+        latest,
+        "free",
+        prompt_value_lane_state=state,
+    )
+    assert selected == {"update_connected_prompt"}
+    assert not ({
+        "set_node_values",
+        "plan_workflow",
+        "apply_workflow_plan",
+        "queue_workflow",
+    } & selected)
+
+
+def test_recorded_prompt_noun_typo_inherits_immediate_reference_draft():
+    latest = "can u add the pronmpt now"
+    messages = [
+        {
+            "role": "user",
+            "content": (
+                "nooooo its not the texture.... pls analyze the tetxure of the "
+                "coat in image_2 and give me the refined prompt"
+            ),
+            "metadata": {},
+        },
+        {
+            "role": "assistant",
+            "content": "I inspected image_2. Use this refined prompt: brushed wool.",
+            "status": "complete",
+            "metadata": {
+                "promptValueLane": {"active": False, "referenceImage": False},
+                "toolSteps": [{"name": "view_chat_image", "status": "done"}],
+            },
+        },
+        {"role": "user", "content": latest, "metadata": {}},
+    ]
+
+    assert prompt_value_edit_requested(latest) is True
+    state = derive_prompt_value_lane_state(messages, latest)
+    assert state == {"active": True, "referenceImage": True}
+    selected = tools_for_message(
+        latest,
+        "free",
+        prompt_value_lane_state=state,
+    )
+    assert selected == {
+        "view_prompt_reference_image",
+        "update_connected_prompt",
+    }
+    assert prompt_reference_environment(
+        {"active": False, "promptReferenceImage": False},
+        state,
+    ) == {"FL_MCP_PROMPT_REFERENCE_REQUIRED": "1"}
+    assert not ({
+        "set_node_values",
+        "plan_workflow",
+        "apply_workflow_plan",
+        "queue_workflow",
+    } & selected)
+
+
+@pytest.mark.parametrize(
+    "messages",
+    (
+        [],
+        [
+            {
+                "role": "user",
+                "content": "Analyze image_2 and draft the prompt.",
+                "metadata": {},
+            },
+            {
+                "role": "assistant",
+                "content": "Inspection failed.",
+                "metadata": {
+                    "toolSteps": [{"name": "view_chat_image", "status": "failed"}],
+                },
+            },
+        ],
+        [
+            {
+                "role": "user",
+                "content": "Analyze image_2 and draft the prompt.",
+                "metadata": {},
+            },
+            {
+                "role": "assistant",
+                "content": "Draft ready.",
+                "metadata": {
+                    "toolSteps": [{"name": "view_chat_image", "status": "done"}],
+                },
+            },
+            {"role": "user", "content": "What is the queue status?", "metadata": {}},
+            {"role": "assistant", "content": "The queue is empty.", "metadata": {}},
+        ],
+    ),
+)
+def test_reference_draft_handoff_requires_immediate_successful_inspection(messages):
+    latest = "can u add the pronmpt now"
+    state = derive_prompt_value_lane_state(
+        [*messages, {"role": "user", "content": latest, "metadata": {}}],
+        latest,
+    )
+    assert state == {"active": True, "referenceImage": False}
+    assert tools_for_message(
+        latest,
+        "free",
+        prompt_value_lane_state=state,
+    ) == {"update_connected_prompt"}
+
+
+@pytest.mark.parametrize(
+    ("prior_user", "assistant_status", "assistant_content"),
+    (
+        ("Inspect image_2.", "complete", "Image inspection complete."),
+        (
+            "Analyze image_2 and give me a refined prompt.",
+            "interrupted",
+            "Draft interrupted.",
+        ),
+        ("Analyze image_2 and draft the prompt.", "complete", ""),
+    ),
+)
+def test_reference_draft_handoff_rejects_incomplete_or_non_draft_context(
+    prior_user,
+    assistant_status,
+    assistant_content,
+):
+    latest = "can u add the pronmpt now"
+    messages = [
+        {"role": "user", "content": prior_user, "metadata": {}},
+        {
+            "role": "assistant",
+            "content": assistant_content,
+            "status": assistant_status,
+            "metadata": {
+                "toolSteps": [{"name": "view_chat_image", "status": "done"}],
+            },
+        },
+        {"role": "user", "content": latest, "metadata": {}},
+    ]
+    assert derive_prompt_value_lane_state(messages, latest) == {
+        "active": True,
+        "referenceImage": False,
+    }
+
+
+def test_negated_prompt_draft_handoff_does_not_inherit_reference_authority():
+    for request in (
+        "don't add the pronmpt now",
+        "don't add the pronmpt now please",
+        "do not add the pronmpt now, I only want to review it",
+        "without adding the pronmpt, show it to me",
+        "please refrain from adding the pronmpt",
+        "hold off on adding the pronmpt",
+        "not now; add the pronmpt later",
+    ):
+        assert prompt_draft_continuation_requested(request) is False
+        assert prompt_value_edit_requested(request) is False
+
+
+@pytest.mark.parametrize(
+    ("prior_user", "assistant_content", "tool_result"),
+    (
+        (
+            "Do not use image_2; draft the prompt from image_1.",
+            "Here is the refined prompt.",
+            None,
+        ),
+        (
+            "Analyze image_2 and draft the prompt.",
+            "I inspected image_2 but couldn't draft the prompt.",
+            None,
+        ),
+        (
+            "Analyze image_2 and draft the prompt.",
+            "Here is the refined prompt.",
+            '{"structuredContent":{"success":false,"error":"unavailable"}}',
+        ),
+    ),
+)
+def test_reference_draft_handoff_rejects_negated_or_failed_evidence(
+    prior_user,
+    assistant_content,
+    tool_result,
+):
+    latest = "can u add the pronmpt now"
+    messages = [
+        {"role": "user", "content": prior_user, "metadata": {}},
+        {
+            "role": "assistant",
+            "content": assistant_content,
+            "status": "complete",
+            "metadata": {
+                "toolSteps": [{
+                    "name": "view_chat_image",
+                    "status": "done",
+                    "result": tool_result,
+                }],
+            },
+        },
+        {"role": "user", "content": latest, "metadata": {}},
+    ]
+    assert derive_prompt_value_lane_state(messages, latest) == {
+        "active": True,
+        "referenceImage": False,
+    }
+
+
+def test_prompt_correction_survives_one_read_only_mask_inspection_turn():
+    latest = "Use fuzzy wide-wale corduroy texture instead of leather."
+    messages = [
+        {
+            "role": "assistant",
+            "content": "The earlier prompt was updated.",
+            "metadata": {
+                "toolSteps": [{
+                    "name": "update_connected_prompt",
+                    "status": "done",
+                }],
+            },
+        },
+        {
+            "role": "user",
+            "content": "analyze the coat texture more specifically",
+            "metadata": {},
+        },
+        {
+            "role": "assistant",
+            "content": "The mask source shows a ribbed fabric.",
+            "metadata": {
+                "promptValueLane": {"active": False, "referenceImage": False},
+                "toolSteps": [{"name": "view_node_mask", "status": "done"}],
+            },
+        },
+        {"role": "user", "content": latest, "metadata": {}},
+    ]
+
+    state = derive_prompt_value_lane_state(messages, latest)
+    assert state == {"active": True, "referenceImage": False}
+    assert tools_for_message(
+        latest,
+        "free",
+        prompt_value_lane_state=state,
+    ) == {"update_connected_prompt"}
+
+
+@pytest.mark.parametrize(
+    ("phrase", "expected_edit"),
+    (
+        ("adjsut the prompt", True),
+        ("djust the prompt", True),
+        ("can u add the pronmpt now", True),
+        ("analyze the prompt", False),
+        ("give me the prompt", False),
+        ("show the prompt", False),
+        ("adjsut the mask", False),
+        ("djust the mask", False),
+        ("just the prompt", False),
+    ),
+)
+def test_prompt_action_typo_is_bounded_to_prompt_value_edits(phrase, expected_edit):
+    assert prompt_value_edit_requested(phrase) is expected_edit
+
+
+def test_prompt_action_typo_does_not_capture_an_explicit_connection_edit():
+    request = "adjsut the prompt node and connect it to the sampler"
+    assert explicit_topology_change_requested(request) is True
+    assert prompt_value_edit_requested(request) is False
+    assert tools_for_message(request, "free") == {
+        "compile_workflow_refinement_spec",
+        "apply_workflow_graph_patch",
+    }
+
+    noun_typo = "add the pronmpt node and connect it to the sampler"
+    assert explicit_topology_change_requested(noun_typo) is True
+    assert prompt_value_edit_requested(noun_typo) is False
+    assert tools_for_message(noun_typo, "free") == {
+        "compile_workflow_refinement_spec",
+        "apply_workflow_graph_patch",
+    }
+
+    missing_initial = "djust the prompt node and connect it to the sampler"
+    assert explicit_topology_change_requested(missing_initial) is True
+    assert prompt_value_edit_requested(missing_initial) is False
+
+
+@pytest.mark.parametrize(
+    "phrase",
+    (
+        "don't adjust the prompt",
+        "do not adjsut the prompt",
+        "don't djust the prompt",
+        "do not remove the prompt",
+        "without modifying the prompt",
+        "refrain from revising the prompt",
+    ),
+)
+def test_negated_prompt_actions_never_expose_prompt_mutation(phrase):
+    assert prompt_value_edit_requested(phrase) is False
+    assert "update_connected_prompt" not in tools_for_message(phrase, "free")
+
+
+@pytest.mark.parametrize(
+    "phrase",
+    (
+        "don't change image_1; adjust the prompt",
+        "do not edit the mask, but update the prompt",
+        "without modifying image_1, revise the prompt",
+        "without changing anything else, adjust the prompt",
+        "do not change anything except adjust the prompt",
+    ),
+)
+def test_negated_nonprompt_clause_does_not_hide_positive_prompt_edit(phrase):
+    assert prompt_value_edit_requested(phrase) is True
+    tools = tools_for_message(phrase, "free")
+    assert "update_connected_prompt" in tools
+    assert not ({
+        "plan_workflow",
+        "plan_workflow_refinement",
+        "compile_workflow_refinement_spec",
+        "apply_workflow_graph_patch",
+        "set_node_values",
+        "queue_workflow",
+    } & tools)
+
+
+@pytest.mark.parametrize(
+    "phrase",
+    (
+        "adjust the mask and show me the prompt",
+        "adjust the mask; give me the prompt",
+        "change image1 then give me the prompt",
+        "adjust image_1 and show me the prompt",
+        "change image-2 then display the prompt",
+        "edit image_1 using the prompt",
+        "edit the image according to the prompt",
+        "update the image based on the prompt",
+        "change the mask according to the prompt",
+        "adjust the canvas based on the prompt",
+    ),
+)
+def test_mask_action_followed_by_prompt_read_does_not_become_prompt_mutation(phrase):
+    assert prompt_value_edit_requested(phrase) is False
+    assert "update_connected_prompt" not in tools_for_message(phrase, "free")
+
+
+@pytest.mark.parametrize(
+    "phrase",
+    (
+        "adjust the mask; keep the prompt unchanged",
+        "change image1 but leave the prompt alone",
+        "edit image_1 and do not update the prompt",
+        "modify the mask, prompt unchanged",
+    ),
+)
+def test_canvas_edit_with_prompt_preservation_never_exposes_prompt_mutation(phrase):
+    assert prompt_value_edit_requested(phrase) is False
+    assert "update_connected_prompt" not in tools_for_message(phrase, "free")
+
+
+@pytest.mark.parametrize(
+    "phrase",
+    (
+        "fix the prompt",
+        "correct the prompt",
+        "tweak the prompt",
+        "refine the prompt",
+        "improve the prompt",
+        "reword the prompt",
+        "adapt the prompt to image_2",
+        "update both the positive and negative prompts",
+        "change the positive and negative prompts",
+        "adjust the style and prompt",
+    ),
+)
+def test_intuitive_and_coordinated_prompt_edits_use_the_narrow_lane(phrase):
+    assert prompt_value_edit_requested(phrase) is True
+    tools = tools_for_message(phrase, "free")
+    assert "update_connected_prompt" in tools
+    assert not ({"set_node_values", "queue_workflow", "plan_workflow"} & tools)
+
+
+@pytest.mark.parametrize(
+    "phrase",
+    (
+        "don't fix the prompt",
+        "do not refine the prompt",
+        "refine image_1 using the prompt",
+    ),
+)
+def test_new_prompt_actions_remain_bounded_by_denial_and_target(phrase):
+    assert prompt_value_edit_requested(phrase) is False
+    assert "update_connected_prompt" not in tools_for_message(phrase, "free")
+
+
+@pytest.mark.parametrize(
+    "phrase",
+    (
+        "keep the current prompt and add 'cinematic lighting'",
+        "preserve the existing prompt and append 'blue powder'",
+        "don't replace the prompt; append 'blue powder'",
+        "leave the prompt as-is except add 'blue powder'",
+        "keep the prompt, but update the garment description",
+        "retain the prompt and change only the texture wording",
+    ),
+)
+def test_prompt_preservation_plus_explicit_delta_uses_narrow_value_edit(phrase):
+    assert prompt_value_edit_requested(phrase) is True
+    tools = tools_for_message(phrase, "free")
+    assert tools == {"update_connected_prompt"}
+
+
+@pytest.mark.parametrize(
+    "phrase",
+    (
+        "keep the prompt and do not add anything",
+        "preserve the prompt but don't change it",
+        "don't replace the prompt; don't append anything",
+        "leave the prompt as-is except do not add anything",
+        "retain the prompt and never change it",
+        "keep the prompt but update nothing",
+        "preserve the prompt and append nothing",
+        "keep the prompt and remove nothing",
+    ),
+)
+def test_prompt_preservation_without_a_positive_delta_never_mutates(phrase):
+    assert prompt_value_edit_requested(phrase) is False
+    assert "update_connected_prompt" not in tools_for_message(phrase, "free")
+
+
+def test_provider_tool_surface_validation_is_exact_and_bounded():
+    definitions = [
+        SimpleNamespace(name="update_connected_prompt"),
+        SimpleNamespace(name="workflow_overview"),
+    ]
+    assert [item.name for item in prepare_provider_tools(
+        definitions,
+        {"update_connected_prompt"},
+    )] == ["update_connected_prompt"]
+    with pytest.raises(ProviderToolSurfaceMismatch, match="missing=view_node_mask"):
+        prepare_provider_tools(definitions, {"view_node_mask"})
+    with pytest.raises(ProviderToolSurfaceMismatch, match="unexpected=workflow_overview"):
+        require_provider_tool_surface(
+            {"update_connected_prompt"},
+            {"update_connected_prompt", "workflow_overview"},
+            provider="codex",
+        )
+
+
+def test_prompt_correction_can_follow_success_metadata_but_plain_retry_inherits_reference():
+    correction = "it should focus exclusively on the large central subject"
+    successful_messages = [
+        {
+            "role": "assistant",
+            "content": "Updated.",
+            "metadata": {
+                "promptValueLane": {"active": False, "referenceImage": False},
+                "toolSteps": [{
+                    "name": "update_connected_prompt",
+                    "status": "done",
+                }],
+            },
+        },
+        {"role": "user", "content": correction, "metadata": {}},
+    ]
+    assert derive_prompt_value_lane_state(successful_messages, correction) == {
+        "active": True,
+        "referenceImage": False,
+    }
+
+    retry_messages = [
+        {"role": "user", "content": "adjust the prompt using image_2", "metadata": {}},
+        {
+            "role": "assistant",
+            "content": "Please retry.",
+            "metadata": {
+                "promptValueLane": {"active": True, "referenceImage": True},
+            },
+        },
+        {"role": "user", "content": "retry", "metadata": {}},
+    ]
+    retry_state = derive_prompt_value_lane_state(retry_messages, "retry")
+    assert retry_state == {"active": True, "referenceImage": True}
+    assert tools_for_message(
+        "retry",
+        "free",
+        prompt_value_lane_state=retry_state,
+    ) == {"view_prompt_reference_image", "update_connected_prompt"}
+
+
+def test_combined_mask_lane_retry_remains_in_the_mask_lane():
+    original = "Adjust the prompt for image2 and redraw the face mask."
+    messages = [
+        {"role": "user", "content": original, "metadata": {}},
+        {
+            "role": "assistant",
+            "content": "Please retry.",
+            "metadata": {
+                "promptValueLane": {"active": False, "referenceImage": False},
+                "maskLane": {
+                    "active": True,
+                    "promptValueEdit": True,
+                    "promptReferenceImage": True,
+                    "attachmentAvailable": False,
+                },
+            },
+        },
+        {"role": "user", "content": "retry", "metadata": {}},
+    ]
+
+    prompt_state = derive_prompt_value_lane_state(messages, "retry")
+    mask_state = derive_mask_lane_state(messages, "retry")
+    assert prompt_state == {"active": False, "referenceImage": False}
+    assert mask_state["active"] is True
+    assert tools_for_message(
+        "retry",
+        mask_lane_state=mask_state,
+        prompt_value_lane_state=prompt_state,
+    ) == {
+        "view_prompt_reference_image",
+        "update_connected_prompt",
+        "view_node_mask",
+        "edit_node_mask",
+        "confirm_mask_review",
+    }
+
+
+def test_prompt_correction_history_is_bounded_to_two_intervening_corrections():
+    messages = [
+        {
+            "role": "assistant",
+            "content": "Original prompt lane.",
+            "metadata": {
+                "promptValueLane": {"active": True, "referenceImage": True},
+            },
+        },
+    ]
+    for index in range(3):
+        messages.extend([
+            {
+                "role": "user",
+                "content": f"it should focus mainly on subject {index}",
+                "metadata": {},
+            },
+            {
+                "role": "assistant",
+                "content": "No prompt action.",
+                "metadata": {
+                    "promptValueLane": {"active": False, "referenceImage": False},
+                },
+            },
+        ])
+    latest = "it should instead focus on the current subject"
+    messages.append({"role": "user", "content": latest, "metadata": {}})
+
+    assert derive_prompt_value_lane_state(messages, latest) == {
+        "active": False,
+        "referenceImage": False,
+    }
+    assert derive_prompt_value_lane_state(
+        [{"role": "user", "content": latest, "metadata": {}}],
+        latest,
+    )["active"] is False
+
+
+def test_prompt_policy_rewrites_exclusivity_without_echoing_excluded_subjects():
+    runtime_policy = ren_instructions("off")
+    skill_policy = (
+        chat_runtime_module.PROJECT_ROOT
+        / "skills"
+        / "workflow-assistant"
+        / "SKILL.md"
+    ).read_text(encoding="utf-8")
+
+    for policy in (runtime_policy, skill_policy):
+        assert "never repeat or name the negated subject" in policy
+        assert "Preserve all unmasked pixels." in policy
+        assert "complete replacement" in policy
+        assert "old mixed prompt" in policy
+
+
+@pytest.mark.parametrize(
+    "phrase",
+    (
+        "add the new character description to the prompt",
+        "append cinematic lighting to my prompt",
+        "remove the old face description from the prompt",
+        "change some prompts for the new reference",
+        "prompts need updating for image_2",
+    ),
+)
+def test_common_prompt_value_phrasings_never_reopen_the_general_planners(phrase):
+    assert prompt_value_edit_requested(phrase) is True
+    tools = tools_for_message(phrase, "free")
+    assert "update_connected_prompt" in tools
+    assert not ({
+        "plan_workflow",
+        "plan_workflow_refinement",
+        "compile_workflow_refinement_spec",
+        "apply_workflow_graph_patch",
+    } & tools)
+
+
+def test_adding_a_prompt_node_remains_an_explicit_topology_change():
+    request = "Add a prompt node and connect it to the sampler."
+    assert explicit_topology_change_requested(request) is True
+    assert prompt_value_edit_requested(request) is False
+    assert "compile_workflow_refinement_spec" in tools_for_message(request, "free")
+
+
+@pytest.mark.parametrize(
+    "phrase",
+    (
+        "add a prompt to this node",
+        "can you add a prompt saying a red car to this node",
+        "add some text to the prompt on this node",
+        "replace the prompt on this node",
+        "remove the mask from this node",
+    ),
+)
+def test_adding_a_value_to_an_existing_node_is_not_a_topology_change(phrase):
+    assert explicit_topology_change_requested(phrase) is False
+
+
+def test_prompt_edit_referencing_a_node_by_preposition_keeps_prompt_tool():
+    request = "add a prompt to this node"
+    assert prompt_value_edit_requested(request) is True
+    tools = tools_for_message(request, "free")
+    assert "update_connected_prompt" in tools
+    assert not ({
+        "plan_workflow",
+        "compile_workflow_refinement_spec",
+        "apply_workflow_graph_patch",
+    } & tools)
+
+
+def test_combined_mask_edit_and_casual_output_check_keeps_view_output_image():
+    request = "add coverage to the mask on this node and check the output"
+    tools = tools_for_message(request, "free")
+    assert "view_output_image" in tools
+    assert "edit_node_mask" in tools
+
+
+@pytest.mark.parametrize(
+    "phrase",
+    (
+        "pls the prompt shoulfd highligth a much more poink sand this is way to less pink",
+        "the prompt should highlight the sand more",
+        "can you emphasize the pink more in the prompt",
+        "boost the pink in the prompt",
+        "increase the saturation described in the prompt",
+        "there's way too little pink in the prompt",
+    ),
+)
+def test_prompt_intensity_phrasing_without_a_core_edit_verb_still_exposes_prompt_tool(phrase):
+    assert prompt_value_edit_requested(phrase) is True
+    assert "update_connected_prompt" in tools_for_message(phrase, "free")
+
+
+@pytest.mark.parametrize(
+    "phrase",
+    (
+        "pls change the entire promnpt so that the sand is pink throughout the context",
+        "can you fix the pronmpt",
+        "update the promtp please",
+        "change the prmopt to say something else",
+    ),
+)
+def test_unenumerated_prompt_typos_are_recognized_via_fuzzy_match(phrase):
+    assert prompt_value_edit_requested(phrase) is True
+    assert "update_connected_prompt" in tools_for_message(phrase, "free")
+
+
+@pytest.mark.parametrize(
+    "word",
+    (
+        "profit", "promote", "promoted", "promptly", "props", "primp",
+        "product", "project", "process", "problem", "proper",
+    ),
+)
+def test_prompt_typo_fuzzy_match_never_folds_real_unrelated_words(word):
+    assert chat_runtime_module._canonicalize_prompt_typos(word) == word
+
+
+@pytest.mark.parametrize(
+    "phrase",
+    (
+        "pls make the promot more detaoeld",
+        "make the prompt more detailed",
+        "can you make it more colorful in the prompt",
+    ),
+)
+def test_unrecognized_edit_phrasing_still_widens_default_toolset(phrase):
+    # "make X more Y" has no recognized action verb, so the narrow
+    # prompt_value_edit_requested lane correctly stays closed here - but the
+    # default toolset should still be widened to include the tool rather
+    # than leaving it entirely unreachable, since a closed verb list can
+    # never enumerate every natural phrasing.
+    assert prompt_value_edit_requested(phrase) is False
+    assert "update_connected_prompt" in tools_for_message(phrase, "free")
+
+
+def test_prompt_mention_alongside_other_intent_never_narrows_the_default_toolset():
+    # Widening the default toolset for an unrecognized prompt mention must
+    # never come at the cost of other default tools - unlike the narrow
+    # prompt_value_edit_requested lane (an early-return that replaces the
+    # toolset), this path only adds to it.
+    tools = tools_for_message("queue the workflow with the current prompt", "free")
+    assert "update_connected_prompt" in tools
+    assert "queue_workflow" in tools
+
+
+@pytest.mark.parametrize(
+    "phrase",
+    (
+        "edit image_1 using the prompt",
+        "refine image_1 using the prompt",
+        "edit the image according to the prompt",
+        "update the image based on the prompt",
+    ),
+)
+def test_reference_only_prompt_mention_does_not_widen_default_toolset(phrase):
+    assert "update_connected_prompt" not in tools_for_message(phrase, "free")
+
+
 def test_intent_tool_filter_keeps_core_and_adds_narrow_groups():
     basic = tools_for_message("Inspect the open graph")
     assert "workflow_overview" in basic
@@ -486,6 +1867,12 @@ def test_intent_tool_filter_keeps_core_and_adds_narrow_groups():
     assert "web_search" not in basic
     assert "web_fetch_page" not in basic
     assert "manager_queue_action" not in basic
+    # Gen 2 (plan_workflow_refinement/apply_workflow_refinement) is fully
+    # superseded by compile_workflow_refinement_spec/apply_workflow_graph_patch
+    # and must never be offered by default alongside it.
+    assert "plan_workflow_refinement" not in basic
+    assert "apply_workflow_refinement" not in basic
+    assert not (CORE_CHAT_TOOLS & {"plan_workflow_refinement", "apply_workflow_refinement"})
 
     free_web = tools_for_message("Research current ComfyUI nodes", "free")
     assert "web_search" in free_web
@@ -876,6 +2263,99 @@ def test_tool_result_content_redacts_image_base64_from_chat_timeline():
     assert "[image content shown to Ren]" in rendered
 
 
+def test_tool_result_errors_are_classified_from_mcp_content_envelopes():
+    assert tool_result_is_error({
+        "content": [{
+            "type": "text",
+            "text": "Error calling tool 'view_node_mask': Node not found: image_1",
+        }],
+    }) is True
+    assert tool_result_is_error('{"success":false,"error":"ambiguous target"}') is True
+    assert tool_result_is_error({
+        "structuredContent": {"success": True, "node_id": "1"},
+    }) is False
+    claude_list_envelope = json.dumps([{
+        "type": "text",
+        "text": "Error calling tool 'update_connected_prompt': stale context token",
+    }])
+    assert tool_result_is_error(claude_list_envelope) is True
+    assert tool_result_is_error({
+        "content": [{
+            "type": "text",
+            "text": '{"success":false,"error":"ambiguous target"}',
+        }],
+    }) is True
+    assert tool_result_is_error({
+        "is_error": True,
+        "content": [{"type": "text", "text": "Node not found"}],
+    }) is True
+    # A compiler validation stop is a completed tool call, not a transport failure.
+    assert tool_result_is_error({
+        "structuredContent": {"valid": False, "issues": [{"code": "no_match"}]},
+    }) is False
+    assert tool_result_is_error(
+        "1 validation error for call[view_canvas_images]\nrequest.limit\n  Input should be less than or equal to 8"
+    ) is True
+
+
+def test_tool_result_choice_stop_is_distinct_from_a_failed_call():
+    result = {
+        "structuredContent": {
+            "success": False,
+            "needs_choice": True,
+            "reason": "requested_node_not_mask_compatible",
+        },
+    }
+
+    assert tool_result_needs_choice(result) is True
+    assert tool_result_is_error(result) is True
+
+
+@pytest.mark.asyncio
+async def test_choice_tool_result_is_persisted_as_choice_timeline_step(tmp_path):
+    runtime = ChatRuntime(ChatStore(tmp_path / "chat.db", tmp_path / "missing.db"))
+    state = ActiveRun("run-1", "conversation-1", "session-1")
+    await runtime.publish(state, {
+        "type": "TOOL_CALL_START",
+        "toolCallId": "choice",
+        "toolCallName": "view_node_mask",
+    })
+    await runtime.publish(state, {
+        "type": "TOOL_CALL_RESULT",
+        "toolCallId": "choice",
+        "content": json.dumps({
+            "success": False,
+            "needs_choice": True,
+            "reason": "requested_node_not_mask_compatible",
+        }),
+    })
+
+    assert state.tool_steps[0]["status"] == "needs_choice"
+
+
+@pytest.mark.asyncio
+async def test_failed_tool_result_is_persisted_as_failed_timeline_step(tmp_path):
+    runtime = ChatRuntime(ChatStore(tmp_path / "chat.db", tmp_path / "missing.db"))
+    state = ActiveRun("run-1", "conversation-1", "session-1")
+    await runtime.publish(state, {
+        "type": "TOOL_CALL_START",
+        "toolCallId": "broken",
+        "toolCallName": "view_node_mask",
+    })
+    await runtime.publish(state, {
+        "type": "TOOL_CALL_RESULT",
+        "toolCallId": "broken",
+        "content": json.dumps({
+            "content": [{
+                "type": "text",
+                "text": "Error calling tool 'view_node_mask': Node not found: image_1",
+            }],
+        }),
+    })
+
+    assert state.tool_steps[0]["status"] == "failed"
+
+
 def test_completed_run_retention_is_bounded(tmp_path):
     runtime = ChatRuntime(ChatStore(tmp_path / "chat.db", tmp_path / "missing.db"))
     runtime.MAX_RETAINED_RUNS = 2
@@ -914,6 +2394,21 @@ def test_workflow_context_is_shared_by_prompts_and_mcp_environment():
         "FL_MCP_WORKFLOW_NAME": "A",
         "FL_MCP_WORKFLOW_PATH": "workflows/a.json",
     }
+
+
+def test_prompt_reference_environment_is_bound_to_routed_lane_state():
+    assert prompt_reference_environment(
+        {"active": False, "promptReferenceImage": False},
+        {"active": True, "referenceImage": False},
+    ) == {"FL_MCP_PROMPT_REFERENCE_REQUIRED": "0"}
+    assert prompt_reference_environment(
+        {"active": False, "promptReferenceImage": False},
+        {"active": True, "referenceImage": True},
+    ) == {"FL_MCP_PROMPT_REFERENCE_REQUIRED": "1"}
+    assert prompt_reference_environment(
+        {"active": True, "promptReferenceImage": True},
+        {"active": False, "referenceImage": False},
+    ) == {"FL_MCP_PROMPT_REFERENCE_REQUIRED": "1"}
 
 
 def test_empty_request_retry_uses_same_approval_fingerprint():
@@ -1054,6 +2549,52 @@ async def test_claude_waits_for_mcp_tool_discovery(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_claude_waits_for_the_exact_selected_tool_surface(monkeypatch):
+    class SettlingClient:
+        calls = 0
+
+        async def get_mcp_status(self):
+            self.calls += 1
+            tools = (
+                [{"name": "mcp__ren__workflow_overview"}]
+                if self.calls == 1
+                else [{"name": "mcp__ren__update_connected_prompt"}]
+            )
+            return {"mcpServers": [{
+                "name": "ren",
+                "status": "connected",
+                "tools": tools,
+            }]}
+
+    async def no_wait(_seconds):
+        return None
+
+    monkeypatch.setattr("chat_runtime.asyncio.sleep", no_wait)
+    client = SettlingClient()
+    await wait_for_claude_mcp(
+        client,
+        expected_tools={"update_connected_prompt"},
+        timeout=1,
+    )
+    assert client.calls == 2
+
+    class PartialClient:
+        async def get_mcp_status(self):
+            return {"mcpServers": [{
+                "name": "ren",
+                "status": "connected",
+                "tools": [{"name": "mcp__ren__workflow_overview"}],
+            }]}
+
+    with pytest.raises(ProviderToolSurfaceMismatch, match="missing=update_connected_prompt"):
+        await wait_for_claude_mcp(
+            PartialClient(),
+            expected_tools={"update_connected_prompt"},
+            timeout=0,
+        )
+
+
+@pytest.mark.asyncio
 async def test_codex_mcp_discovery_has_a_startup_timeout():
     class HangingClient:
         async def request(self, *_args, **_kwargs):
@@ -1064,6 +2605,45 @@ async def test_codex_mcp_discovery_has_a_startup_timeout():
             HangingClient(),
             {"threadId": "thread-1"},
             object,
+            timeout=0.01,
+        )
+
+
+@pytest.mark.asyncio
+async def test_codex_waits_for_the_exact_selected_tool_surface(monkeypatch):
+    class SettlingClient:
+        calls = 0
+
+        async def request(self, *_args, **_kwargs):
+            self.calls += 1
+            tools = (
+                {"workflow_overview": {}}
+                if self.calls == 1
+                else {"update_connected_prompt": {}}
+            )
+            return SimpleNamespace(data=[SimpleNamespace(name="ren", tools=tools)])
+
+    async def no_wait(_seconds):
+        return None
+
+    monkeypatch.setattr("chat_runtime.asyncio.sleep", no_wait)
+    client = SettlingClient()
+    result = await wait_for_codex_mcp_status(
+        client,
+        {"threadId": "thread-1"},
+        object,
+        expected_tools={"update_connected_prompt"},
+        timeout=1,
+    )
+    assert result.data[0].tools == {"update_connected_prompt": {}}
+    assert client.calls == 2
+
+    with pytest.raises(ProviderToolSurfaceMismatch, match="missing=view_node_mask"):
+        await wait_for_codex_mcp_status(
+            SettlingClient(),
+            {"threadId": "thread-1"},
+            object,
+            expected_tools={"view_node_mask"},
             timeout=0.01,
         )
 
@@ -1206,6 +2786,27 @@ async def test_claude_subscription_streams_tools_approvals_and_persists_session(
             ToolResultBlock(tool_use_id="tool-1", content='{"total_nodes":8}')
         ])
         yield StreamEvent(
+            uuid="event-error-start",
+            session_id="claude-session",
+            event={
+                "type": "content_block_start",
+                "index": 2,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": "tool-error",
+                    "name": "mcp__ren__view_node_mask",
+                    "input": {"request": {"node_id": "image_1"}},
+                },
+            },
+        )
+        yield UserMessage(content=[
+            ToolResultBlock(
+                tool_use_id="tool-error",
+                content=[{"type": "text", "text": "Node not found: image_1"}],
+                is_error=True,
+            ),
+        ])
+        yield StreamEvent(
             uuid="event-5",
             session_id="claude-session",
             event={
@@ -1248,6 +2849,8 @@ async def test_claude_subscription_streams_tools_approvals_and_persists_session(
     assert assistant["content"] == "Checked. Eight nodes."
     assert assistant["metadata"]["claudeSessionId"] == "claude-session"
     assert assistant["metadata"]["toolSteps"][0]["contentOffset"] == len("Checked. ")
+    assert assistant["metadata"]["toolSteps"][1]["status"] == "failed"
+    assert '"isError":true' in assistant["metadata"]["toolSteps"][1]["result"]
 
 
 def test_provider_failure_message_surfaces_sanitized_claude_stderr():
@@ -1431,6 +3034,7 @@ async def test_codex_subscription_streams_ren_tools_and_persists_thread(
     class FakeClient:
         def __init__(self):
             self._sync = FakeSyncClient()
+            self.allowed_tools = set()
 
         async def request(self, method, _params, *, response_model):
             del response_model
@@ -1443,7 +3047,10 @@ async def test_codex_subscription_streams_ren_tools_and_persists_thread(
                 ))
             assert method == "mcpServerStatus/list"
             return SimpleNamespace(data=[
-                SimpleNamespace(name="ren", tools={"workflow_overview": {}})
+                SimpleNamespace(
+                    name="ren",
+                    tools={name: {} for name in self.allowed_tools},
+                )
             ])
 
         async def thread_start(self, params):
@@ -1451,6 +3058,9 @@ async def test_codex_subscription_streams_ren_tools_and_persists_thread(
             assert params.config["mcp_servers"]["other"]["enabled"] is False
             assert params.config["plugins"]["example@plugin"]["enabled"] is False
             assert params.config["mcp_servers"]["ren"]["enabled_tools"]
+            self.allowed_tools = set(
+                params.config["mcp_servers"]["ren"]["enabled_tools"]
+            )
             return SimpleNamespace(thread=SimpleNamespace(id="codex-thread"))
 
     class FakeCodex:

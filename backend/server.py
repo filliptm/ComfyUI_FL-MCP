@@ -319,10 +319,19 @@ async def mcp_status() -> Dict[str, Any]:
 
 @app.post("/api/mcp/shutdown")
 async def mcp_shutdown() -> JSONResponse:
+    # "embedded" (the default when FL_MCP_MODE is unset) covers a
+    # subprocess-launched backend too. Both need this endpoint so
+    # ServerRunner.start() can replace a stale backend left running by a
+    # ComfyUI restart that didn't actually terminate its child process;
+    # without it, a stale embedded/subprocess backend is never replaced.
     mode = os.getenv("FL_MCP_MODE", "embedded")
-    if mode != "daemon":
+    if mode not in {"daemon", "embedded"}:
         return JSONResponse(
-            {"success": False, "error": "Shutdown is only available in daemon mode.", "mode": mode},
+            {
+                "success": False,
+                "error": "Shutdown is only available in daemon or embedded mode.",
+                "mode": mode,
+            },
             status_code=409,
         )
 

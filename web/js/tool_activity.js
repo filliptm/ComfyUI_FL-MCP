@@ -129,8 +129,18 @@ export const TOOL_CONFIG = {
     },
     "view_node_mask": {
         icon: "🎭",
-        label: "Inspect Mask",
-        description: "Highlighting masked pixels in magenta"
+        label: "Inspect Image for Masking",
+        description: "Loading the source image and current alpha; an empty mask is valid"
+    },
+    "view_prompt_reference_image": {
+        icon: "👁️",
+        label: "Inspect Reference",
+        description: "Loading the exact image connected to the reference input"
+    },
+    "update_connected_prompt": {
+        icon: "✍️",
+        label: "Update Prompt",
+        description: "Updating the exact connected prompt value"
     },
     "edit_node_mask": {
         icon: "🖌️",
@@ -540,6 +550,8 @@ const TOOL_ICON_CLASSES = {
     view_chat_image: "pi pi-eye",
     place_chat_image_in_node: "pi pi-sign-in",
     view_node_mask: "pi pi-eye",
+    view_prompt_reference_image: "pi pi-eye",
+    update_connected_prompt: "pi pi-pencil",
     edit_node_mask: "pi pi-pencil",
     confirm_mask_review: "pi pi-check-circle",
     cancel_workflow: "pi pi-stop",
@@ -592,7 +604,9 @@ const TOOL_RUNNING_LABELS = {
     view_output_image: "Loading final output for review",
     view_chat_image: "Inspecting attached image",
     place_chat_image_in_node: "Placing image in selected node",
-    view_node_mask: "Loading mask overlay",
+    view_node_mask: "Inspecting source image for masking",
+    view_prompt_reference_image: "Inspecting connected reference image",
+    update_connected_prompt: "Updating connected prompt",
     edit_node_mask: "Saving mask edit",
     confirm_mask_review: "Waiting for mask approval",
     take_screenshot: "Capturing canvas",

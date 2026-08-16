@@ -1018,6 +1018,9 @@ test("ToolExecutor derives its advertised tools from the registered handler map"
     assert.ok(supportedTools.includes("apply_workflow_graph_patch"));
     assert.ok(supportedTools.includes("navigate_workflow_branch"));
     assert.equal(contractRevisions.apply_workflow_graph_patch, 3);
+    assert.equal(contractRevisions.get_node_image_ref, 2);
+    assert.equal(contractRevisions.get_canvas_image_refs, 1);
+    assert.equal(contractRevisions.get_selected_nodes, 2);
     assert.equal(contractRevisions.navigate_workflow_branch, 1);
     assert.equal(contractRevisions.find_node, 1);
     assert.deepEqual(Array.from(supportedTools), [...supportedTools].sort());
@@ -1061,6 +1064,126 @@ test("refinement rollback restores the pinned workflow object and balances its t
     assert.equal(harness.canvas.beforeCalls, 1);
     assert.equal(harness.canvas.afterCalls, 1);
     assert.equal(harness.canvas.read_only, false);
+});
+
+
+test("nested image rollback verifies exact serialization before presentation-only full-size hydration", async () => {
+    const harness = flApiHarness();
+    const imageValue = "ren-chat/session/source.png [input]";
+    const node = {
+        id: 33,
+        widgets: [{ name: "image", value: imageValue, options: { values: [imageValue] } }],
+        widgets_values: [imageValue],
+        properties: {},
+        images: [{ filename: "runtime-only-sentinel.png", subfolder: "", type: "input" }],
+        imgs: [],
+        imageIndex: -1,
+    };
+    harness.graph._nodes = [node];
+    harness.browserApi.apiURL = value => value;
+    harness.graph.serialize = () => ({
+        marker: "nested-image",
+        nodes: [{
+            id: node.id,
+            widgets_values: structuredClone(node.widgets_values),
+            properties: structuredClone(node.properties),
+        }],
+        links: [],
+        extra: {},
+    });
+    harness.app.loadGraphData = async (snapshot, _clean, _restoreView, workflow) => {
+        const restoredNode = snapshot.nodes[0];
+        node.widgets[0].value = restoredNode.widgets_values[0];
+        node.widgets_values = structuredClone(restoredNode.widgets_values);
+        node.properties = structuredClone(restoredNode.properties);
+        harness.workflowStore.activeWorkflow = workflow;
+    };
+
+    class FullSizeImage {
+        constructor() {
+            this.complete = true;
+            this.naturalWidth = 3584;
+            this.naturalHeight = 1536;
+        }
+
+        set src(value) {
+            this._src = value;
+            this.onload?.();
+        }
+
+        get src() {
+            return this._src;
+        }
+    }
+
+    const parseNestedImage = currentNode => {
+        const value = currentNode?.widgets?.find(widget => widget.name === "image")?.value;
+        if (typeof value !== "string" || !value.includes("/")) return null;
+        return {
+            filename: "source.png",
+            subfolder: "ren-chat/session",
+            type: "input",
+        };
+    };
+    const exactHash = async workflow => JSON.stringify(workflow);
+    const { Class: FL_API } = await loadFlApi(harness, {
+        Image: FullSizeImage,
+        nestedImageRefForNode: parseNestedImage,
+        workflowGraphHash: exactHash,
+        canonicalWorkflowJSON: workflow => JSON.stringify(workflow),
+    });
+    const flApi = new FL_API();
+    const pin = flApi.pinActiveWorkflow(flApi.getActiveWorkflowIdentity());
+    const snapshot = flApi.captureWorkflowSnapshot(pin);
+    const runtimeImagesBefore = structuredClone(node.images);
+
+    node.widgets[0].value = "wrong.png [input]";
+    node.widgets_values = ["wrong.png [input]"];
+    node.properties = { image: "wrong.png [input]" };
+
+    const restored = await flApi.restoreWorkflowSnapshot(snapshot, pin);
+
+    assert.equal(restored.snapshot_restored, true);
+    assert.equal(restored.hash_verified, true);
+    assert.equal(restored.graph_hash, await exactHash(snapshot));
+    assert.deepEqual(harness.graph.serialize(), snapshot);
+    assert.deepEqual(node.properties, {});
+    assert.deepEqual(node.widgets_values, [imageValue]);
+    assert.deepEqual(node.images, runtimeImagesBefore);
+    assert.equal(node.imageIndex, 0);
+    assert.equal(node.imgs.length, 1);
+    assert.equal(node.imgs[0].naturalWidth, 3584);
+    assert.equal(node.imgs[0].naturalHeight, 1536);
+    assert.match(node.imgs[0].src, /^\/view\?/);
+    assert.doesNotMatch(node.imgs[0].src, /\/fl_mcp\/image\/thumbnail/);
+});
+
+
+test("rollback skips image hydration when loadGraphData does not restore the exact snapshot", async () => {
+    const harness = flApiHarness();
+    const exactHash = async workflow => JSON.stringify(workflow);
+    const { Class: FL_API } = await loadFlApi(harness, {
+        workflowGraphHash: exactHash,
+        canonicalWorkflowJSON: workflow => JSON.stringify(workflow),
+    });
+    const flApi = new FL_API();
+    const pin = flApi.pinActiveWorkflow(flApi.getActiveWorkflowIdentity());
+    const snapshot = flApi.captureWorkflowSnapshot(pin);
+    let hydrationCalls = 0;
+    flApi.hydrateNestedImagePreviews = () => { hydrationCalls += 1; };
+    harness.app.loadGraphData = async (restored, _clean, _restoreView, workflow) => {
+        harness.graphState = {
+            ...structuredClone(restored),
+            extra: { ...(restored.extra || {}), rollback_corruption: true },
+        };
+        harness.workflowStore.activeWorkflow = workflow;
+    };
+
+    await assert.rejects(
+        flApi.restoreWorkflowSnapshot(snapshot, pin),
+        /did not restore exactly; preview hydration was skipped/,
+    );
+    assert.equal(hydrationCalls, 0);
 });
 
 
@@ -1116,6 +1239,224 @@ test("same-workflow edits violate the mutation guard while accepted agent edits 
         ),
     );
 });
+
+
+test("mutation guard rejects a graph rewrite while its digest is pending", async () => {
+    const harness = flApiHarness();
+    let rewriteDuringHash = false;
+    const guardedHash = async workflow => {
+        const digest = `hash:${workflow.marker || "graph"}`;
+        await Promise.resolve();
+        if (rewriteDuringHash) {
+            rewriteDuringHash = false;
+            harness.graphState = { ...harness.graphState, marker: "hash-race-user" };
+        }
+        return digest;
+    };
+    const { Class: FL_API } = await loadFlApi(harness, {
+        workflowGraphHash: guardedHash,
+    });
+    const flApi = new FL_API();
+    const pin = flApi.pinActiveWorkflow(flApi.getActiveWorkflowIdentity());
+    const guard = await flApi.createWorkflowMutationGuard(pin);
+
+    rewriteDuringHash = true;
+    await assert.rejects(
+        () => flApi.assertWorkflowMutationGuard(guard),
+        error => (
+            error?.code === "concurrent_workflow_edit"
+            && error?.details?.reason === "graph_changed_during_hash"
+            && error?.details?.phase === "assert"
+            && error?.details?.expected_graph_hash === "hash:raw"
+            && error?.details?.actual_graph_hash === "hash:hash-race-user"
+        ),
+    );
+});
+
+
+test("created-node normalization settles without accepting edits elsewhere", async () => {
+    const harness = flApiHarness();
+    const lifecycleEffects = [];
+    let frameId = 0;
+    const guardedHash = async workflow => {
+        const digest = await workflowGraphHash(workflow);
+        lifecycleEffects.shift()?.();
+        return digest;
+    };
+    const { Class: FL_API } = await loadFlApi(harness, {
+        canonicalWorkflowJSON,
+        workflowGraphHash: guardedHash,
+        requestAnimationFrame: callback => {
+            frameId += 1;
+            callback(frameId);
+            return frameId;
+        },
+        cancelAnimationFrame() {},
+    });
+    harness.graphState = {
+        version: 0.4,
+        last_node_id: 1,
+        last_link_id: 0,
+        nodes: [{
+            id: 1,
+            type: "Sentinel",
+            pos: [0, 0],
+            size: [220, 120],
+            widgets_values: ["untouched"],
+            properties: {},
+        }],
+        links: [],
+        groups: [],
+        config: {},
+        extra: {},
+    };
+    const flApi = new FL_API();
+    const pin = flApi.pinActiveWorkflow(flApi.getActiveWorkflowIdentity());
+    const guard = await flApi.createWorkflowMutationGuard(pin);
+
+    harness.graphState.last_node_id = 2;
+    harness.graphState.nodes.push({
+        id: 2,
+        type: "LoadImage",
+        pos: [300, 0],
+        size: [282.798828125, 102],
+        widgets_values: ["source.png", "image"],
+        properties: {},
+    });
+    const checkpoint = flApi.captureCreatedNodeNormalizationCheckpoint(guard, {
+        node_id: 2,
+        node_type: "LoadImage",
+        definition_id: null,
+    });
+    lifecycleEffects.push(() => {
+        const created = harness.graphState.nodes.find(node => node.id === 2);
+        created.size = [282.798828125, 314];
+        created.widgets_values = ["source.png", "image"];
+        created.properties = { cnr_id: "comfy-core", ver: "0.29.0" };
+    });
+
+    const acceptedHash = await flApi.acceptCreatedNodeNormalization(guard, checkpoint);
+
+    assert.equal(acceptedHash, await workflowGraphHash(harness.graphState));
+    assert.equal(guard.expectedGraphHash, acceptedHash);
+    assert.deepEqual(harness.graphState.nodes[0].widgets_values, ["untouched"]);
+    assert.deepEqual(harness.graphState.nodes[1].size, [282.798828125, 314]);
+
+    harness.graphState.last_node_id = 3;
+    harness.graphState.nodes.push({
+        id: 3,
+        type: "LoadImage",
+        pos: [600, 0],
+        size: [282.798828125, 102],
+        widgets_values: ["source.png", "image"],
+        properties: {},
+    });
+    const unsafeCheckpoint = flApi.captureCreatedNodeNormalizationCheckpoint(guard, {
+        node_id: 3,
+        node_type: "LoadImage",
+        definition_id: null,
+    });
+    lifecycleEffects.push(() => {
+        harness.graphState.nodes[0].pos = [99, 0];
+    });
+
+    await assert.rejects(
+        () => flApi.acceptCreatedNodeNormalization(guard, unsafeCheckpoint),
+        error => (
+            error?.code === "concurrent_workflow_edit"
+            && error?.details?.phase === "created_node_normalization"
+            && error?.details?.reason === "change_outside_created_node_during_hash"
+            && error?.details?.node_id === 3
+        ),
+    );
+});
+
+
+
+test("hidden-page node normalization waits for visible lifecycle frames", async () => {
+    const harness = flApiHarness();
+    const visibility = { visibilityState: "hidden" };
+    const { Class: FL_API } = await loadFlApi(harness, {
+        canonicalWorkflowJSON,
+        workflowGraphHash,
+        document: visibility,
+    });
+    harness.graphState = {
+        version: 0.4,
+        last_node_id: 0,
+        last_link_id: 0,
+        nodes: [],
+        links: [],
+        groups: [],
+        config: {},
+        extra: {},
+    };
+    const flApi = new FL_API();
+    const pin = flApi.pinActiveWorkflow(flApi.getActiveWorkflowIdentity());
+    const guard = await flApi.createWorkflowMutationGuard(pin);
+
+    harness.graphState.last_node_id = 1;
+    harness.graphState.nodes.push({
+        id: 1,
+        type: "LoadImage",
+        pos: [0, 0],
+        size: [282.798828125, 102],
+        widgets_values: ["source.png", "image"],
+        properties: {},
+    });
+    const checkpoint = flApi.captureCreatedNodeNormalizationCheckpoint(guard, {
+        node_id: 1,
+        node_type: "LoadImage",
+        definition_id: null,
+    });
+    let now = 0;
+    const pendingTurns = [];
+    flApi._createdNodeNormalizationNow = () => now;
+    flApi._waitForCreatedNodeNormalizationTurn = () => new Promise(resolve => {
+        pendingTurns.push(resolve);
+    });
+    let settled = false;
+    const acceptance = flApi.acceptCreatedNodeNormalization(guard, checkpoint)
+        .then(value => {
+            settled = true;
+            return value;
+        });
+    const advance = async ({ ms, visible, mutate = null }) => {
+        now += ms;
+        visibility.visibilityState = visible ? "visible" : "hidden";
+        mutate?.();
+        assert.ok(pendingTurns.length > 0, "normalization turn must be pending");
+        pendingTurns.shift()({
+            visible,
+            frameObserved: visible,
+        });
+        await Promise.resolve();
+        await Promise.resolve();
+    };
+
+    await advance({
+        ms: 80,
+        visible: false,
+        mutate: () => {
+            harness.graphState.nodes[0].size = [282.798828125, 314];
+        },
+    });
+    await advance({ ms: 80, visible: false });
+    await advance({ ms: 80, visible: false });
+    assert.equal(settled, false, "hidden timer turns cannot prove rAF lifecycle quiescence");
+    await advance({ ms: 40, visible: true });
+    await advance({ ms: 40, visible: true });
+    await advance({ ms: 40, visible: true });
+    assert.equal(settled, false, "three frames alone are shorter than the quiet horizon");
+    await advance({ ms: 80, visible: true });
+    await advance({ ms: 40, visible: true });
+
+    await acceptance;
+
+    assert.deepEqual(harness.graphState.nodes[0].size, [282.798828125, 314]);
+    assert.equal(guard.expectedGraphHash, await workflowGraphHash(harness.graphState));
+});
+
 
 
 test("inactive transaction cleanup never calls a private tracker afterChange or masks failure", async () => {
@@ -1308,6 +1649,292 @@ test("FL_API attachment assignment verifies string refs without changing node pr
     assert.equal(node.widgets_values[0], assigned.value);
     assert.equal(flApi.verifyAttachmentExact(2, attachment), true);
     assert.deepEqual(node.properties, { preserve: "exactly" });
+});
+
+
+test("FL_API mask inspection follows the exact pending revision source", async () => {
+    const harness = flApiHarness();
+    const node = {
+        id: 41,
+        type: "LoadImage",
+        comfyClass: "LoadImage",
+        title: "LOAD & MASK IMAGE",
+        widgets: [{ name: "image", value: "original/source.png [input]" }],
+        images: [],
+    };
+    harness.graph._nodes = [node];
+    const { Class: FL_API } = await loadFlApi(harness);
+    const flApi = new FL_API();
+    const original = {
+        filename: "source.png",
+        subfolder: "original",
+        type: "input",
+    };
+    const pending = {
+        filename: "revision-1.png",
+        subfolder: "fl_mcp_masks",
+        type: "input",
+    };
+    flApi.pendingMaskReviews.set("41", {
+        token: "review-1",
+        nodeId: 41,
+        image: pending,
+        originalImage: original,
+        previewUrl: null,
+    });
+
+    const inspected = flApi.getNodeImageRef(41);
+    assert.deepEqual(inspected.image, pending);
+    assert.equal(inspected.pending_review, true);
+    assert.deepEqual(inspected.original_image, original);
+
+    flApi.pendingMaskReviews.clear();
+    const committed = flApi.getNodeImageRef(41);
+    assert.deepEqual(committed.image, original);
+    assert.equal(committed.pending_review, false);
+});
+
+
+test("FL_API exact image inspection returns canonical serialized ID for string runtime ID", async () => {
+    const harness = flApiHarness();
+    const imageWidget = { name: "image", value: "reference.png [input]" };
+    const node = {
+        id: "1",
+        type: "LoadImage",
+        comfyClass: "LoadImage",
+        title: "Reference",
+        widgets: [imageWidget],
+        images: [],
+        serialize: () => ({ id: 1, type: "LoadImage" }),
+        pos: [10, 20],
+        size: [300, 200],
+        mode: 0,
+        inputs: [],
+        outputs: [],
+    };
+    harness.graph._nodes = [node];
+    harness.canvas.selected_nodes = { "1": node };
+    harness.graphState = {
+        marker: "raw",
+        nodes: [{ id: 1, type: "LoadImage" }],
+        links: [],
+        extra: {},
+    };
+    const { Class: FL_API } = await loadFlApi(harness);
+    const flApi = new FL_API();
+    const pin = flApi.pinActiveWorkflow(flApi.getActiveWorkflowIdentity());
+
+    const result = flApi.getNodeImageRef(1, pin);
+
+    assert.equal(result.node_id, 1);
+    assert.equal(typeof result.node_id, "number");
+    assert.deepEqual(result.image, {
+        filename: "reference.png",
+        subfolder: "",
+        type: "input",
+    });
+    assert.throws(
+        () => flApi.getNodeImageRef("1", pin),
+        /missing|absent|not a serialized workflow ID/,
+    );
+    const selected = flApi.getSelectedNodes(pin);
+    assert.equal(selected.length, 1);
+    assert.equal(selected[0].id, 1);
+    assert.equal(typeof selected[0].id, "number");
+});
+
+
+test("FL_API canvas image discovery is stable, plural, exact, and deduplicated", async () => {
+    const harness = flApiHarness();
+    const makeNode = (runtimeId, serializedId, x, y, widget, images = []) => ({
+        id: runtimeId,
+        type: "LoadImage",
+        comfyClass: "LoadImage",
+        title: `Image ${serializedId}`,
+        widgets: widget ? [{ name: "image", value: widget }] : [],
+        images,
+        pos: [x, y],
+        serialize: () => ({
+            id: serializedId,
+            type: "LoadImage",
+            pos: [x, y],
+        }),
+    });
+    const lower = makeNode("1", 1, 20, 100, "shared.png [input]", [
+        { filename: "batch-1.png", subfolder: "temp", type: "temp" },
+        { filename: "batch-2.png", subfolder: "temp", type: "temp" },
+    ]);
+    const upper = makeNode("2", 2, 20, 0, "shared.png [input]");
+    harness.graph._nodes = [lower, upper];
+    harness.graphState = {
+        marker: "raw",
+        nodes: [lower.serialize(), upper.serialize()],
+        links: [],
+        extra: {},
+    };
+    const { Class: FL_API } = await loadFlApi(harness);
+    const flApi = new FL_API();
+    const pin = flApi.pinActiveWorkflow(flApi.getActiveWorkflowIdentity());
+
+    const firstPage = flApi.getCanvasImageRefs({ offset: 0, limit: 2 }, pin);
+
+    assert.equal(firstPage.total_count, 3);
+    assert.equal(firstPage.has_more, true);
+    assert.equal(firstPage.next_offset, 2);
+    assert.deepEqual(firstPage.images[0].image, {
+        filename: "shared.png",
+        subfolder: "",
+        type: "input",
+    });
+    assert.deepEqual(
+        Array.from(firstPage.images[0].sources, source => source.node_id),
+        [2, 1],
+    );
+    assert.equal(firstPage.images[0].source_count, 2);
+    assert.equal(firstPage.images[1].image.filename, "batch-1.png");
+    assert.equal(firstPage.images[1].sources[0].image_index, 0);
+
+    const explicit = flApi.getCanvasImageRefs({ nodeIds: [1] }, pin);
+    assert.deepEqual(
+        Array.from(explicit.images, item => item.image.filename),
+        ["shared.png", "batch-1.png", "batch-2.png"],
+    );
+    assert.throws(
+        () => flApi.getCanvasImageRefs({ nodeIds: ["1"] }, pin),
+        error => error?.code === "canvas_image_node_unavailable",
+    );
+    assert.throws(
+        () => flApi.getCanvasImageRefs({ nodeIds: [1, 1] }, pin),
+        /duplicate exact IDs/,
+    );
+});
+
+
+test("mask edit receipt with serialized integer ID survives pending view and confirmation", async () => {
+    const harness = flApiHarness();
+    const imageWidget = { name: "image", value: "source.png [input]" };
+    const node = {
+        id: "1",
+        type: "LoadImage",
+        comfyClass: "LoadImage",
+        widgets: [imageWidget],
+        serialize: () => ({ id: 1, type: "LoadImage" }),
+    };
+    harness.graph._nodes = [node];
+    harness.graphState = {
+        nodes: [{ id: 1, type: "LoadImage" }],
+        links: [],
+        extra: {},
+    };
+    const { Class: FL_API } = await loadFlApi(harness);
+    const flApi = new FL_API();
+    const workflowIdentity = flApi.getActiveWorkflowIdentity();
+    const source = { filename: "source.png", subfolder: "", type: "input" };
+    const edited = { filename: "edited.png", subfolder: "fl_mcp_masks", type: "input" };
+    const graphHash = "a".repeat(64);
+    // This is the exact authority emitted by editNodeMask: canonical serialized
+    // node ID, never the live LiteGraph string projection.
+    flApi.pendingMaskReviews.set("number:1", {
+        token: "review-typed-id",
+        nodeId: 1,
+        image: edited,
+        originalImage: source,
+        committedImage: source,
+        previewUrl: null,
+        workflowIdentity,
+        graphHash,
+        sourceImage: source,
+    });
+    flApi.createWorkflowMutationGuard = async () => ({ expectedGraphHash: graphHash });
+    flApi.acceptWorkflowMutationGuard = async () => "b".repeat(64);
+    flApi._assignImageToNode = (_node, image) => {
+        imageWidget.value = `${image.subfolder ? `${image.subfolder}/` : ""}${image.filename} [input]`;
+    };
+    flApi._releaseMaskReviewPreview = () => {};
+    flApi._markGraphChanged = () => {};
+    flApi._restoreAutoQueueAfterMaskReview = () => {};
+
+    const pending = flApi.getPendingMaskReviewReceipt(1);
+    assert.equal(pending.node_id, 1);
+    assert.equal(typeof pending.node_id, "number");
+    assert.equal(pending.review_token, "review-typed-id");
+
+    const confirmed = await flApi.confirmMaskReview(1, pending.review_token);
+    assert.equal(confirmed.success, true);
+    assert.equal(confirmed.node_id, 1);
+    assert.equal(typeof confirmed.node_id, "number");
+    assert.equal(confirmed.review_token, pending.review_token);
+    assert.equal(confirmed.queued, false);
+    assert.equal(flApi.pendingMaskReviews.size, 0);
+});
+
+
+test("FL_API mask confirmation preserves verified success when auto-queue restore fails", async () => {
+    const harness = flApiHarness();
+    const node = { id: 41, type: "LoadImage", widgets: [] };
+    harness.graph._nodes = [node];
+    const { Class: FL_API } = await loadFlApi(harness);
+    const flApi = new FL_API();
+    const original = {
+        filename: "source.png",
+        subfolder: "original",
+        type: "input",
+    };
+    const approved = {
+        filename: "mask.png",
+        subfolder: "fl_mcp_masks",
+        type: "input",
+    };
+    let committed = structuredClone(original);
+    let pauseCalls = 0;
+    let graphChanges = 0;
+    flApi.pendingMaskReviews.set("number:41", {
+        token: "review-1",
+        nodeId: 41,
+        image: approved,
+        originalImage: original,
+        committedImage: original,
+        previewUrl: null,
+        workflowIdentity: "workflow-a",
+        graphHash: "a".repeat(64),
+        sourceImage: original,
+    });
+    flApi.maskReviewAutoQueueState = { kind: "queueSettings", mode: "instant" };
+    flApi.pinActiveWorkflow = identity => ({ identity });
+    flApi.createWorkflowMutationGuard = async () => ({
+        expectedGraphHash: "a".repeat(64),
+    });
+    flApi._workflowNodeFromSerializedId = () => node;
+    flApi.getNodeImageRef = () => ({ image: structuredClone(committed) });
+    flApi._assignImageToNode = (_node, image) => {
+        committed = structuredClone(image);
+    };
+    flApi.acceptWorkflowMutationGuard = async () => "b".repeat(64);
+    flApi._releaseMaskReviewPreview = () => {};
+    flApi._markGraphChanged = () => {
+        graphChanges += 1;
+    };
+    flApi._restoreAutoQueueAfterMaskReview = () => {
+        throw new Error("auto-queue restore failed");
+    };
+    flApi._pauseAutoQueueForMaskReview = () => {
+        pauseCalls += 1;
+        return { kind: "queueSettings", mode: "disabled" };
+    };
+
+    const result = await flApi.confirmMaskReview(41, "review-1");
+
+    assert.equal(result.success, true);
+    assert.equal(result.approved, true);
+    assert.equal(result.queued, false);
+    assert.deepEqual(committed, approved);
+    assert.equal(graphChanges, 1);
+    assert.equal(pauseCalls, 1);
+    assert.equal(flApi.pendingMaskReviews.size, 0);
+    assert.deepEqual(Array.from(result.cleanup_warnings, item => ({ ...item })), [{
+        phase: "restore_auto_queue",
+        message: "auto-queue restore failed",
+    }]);
 });
 
 
@@ -1534,6 +2161,21 @@ test("tool executor registers and routes GraphPatch through the guarded real ada
             assert.equal(received, guard);
             calls.push("hash-accept");
         },
+        captureCreatedNodeNormalizationCheckpoint(received, target) {
+            assert.equal(received, guard);
+            assert.deepEqual(JSON.parse(JSON.stringify(target)), {
+                node_id: 7,
+                node_type: "Child",
+                definition_id: null,
+            });
+            calls.push("normalization-checkpoint");
+            return { target };
+        },
+        acceptCreatedNodeNormalization(received, checkpoint) {
+            assert.equal(received, guard);
+            assert.equal(checkpoint.target.node_id, 7);
+            calls.push("normalization-accept");
+        },
         captureWorkflowSnapshot(received) {
             assert.equal(received, pin);
             calls.push("capture");
@@ -1694,6 +2336,7 @@ test("tool executor registers and routes GraphPatch through the guarded real ada
 
 test("root GraphPatch keeps serialized integer IDs across live string-node create and retry", async () => {
     const schemaHash = "7".repeat(64);
+    const deferredNodeEffects = [];
     class ProjectedNode {
         constructor(id = null) {
             this.id = id === null ? null : String(id);
@@ -1749,6 +2392,10 @@ test("root GraphPatch keeps serialized integer IDs across live string-node creat
             node.id = String(this.lastNodeId);
             node.graph = this;
             this._nodes.push(node);
+            deferredNodeEffects.push(() => {
+                node.size = [node.size[0], node.size[1] + 17];
+                node.properties.frontend_normalized = true;
+            });
         }
 
         remove(node) {
@@ -1812,6 +2459,11 @@ test("root GraphPatch keeps serialized integer IDs across live string-node creat
     }
 
     const graph = new ProjectedGraph();
+    const guardedWorkflowGraphHash = async snapshot => {
+        const digest = await workflowGraphHash(snapshot);
+        deferredNodeEffects.shift()?.();
+        return digest;
+    };
     const workflow = { key: "projected-root-workflow", changeTracker: { changeCount: 0 } };
     const app = {
         graph,
@@ -1832,7 +2484,7 @@ test("root GraphPatch keeps serialized integer IDs across live string-node creat
         ) },
         GRAPH_PRECONDITION_SCHEMA: "fl-mcp.graph-precondition.v1",
         canonicalWorkflowJSON,
-        workflowGraphHash,
+        workflowGraphHash: guardedWorkflowGraphHash,
         workflowGraphHashExcludingExtra,
         nodeIdsEqual: (left, right) => String(left) === String(right),
         findNonOverlappingPosition: value => ({ x: value.x, y: value.y }),
@@ -1843,6 +2495,12 @@ test("root GraphPatch keeps serialized integer IDs across live string-node creat
         normalizeMaskRegion: value => value,
         parseImageWidgetRef: () => null,
         summarizeMaskPixels: () => ({}),
+        document: { visibilityState: "visible" },
+        requestAnimationFrame: callback => {
+            callback();
+            return 1;
+        },
+        cancelAnimationFrame() {},
     });
     const flApi = new FL_API();
     flApi.pauseAutoQueue = () => ({ mode: "disabled" });
@@ -2019,6 +2677,7 @@ test("root GraphPatch keeps serialized integer IDs across live string-node creat
     assert.deepEqual(graph.serialize().links.map(link => [link[1], link[3]]), [[1, 3]]);
     assert.deepEqual(graph._nodes[0].pos, [10, 20]);
     assert.deepEqual(graph._nodes[0].size, [230, 130]);
+    assert.equal(graph._nodes[1].properties.frontend_normalized, true);
     assert.equal(retry.success, true, JSON.stringify(retry.error));
     assert.equal(retry.already_applied, true);
     assert.equal(graph._nodes.length, 2);
@@ -2139,6 +2798,8 @@ test("the guarded ToolExecutor adapter lets an edge unlock a deferred dynamic-sl
         createWorkflowMutationGuard() { return guard; },
         assertWorkflowMutationGuard() {},
         acceptWorkflowMutationGuard() {},
+        captureCreatedNodeNormalizationCheckpoint(_guard, target) { return { target }; },
+        acceptCreatedNodeNormalization() {},
         captureWorkflowSnapshot() { return clone(workflow); },
         restoreWorkflowSnapshot(snapshot) { workflow = clone(snapshot); },
         getWorkflowNode(id) { return observedNode(id); },

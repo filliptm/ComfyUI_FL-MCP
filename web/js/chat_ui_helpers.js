@@ -201,12 +201,14 @@ export function toolHistorySummary(steps = []) {
         done: 0,
         retried: 0,
         failed: 0,
+        needsChoice: 0,
         interrupted: 0,
     };
     for (const step of entries) {
         const status = String(step?.status || "").toLowerCase();
         if (status === "running") counts.running += 1;
         else if (["failed", "error"].includes(status)) counts.failed += 1;
+        else if (status === "needs_choice") counts.needsChoice += 1;
         else if (status === "retried") counts.retried += 1;
         else if (["cancelled", "interrupted"].includes(status)) counts.interrupted += 1;
         else counts.done += 1;
@@ -223,12 +225,25 @@ export function summarizeToolStep(step, config = {}) {
         : args;
     const result = toolResultPayload(step?.result);
     const failed = ["failed", "error"].includes(step?.status);
+    const needsChoice = step?.status === "needs_choice"
+        || (failed && result?.needs_choice === true);
+    if (needsChoice) {
+        const choiceLabels = {
+            view_node_mask: "Choose the exact image node to inspect",
+            view_prompt_reference_image: "Choose the exact reference image route",
+            update_connected_prompt: "Choose the exact prompt target",
+        };
+        return choiceLabels[name] || `${config.label || name || "Action"} needs your choice`;
+    }
     if (failed) {
         const failureLabels = {
             view_output_image: "Couldn’t review output image",
             view_chat_image: "Couldn’t inspect attached image",
+            view_canvas_images: "Couldn’t inspect canvas images",
             place_chat_image_in_node: "Couldn’t place attached image",
-            view_node_mask: "Couldn’t inspect image mask",
+            view_node_mask: "Couldn’t inspect image for masking",
+            view_prompt_reference_image: "Couldn’t inspect reference image",
+            update_connected_prompt: "Couldn’t update connected prompt",
             edit_node_mask: "Couldn’t update image mask",
             confirm_mask_review: "Mask needs changes",
             web_search: "Couldn’t search the web",
@@ -266,6 +281,16 @@ export function summarizeToolStep(step, config = {}) {
         const size = dimensionsLabel(result?.originalSize);
         return size ? `Inspected attached image · ${size}` : "Inspected attached image";
     }
+    if (name === "view_canvas_images") {
+        const returned = Number(result?.returned_count);
+        const total = Number(result?.total_count);
+        if (Number.isInteger(returned) && Number.isInteger(total)) {
+            return result?.has_more
+                ? `Inspected ${returned} of ${total} canvas images`
+                : `Inspected all ${total} canvas images`;
+        }
+        return "Inspected canvas images";
+    }
     if (name === "place_chat_image_in_node") {
         const node = result?.title
             || (result?.node_id !== undefined ? `node ${result.node_id}` : "selected node");
@@ -275,8 +300,18 @@ export function summarizeToolStep(step, config = {}) {
         const node = result?.title
             || (result?.node_id !== undefined ? `node ${result.node_id}` : "image");
         const coverage = coverageLabel(result);
-        const summary = `Inspected mask on ${node}`;
+        const summary = `Inspected ${node} for masking`;
         return coverage ? `${summary} · ${coverage}` : summary;
+    }
+    if (name === "view_prompt_reference_image") {
+        const input = result?.consumer_input || "reference input";
+        return `Inspected image connected to ${input}`;
+    }
+    if (name === "update_connected_prompt") {
+        const node = result?.producer_node_id !== undefined
+            ? `node ${result.producer_node_id}`
+            : "connected prompt";
+        return `Updated exact prompt on ${node}`;
     }
     if (name === "edit_node_mask") {
         const regions = Array.isArray(request?.regions) ? request.regions : [];

@@ -1,5 +1,6 @@
 import uuid
 
+import pytest
 import server
 from fastapi.testclient import TestClient
 from models import (
@@ -300,6 +301,35 @@ def test_outdated_frontend_handshakes_cannot_replace_capable_active_bridge():
                 forwarded = frontend.receive_json()
                 assert forwarded["request_id"] == "active-bridge-request"
                 assert forwarded["tool_name"] == "generate_seed"
+
+
+@pytest.mark.parametrize("mode", [None, "daemon", "embedded"])
+def test_mcp_shutdown_allows_daemon_and_embedded_mode(monkeypatch, mode):
+    exit_calls = []
+    monkeypatch.setattr(server.os, "_exit", lambda code: exit_calls.append(code))
+    if mode is None:
+        monkeypatch.delenv("FL_MCP_MODE", raising=False)
+    else:
+        monkeypatch.setenv("FL_MCP_MODE", mode)
+
+    with TestClient(server.app) as client:
+        response = client.post("/api/mcp/shutdown")
+
+    assert response.status_code == 200
+    assert response.json()["success"] is True
+
+
+def test_mcp_shutdown_rejects_other_modes(monkeypatch):
+    exit_calls = []
+    monkeypatch.setattr(server.os, "_exit", lambda code: exit_calls.append(code))
+    monkeypatch.setenv("FL_MCP_MODE", "manual")
+
+    with TestClient(server.app) as client:
+        response = client.post("/api/mcp/shutdown")
+
+    assert response.status_code == 409
+    assert response.json()["success"] is False
+    assert exit_calls == []
 
 
 def test_frontend_handshake_rejects_a_mismatched_manifest_hash():

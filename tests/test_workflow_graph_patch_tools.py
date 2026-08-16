@@ -722,6 +722,159 @@ def test_backend_idempotency_accepts_attested_same_value_and_layout_no_op_retry(
     assert result["queued"] is False
 
 
+def test_backend_idempotency_accepts_only_exact_native_upload_widget_projection():
+    catalog = _catalog()
+    plan = GraphPatchPlan.model_validate(
+        {
+            "operation": "patch",
+            "expected_workflow_identity": "fl-mcp-workflow-before",
+            "expected_graph_hash": "a" * 64,
+            "assertions": {"nodes": [], "edges": []},
+            "create_nodes": [
+                {
+                    "alias": "input_image",
+                    "node_type": "LoadImage",
+                    "schema_hash": node_schema_hash(
+                        "LoadImage",
+                        catalog["LoadImage"],
+                    ),
+                    "values": {"image": "example.png"},
+                }
+            ],
+            "expected_delta": {
+                "created_node_count": 1,
+                "updated_node_count": 0,
+                "removed_node_count": 0,
+                "added_edge_count": 0,
+                "removed_edge_count": 0,
+                "final_node_count": 1,
+                "final_edge_count": 0,
+            },
+        }
+    )
+    catalog_hash = catalog_contract_hash(catalog)
+    request = ApplyGraphPatchRequest(
+        application_id="graph-patch-load-image-retry-0001",
+        expected_catalog_hash=catalog_hash,
+        patch_hash=graph_patch_hash(plan, catalog_hash),
+        plan=plan,
+    )
+    active = {
+        "workflow_identity": plan.expected_workflow_identity,
+        "graph_hash": "e" * 64,
+        "graph_patch_content_hash": CONTENT_HASH,
+        "workflow": {
+            "version": 0.4,
+            "last_node_id": 9,
+            "last_link_id": 0,
+            "nodes": [
+                {
+                    "id": 9,
+                    "type": "LoadImage",
+                    "inputs": [
+                        {
+                            "name": "image",
+                            "type": "COMBO",
+                            "widget": {"name": "image"},
+                            "link": None,
+                        },
+                        {
+                            "name": "upload",
+                            "type": "IMAGEUPLOAD",
+                            "widget": {"name": "upload"},
+                            "link": None,
+                        },
+                    ],
+                    "outputs": [
+                        {"name": "IMAGE", "type": "IMAGE", "links": None},
+                        {"name": "MASK", "type": "MASK", "links": None},
+                    ],
+                    "widgets_values": ["example.png", "image"],
+                }
+            ],
+            "links": [],
+            "groups": [],
+            "config": {},
+            "extra": {
+                "fl_mcp_graph_patch_ledger": {
+                    "schema": "fl-mcp.workflow-graph-patch.v2",
+                    "order": [request.application_id],
+                    "entries": {
+                        request.application_id: {
+                            "patch_hash": request.patch_hash,
+                            "result_content_hash": CONTENT_HASH,
+                            "aliases": {"input_image": 9},
+                            "created_node_ids": [9],
+                            "removed_node_ids": [],
+                        }
+                    },
+                }
+            },
+        },
+    }
+
+    result = mcp_server._completed_graph_patch_result(
+        active,
+        request,
+        catalog=catalog,
+    )
+
+    assert result["success"] is True
+    assert result["already_applied"] is True
+    assert result["verification"]["idempotency_verified"] is True
+
+    ambiguous = deepcopy(active)
+    ambiguous["workflow"]["nodes"][0]["inputs"][1]["widget"]["name"] = "image"
+    ambiguous_result = mcp_server._completed_graph_patch_result(
+        ambiguous,
+        request,
+        catalog=catalog,
+    )
+    assert ambiguous_result["success"] is False
+    assert ambiguous_result["error"]["code"] == "invalid_graph_patch_ledger"
+    assert "completed_patch_values_unavailable" in {
+        issue["code"]
+        for issue in ambiguous_result["validation"]["issues"]
+    }
+
+    invalid_projections = {}
+    wrong_type = deepcopy(active)
+    wrong_type["workflow"]["nodes"][0]["inputs"][1]["type"] = "STRING"
+    invalid_projections["wrong upload type"] = wrong_type
+
+    wrong_name = deepcopy(active)
+    wrong_name["workflow"]["nodes"][0]["inputs"][1]["name"] = "refresh"
+    wrong_name["workflow"]["nodes"][0]["inputs"][1]["widget"]["name"] = "refresh"
+    invalid_projections["wrong upload name"] = wrong_name
+
+    wrong_target = deepcopy(active)
+    wrong_target["workflow"]["nodes"][0]["widgets_values"][1] = "mask"
+    invalid_projections["wrong paired widget"] = wrong_target
+
+    second_extra = deepcopy(active)
+    second_extra["workflow"]["nodes"][0]["inputs"].append({
+        "name": "refresh",
+        "type": "IMAGEUPLOAD",
+        "widget": {"name": "refresh"},
+        "link": None,
+    })
+    second_extra["workflow"]["nodes"][0]["widgets_values"].append("image")
+    invalid_projections["second extra widget"] = second_extra
+
+    for label, invalid in invalid_projections.items():
+        invalid_result = mcp_server._completed_graph_patch_result(
+            invalid,
+            request,
+            catalog=catalog,
+        )
+        assert invalid_result["success"] is False, label
+        assert invalid_result["error"]["code"] == "invalid_graph_patch_ledger", label
+        assert "completed_patch_values_unavailable" in {
+            issue["code"]
+            for issue in invalid_result["validation"]["issues"]
+        }, label
+
+
 def test_backend_idempotency_does_not_cross_workflow_identity():
     request = _request()
     active = _active(request)

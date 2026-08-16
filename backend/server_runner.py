@@ -269,10 +269,16 @@ class ServerRunner:
             if (
                 probe["is_fl_mcp"]
                 and probe["same_project"]
-                and probe["mode"] == "daemon"
+                and probe["mode"] in {"daemon", "embedded"}
                 and self.launch_mode in {"auto", "subprocess"}
             ):
-                print(f"[FL-MCP] Replacing stale daemon on port {self.port}.")
+                # "embedded" is what a subprocess-launched backend reports when
+                # FL_MCP_MODE is unset (the common case). Without this, a stale
+                # embedded-mode backend left running by a ComfyUI restart that
+                # didn't actually kill its child process is never replaced -
+                # start() just logs an error and gives up, silently serving
+                # stale code indefinitely.
+                print(f"[FL-MCP] Replacing stale {probe['mode']} backend on port {self.port}.")
                 if not self._shutdown_stale_daemon():
                     print(f"[FL-MCP] {self.last_error}")
                     return False

@@ -11,6 +11,14 @@ from pydantic import BaseModel, Field, StrictInt, StrictStr, model_validator
 _TOOL_NAME_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 REQUIRED_FRONTEND_TOOL_CONTRACT_REVISIONS = {
     "apply_workflow_graph_patch": 3,
+    "confirm_mask_review": 3,
+    "edit_node_mask": 5,
+    "get_node_image_ref": 2,
+    "get_canvas_image_refs": 1,
+    "get_selected_nodes": 2,
+    "queue_workflow": 3,
+    "recover_narrow_operation": 1,
+    "set_node_values_exact": 4,
 }
 ToolContractRevision = Annotated[StrictInt, Field(ge=1, le=2_147_483_647)]
 

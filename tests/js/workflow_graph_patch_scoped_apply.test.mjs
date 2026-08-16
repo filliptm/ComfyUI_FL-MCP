@@ -954,6 +954,12 @@ async function nativeRegisteredFixture({
         normalizeMaskRegion: value => value,
         parseImageWidgetRef: () => null,
         summarizeMaskPixels: () => ({}),
+        document: { visibilityState: "visible" },
+        requestAnimationFrame: callback => {
+            callback();
+            return 1;
+        },
+        cancelAnimationFrame() {},
     });
     const flApi = new FL_API();
     flApi.pauseAutoQueue = () => ({ mode: "disabled" });

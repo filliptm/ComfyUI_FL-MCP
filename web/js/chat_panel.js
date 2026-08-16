@@ -2722,6 +2722,7 @@ export class AssistantPanel {
         metaParts.push(`${summary.total} ${summary.total === 1 ? "action" : "actions"}`);
         if (!active && summary.done) metaParts.push(`${summary.done} done`);
         if (summary.retried) metaParts.push(`${summary.retried} retried`);
+        if (summary.needsChoice) metaParts.push(`${summary.needsChoice} needs choice`);
         if (summary.failed) metaParts.push(`${summary.failed} failed`);
         if (summary.interrupted) metaParts.push(`${summary.interrupted} interrupted`);
         if (active) metaParts.push(`${summary.total} ${summary.total === 1 ? "call" : "calls"}`);

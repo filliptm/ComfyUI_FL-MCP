@@ -4,19 +4,21 @@ Provides secure, deterministic access to ComfyUI directory structure
 for MCP-based analysis and discovery.
 """
 
-import re
+import hashlib
+import json
 import logging
-import httpx
+import re
+from collections.abc import Iterator, Mapping
 from pathlib import Path
-from typing import List, Dict, Optional, Union, Any, Iterator
-from dataclasses import dataclass
-from enum import Enum
+from typing import Any, Dict, List, Optional, Union
 from urllib.parse import quote
 
-from comfy_models import ComfyFolderType, ComfyFileInfo, ComfySearchResult
-from config import settings
+import httpx
+from comfy_models import ComfyFileInfo, ComfyFolderType, ComfySearchResult
 from comfy_runtime_paths import configured_runtime_paths
+from config import settings
 from extra_model_paths_loader import ExtraModelPathsLoader
+from narrow_edit_idempotency import NarrowEditIdempotencyError, _canonical_typed_bytes
 from path_resolver import PathResolver
 
 logger = logging.getLogger(__name__)
@@ -26,6 +28,442 @@ READ_MAX_LINES = 800
 LONG_LINE_CHARS = 1000
 SEARCH_LINE_CHARS = 600
 MAX_READ_FILE_BYTES = 5 * 1024 * 1024
+EXECUTION_SUBMISSION_ATTESTATION_SCHEMA = "fl-mcp.execution-submission-attestation.v1"
+EXECUTION_PROVENANCE_SCHEMA = "fl-mcp.execution-provenance.v1"
+EXECUTION_PROVENANCE_SOURCE = "frontend_queue_capture"
+EXECUTION_PROVENANCE_EXTRA_KEY = "fl_mcp_execution_provenance"
+EXECUTION_GRAPH_HASH_SCHEMA = "fl-mcp.graph-precondition.v1"
+SUBMITTED_API_PROMPT_HASH_SCHEMA = "fl-mcp.execution-api-prompt.typed-v1"
+SUBMITTED_EDITABLE_WORKFLOW_HASH_SCHEMA = "fl-mcp.execution-workflow.typed-v1"
+SUBMITTED_NODE_INPUTS_HASH_SCHEMA = "fl-mcp.execution-node-inputs.typed-v1"
+SUBMITTED_STRING_INPUT_HASH_SCHEMA = "fl-mcp.execution-string-input.typed-v1"
+MAX_EXECUTION_SUBMISSION_ATTESTATION_BYTES = 8 * 1024 * 1024
+MAX_EXECUTION_HISTORY_RESPONSE_BYTES = 16 * 1024 * 1024
+MAX_EXECUTION_SUBMISSION_NODES = 10_000
+MAX_EXECUTION_ATTESTED_NODE_IDS = 20
+MAX_EXECUTION_NODE_INPUTS = 1_000
+MAX_EXECUTION_NODE_STRING_FACTS = 32
+_SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+_PROVENANCE_FIELDS = {
+    "schema",
+    "source",
+    "api_prompt",
+    "editable_workflow",
+    "graph_hash",
+    "graph_hash_schema",
+    "raw_prompt_returned",
+    "captured_at_ms",
+    "operation_id",
+    "operation_request_hash",
+}
+_PROVENANCE_API_PROMPT_FIELDS = {"schema", "sha256", "canonical_bytes", "node_count"}
+_PROVENANCE_WORKFLOW_FIELDS = {
+    "schema",
+    "sha256",
+    "canonical_bytes",
+    "node_count",
+    "workflow_id",
+    "revision",
+}
+
+
+class _SubmissionAttestationUnavailable(ValueError):
+    """Internal bounded failure that is safe to expose as a fixed reason code."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+def _bounded_typed_sha256(value: Any, *, schema: str) -> tuple[str, int]:
+    """Hash one value with the browser-parity typed canonical encoding."""
+
+    try:
+        canonical = _canonical_typed_bytes({"schema": schema, "value": value})
+    except (NarrowEditIdempotencyError, OverflowError, RecursionError) as exc:
+        raise _SubmissionAttestationUnavailable("submission_malformed") from exc
+    if len(canonical) > MAX_EXECUTION_SUBMISSION_ATTESTATION_BYTES:
+        raise _SubmissionAttestationUnavailable("submission_too_large")
+    return hashlib.sha256(canonical).hexdigest(), len(canonical)
+
+
+def _bounded_node_count(nodes: Any) -> int:
+    if not isinstance(nodes, (list, Mapping)):
+        raise _SubmissionAttestationUnavailable("submission_malformed")
+    count = len(nodes)
+    if count > MAX_EXECUTION_SUBMISSION_NODES:
+        raise _SubmissionAttestationUnavailable("submission_too_large")
+    return count
+
+
+def _safe_integer(value: Any) -> bool:
+    return (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and abs(value) <= 9_007_199_254_740_991
+    )
+
+
+def _safe_nonnegative_integer(value: Any) -> bool:
+    return _safe_integer(value) and value >= 0
+
+
+def _workflow_without_execution_provenance(
+    workflow: Mapping[str, Any],
+) -> tuple[dict[str, Any], Any]:
+    detached = dict(workflow)
+    extra = workflow.get("extra")
+    provenance = None
+    if isinstance(extra, Mapping):
+        detached_extra = dict(extra)
+        provenance = detached_extra.pop(EXECUTION_PROVENANCE_EXTRA_KEY, None)
+        detached["extra"] = detached_extra
+    return detached, provenance
+
+
+def _capture_record_verification(
+    record: Any,
+    *,
+    api_prompt: Mapping[str, Any],
+    api_prompt_sha256: str,
+    api_prompt_bytes: int,
+    api_prompt_node_count: int,
+    editable_workflow_sha256: str,
+    editable_workflow_bytes: int,
+    editable_workflow_node_count: int,
+    editable_workflow_id: str | None,
+    editable_workflow_revision: int | None,
+) -> tuple[bool, str | None, dict[str, Any]]:
+    safe_graph_facts = {"graph_hash": None, "graph_hash_schema": None}
+    if not isinstance(record, Mapping):
+        return False, "frontend_queue_capture_missing", safe_graph_facts
+    if set(record) != _PROVENANCE_FIELDS:
+        return False, "frontend_queue_capture_malformed", safe_graph_facts
+    api_record = record.get("api_prompt")
+    workflow_record = record.get("editable_workflow")
+    if (
+        not isinstance(api_record, Mapping)
+        or set(api_record) != _PROVENANCE_API_PROMPT_FIELDS
+        or not isinstance(workflow_record, Mapping)
+        or set(workflow_record) != _PROVENANCE_WORKFLOW_FIELDS
+    ):
+        return False, "frontend_queue_capture_malformed", safe_graph_facts
+    workflow_id = workflow_record.get("workflow_id")
+    revision = workflow_record.get("revision")
+    if (
+        record.get("schema") != EXECUTION_PROVENANCE_SCHEMA
+        or record.get("source") != EXECUTION_PROVENANCE_SOURCE
+        or record.get("raw_prompt_returned") is not False
+        or not isinstance(record.get("operation_id"), str)
+        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{7,127}", record["operation_id"]) is None
+        or not isinstance(record.get("operation_request_hash"), str)
+        or _SHA256_PATTERN.fullmatch(record["operation_request_hash"]) is None
+        or not _safe_nonnegative_integer(record.get("captured_at_ms"))
+        or api_record.get("schema") != SUBMITTED_API_PROMPT_HASH_SCHEMA
+        or workflow_record.get("schema") != SUBMITTED_EDITABLE_WORKFLOW_HASH_SCHEMA
+        or (workflow_id is not None and not isinstance(workflow_id, str))
+        or (revision is not None and not _safe_integer(revision))
+        or record.get("graph_hash_schema") != EXECUTION_GRAPH_HASH_SCHEMA
+        or not isinstance(record.get("graph_hash"), str)
+        or _SHA256_PATTERN.fullmatch(record["graph_hash"]) is None
+        or not isinstance(api_record.get("sha256"), str)
+        or _SHA256_PATTERN.fullmatch(api_record["sha256"]) is None
+        or not _safe_nonnegative_integer(api_record.get("canonical_bytes"))
+        or not _safe_nonnegative_integer(api_record.get("node_count"))
+        or not isinstance(workflow_record.get("sha256"), str)
+        or _SHA256_PATTERN.fullmatch(workflow_record["sha256"]) is None
+        or not _safe_nonnegative_integer(workflow_record.get("canonical_bytes"))
+        or not _safe_nonnegative_integer(workflow_record.get("node_count"))
+    ):
+        return False, "frontend_queue_capture_malformed", safe_graph_facts
+    try:
+        workflow_id_bytes = str(workflow_id or "").encode("utf-8")
+    except UnicodeEncodeError:
+        return False, "frontend_queue_capture_malformed", safe_graph_facts
+    if len(workflow_id_bytes) > 256:
+        return False, "frontend_queue_capture_malformed", safe_graph_facts
+    expected_api = {
+        "schema": SUBMITTED_API_PROMPT_HASH_SCHEMA,
+        "sha256": api_prompt_sha256,
+        "canonical_bytes": api_prompt_bytes,
+        "node_count": api_prompt_node_count,
+    }
+    expected_workflow = {
+        "schema": SUBMITTED_EDITABLE_WORKFLOW_HASH_SCHEMA,
+        "sha256": editable_workflow_sha256,
+        "canonical_bytes": editable_workflow_bytes,
+        "node_count": editable_workflow_node_count,
+        "workflow_id": editable_workflow_id,
+        "revision": editable_workflow_revision,
+    }
+    if dict(api_record) != expected_api or dict(workflow_record) != expected_workflow:
+        return False, "frontend_queue_capture_hash_mismatch", safe_graph_facts
+    if len(api_prompt) != api_prompt_node_count:
+        return False, "frontend_queue_capture_hash_mismatch", safe_graph_facts
+    return True, None, {
+        "graph_hash": record["graph_hash"],
+        "graph_hash_schema": EXECUTION_GRAPH_HASH_SCHEMA,
+        "captured_at_ms": record["captured_at_ms"],
+        "workflow_id": editable_workflow_id,
+        "revision": editable_workflow_revision,
+        "operation_id": record["operation_id"],
+        "operation_request_hash": record["operation_request_hash"],
+    }
+
+
+def _typed_node_id(value: Any) -> int | str | None:
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        return None
+    return value
+
+
+def _editable_workflow_nodes(workflow: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    nodes = workflow.get("nodes")
+    if isinstance(nodes, list):
+        values = nodes
+    elif isinstance(nodes, Mapping):
+        values = [
+            ({**node, "id": key} if isinstance(node, Mapping) and "id" not in node else node)
+            for key, node in nodes.items()
+        ]
+    else:
+        return []
+    return [node for node in values if isinstance(node, Mapping)]
+
+
+def _input_name_fact(name: str) -> dict[str, Any]:
+    if re.fullmatch(r"[A-Za-z0-9_.:-]{1,64}", name):
+        return {"input": name}
+    encoded = name.encode("utf-8")
+    return {
+        "input_name_sha256": hashlib.sha256(encoded).hexdigest(),
+        "input_name_utf8_bytes": len(encoded),
+    }
+
+
+def _string_input_kind(name: str, value: str) -> str:
+    normalized = "".join(character for character in name.casefold() if character.isalnum())
+    if (
+        any(role in normalized for role in ("image", "mask", "reference", "filename"))
+        or re.search(r"\.(?:png|jpe?g|webp|gif|bmp|tiff?)(?:\s*\[[^]]+\])?$", value, re.I)
+    ):
+        return "image_reference"
+    return "text"
+
+
+def _requested_node_attestation(
+    *,
+    requested_node_id: int | str,
+    api_prompt: Mapping[str, Any],
+    editable_workflow: Mapping[str, Any],
+) -> dict[str, Any]:
+    unavailable = {"node_id": requested_node_id, "available": False}
+    nodes = _editable_workflow_nodes(editable_workflow)
+    exact_matches = [
+        node
+        for node in nodes
+        if type(_typed_node_id(node.get("id"))) is type(requested_node_id)
+        and _typed_node_id(node.get("id")) == requested_node_id
+    ]
+    string_id_matches = [
+        node
+        for node in nodes
+        if (node_id := _typed_node_id(node.get("id"))) is not None
+        and str(node_id) == str(requested_node_id)
+    ]
+    if len(exact_matches) != 1:
+        return {
+            **unavailable,
+            "reason": "editable_node_ambiguous" if exact_matches else "editable_node_missing",
+        }
+    if len(string_id_matches) != 1:
+        return {**unavailable, "reason": "api_prompt_node_id_collision"}
+    api_node = api_prompt.get(str(requested_node_id))
+    if not isinstance(api_node, Mapping):
+        return {**unavailable, "reason": "api_prompt_node_missing"}
+    class_type = api_node.get("class_type")
+    inputs = api_node.get("inputs")
+    try:
+        class_type_bytes = class_type.encode("utf-8") if isinstance(class_type, str) else b""
+    except UnicodeEncodeError:
+        class_type_bytes = b""
+    if not 1 <= len(class_type_bytes) <= 256 or not isinstance(inputs, Mapping):
+        return {**unavailable, "reason": "api_prompt_node_malformed"}
+    if len(inputs) > MAX_EXECUTION_NODE_INPUTS:
+        return {**unavailable, "reason": "node_inputs_too_large"}
+    try:
+        inputs_sha256, inputs_canonical_bytes = _bounded_typed_sha256(
+            inputs,
+            schema=SUBMITTED_NODE_INPUTS_HASH_SCHEMA,
+        )
+        string_facts = []
+        input_names = list(inputs)
+        if any(not isinstance(name, str) for name in input_names):
+            raise _SubmissionAttestationUnavailable("submission_malformed")
+        input_names.sort()
+        for name in input_names:
+            value = inputs[name]
+            if not isinstance(value, str):
+                continue
+            if len(string_facts) >= MAX_EXECUTION_NODE_STRING_FACTS:
+                break
+            value_sha256, _ = _bounded_typed_sha256(
+                value,
+                schema=SUBMITTED_STRING_INPUT_HASH_SCHEMA,
+            )
+            string_facts.append(
+                {
+                    **_input_name_fact(name),
+                    "kind": _string_input_kind(name, value),
+                    "value_sha256": value_sha256,
+                    "utf8_bytes": len(value.encode("utf-8")),
+                }
+            )
+    except (UnicodeEncodeError, _SubmissionAttestationUnavailable) as exc:
+        reason = exc.reason if isinstance(exc, _SubmissionAttestationUnavailable) else "submission_malformed"
+        return {**unavailable, "reason": reason}
+    return {
+        "node_id": requested_node_id,
+        "available": True,
+        "class_type": class_type,
+        "inputs_hash_schema": SUBMITTED_NODE_INPUTS_HASH_SCHEMA,
+        "inputs_sha256": inputs_sha256,
+        "inputs_canonical_bytes": inputs_canonical_bytes,
+        "input_count": len(inputs),
+        "string_inputs": string_facts,
+        "string_inputs_truncated": sum(
+            1 for value in inputs.values() if isinstance(value, str)
+        ) > len(string_facts),
+    }
+
+
+def _submission_attestation(
+    raw_prompt: Any,
+    *,
+    attest_node_ids: tuple[int | str, ...] = (),
+) -> dict[str, Any]:
+    """Derive non-plaintext identity facts from one Comfy history prompt tuple."""
+
+    unavailable = {
+        "schema": EXECUTION_SUBMISSION_ATTESTATION_SCHEMA,
+        "available": False,
+    }
+    try:
+        if not isinstance(raw_prompt, (list, tuple)) or len(raw_prompt) < 4:
+            raise _SubmissionAttestationUnavailable("submission_malformed")
+        api_prompt = raw_prompt[2]
+        extra_data = raw_prompt[3]
+        if not isinstance(api_prompt, Mapping) or not isinstance(extra_data, Mapping):
+            raise _SubmissionAttestationUnavailable("submission_malformed")
+        extra_pnginfo = extra_data.get("extra_pnginfo")
+        if not isinstance(extra_pnginfo, Mapping):
+            raise _SubmissionAttestationUnavailable("submission_malformed")
+        raw_editable_workflow = extra_pnginfo.get("workflow")
+        if not isinstance(raw_editable_workflow, Mapping):
+            raise _SubmissionAttestationUnavailable("submission_malformed")
+        editable_workflow, provenance_record = _workflow_without_execution_provenance(
+            raw_editable_workflow
+        )
+
+        api_prompt_node_count = _bounded_node_count(api_prompt)
+        editable_workflow_node_count = _bounded_node_count(editable_workflow.get("nodes"))
+        api_prompt_sha256, api_prompt_bytes = _bounded_typed_sha256(
+            api_prompt,
+            schema=SUBMITTED_API_PROMPT_HASH_SCHEMA,
+        )
+        editable_workflow_sha256, editable_workflow_bytes = (
+            _bounded_typed_sha256(
+                editable_workflow,
+                schema=SUBMITTED_EDITABLE_WORKFLOW_HASH_SCHEMA,
+            )
+        )
+        workflow_id_value = editable_workflow.get("id")
+        editable_workflow_id = (
+            workflow_id_value if isinstance(workflow_id_value, str) else None
+        )
+        workflow_revision_value = editable_workflow.get("revision")
+        editable_workflow_revision = (
+            workflow_revision_value if _safe_integer(workflow_revision_value) else None
+        )
+        capture_verified, capture_reason, capture_facts = _capture_record_verification(
+            provenance_record,
+            api_prompt=api_prompt,
+            api_prompt_sha256=api_prompt_sha256,
+            api_prompt_bytes=api_prompt_bytes,
+            api_prompt_node_count=api_prompt_node_count,
+            editable_workflow_sha256=editable_workflow_sha256,
+            editable_workflow_bytes=editable_workflow_bytes,
+            editable_workflow_node_count=editable_workflow_node_count,
+            editable_workflow_id=editable_workflow_id,
+            editable_workflow_revision=editable_workflow_revision,
+        )
+        if len(attest_node_ids) > MAX_EXECUTION_ATTESTED_NODE_IDS:
+            raise _SubmissionAttestationUnavailable("too_many_attested_node_ids")
+        typed_requested = [(type(node_id).__name__, node_id) for node_id in attest_node_ids]
+        if (
+            any(_typed_node_id(node_id) is None for node_id in attest_node_ids)
+            or len(set(typed_requested)) != len(typed_requested)
+        ):
+            raise _SubmissionAttestationUnavailable("attested_node_ids_malformed")
+        node_attestations = [
+            _requested_node_attestation(
+                requested_node_id=node_id,
+                api_prompt=api_prompt,
+                editable_workflow=editable_workflow,
+            )
+            for node_id in attest_node_ids
+        ]
+    except _SubmissionAttestationUnavailable as exc:
+        return {**unavailable, "reason": exc.reason}
+
+    return {
+        "schema": EXECUTION_SUBMISSION_ATTESTATION_SCHEMA,
+        "available": True,
+        "raw_prompt_returned": False,
+        "hash_algorithm": "sha256",
+        "source": (
+            EXECUTION_PROVENANCE_SOURCE if provenance_record is not None else "history_derived"
+        ),
+        "verified": capture_verified,
+        **({"verification_reason": capture_reason} if capture_reason else {}),
+        "api_prompt": {
+            "schema": SUBMITTED_API_PROMPT_HASH_SCHEMA,
+            "sha256": api_prompt_sha256,
+            "canonical_bytes": api_prompt_bytes,
+            "node_count": api_prompt_node_count,
+        },
+        "editable_workflow": {
+            "schema": SUBMITTED_EDITABLE_WORKFLOW_HASH_SCHEMA,
+            "sha256": editable_workflow_sha256,
+            "canonical_bytes": editable_workflow_bytes,
+            "node_count": editable_workflow_node_count,
+        },
+        "node_attestations": node_attestations,
+        **capture_facts,
+    }
+
+
+async def _bounded_history_json_response(
+    client: httpx.AsyncClient,
+    url: str,
+) -> Any:
+    """Stream one opt-in history response under a pre-decode byte ceiling."""
+
+    async with client.stream("GET", url, timeout=10.0) as response:
+        response.raise_for_status()
+        content_length = response.headers.get("content-length")
+        if content_length and content_length.isdecimal():
+            if int(content_length) > MAX_EXECUTION_HISTORY_RESPONSE_BYTES:
+                raise ComfyUIError("ComfyUI history response exceeds the safe byte limit.")
+        payload = bytearray()
+        async for chunk in response.aiter_bytes():
+            payload.extend(chunk)
+            if len(payload) > MAX_EXECUTION_HISTORY_RESPONSE_BYTES:
+                raise ComfyUIError("ComfyUI history response exceeds the safe byte limit.")
+    try:
+        return json.loads(payload)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ComfyUIError("ComfyUI returned malformed execution history JSON.") from exc
 
 
 def _chunk_long_lines(text: str, limit: int = LONG_LINE_CHARS) -> str:
@@ -211,12 +649,24 @@ class ComfyUITools:
             else:
                 logger.debug(f"Skipping non-existent path: {folder_path}")
     
-    async def fetch_history(self, prompt_id: Optional[str] = None, max_items: int = 10) -> Dict[str, Any]:
+    async def fetch_history(
+        self,
+        prompt_id: Optional[str] = None,
+        max_items: int = 10,
+        *,
+        include_submission_attestation: bool = False,
+        attest_node_ids: tuple[int | str, ...] = (),
+    ) -> Dict[str, Any]:
         """Fetch execution history from ComfyUI.
         
         Args:
             prompt_id: Optional specific prompt ID to fetch. If None, fetches recent history.
             max_items: Maximum number of history items to fetch (default: 10)
+            include_submission_attestation: Derive bounded hashes and node counts from
+                the submitted prompt tuple before redacting it. Raw prompt and widget
+                values are never returned.
+            attest_node_ids: Up to 20 exact typed node IDs for compact, non-plaintext
+                per-node input attestations. Used only with submission attestation.
             
         Returns:
             If prompt_id is provided: Single history entry dict or None if not found
@@ -232,26 +682,44 @@ class ComfyUITools:
                     if prompt_id
                     else "/history"
                 )
-                response = await client.get(
-                    f"{self.comfy_url}{history_path}",
-                    params=None if prompt_id else {"max_items": max_items},
-                    timeout=10.0
-                )
-                response.raise_for_status()
+                history_url = f"{self.comfy_url}{history_path}"
+                if include_submission_attestation:
+                    if not prompt_id:
+                        raise ComfyUIError(
+                            "Submission attestation requires one exact prompt ID."
+                        )
+                    history = await _bounded_history_json_response(client, history_url)
+                else:
+                    response = await client.get(
+                        history_url,
+                        params=None if prompt_id else {"max_items": max_items},
+                        timeout=10.0,
+                    )
+                    response.raise_for_status()
+                    history = response.json()
+                if not isinstance(history, dict):
+                    raise ComfyUIError("ComfyUI returned malformed execution history JSON.")
                 
-                history = response.json()
-                
-                # Strip out "prompt" key to reduce token usage
-                # We only care about status, outputs, and errors
-                for prompt_id_key, entry in history.items():
-                    if "prompt" in entry:
-                        del entry["prompt"]
+                # The raw submitted API prompt and editable workflow can contain
+                # arbitrary widget plaintext. Keep the historical default redaction;
+                # the opt-in path returns only bounded identity metadata.
+                for entry in history.values():
+                    if not isinstance(entry, dict):
+                        continue
+                    if include_submission_attestation:
+                        entry["submission_attestation"] = _submission_attestation(
+                            entry.get("prompt"),
+                            attest_node_ids=attest_node_ids,
+                        )
+                    entry.pop("prompt", None)
                 
                 if prompt_id:
                     return history.get(prompt_id)
                 else:
                     return history
                     
+        except ComfyUIError:
+            raise
         except httpx.TimeoutException:
             raise ComfyUIError(
                 f"ComfyUI server timeout. Is ComfyUI running at {self.comfy_url}?"
@@ -430,7 +898,7 @@ class ComfyUITools:
         for folder_path in self._iter_all_paths(folder_type):
             # Security check
             try:
-                folder_path_resolved = folder_path.resolve()
+                folder_path.resolve()
                 # Note: folder_path might be outside comfyui_root if from extra_model_paths.yaml
                 # This is intentional - we trust the YAML config
             except (OSError, RuntimeError) as e:
@@ -676,8 +1144,9 @@ class ComfyUITools:
             ComfyUIError: If file access fails or is invalid
         """
         try:
-            from PIL import Image
             import json
+
+            from PIL import Image
             
             # Validate and resolve path
             full_path = self._validate_path(image_path)

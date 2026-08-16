@@ -47,6 +47,7 @@ def test_consequential_tools_require_approval():
 
 
 def test_official_registry_discovery_is_read_only():
+    assert classify_tool("view_canvas_images") == "read_only"
     assert classify_tool("registry_search_packages") == "read_only"
     assert classify_tool("registry_get_package") == "read_only"
     assert classify_tool("plan_workflow") == "read_only"

@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
 dependencies = [
+    "aiohttp",
     "fastapi>=0.115,<0.116",
     "uvicorn[standard]",
     "python-multipart",
@@ -22,6 +23,13 @@ dependencies = [
     "selectolax>=0.4.11,<0.5",
     "Pillow",
     "PyYAML>=6.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "pytest-asyncio",
+    "pytest-cov",
 ]
 
 [project.urls]
