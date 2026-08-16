@@ -8,6 +8,7 @@
  */
 
 import { app } from "../../scripts/app.js";
+import { api } from "../../scripts/api.js";
 
 /**
  * QueryExecutor class - Executes queries against the workflow
@@ -509,15 +510,55 @@ export class QueryExecutor {
     }
 
     /**
+     * Fetch the live /object_info catalog so required-vs-optional status can
+     * be read from ComfyUI's actual node schema instead of guessed. Returns
+     * null on failure so callers can fall back to the heuristics below.
+     * @returns {Promise<object|null>} Catalog keyed by node class name
+     */
+    async _fetchNodeDefinitions() {
+        try {
+            const response = await api.fetchApi("/object_info", { cache: "no-store" });
+            if (!response.ok) return null;
+            return await response.json();
+        } catch (error) {
+            console.warn("[QueryExecutor] Could not fetch /object_info for preflight checks:", error);
+            return null;
+        }
+    }
+
+    /**
      * Check if an input slot is required for a node
      * @param {object} rawNode - Raw LiteGraph node
      * @param {object} input - Input slot
+     * @param {object|null} nodeDefs - /object_info catalog keyed by node class name
      * @returns {boolean} True if the input is required
      */
-    isInputSlotRequired(rawNode, input) {
+    isInputSlotRequired(rawNode, input, nodeDefs = null) {
+        // The live ComfyUI node schema is authoritative when available - it's
+        // the actual required/optional split the node class declares, not a
+        // guess. Only fall through to the heuristics below when the schema is
+        // unavailable (fetch failed) or doesn't mention this slot at all
+        // (e.g. a dynamically-added input).
+        const nodeType = rawNode.comfyClass || rawNode.type;
+        const schemaInput = nodeDefs?.[nodeType]?.input;
+        if (schemaInput && input.name) {
+            if (
+                schemaInput.optional
+                && Object.prototype.hasOwnProperty.call(schemaInput.optional, input.name)
+            ) {
+                return false;
+            }
+            if (
+                schemaInput.required
+                && Object.prototype.hasOwnProperty.call(schemaInput.required, input.name)
+            ) {
+                return true;
+            }
+        }
+
         // In ComfyUI, most inputs are required unless they have default values or are optional
         // We'll use several heuristics to determine if an input is required:
-        
+
         // 1. Check if the input type ends with "?" (optional marker)
         if (typeof input.type === 'string' && input.type.endsWith('?')) {
             return false;
@@ -554,7 +595,6 @@ export class QueryExecutor {
         }
         
         // 5. Some node types have specific patterns
-        const nodeType = rawNode.comfyClass || rawNode.type;
         if (nodeType) {
             // Loader nodes typically require their main input
             if (nodeType.includes('Loader') || nodeType.includes('Load')) {
@@ -585,11 +625,12 @@ export class QueryExecutor {
 
     /**
      * Get workflow overview with enhanced connection analysis
-     * @returns {object} Workflow overview
+     * @returns {Promise<object>} Workflow overview
      */
-    getWorkflowOverview() {
+    async getWorkflowOverview() {
         const nodes = this.getAllNodes();
         const rawNodes = this.app.graph ? this.app.graph._nodes : [];
+        const nodeDefs = await this._fetchNodeDefinitions();
         
         // Count nodes by type
         const typeCount = {};
@@ -626,7 +667,7 @@ export class QueryExecutor {
                 if (!rawInput) continue;
                 
                 // Check if this input is required
-                if (this.isInputSlotRequired(rawNode, rawInput)) {
+                if (this.isInputSlotRequired(rawNode, rawInput, nodeDefs)) {
                     missingSlots.push({
                         slot_name: input.slot,
                         slot_type: input.type,
