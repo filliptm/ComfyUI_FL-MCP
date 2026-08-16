@@ -241,9 +241,79 @@ PROMPT_CONTEXT_INSPECTION_TOOLS = {
     "view_node_mask",
     "view_prompt_reference_image",
 }
-PROMPT_WORD_PATTERN = (
-    r"(?:prompts?|pormots?|promots?|promts?|prmopts?|promtps?|pronmpts?)"
-)
+PROMPT_WORD_PATTERN = r"(?:prompts?)"
+# Enumerating every possible typo of "prompt" doesn't scale; instead every
+# alphabetic token close to "prompt"/"prompts" by edit distance is folded to
+# the canonical spelling once, in _canonicalize_prompt_typos below, so every
+# PROMPT_WORD_PATTERN match downstream sees only the canonical form.
+_PROMPT_TYPO_TOKEN_RE = re.compile(r"[a-z']+")
+_PROMPT_TYPO_CANONICAL_TARGETS = ("prompt", "prompts")
+_PROMPT_TYPO_MAX_DISTANCE = 2
+_PROMPT_TYPO_TOKEN_LENGTH_RANGE = (5, 8)
+# "pormot(s)" sits just outside edit-distance 2 of "prompt(s)" (distance 3-4)
+# but has existing test coverage from before fuzzy matching existed; kept as
+# an exact allowlist rather than loosening the distance threshold globally,
+# since a threshold of 3 pulls in common real words (print, point, group,
+# process, product, project, permit, ...) confirmed against a full
+# dictionary scan.
+_PROMPT_LEGACY_TYPO_TOKENS = frozenset({"pormot", "pormots"})
+# Real English words within edit-distance 2 of "prompt"/"prompts" (found via
+# an exhaustive scan of /usr/share/dict/words) that fuzzy matching must never
+# fold, since they mean something unrelated to "the prompt" here.
+_PROMPT_FUZZY_MATCH_DENYLIST = frozenset({
+    "profit", "promote", "promoted", "promotes", "promoting", "promoter",
+    "promoters", "promptly", "props", "primp", "primps", "primped",
+    "primping", "tromp", "tromps", "tromped", "tromping", "trompe",
+    "dompt", "droopt", "dropt", "pompa", "preomit", "promic", "pronpl",
+    "propus", "rompu", "rompy",
+})
+
+
+def _levenshtein_distance(left: str, right: str) -> int:
+    if left == right:
+        return 0
+    if not left:
+        return len(right)
+    if not right:
+        return len(left)
+    previous_row = list(range(len(right) + 1))
+    for i, left_char in enumerate(left, start=1):
+        current_row = [i]
+        for j, right_char in enumerate(right, start=1):
+            current_row.append(min(
+                previous_row[j] + 1,
+                current_row[j - 1] + 1,
+                previous_row[j - 1] + (left_char != right_char),
+            ))
+        previous_row = current_row
+    return previous_row[-1]
+
+
+def _canonicalize_prompt_typos(text: str) -> str:
+    """Fold any close misspelling of "prompt"/"prompts" to its canonical form."""
+
+    min_length, max_length = _PROMPT_TYPO_TOKEN_LENGTH_RANGE
+
+    def replace(match: "re.Match[str]") -> str:
+        token = match.group(0)
+        if token in _PROMPT_TYPO_CANONICAL_TARGETS:
+            return token
+        if token in _PROMPT_LEGACY_TYPO_TOKENS:
+            return "prompt"
+        if token in _PROMPT_FUZZY_MATCH_DENYLIST:
+            return token
+        if not (min_length <= len(token) <= max_length):
+            return token
+        if any(
+            _levenshtein_distance(token, target) <= _PROMPT_TYPO_MAX_DISTANCE
+            for target in _PROMPT_TYPO_CANONICAL_TARGETS
+        ):
+            return "prompt"
+        return token
+
+    return _PROMPT_TYPO_TOKEN_RE.sub(replace, text)
+
+
 PROMPT_VALUE_ACTION_PATTERN = (
     r"(?:add(?:ed|ing)?|append(?:ed|ing)?|remov(?:e|ed|ing)|"
     r"adjust(?:ed|ing)?|adjsut(?:ed|ing)?|djust(?:ed|ing)?|"
@@ -264,10 +334,10 @@ PROMPT_VALUE_NEGATABLE_ACTION_PATTERN = (
 
 
 def _visible_user_text(message: str) -> str:
-    return str(message or "").split(
+    return _canonicalize_prompt_typos(str(message or "").split(
         "\n\nThe user attached ComfyUI input image(s)",
         1,
-    )[0].casefold().replace("’", "'").replace("‘", "'")
+    )[0].casefold().replace("’", "'").replace("‘", "'"))
 
 
 def _message_has_attachment_context(message: str) -> bool:

@@ -1777,6 +1777,31 @@ def test_prompt_intensity_phrasing_without_a_core_edit_verb_still_exposes_prompt
     assert "update_connected_prompt" in tools_for_message(phrase, "free")
 
 
+@pytest.mark.parametrize(
+    "phrase",
+    (
+        "pls change the entire promnpt so that the sand is pink throughout the context",
+        "can you fix the pronmpt",
+        "update the promtp please",
+        "change the prmopt to say something else",
+    ),
+)
+def test_unenumerated_prompt_typos_are_recognized_via_fuzzy_match(phrase):
+    assert prompt_value_edit_requested(phrase) is True
+    assert "update_connected_prompt" in tools_for_message(phrase, "free")
+
+
+@pytest.mark.parametrize(
+    "word",
+    (
+        "profit", "promote", "promoted", "promptly", "props", "primp",
+        "product", "project", "process", "problem", "proper",
+    ),
+)
+def test_prompt_typo_fuzzy_match_never_folds_real_unrelated_words(word):
+    assert chat_runtime_module._canonicalize_prompt_typos(word) == word
+
+
 def test_intent_tool_filter_keeps_core_and_adds_narrow_groups():
     basic = tools_for_message("Inspect the open graph")
     assert "workflow_overview" in basic
