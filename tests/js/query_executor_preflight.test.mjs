@@ -32,8 +32,23 @@ const NODE_DEFS = {
     },
     ImageResizeKJv2: {
         input: {
-            required: { image: ["IMAGE", {}], width: ["INT", {}], height: ["INT", {}] },
+            required: {
+                image: ["IMAGE", {}],
+                width: ["INT", {}],
+                height: ["INT", {}],
+                upscale_method: [["nearest", "bilinear"], {}],
+                keep_proportion: [["stretch", "resize"], {}],
+                pad_color: ["STRING", {}],
+                crop_position: [["center", "top"], {}],
+                divisible_by: ["INT", {}],
+            },
             optional: { mask: ["MASK", {}], device: [["cpu", "gpu"], {}] },
+        },
+    },
+    LoadImage: {
+        input: {
+            required: { image: [["a.png", "b.png"], {}] },
+            optional: {},
         },
     },
     FL_InpaintCrop: {
@@ -123,6 +138,57 @@ test("Image Resize's optional 'mask' input (no matching widget) is not reported 
                 { name: "image", type: "IMAGE", connected: true },
                 { name: "mask", type: "MASK", connected: false },
             ],
+        },
+    ]);
+    const executor = await loadQueryExecutor(graph, NODE_DEFS);
+
+    const overview = await executor.getWorkflowOverview();
+
+    assert.equal(overview.required_slots_missing.length, 0);
+});
+
+test("Image Resize's required-but-widget-backed combo/string/int params are not reported as missing", async () => {
+    // Live regression: these are declared "required" in the node's own
+    // schema (ComfyUI puts widget-backed params there too), but each also
+    // has a matching widget with a value - the widget satisfies the
+    // parameter at execution time even though nothing is wired to the slot.
+    const graph = makeGraph([
+        {
+            id: 20,
+            comfyClass: "ImageResizeKJv2",
+            widgets: [
+                { name: "width", value: 512 },
+                { name: "height", value: 512 },
+                { name: "upscale_method", value: "bilinear" },
+                { name: "keep_proportion", value: "stretch" },
+                { name: "pad_color", value: "0, 0, 0" },
+                { name: "crop_position", value: "center" },
+                { name: "divisible_by", value: 2 },
+            ],
+            inputs: [
+                { name: "image", type: "IMAGE", connected: true },
+                { name: "upscale_method", type: "COMBO", connected: false },
+                { name: "keep_proportion", type: "COMBO", connected: false },
+                { name: "pad_color", type: "STRING", connected: false },
+                { name: "crop_position", type: "COMBO", connected: false },
+                { name: "divisible_by", type: "INT", connected: false },
+            ],
+        },
+    ]);
+    const executor = await loadQueryExecutor(graph, NODE_DEFS);
+
+    const overview = await executor.getWorkflowOverview();
+
+    assert.equal(overview.required_slots_missing.length, 0);
+});
+
+test("LoadImage's required 'image' combo widget is not reported as missing once a file is selected", async () => {
+    const graph = makeGraph([
+        {
+            id: 21,
+            comfyClass: "LoadImage",
+            widgets: [{ name: "image", value: "example.png" }],
+            inputs: [{ name: "image", type: "COMBO", connected: false }],
         },
     ]);
     const executor = await loadQueryExecutor(graph, NODE_DEFS);

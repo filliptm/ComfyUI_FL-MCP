@@ -534,12 +534,29 @@ export class QueryExecutor {
      * @returns {boolean} True if the input is required
      */
     isInputSlotRequired(rawNode, input, nodeDefs = null) {
-        // The live ComfyUI node schema is authoritative when available - it's
-        // the actual required/optional split the node class declares, not a
-        // guess. Only fall through to the heuristics below when the schema is
-        // unavailable (fetch failed) or doesn't mention this slot at all
-        // (e.g. a dynamically-added input).
+        // A widget with the same name and a defined value always satisfies
+        // this parameter at execution time, wired or not - ComfyUI's own
+        // INPUT_TYPES() schema puts widget-backed combo/string/int/bool/float
+        // parameters under "required" right alongside true wire-only inputs,
+        // and most of a node's "required" schema entries are actually
+        // widgets that happen to also render as a connectable slot. This
+        // must be checked before the schema's required/optional split below,
+        // or every unconnected widget-backed parameter in the entire graph
+        // gets misreported as a missing connection.
         const nodeType = rawNode.comfyClass || rawNode.type;
+        if (rawNode.widgets && input.name) {
+            const correspondingWidget = rawNode.widgets.find(w => w.name === input.name);
+            if (correspondingWidget && correspondingWidget.value !== undefined && correspondingWidget.value !== null) {
+                return false;
+            }
+        }
+
+        // The live ComfyUI node schema is authoritative for anything left
+        // over once the widget check above has had a chance to clear it -
+        // it's the actual required/optional split the node class declares,
+        // not a guess. Only fall through to the heuristics below when the
+        // schema is unavailable (fetch failed) or doesn't mention this slot
+        // at all (e.g. a dynamically-added input).
         const schemaInput = nodeDefs?.[nodeType]?.input;
         if (schemaInput && input.name) {
             if (
@@ -572,9 +589,9 @@ export class QueryExecutor {
             'sampler_name', 'scheduler', 'positive', 'negative', 'latent_image',
             'denoise', 'model', 'clip', 'vae', 'image', 'mask', 'filename_prefix'
         ];
-        
+
         const slotName = input.name ? input.name.toLowerCase() : '';
-        
+
         // 3. Some slots are commonly optional
         if (optionalSlots.some(optional => slotName.includes(optional))) {
             // But still check if there's a widget with the same name (which would make it not required)
@@ -585,16 +602,8 @@ export class QueryExecutor {
                 }
             }
         }
-        
-        // 4. Check if there's a corresponding widget that provides a default value
-        if (rawNode.widgets && input.name) {
-            const correspondingWidget = rawNode.widgets.find(w => w.name === input.name);
-            if (correspondingWidget && correspondingWidget.value !== undefined && correspondingWidget.value !== null) {
-                return false;
-            }
-        }
-        
-        // 5. Some node types have specific patterns
+
+        // 4. Some node types have specific patterns
         if (nodeType) {
             // Loader nodes typically require their main input
             if (nodeType.includes('Loader') || nodeType.includes('Load')) {
