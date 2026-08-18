@@ -1906,6 +1906,8 @@ INTENT_TOOL_GROUPS = {
         "get_queue_status_details",
         "clear_error_buffer",
         "comfy_get_logs",
+        "comfy_jobs_list",
+        "comfy_job_get",
     },
     "manager": {
         "manager_search_nodes",
@@ -1914,11 +1916,19 @@ INTENT_TOOL_GROUPS = {
         "manager_queue_action",
         "manager_queue_status",
         "manager_queue_start",
+        "manager_queue_reset",
         "manager_v4_installed_packs",
+        "manager_v4_status",
+        "manager_v4_snapshots",
+        "comfy_node_replacements_get",
     },
     "models": {
         "comfy_models_list",
         "comfy_assets_list",
+        "comfy_asset_get",
+        "comfy_asset_upload",
+        "comfy_tags_list",
+        "comfy_list_folders",
         "comfy_search_resources",
         "manager_search_external_models",
     },
@@ -1929,6 +1939,12 @@ INTENT_TOOL_GROUPS = {
         "custom_nodes_write_file",
         "custom_nodes_apply_patch",
         "custom_nodes_validate_pack",
+        "custom_nodes_create_pack",
+        "custom_nodes_git_status",
+        "custom_nodes_git_diff",
+        "custom_nodes_git_commit",
+        "custom_nodes_git_push",
+        "comfy_read_file",
     },
     "files": {
         "workflow_list_files",
@@ -1936,7 +1952,198 @@ INTENT_TOOL_GROUPS = {
         "workflow_save_current",
         "workflow_load_json",
         "workflow_delete_file",
+        "workflow_rename_file",
+        "extract_workflow_from_image",
     },
+    "graph_query": {
+        "query_workflow",
+        "workflow_diagram",
+        "node_library_find_compatible",
+    },
+    "queue_control": {
+        "cancel_workflow",
+        "delete_queue_items",
+        "enable_auto_queue",
+        "disable_auto_queue",
+        "set_batch_count",
+        "comfy_history_delete",
+    },
+    "canvas_ops": {
+        "bypass_nodes",
+        "unbypass_nodes",
+        "pin_nodes",
+        "unpin_nodes",
+        "select_nodes",
+        "focus_on_nodes",
+    },
+    "tabs": {
+        "workflow_get_tabs",
+        "workflow_close_current",
+        "workflow_duplicate_current",
+    },
+    "templates": {
+        "comfy_workflow_templates_list",
+        "comfy_global_subgraphs_list",
+    },
+    "uploads": {
+        "comfy_upload_image",
+        "comfy_upload_mask",
+    },
+    "ui_commands": {
+        "frontend_list_commands",
+        "frontend_list_keybindings",
+        "frontend_execute_command",
+    },
+    "system": {
+        "comfy_status",
+        "comfy_restart",
+        "comfy_free_memory",
+        "get_system_info",
+        "comfy_settings_get",
+        "comfy_settings_set",
+    },
+    "utility": {
+        "generate_seed",
+        "generate_int",
+        "generate_float",
+        "random_choice",
+        "calculate_expressions",
+    },
+}
+
+# Word-boundary triggers for the intent groups above that are not covered by
+# the older substring keyword checks in tools_for_message. Patterns accept
+# morphological variants (-ing/-ed/-s) deliberately: matching only bare verb
+# stems silently missed exactly the phrasings real users type ("I'm searching
+# for..." vs "search").
+INTENT_GROUP_TRIGGERS: dict[str, re.Pattern[str]] = {
+    "debug": re.compile(r"\bjobs?\b", re.IGNORECASE),
+    "manager": re.compile(
+        r"\b(?:deprecated|replacements?|snapshots?)\b",
+        re.IGNORECASE,
+    ),
+    "models": re.compile(r"\btags?\b|\blist\s+folders?\b", re.IGNORECASE),
+    "coding": re.compile(r"\bgit\b|\bcommit(?:ted|ting|s)?\b|\bdiff\b", re.IGNORECASE),
+    "files": re.compile(
+        r"\brenam(?:e|ed|ing)\b|\bmove\s+(?:the\s+)?workflow\b"
+        r"|\bextract(?:ed|ing)?\b.{0,40}\bworkflow\b"
+        r"|\bworkflow\b.{0,30}\bfrom\s+(?:the\s+|this\s+)?(?:image|png|screenshot)\b"
+        r"|\b(?:png|image)\s+metadata\b"
+        r"|\b(?:recreate|rebuild)\b.{0,30}\bworkflow\b"
+        r"|\bhow\s+was\s+(?:this|that)\s+image\s+made\b",
+        re.IGNORECASE,
+    ),
+    "graph_query": re.compile(
+        r"\bwhich\s+nodes?\b|\bhow\s+many\s+nodes?\b|\bupstream\b|\bdownstream\b"
+        r"|\bconnected\s+to\b|\btrac(?:e|ed|ing)\b|\bwhat\s+feeds\b"
+        r"|\bdiagrams?\b|\bmermaid\b|\bvisuali[sz](?:e|ed|ing)\b|\bflow\s?charts?\b"
+        r"|\bcompatible\b|\bwhat\s+can\s+i\s+connect\b"
+        r"|\b(?:goes|comes)\s+(?:before|after|next)\b",
+        re.IGNORECASE,
+    ),
+    "queue_control": re.compile(
+        r"\bcancel(?:led|ling|ed|ing|s)?\b|\bstop(?:ped|ping|s)?\b"
+        r"|\binterrupt(?:ed|ing|s)?\b|\babort(?:ed|ing|s)?\b"
+        r"|\bauto[- ]?queue\b|\bcontinuous\s+generation\b"
+        r"|\bbatch(?:es)?\b|\bclear\b.{0,30}\b(?:queue|history)\b",
+        re.IGNORECASE,
+    ),
+    "canvas_ops": re.compile(
+        r"\bbypass(?:ed|ing|es)?\b|\b(?:un)?mut(?:e|ed|ing)\b"
+        r"|\b(?:un)?pin(?:ned|ning|s)?\b|\block\s+(?:the\s+|this\s+|that\s+)?nodes?\b"
+        r"|\bselect(?:ed|ing)?\b.{0,30}\bnodes?\b"
+        r"|\bfocus(?:ed|ing)?\s+on\b|\b(?:disable|enable)\b.{0,20}\bnodes?\b",
+        re.IGNORECASE,
+    ),
+    "tabs": re.compile(
+        r"\btabs\b|\b(?:which|active|current|open|switch|close)\s+tab\b"
+        r"|\b(?:close|duplicat(?:e|ed|ing)|copy\s+of)\b.{0,20}\b(?:workflow|tab)\b",
+        re.IGNORECASE,
+    ),
+    "templates": re.compile(
+        r"\btemplates?\b|\bsubgraphs?\b"
+        r"|\b(?:example|starter|preset)\s+workflows?\b",
+        re.IGNORECASE,
+    ),
+    "uploads": re.compile(
+        r"\bupload(?:ed|ing|s)?\b|\binput\s+folder\b|\bimport\s+(?:an?\s+)?image\b",
+        re.IGNORECASE,
+    ),
+    "ui_commands": re.compile(
+        r"\bhot\s?keys?\b|\bshortcuts?\b|\bkey\s?bindings?\b"
+        r"|\b(?:frontend|ui)\s+commands?\b|\bundo\b|\bredo\b",
+        re.IGNORECASE,
+    ),
+    "system": re.compile(
+        r"\brestart(?:ed|ing|s)?\b|\breboot(?:ed|ing)?\b|\bcrash(?:ed|ing|es)?\b"
+        r"|\bnot\s+responding\b|\bfrozen\b|\bserver\s+status\b"
+        r"|\bout\s+of\s+memory\b|\bvram\b|\bfree\s+(?:up\s+)?memory\b"
+        r"|\bunload\s+models?\b|\bcuda\b|\bsystem\s+info\b|\bgpu\b"
+        r"|\bpython\s+version\b|\boperating\s+system\b|\bsettings?\b|\bpreferences?\b",
+        re.IGNORECASE,
+    ),
+    "utility": re.compile(
+        r"\bseeds?\b|\brandom(?:ized?|izing|ly)?\b|\bshuffl(?:e|ed|ing)\b"
+        r"|\bpick\s+one\b|\bcalculat(?:e|ed|ing|ion)\b",
+        re.IGNORECASE,
+    ),
+}
+
+# Inside the graph-change lane (which narrows the tool set down to the
+# compiler pair), a triggered group survives only if its intent is clearly
+# operational rather than incidental vocabulary of a graph edit. "Change the
+# seed on the selected node to 7" mentions "seed" and "selected node" but is
+# purely a compiler value edit; "pin these nodes so they don't move" names an
+# actual canvas-state operation the compiler cannot perform. Groups listed
+# here must re-match this stricter pattern to be re-added after narrowing;
+# groups not listed are always re-added when triggered.
+GRAPH_LANE_STRONG_TRIGGERS: dict[str, re.Pattern[str]] = {
+    "canvas_ops": re.compile(
+        r"\bbypass(?:ed|ing|es)?\b|\b(?:un)?mut(?:e|ed|ing)\b"
+        r"|\b(?:un)?pin(?:ned|ning|s)?\b|\block\s+(?:the\s+|this\s+|that\s+)?nodes?\b"
+        r"|\bfocus(?:ed|ing)?\s+on\b|\b(?:disable|enable)\b.{0,20}\bnodes?\b",
+        re.IGNORECASE,
+    ),
+    "utility": re.compile(
+        r"\brandom(?:ized?|izing|ly)?\b|\bshuffl(?:e|ed|ing)\b"
+        r"|\bpick\s+one\b|\bcalculat(?:e|ed|ing|ion)\b",
+        re.IGNORECASE,
+    ),
+}
+
+# Registered MCP tools that are deliberately NOT selectable by the chat
+# runtime. Each entry needs a reason; the reachability test in
+# tests/test_tool_reachability.py fails if a registered tool is neither
+# selectable nor listed here, so a new tool cannot silently ship unreachable.
+DELIBERATELY_UNEXPOSED_TOOLS = {
+    "plan_workflow_refinement": (
+        "Retired Gen-2 pair, removed from chat selection in commit 9f0bb05; "
+        "superseded by compile_workflow_refinement_spec."
+    ),
+    "apply_workflow_refinement": (
+        "Retired Gen-2 pair, removed from chat selection in commit 9f0bb05; "
+        "superseded by apply_workflow_graph_patch."
+    ),
+    "connect_nodes": (
+        "Superseded by connect_nodes_batch, which handles a single "
+        "connection as a batch of one with the same auto_match semantics."
+    ),
+    "auto_connect_workflow": (
+        "Nondeterministic bulk type-match connect; replaced by the "
+        "deterministic GraphPatch refinement lane."
+    ),
+    "comfy_assets_upload": (
+        "Bulk variant of comfy_asset_upload; the single-asset tool is "
+        "exposed instead."
+    ),
+    "custom_nodes_read_file": (
+        "Superseded by custom_nodes_read_file_excerpt, whose bounded reads "
+        "keep responses within context limits."
+    ),
+    "manager_v4_queue_status": "Duplicate of exposed manager_queue_status.",
+    "manager_v4_queue_action": "Duplicate of exposed manager_queue_action.",
+    "manager_v4_node_mappings": "Duplicate of exposed manager_get_node_mappings.",
+    "manager_v4_external_models": "Duplicate of exposed manager_search_external_models.",
 }
 
 CLAUDE_BUILTIN_TOOLS = {
@@ -2339,6 +2546,13 @@ def tools_for_message(
         for word in ("save workflow", "load workflow", "workflow file", "delete workflow")
     ):
         selected.update(INTENT_TOOL_GROUPS["files"])
+    triggered_groups = {
+        group_name
+        for group_name, trigger in INTENT_GROUP_TRIGGERS.items()
+        if trigger.search(text)
+    }
+    for group_name in triggered_groups:
+        selected.update(INTENT_TOOL_GROUPS[group_name])
     if search_mode != "off":
         selected.update({"web_search", "web_fetch_page"})
     if branch_intent is not None:
@@ -2385,6 +2599,18 @@ def tools_for_message(
         # requested read-only canvas capability.
         if canvas_inspection:
             selected.update(CANVAS_IMAGE_INSPECTION_TOOLS)
+        # The same principle holds for explicitly triggered intent groups:
+        # "pin these nodes" or "duplicate this workflow" may read as a graph
+        # change, but the tools that actually satisfy them (canvas state
+        # toggles, tab management, queue control, ...) are not the low-level
+        # mutation tools the narrowing exists to remove, and the compiler
+        # pair cannot perform them. Groups whose vocabulary commonly appears
+        # incidentally inside graph-edit sentences must re-match their
+        # stricter graph-lane pattern to survive.
+        for group_name in triggered_groups:
+            strong = GRAPH_LANE_STRONG_TRIGGERS.get(group_name)
+            if strong is None or strong.search(text):
+                selected.update(INTENT_TOOL_GROUPS[group_name])
     return selected
 
 
