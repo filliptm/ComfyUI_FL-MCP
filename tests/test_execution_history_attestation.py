@@ -37,7 +37,10 @@ process.stdout.write(JSON.stringify({original, prepared}));
         capture_output=True,
         check=True,
         text=True,
-        timeout=10,
+        # A cold Node start on a loaded Windows CI runner has repeatedly blown
+        # a 10s budget (two consecutive PR runs flaked and passed on rerun);
+        # the script itself finishes in well under a second once Node is up.
+        timeout=60,
     )
     payload = json.loads(completed.stdout)
     prepared = payload["prepared"]

@@ -954,6 +954,42 @@ def test_node_discovery_request_naming_masking_is_not_swallowed_by_mask_lane(mes
     assert tools != {"view_node_mask", "edit_node_mask", "confirm_mask_review"}
 
 
+@pytest.mark.parametrize(
+    ("message", "expected_tool"),
+    (
+        ("cancel the current run", "cancel_workflow"),
+        ("stop the queue and clear it", "delete_queue_items"),
+        ("turn on auto queue", "enable_auto_queue"),
+        ("bypass the upscaler node", "bypass_nodes"),
+        ("mute that node for now", "bypass_nodes"),
+        ("pin these nodes so they don't move", "pin_nodes"),
+        ("which tabs are open?", "workflow_get_tabs"),
+        ("make a copy of this workflow in a new tab", "workflow_duplicate_current"),
+        ("restart comfyui pls", "comfy_restart"),
+        ("im running out of vram", "comfy_free_memory"),
+        ("show me a diagram of this workflow", "workflow_diagram"),
+        ("what nodes are compatible with the ksampler output", "node_library_find_compatible"),
+        ("give me a random seed", "generate_seed"),
+        ("upload this image to the input folder", "comfy_upload_image"),
+        ("start from an example workflow template", "comfy_workflow_templates_list"),
+        ("undo that last change", "frontend_execute_command"),
+        ("rename the workflow file to final_v2", "workflow_rename_file"),
+        ("extract the workflow from this png", "extract_workflow_from_image"),
+        ("commit my custom node changes with git", "custom_nodes_git_commit"),
+        ("is there a replacement for this deprecated node", "comfy_node_replacements_get"),
+    ),
+)
+def test_intent_group_triggers_surface_the_matching_tool(message, expected_tool):
+    assert expected_tool in tools_for_message(message, "free")
+
+
+def test_intent_group_exposure_does_not_weaken_graph_lane_narrowing():
+    tools = tools_for_message("build me a simple txt2img workflow", "free")
+    assert "compile_workflow_refinement_spec" in tools
+    assert "create_nodes" not in tools
+    assert "set_node_values" not in tools
+
+
 def test_mask_lane_survives_terse_and_attachment_followups_without_core_tools():
     original = "Please adjust the prompt for image2 and draw the face mask."
     stored_state = {
