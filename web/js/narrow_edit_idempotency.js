@@ -24,7 +24,7 @@ export function validateNarrowOperationId(operationId) {
 }
 
 
-function assertWellFormedString(value) {
+function assertWellFormedString(value, path) {
     for (let index = 0; index < value.length; index += 1) {
         const code = value.charCodeAt(index);
         if (code >= 0xd800 && code <= 0xdbff) {
@@ -32,22 +32,22 @@ function assertWellFormedString(value) {
             if (!(next >= 0xdc00 && next <= 0xdfff)) {
                 throw narrowEditError(
                     "narrow_edit_payload_invalid",
-                    "Operation payload text must be valid UTF-8.",
+                    `Operation payload text must be valid UTF-8 (at ${path}).`,
                 );
             }
             index += 1;
         } else if (code >= 0xdc00 && code <= 0xdfff) {
             throw narrowEditError(
                 "narrow_edit_payload_invalid",
-                "Operation payload text must be valid UTF-8.",
+                `Operation payload text must be valid UTF-8 (at ${path}).`,
             );
         }
     }
 }
 
 
-function utf8Hex(value) {
-    assertWellFormedString(value);
+function utf8Hex(value, path) {
+    assertWellFormedString(value, path);
     return [...new TextEncoder().encode(value)]
         .map(byte => byte.toString(16).padStart(2, "0"))
         .join("");
@@ -66,11 +66,11 @@ function compareUnicodeScalars(left, right) {
 }
 
 
-function float64Hex(value) {
+function float64Hex(value, path) {
     if (!Number.isFinite(value)) {
         throw narrowEditError(
             "narrow_edit_payload_invalid",
-            "Operation payload numbers must be finite.",
+            `Operation payload numbers must be finite (at ${path}).`,
         );
     }
     const normalized = Object.is(value, -0) ? 0 : value;
@@ -80,33 +80,41 @@ function float64Hex(value) {
 }
 
 
-export function canonicalTypedText(value) {
+// path is diagnostic only (it names the exact offending field when this
+// throws on a real, deeply nested workflow/prompt payload) - it never
+// affects the canonical text or its hash, so existing hashes are unchanged.
+export function canonicalTypedText(value, path = "$") {
     if (value === null) return "n;";
     if (typeof value === "boolean") return value ? "b1;" : "b0;";
-    if (typeof value === "number") return `d${float64Hex(value)};`;
+    if (typeof value === "number") return `d${float64Hex(value, path)};`;
     if (typeof value === "string") {
         const encoded = new TextEncoder().encode(value);
-        return `s${encoded.length}:${utf8Hex(value)};`;
+        return `s${encoded.length}:${utf8Hex(value, path)};`;
     }
     if (Array.isArray(value)) {
-        return `a${value.length}:[${value.map(canonicalTypedText).join("")}];`;
+        return `a${value.length}:[${
+            value.map((item, index) => canonicalTypedText(item, `${path}[${index}]`)).join("")
+        }];`;
     }
     if (value && typeof value === "object") {
         const prototype = Object.getPrototypeOf(value);
         if (prototype !== Object.prototype && prototype !== null) {
             throw narrowEditError(
                 "narrow_edit_payload_invalid",
-                "Operation payloads must use the exact JSON data model.",
+                `Operation payloads must use the exact JSON data model `
+                + `(at ${path}: a non-plain object was found).`,
             );
         }
         const keys = Object.keys(value).sort(compareUnicodeScalars);
         return `o${keys.length}:{${keys.map(
-            key => `${canonicalTypedText(key)}${canonicalTypedText(value[key])}`,
+            key => `${canonicalTypedText(key, `${path}.<key>`)}`
+                + `${canonicalTypedText(value[key], `${path}.${key}`)}`,
         ).join("")}};`;
     }
     throw narrowEditError(
         "narrow_edit_payload_invalid",
-        "Operation payloads must use the exact JSON data model.",
+        `Operation payloads must use the exact JSON data model `
+        + `(at ${path}: found ${value === undefined ? "undefined" : typeof value}).`,
     );
 }
 

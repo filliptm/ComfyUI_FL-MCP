@@ -4,6 +4,7 @@ import test from "node:test";
 import {
     NarrowEditOperationLedger,
     canonicalNarrowOperationHash,
+    canonicalTypedText,
     validateNarrowOperationId,
 } from "../../web/js/narrow_edit_idempotency.js";
 
@@ -38,6 +39,51 @@ test("browser and backend typed canonical hash vectors remain identical", async 
         }),
         "e4ccc8b3329096322f2358b9c233be473a78d8291eeeedae64406dc5a8dfc50a",
     );
+});
+
+
+test("an invalid value deep in a real workflow-shaped payload names its exact path", () => {
+    // This is the live failure mode: a huge queue submission (the full API
+    // prompt / workflow JSON) has one bad value buried in it, and the
+    // resulting "Operation payloads must use the exact JSON data model"
+    // error is otherwise indistinguishable from any other payload bug.
+    const workflowShaped = {
+        output: {
+            "12": { class_type: "SaveImage", inputs: { filename_prefix: "out" } },
+            "34": { class_type: "PrimitiveStringMultiline", inputs: { value: undefined } },
+        },
+    };
+    assert.throws(
+        () => canonicalTypedText(workflowShaped),
+        error => (
+            error?.code === "narrow_edit_payload_invalid"
+            && error.message.includes("$.output.34.inputs.value")
+        ),
+    );
+});
+
+
+test("a non-plain object nested in a payload names its exact path", () => {
+    assert.throws(
+        () => canonicalTypedText({ nodes: [{ widgets_values: new Map() }] }),
+        error => (
+            error?.code === "narrow_edit_payload_invalid"
+            && error.message.includes("$.nodes[0].widgets_values")
+        ),
+    );
+});
+
+
+test("path tracking never changes the canonical text for valid payloads", async () => {
+    // The path suffix is diagnostic-only, used solely inside thrown error
+    // messages - it must never leak into the returned canonical text, since
+    // that text is hashed and compared against the backend's independently
+    // computed hash. The hardcoded cross-language vector test above already
+    // proves this end-to-end; this checks the property directly.
+    const withPath = canonicalTypedText({ a: [1, "x", true, null], b: 1 }, "some.custom.$path");
+    const withDefaultPath = canonicalTypedText({ b: 1, a: [1, "x", true, null] });
+    assert.equal(withPath, withDefaultPath);
+    assert.equal(withPath.includes("some.custom"), false);
 });
 
 
