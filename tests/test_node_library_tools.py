@@ -392,8 +392,9 @@ class FakePlannerClient:
             }
         }
 
-    async def catalog_snapshot(self, *, force_refresh=False):
+    async def catalog_snapshot(self, *, force_refresh=False, max_age_seconds=None):
         self.force_refresh = force_refresh
+        self.max_age_seconds = max_age_seconds
         return NodeCatalogSnapshot(
             data=self.catalog,
             source=self.source,
@@ -419,7 +420,8 @@ async def test_mcp_plan_workflow_is_a_read_only_catalog_pinned_dry_run(monkeypat
     )
 
     assert result["valid"] is True
-    assert client.force_refresh is True
+    assert client.force_refresh is False
+    assert client.max_age_seconds == mcp_server.STRICT_CATALOG_FRESHNESS_SECONDS
     assert result["catalog"]["catalog_hash"] == "c" * 64
     assert result["plan"]["nodes"][0]["schema_hash"]
 
@@ -445,7 +447,8 @@ async def test_mcp_resolves_semantic_roles_against_one_catalog_snapshot(monkeypa
     )
 
     assert result["valid"] is True
-    assert client.force_refresh is True
+    assert client.force_refresh is False
+    assert client.max_age_seconds == mcp_server.STRICT_CATALOG_FRESHNESS_SECONDS
     assert result["selected_node_types"] == {"source": "Source"}
     assert result["catalog"]["catalog_hash"] == "c" * 64
     assert result["resolution_hash"]

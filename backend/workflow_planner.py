@@ -17,6 +17,7 @@ from node_library import (
     node_schema_hash,
 )
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+from workflow_schema_capabilities import stable_default_for_spec
 
 WORKFLOW_PLAN_SCHEMA = "fl-mcp.workflow-plan.v1"
 _ALIAS_PATTERN = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
@@ -736,6 +737,17 @@ def compile_workflow_plan(
                 continue
             _, metadata = _input_parts(spec)
             if metadata.get("dynamic_type") == _DYNAMIC_COMBO:
+                continue
+            # ComfyUI's own frontend never leaves a widget truly empty - a
+            # combo with no explicit selection auto-selects its first option
+            # (e.g. LoadImage's file picker defaults to the first file in the
+            # input folder). Match that instead of blocking node creation
+            # outright; only a widget with no deterministic fallback at all
+            # (e.g. a combo with zero options) still requires an explicit
+            # value.
+            default = stable_default_for_spec(spec)
+            if default.available:
+                accepted_values[name] = _canonical_widget_value(spec, default.value)
                 continue
             issues.append(
                 _issue(

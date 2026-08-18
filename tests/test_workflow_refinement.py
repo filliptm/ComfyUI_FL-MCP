@@ -329,6 +329,24 @@ def _wavelet_append_request(*, side_input_mappings=None, terminal_source=None):
     )
 
 
+def test_replacement_node_widget_with_a_schema_default_is_auto_filled():
+    # ComfyUI's own frontend never leaves a widget with a declared default
+    # truly unset - omitting "align_method" must not block node creation,
+    # since the node schema already declares "wavelet" as its default.
+    payload = _wavelet_append_request().model_dump(mode="json")
+    del payload["replacement_nodes"][0]["values"]["align_method"]
+
+    result = _compile(
+        PlanWorkflowRefinementRequest.model_validate(payload),
+        _wavelet_catalog(),
+    )
+
+    assert result["valid"] is True, result["issues"]
+    assert "missing_widget_value" not in [issue["code"] for issue in result["issues"]]
+    replacement = result["plan"]["replacement"]["nodes"][0]
+    assert replacement["values"]["align_method"] == "wavelet"
+
+
 def test_normalizer_resolves_array_and_mapping_links_with_exact_slot_facts():
     workflow = _workflow(with_middle=False, sibling=False)
     graph = normalize_workflow_graph(workflow)

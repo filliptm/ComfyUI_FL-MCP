@@ -1595,6 +1595,47 @@ def test_apply_envelope_round_trips_back_to_the_same_canonical_planner_request()
     assert recompiled["plan"] == planned["plan"]
 
 
+def test_created_load_image_without_an_explicit_file_gets_the_first_option():
+    # ComfyUI's own frontend never leaves a combo widget truly unset - a
+    # newly dropped LoadImage node auto-selects the first file in its
+    # options list. Omitting "image" from a created node's values must not
+    # block node creation; it should resolve to that same first option.
+    catalog = _catalog()
+    empty_graph = NormalizedGraphSnapshot(
+        schema="fl-mcp.normalized-workflow-graph.v1",
+        complete=True,
+        nodes=[],
+        outputs=[],
+        edges=[],
+    )
+    request = PlanGraphPatchRequest.model_validate(
+        {
+            "application_id": "graph-patch-load-image-default",
+            "expected_workflow_identity": "fl-mcp-workflow-fixture-0001",
+            "expected_graph_hash": "a" * 64,
+            "expected_catalog_hash": catalog_contract_hash(catalog),
+            "graph": empty_graph.model_dump(mode="json"),
+            "create_nodes": [
+                {
+                    "alias": "reference_image",
+                    "node_type": "LoadImage",
+                    "schema_hash": node_schema_hash("LoadImage", catalog["LoadImage"]),
+                    "values": {},
+                }
+            ],
+        }
+    )
+
+    result = _compile(request)
+
+    assert result["valid"] is True, result["issues"]
+    assert "missing_widget_value" not in _codes(result)
+    created = next(
+        item for item in result["plan"]["create_nodes"] if item["alias"] == "reference_image"
+    )
+    assert created["values"]["image"] == "factory.png"
+
+
 def test_unrelated_unloaded_frontend_branch_is_preserved_opaquely():
     """An independent edit must not require schemas for untouched UI artifacts."""
 

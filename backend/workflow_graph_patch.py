@@ -51,6 +51,7 @@ from workflow_schema_capabilities import (
     infer_dynamic_selector_values,
     materialize_inputs,
     normalize_node_schema,
+    stable_default_for_spec,
 )
 from workflow_scope import (
     SCOPE_INPUT_NODE_ID,
@@ -1281,6 +1282,17 @@ def _canonical_values(
             if metadata.get("dynamic_type") == "COMFY_DYNAMICCOMBO_V3" and name in values:
                 continue
             if name not in values:
+                # ComfyUI's own frontend never leaves a widget truly empty -
+                # a combo with no explicit selection auto-selects its first
+                # option (e.g. LoadImage's file picker defaults to the first
+                # file in the input folder). Match that instead of blocking
+                # node creation outright; only a widget with no deterministic
+                # fallback at all (e.g. a combo with zero options) still
+                # requires an explicit value.
+                default = stable_default_for_spec(slot["spec"])
+                if default.available:
+                    accepted[name] = _canonical_widget_value(slot["spec"], default.value)
+                    continue
                 issues.append(
                     _issue(
                         "missing_widget_value",

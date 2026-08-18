@@ -1284,7 +1284,7 @@ test("GraphPatch v2 builds the production Seedance/VHS DAG and preserves Wavelet
     assert.equal(outgoing.has(65), false, "VHS remains a second sink");
     assert.equal(result.verification.valid, true);
     assert.equal(result.verification.preserved_edge_count, 13);
-    assert.equal(result.reveal_delay_ms, 318);
+    assert.equal(result.reveal_delay_ms, 100);
     assert.deepEqual(
         adapter.events.map(item => item.phase),
         [
@@ -1297,8 +1297,13 @@ test("GraphPatch v2 builds the production Seedance/VHS DAG and preserves Wavelet
         adapter.events.filter(item => item.phase === "node").map(item => item.alias),
         ["seedance_reference", "save_video", "video_components", "video_combine"],
     );
-    assert.ok(adapter.events.every(item => item.delay_ms === 318));
-    assert.equal(adapter.events.length * result.reveal_delay_ms, 3498);
+    assert.ok(
+        adapter.events.filter(item => item.phase === "node").every(item => item.delay_ms === 0),
+        "node creation already paced itself via the normalization guard wait",
+    );
+    assert.ok(
+        adapter.events.filter(item => item.phase !== "node").every(item => item.delay_ms === 100),
+    );
     assert.equal(adapter.workflow.extra[GRAPH_PATCH_LEDGER_KEY].schema, WORKFLOW_GRAPH_PATCH_SCHEMA);
 });
 

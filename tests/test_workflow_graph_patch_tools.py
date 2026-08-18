@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 from copy import deepcopy
 from types import SimpleNamespace
@@ -446,8 +447,8 @@ class _FakeCatalogClient:
         self.data = _catalog()
         self.catalog_hash = catalog_hash or catalog_contract_hash(self.data)
 
-    async def catalog_snapshot(self, *, force_refresh: bool = False):
-        assert force_refresh is True
+    async def catalog_snapshot(self, *, force_refresh: bool = False, max_age_seconds=None):
+        assert max_age_seconds == mcp_server.STRICT_CATALOG_FRESHNESS_SECONDS
         return NodeCatalogSnapshot(
             data=self.data,
             source=self.source,
@@ -1736,6 +1737,45 @@ async def test_compile_and_apply_tools_round_trip_one_unchanged_empty_canvas_pat
 
 
 @pytest.mark.asyncio
+async def test_apply_tool_reports_outcome_unknown_on_frontend_timeout(monkeypatch):
+    # A bare asyncio.TimeoutError from the websocket bridge used to surface as
+    # "Tool execution failed: " (an empty message, since TimeoutError() has no
+    # str()) - telling the model nothing about whether the canvas changed or
+    # that retrying with the same request is safe.
+    async def execute_tool(ctx, name, payload, timeout_ms=30000):
+        if name == "workflow_get_current_json":
+            return _active_workflow_result()
+        assert name == "apply_workflow_graph_patch"
+        raise asyncio.TimeoutError()
+
+    monkeypatch.setattr(mcp_server, "_execute_tool", execute_tool)
+    monkeypatch.setattr(
+        mcp_server,
+        "get_node_library_client",
+        lambda **kwargs: _FakeCatalogClient(),
+    )
+    monkeypatch.setattr(mcp_server.settings, "enable_workflow_writes", True)
+
+    planned = await mcp_server.compile_workflow_refinement_spec.fn(
+        _semantic_request(),
+        _context(),
+    )
+    assert planned["valid"] is True, planned["issues"]
+    request = ApplyGraphPatchRequest.model_validate(deepcopy(planned["apply_request"]))
+
+    result = await mcp_server.apply_workflow_graph_patch.fn(request, _context())
+
+    assert result["success"] is False
+    assert result["applied"] is False
+    assert result["already_applied"] is False
+    assert result["application_id"] == request.application_id
+    assert result["patch_hash"] == request.patch_hash
+    assert result["error"]["code"] == "apply_outcome_unknown"
+    assert result["rollback"]["complete"] is False
+    assert result["queued"] is False
+
+
+@pytest.mark.asyncio
 async def test_inferred_float_default_survives_integral_json_apply_round_trip(
     monkeypatch,
 ):
@@ -2074,14 +2114,17 @@ async def test_apply_rechecks_attachment_after_awaited_catalog_refresh(
             super().__init__()
             self.snapshot_count = 0
 
-        async def catalog_snapshot(self, *, force_refresh: bool = False):
+        async def catalog_snapshot(self, *, force_refresh: bool = False, max_age_seconds=None):
             self.snapshot_count += 1
             if self.snapshot_count == 2:
                 if change == "deleted":
                     attachment_path.unlink()
                 else:
                     attachment_path.write_bytes(b"X" * len(original))
-            return await super().catalog_snapshot(force_refresh=force_refresh)
+            return await super().catalog_snapshot(
+                force_refresh=force_refresh,
+                max_age_seconds=max_age_seconds,
+            )
 
     catalog_client = MutatingCatalogClient()
     monkeypatch.setattr(mcp_server, "_execute_tool", execute_tool)

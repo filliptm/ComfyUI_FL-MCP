@@ -5872,6 +5872,16 @@ def _planner_request_from_apply(
     )
 
 
+# Compile/apply/plan/branch tools pin a catalog hash and must fail closed on
+# real drift, so they cannot rely on the client's full cache_ttl (5 minutes).
+# They also don't need a real HTTP re-fetch on every single call: a compile
+# immediately followed by its apply should see the same catalog, not pay two
+# independent ~300-800ms fetch+hash+persist round trips for a window where
+# nothing could plausibly have changed. This horizon is deliberately much
+# shorter than the ordinary cache TTL, not a relaxation of it.
+STRICT_CATALOG_FRESHNESS_SECONDS = 3.0
+
+
 @mcp.tool()
 async def plan_workflow_refinement(
     request: PlanCurrentWorkflowRefinementRequest,
@@ -5955,7 +5965,7 @@ async def plan_workflow_refinement(
             server_url=settings.comfyui_server_url,
             timeout=settings.comfyui_api_timeout,
         )
-        snapshot = await client.catalog_snapshot(force_refresh=True)
+        snapshot = await client.catalog_snapshot(max_age_seconds=STRICT_CATALOG_FRESHNESS_SECONDS)
         planner_request = PlanWorkflowRefinementRequest(
             application_id=request.application_id,
             expected_workflow_identity=active["workflow_identity"],
@@ -6081,7 +6091,7 @@ async def apply_workflow_refinement(
             server_url=settings.comfyui_server_url,
             timeout=settings.comfyui_api_timeout,
         )
-        snapshot = await client.catalog_snapshot(force_refresh=True)
+        snapshot = await client.catalog_snapshot(max_age_seconds=STRICT_CATALOG_FRESHNESS_SECONDS)
         graph = normalize_workflow_graph(active["workflow"])
         planner_request = _planner_request_from_apply(request, graph)
         compiled = compile_workflow_refinement(
@@ -6248,7 +6258,7 @@ async def workflow_branch_compare(
             server_url=settings.comfyui_server_url,
             timeout=settings.comfyui_api_timeout,
         )
-        snapshot = await client.catalog_snapshot(force_refresh=True)
+        snapshot = await client.catalog_snapshot(max_age_seconds=STRICT_CATALOG_FRESHNESS_SECONDS)
         result = compare_workflow_branches(
             request,
             workflow=active["workflow"],
@@ -6422,7 +6432,7 @@ async def compile_workflow_branch_operation(
             server_url=settings.comfyui_server_url,
             timeout=settings.comfyui_api_timeout,
         )
-        snapshot = await client.catalog_snapshot(force_refresh=True)
+        snapshot = await client.catalog_snapshot(max_age_seconds=STRICT_CATALOG_FRESHNESS_SECONDS)
         return compile_branch_operation(
             request,
             active["workflow"],
@@ -6498,7 +6508,7 @@ async def resolve_workflow_branch_successor(
             server_url=settings.comfyui_server_url,
             timeout=settings.comfyui_api_timeout,
         )
-        snapshot = await client.catalog_snapshot(force_refresh=True)
+        snapshot = await client.catalog_snapshot(max_age_seconds=STRICT_CATALOG_FRESHNESS_SECONDS)
         completed = _completed_graph_patch_result(
             active,
             request.apply_request,
@@ -6604,7 +6614,7 @@ async def compile_workflow_refinement_spec(
             server_url=settings.comfyui_server_url,
             timeout=settings.comfyui_api_timeout,
         )
-        snapshot = await client.catalog_snapshot(force_refresh=True)
+        snapshot = await client.catalog_snapshot(max_age_seconds=STRICT_CATALOG_FRESHNESS_SECONDS)
         attachment_values = _validated_plan_attachment_values(request)
         return compile_semantic_refinement(
             request,
@@ -7085,8 +7095,9 @@ async def apply_workflow_graph_patch(
 ) -> Dict[str, Any]:
     """Atomically apply one unchanged semantic GraphPatch v2 or scoped v3 envelope.
 
-    The backend rereads the active graph, refreshes the local node catalog, and
-    recompiles the supplied canonical plan. Scoped v3 plans additionally resolve
+    The backend rereads the active graph, revalidates against a node catalog no
+    older than a few seconds, and recompiles the supplied canonical plan. Scoped
+    v3 plans additionally resolve
     the exact definition hash, edit mode, immutable boundary ports, and complete
     shared-definition instance set from the fresh root workflow. Any workflow,
     graph, catalog, schema, scope, slot, value, or hash drift stops before browser
@@ -7127,7 +7138,7 @@ async def apply_workflow_graph_patch(
             server_url=settings.comfyui_server_url,
             timeout=settings.comfyui_api_timeout,
         )
-        snapshot = await client.catalog_snapshot(force_refresh=True)
+        snapshot = await client.catalog_snapshot(max_age_seconds=STRICT_CATALOG_FRESHNESS_SECONDS)
         completed = _completed_graph_patch_result(
             active,
             request,
@@ -7234,6 +7245,47 @@ async def apply_workflow_graph_patch(
         raise RuntimeError(f"Graph-patch application failed: {exc}") from exc
     except ValueError as exc:
         raise RuntimeError(f"Active workflow graph is invalid: {exc}") from exc
+    except asyncio.TimeoutError:
+        # asyncio.wait_for raises a bare TimeoutError with an empty message,
+        # which the generic handler below would surface as the uninformative
+        # "Tool execution failed: " - telling the model nothing and inviting
+        # it to re-probe canvas state repeatedly instead of just retrying.
+        # The frontend may or may not have applied the mutation; that is
+        # genuinely unknown here. But the ledger check at the top of this
+        # function (_completed_graph_patch_result) already recognizes a
+        # completed application_id and returns its result without reapplying,
+        # so retrying with this exact, unchanged request is always safe.
+        logger.warning(
+            "apply_workflow_graph_patch timed out waiting for the frontend "
+            "(application_id=%s); retry with the same request is safe.",
+            request.application_id,
+        )
+        return {
+            "success": False,
+            "applied": False,
+            "already_applied": False,
+            "application_id": request.application_id,
+            "patch_hash": request.patch_hash,
+            "error": {
+                "code": "apply_outcome_unknown",
+                "message": (
+                    "The frontend did not respond before the apply timeout "
+                    "elapsed; whether the canvas changed is unknown. Retry "
+                    "with this exact, unchanged apply request - a completed "
+                    "application_id is recognized and returned without "
+                    "reapplying, so retrying is always safe."
+                ),
+            },
+            "validation": empty_validation,
+            "rollback": {
+                "attempted": False,
+                "complete": False,
+                "snapshot_restored": False,
+                "hash_verified": False,
+                "errors": [],
+            },
+            "queued": False,
+        }
     except Exception as exc:
         logger.error("Unexpected error in apply_workflow_graph_patch: %s", exc)
         raise RuntimeError(f"Tool execution failed: {exc}") from exc
@@ -7261,7 +7313,7 @@ async def plan_workflow(request: PlanWorkflowRequest, ctx: Context) -> Dict[str,
             server_url=settings.comfyui_server_url,
             timeout=settings.comfyui_api_timeout,
         )
-        snapshot = await client.catalog_snapshot(force_refresh=True)
+        snapshot = await client.catalog_snapshot(max_age_seconds=STRICT_CATALOG_FRESHNESS_SECONDS)
         attachment_values = _validated_plan_attachment_values(request)
         return compile_workflow_plan(
             request,
@@ -7306,7 +7358,7 @@ async def compile_workflow_spec(
             server_url=settings.comfyui_server_url,
             timeout=settings.comfyui_api_timeout,
         )
-        snapshot = await client.catalog_snapshot(force_refresh=True)
+        snapshot = await client.catalog_snapshot(max_age_seconds=STRICT_CATALOG_FRESHNESS_SECONDS)
         attachment_values = _validated_plan_attachment_values(request)
         return compile_semantic_workflow(
             request,
@@ -7353,7 +7405,7 @@ async def resolve_workflow_spec(
             server_url=settings.comfyui_server_url,
             timeout=settings.comfyui_api_timeout,
         )
-        snapshot = await client.catalog_snapshot(force_refresh=True)
+        snapshot = await client.catalog_snapshot(max_age_seconds=STRICT_CATALOG_FRESHNESS_SECONDS)
         return resolve_workflow_capabilities(
             request,
             snapshot.data,
@@ -7396,7 +7448,7 @@ async def apply_workflow_plan(
             server_url=settings.comfyui_server_url,
             timeout=settings.comfyui_api_timeout,
         )
-        snapshot = await client.catalog_snapshot(force_refresh=True)
+        snapshot = await client.catalog_snapshot(max_age_seconds=STRICT_CATALOG_FRESHNESS_SECONDS)
         plan_request = PlanWorkflowRequest(
             nodes=request.nodes,
             connections=request.connections,
