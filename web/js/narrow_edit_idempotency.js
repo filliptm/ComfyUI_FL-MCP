@@ -92,8 +92,12 @@ export function canonicalTypedText(value, path = "$") {
         return `s${encoded.length}:${utf8Hex(value, path)};`;
     }
     if (Array.isArray(value)) {
+        // JSON.stringify renders an undefined array element as null (arrays
+        // must preserve indices) - match that exactly rather than erroring.
         return `a${value.length}:[${
-            value.map((item, index) => canonicalTypedText(item, `${path}[${index}]`)).join("")
+            value.map(
+                (item, index) => canonicalTypedText(item === undefined ? null : item, `${path}[${index}]`),
+            ).join("")
         }];`;
     }
     if (value && typeof value === "object") {
@@ -105,7 +109,14 @@ export function canonicalTypedText(value, path = "$") {
                 + `(at ${path}: a non-plain object was found).`,
             );
         }
-        const keys = Object.keys(value).sort(compareUnicodeScalars);
+        // JSON.stringify silently omits object properties whose value is
+        // undefined (unlike array elements) - real workflow/prompt payloads
+        // from ComfyUI's own serializer carry these (e.g. a "definitions"
+        // field left undefined when there is nothing to define), so this
+        // must match that exact behavior rather than treat it as malformed.
+        const keys = Object.keys(value)
+            .filter(key => value[key] !== undefined)
+            .sort(compareUnicodeScalars);
         return `o${keys.length}:{${keys.map(
             key => `${canonicalTypedText(key, `${path}.<key>`)}`
                 + `${canonicalTypedText(value[key], `${path}.${key}`)}`,

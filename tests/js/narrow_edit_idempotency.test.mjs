@@ -42,23 +42,33 @@ test("browser and backend typed canonical hash vectors remain identical", async 
 });
 
 
-test("an invalid value deep in a real workflow-shaped payload names its exact path", () => {
-    // This is the live failure mode: a huge queue submission (the full API
-    // prompt / workflow JSON) has one bad value buried in it, and the
-    // resulting "Operation payloads must use the exact JSON data model"
-    // error is otherwise indistinguishable from any other payload bug.
+test("an undefined object property is dropped like JSON.stringify, not rejected", () => {
+    // Live regression: ComfyUI's own app.graphToPrompt() serializer includes
+    // fields like workflow.definitions as undefined (not omitted, not null)
+    // when there is nothing to define - a real, benign value from ComfyUI
+    // itself, not a bug in the user's workflow. JSON.stringify has always
+    // silently dropped undefined-valued object properties; canonicalTypedText
+    // must match that instead of erroring on every such payload.
     const workflowShaped = {
         output: {
             "12": { class_type: "SaveImage", inputs: { filename_prefix: "out" } },
-            "34": { class_type: "PrimitiveStringMultiline", inputs: { value: undefined } },
         },
+        workflow: { nodes: [], definitions: undefined },
     };
-    assert.throws(
-        () => canonicalTypedText(workflowShaped),
-        error => (
-            error?.code === "narrow_edit_payload_invalid"
-            && error.message.includes("$.output.34.inputs.value")
-        ),
+    assert.equal(
+        canonicalTypedText(workflowShaped),
+        canonicalTypedText({
+            output: { "12": { class_type: "SaveImage", inputs: { filename_prefix: "out" } } },
+            workflow: { nodes: [] },
+        }),
+    );
+});
+
+
+test("an undefined array element is rendered as null like JSON.stringify", () => {
+    assert.equal(
+        canonicalTypedText([1, undefined, 3]),
+        canonicalTypedText([1, null, 3]),
     );
 });
 
@@ -69,6 +79,17 @@ test("a non-plain object nested in a payload names its exact path", () => {
         error => (
             error?.code === "narrow_edit_payload_invalid"
             && error.message.includes("$.nodes[0].widgets_values")
+        ),
+    );
+});
+
+
+test("a function value nested in a payload names its exact path", () => {
+    assert.throws(
+        () => canonicalTypedText({ output: { "34": { inputs: { callback: () => {} } } } }),
+        error => (
+            error?.code === "narrow_edit_payload_invalid"
+            && error.message.includes("$.output.34.inputs.callback")
         ),
     );
 });
