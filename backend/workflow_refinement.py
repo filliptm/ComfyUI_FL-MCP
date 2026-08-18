@@ -24,6 +24,7 @@ from workflow_planner import (
     _types_compatible,
     _validate_widget_value,
 )
+from workflow_schema_capabilities import stable_default_for_spec
 
 NORMALIZED_GRAPH_SCHEMA = "fl-mcp.normalized-workflow-graph.v1"
 WORKFLOW_REFINEMENT_SCHEMA = "fl-mcp.workflow-refinement.v1"
@@ -1174,6 +1175,17 @@ def _resolve_replacement_node(
                     )
                 continue
             if name not in node.values:
+                # ComfyUI's own frontend never leaves a widget truly empty -
+                # a combo with no explicit selection auto-selects its first
+                # option (e.g. LoadImage's file picker defaults to the first
+                # file in the input folder). Match that instead of blocking
+                # node creation outright; only a widget with no deterministic
+                # fallback at all (e.g. a combo with zero options) still
+                # requires an explicit value.
+                default = stable_default_for_spec(spec)
+                if default.available:
+                    accepted_values[name] = _canonical_widget_value(spec, default.value)
+                    continue
                 issues.append(
                     _issue(
                         "missing_widget_value",

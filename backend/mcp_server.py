@@ -7234,6 +7234,47 @@ async def apply_workflow_graph_patch(
         raise RuntimeError(f"Graph-patch application failed: {exc}") from exc
     except ValueError as exc:
         raise RuntimeError(f"Active workflow graph is invalid: {exc}") from exc
+    except asyncio.TimeoutError:
+        # asyncio.wait_for raises a bare TimeoutError with an empty message,
+        # which the generic handler below would surface as the uninformative
+        # "Tool execution failed: " - telling the model nothing and inviting
+        # it to re-probe canvas state repeatedly instead of just retrying.
+        # The frontend may or may not have applied the mutation; that is
+        # genuinely unknown here. But the ledger check at the top of this
+        # function (_completed_graph_patch_result) already recognizes a
+        # completed application_id and returns its result without reapplying,
+        # so retrying with this exact, unchanged request is always safe.
+        logger.warning(
+            "apply_workflow_graph_patch timed out waiting for the frontend "
+            "(application_id=%s); retry with the same request is safe.",
+            request.application_id,
+        )
+        return {
+            "success": False,
+            "applied": False,
+            "already_applied": False,
+            "application_id": request.application_id,
+            "patch_hash": request.patch_hash,
+            "error": {
+                "code": "apply_outcome_unknown",
+                "message": (
+                    "The frontend did not respond before the apply timeout "
+                    "elapsed; whether the canvas changed is unknown. Retry "
+                    "with this exact, unchanged apply request - a completed "
+                    "application_id is recognized and returned without "
+                    "reapplying, so retrying is always safe."
+                ),
+            },
+            "validation": empty_validation,
+            "rollback": {
+                "attempted": False,
+                "complete": False,
+                "snapshot_restored": False,
+                "hash_verified": False,
+                "errors": [],
+            },
+            "queued": False,
+        }
     except Exception as exc:
         logger.error("Unexpected error in apply_workflow_graph_patch: %s", exc)
         raise RuntimeError(f"Tool execution failed: {exc}") from exc

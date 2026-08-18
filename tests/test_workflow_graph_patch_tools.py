@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 from copy import deepcopy
 from types import SimpleNamespace
@@ -1733,6 +1734,45 @@ async def test_compile_and_apply_tools_round_trip_one_unchanged_empty_canvas_pat
         assert contract["schema"] == normalize_node_schema_contract(_catalog()[node_type])
     assert calls[-1][2] == 240000
     assert not any("queue" in name for name, _, _ in calls)
+
+
+@pytest.mark.asyncio
+async def test_apply_tool_reports_outcome_unknown_on_frontend_timeout(monkeypatch):
+    # A bare asyncio.TimeoutError from the websocket bridge used to surface as
+    # "Tool execution failed: " (an empty message, since TimeoutError() has no
+    # str()) - telling the model nothing about whether the canvas changed or
+    # that retrying with the same request is safe.
+    async def execute_tool(ctx, name, payload, timeout_ms=30000):
+        if name == "workflow_get_current_json":
+            return _active_workflow_result()
+        assert name == "apply_workflow_graph_patch"
+        raise asyncio.TimeoutError()
+
+    monkeypatch.setattr(mcp_server, "_execute_tool", execute_tool)
+    monkeypatch.setattr(
+        mcp_server,
+        "get_node_library_client",
+        lambda **kwargs: _FakeCatalogClient(),
+    )
+    monkeypatch.setattr(mcp_server.settings, "enable_workflow_writes", True)
+
+    planned = await mcp_server.compile_workflow_refinement_spec.fn(
+        _semantic_request(),
+        _context(),
+    )
+    assert planned["valid"] is True, planned["issues"]
+    request = ApplyGraphPatchRequest.model_validate(deepcopy(planned["apply_request"]))
+
+    result = await mcp_server.apply_workflow_graph_patch.fn(request, _context())
+
+    assert result["success"] is False
+    assert result["applied"] is False
+    assert result["already_applied"] is False
+    assert result["application_id"] == request.application_id
+    assert result["patch_hash"] == request.patch_hash
+    assert result["error"]["code"] == "apply_outcome_unknown"
+    assert result["rollback"]["complete"] is False
+    assert result["queued"] is False
 
 
 @pytest.mark.asyncio

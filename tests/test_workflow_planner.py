@@ -137,7 +137,32 @@ def test_catalog_change_and_schema_errors_block_plan_hash():
     assert {"catalog_changed", "value_above_maximum", "invalid_option", "unknown_widget"} <= codes
 
 
-def test_active_widget_values_must_be_explicit():
+def test_active_widget_values_without_a_default_must_be_explicit():
+    catalog = _catalog()
+    catalog["ImageProcessor"]["input"]["required"]["mode"] = ["STRING", {}]
+
+    result = _compile(
+        {
+            "nodes": [
+                {
+                    "alias": "process",
+                    "node_type": "ImageProcessor",
+                    "values": {"strength": 0.5},
+                }
+            ]
+        },
+        catalog=catalog,
+    )
+
+    missing = [issue for issue in result["issues"] if issue["code"] == "missing_widget_value"]
+    assert [issue["path"] for issue in missing] == ["nodes[0].values.mode"]
+
+
+def test_a_widget_with_a_schema_default_is_auto_filled_not_flagged_missing():
+    # ComfyUI's own frontend never leaves a widget with a declared default
+    # (or a combo's first option) truly unset - omitting "mode" here must
+    # not be treated as an error, since the node schema already declares
+    # "soft" as its default.
     result = _compile(
         {
             "nodes": [
@@ -151,7 +176,9 @@ def test_active_widget_values_must_be_explicit():
     )
 
     missing = [issue for issue in result["issues"] if issue["code"] == "missing_widget_value"]
-    assert [issue["path"] for issue in missing] == ["nodes[0].values.mode"]
+    assert missing == []
+    resolved = next(node for node in result["resolved_nodes"] if node["alias"] == "process")
+    assert resolved["values"]["mode"] == "soft"
 
 
 def test_connection_validation_rejects_missing_slots_types_and_cycles():
