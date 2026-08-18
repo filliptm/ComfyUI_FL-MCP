@@ -429,10 +429,29 @@ def explicit_topology_change_requested(message: str) -> bool:
     )
 
 
+# "find/search for new masking nodes" names the same word ("masking") the
+# mask-edit detector below matches on, but it asks to discover node packages,
+# not to edit a mask already on the canvas - it must not be swallowed into
+# the narrow mask-editing tool lane, which has no registry/discovery tools.
+_NODE_DISCOVERY_INTENT_PATTERN = re.compile(
+    r"\b(?:find|search(?:\s+for)?|look(?:ing)?\s+for|discover|recommend|suggest)\b"
+    r".{0,40}\b(?:new\s+)?(?:nodes?|node\s+packs?|packages?|extensions?|plugins?)\b",
+    re.IGNORECASE,
+)
+
+
+def node_discovery_requested(message: str) -> bool:
+    """Recognize a request to find/discover new node packages, not edit one."""
+
+    return bool(_NODE_DISCOVERY_INTENT_PATTERN.search(_visible_user_text(message)))
+
+
 def mask_edit_requested(message: str) -> bool:
     """Recognize visual mask work without requiring canvas or node vocabulary."""
 
     if explicit_topology_change_requested(message):
+        return False
+    if node_discovery_requested(message):
         return False
     visible = _visible_user_text(message)
     return bool(

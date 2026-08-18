@@ -36,6 +36,7 @@ from chat_runtime import (
     mask_edit_requested,
     message_content_for_model,
     native_prompt_with_compaction,
+    node_discovery_requested,
     normalize_approval_decision,
     normalize_assistant_timeline,
     normalize_chat_attachments,
@@ -925,6 +926,23 @@ def test_explicit_mask_topology_stays_in_graphpatch_lane():
     } <= tools
     assert "update_connected_prompt" not in tools
     assert "plan_workflow" not in tools
+
+
+@pytest.mark.parametrize(
+    "message",
+    (
+        "Can you find me new nodes for advanced image masking?",
+        "find new masking nodes",
+        "search for a better mask node so we can improve inpainting",
+        "recommend some node packs for masking",
+    ),
+)
+def test_node_discovery_request_naming_masking_is_not_swallowed_by_mask_lane(message):
+    assert node_discovery_requested(message) is True
+    assert mask_edit_requested(message) is False
+    tools = tools_for_message(message, "free")
+    assert {"registry_search_packages", "registry_get_package"} <= tools
+    assert tools != {"view_node_mask", "edit_node_mask", "confirm_mask_review"}
 
 
 def test_mask_lane_survives_terse_and_attachment_followups_without_core_tools():
