@@ -575,7 +575,7 @@ export class FL_API {
             turn < CREATED_NODE_NORMALIZATION_MAX_TURNS;
             turn += 1
         ) {
-            const turnObservation = await this._waitForCreatedNodeNormalizationTurn();
+            await this._waitForCreatedNodeNormalizationTurn();
             const observedAt = this._createdNodeNormalizationNow();
             if (observedAt > deadline) break;
             const observation = this._captureWorkflowGuardObservation(guard.pin);
@@ -613,12 +613,15 @@ export class FL_API {
                 );
             }
 
-            const visibleFrame = Boolean(
-                turnObservation?.visible
-                && turnObservation?.frameObserved
-                && globalThis.document?.visibilityState !== "hidden"
-            );
-            if (!visibleFrame) {
+            // A truly hidden document cannot prove anything: browsers pause
+            // rAF entirely while hidden, so the graph token could be stale
+            // and about to jump the moment the tab is shown again. A merely
+            // *unfocused-but-visible* tab is different - rAF can legitimately
+            // starve there (OS/browser throttling), but the graph token is a
+            // live data-model snapshot, not a paint; a missed frame on a
+            // visible tab is not evidence anything is still changing, so it
+            // must not block wall-clock quiescence from counting.
+            if (globalThis.document?.visibilityState === "hidden") {
                 previousGraphToken = observation.graphToken;
                 stableFrames = 0;
                 quietSince = null;

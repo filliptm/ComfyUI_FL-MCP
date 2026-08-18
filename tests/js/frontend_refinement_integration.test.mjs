@@ -1458,6 +1458,91 @@ test("hidden-page node normalization waits for visible lifecycle frames", async 
 });
 
 
+test("visible-tab node normalization settles from wall-clock quiet time even when no frame paints", async () => {
+    const harness = flApiHarness();
+    const visibility = { visibilityState: "visible" };
+    const { Class: FL_API } = await loadFlApi(harness, {
+        canonicalWorkflowJSON,
+        workflowGraphHash,
+        document: visibility,
+    });
+    harness.graphState = {
+        version: 0.4,
+        last_node_id: 0,
+        last_link_id: 0,
+        nodes: [],
+        links: [],
+        groups: [],
+        config: {},
+        extra: {},
+    };
+    const flApi = new FL_API();
+    const pin = flApi.pinActiveWorkflow(flApi.getActiveWorkflowIdentity());
+    const guard = await flApi.createWorkflowMutationGuard(pin);
+
+    harness.graphState.last_node_id = 1;
+    harness.graphState.nodes.push({
+        id: 1,
+        type: "LoadImage",
+        pos: [0, 0],
+        size: [282.798828125, 102],
+        widgets_values: ["source.png", "image"],
+        properties: {},
+    });
+    const checkpoint = flApi.captureCreatedNodeNormalizationCheckpoint(guard, {
+        node_id: 1,
+        node_type: "LoadImage",
+        definition_id: null,
+    });
+
+    let now = 0;
+    const pendingTurns = [];
+    flApi._createdNodeNormalizationNow = () => now;
+    flApi._waitForCreatedNodeNormalizationTurn = () => new Promise(resolve => {
+        pendingTurns.push(resolve);
+    });
+
+    let settled = false;
+    const acceptance = flApi.acceptCreatedNodeNormalization(guard, checkpoint)
+        .then(value => {
+            settled = true;
+            return value;
+        });
+
+    // The document reports "visible" the entire time (never hidden), but the
+    // rAF watchdog times out on every turn before a frame paints - e.g. an
+    // unfocused-but-visible window under OS/browser rAF throttling. A missed
+    // paint on a genuinely visible tab is not evidence the graph is still
+    // changing; the graph token (a data-model snapshot) is the real signal,
+    // and it must still be able to settle from wall-clock quiescence alone.
+    // Waiting must yield a real timer turn, not just microtasks: the
+    // acceptance path hashes the graph with the real workflowGraphHash,
+    // which resolves via WebCrypto's macrotask, not a microtask.
+    const waitForEvent = async (predicate, maxAttempts = 200) => {
+        for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+            if (predicate()) return true;
+            await new Promise(resolve => setTimeout(resolve, 0));
+        }
+        return false;
+    };
+
+    for (let i = 0; i < 8; i += 1) {
+        const arrived = await waitForEvent(() => pendingTurns.length > 0 || settled);
+        if (!arrived || settled) break;
+        now += 60;
+        pendingTurns.shift()({ visible: true, frameObserved: false });
+    }
+
+    assert.equal(
+        await waitForEvent(() => settled),
+        true,
+        "wall-clock-quiet turns without a rendered frame must still settle",
+    );
+    const acceptedHash = await acceptance;
+    assert.equal(guard.expectedGraphHash, acceptedHash);
+    assert.equal(guard.expectedGraphHash, await workflowGraphHash(harness.graphState));
+});
+
 
 test("inactive transaction cleanup never calls a private tracker afterChange or masks failure", async () => {
     const harness = flApiHarness();
