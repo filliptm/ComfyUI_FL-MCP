@@ -931,10 +931,19 @@ def test_explicit_mask_topology_stays_in_graphpatch_lane():
 @pytest.mark.parametrize(
     "message",
     (
+        # The first two are real user messages, verbatim (typos included),
+        # that were misrouted into the mask lane in production - "searching"
+        # (progressive form) initially slipped past a bare-stem verb match.
+        "Hey, I`m searching for new advanced masking nodes",
+        "can you find me new nodes for advanceed image masking pls",
         "Can you find me new nodes for advanced image masking?",
         "find new masking nodes",
+        "search the ComfyUI Registry for advanced masking packs",
         "search for a better mask node so we can improve inpainting",
+        "I was looking for a better mask node pack",
         "recommend some node packs for masking",
+        "browse the registry for segmentation nodes",
+        "exploring new inpainting plugins",
     ),
 )
 def test_node_discovery_request_naming_masking_is_not_swallowed_by_mask_lane(message):

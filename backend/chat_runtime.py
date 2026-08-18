@@ -433,9 +433,14 @@ def explicit_topology_change_requested(message: str) -> bool:
 # mask-edit detector below matches on, but it asks to discover node packages,
 # not to edit a mask already on the canvas - it must not be swallowed into
 # the narrow mask-editing tool lane, which has no registry/discovery tools.
+# Verbs deliberately accept their progressive/past forms ("I'm searching
+# for...", "I was looking for...") - matching only the bare stem silently
+# missed exactly the phrasings real users type.
 _NODE_DISCOVERY_INTENT_PATTERN = re.compile(
-    r"\b(?:find|search(?:\s+for)?|look(?:ing)?\s+for|discover|recommend|suggest)\b"
-    r".{0,40}\b(?:new\s+)?(?:nodes?|node\s+packs?|packages?|extensions?|plugins?)\b",
+    r"\b(?:find(?:ing)?|search(?:ing|ed)?|look(?:ing|ed)?\s+for|browse|browsing|"
+    r"explor(?:e|ing)|hunt(?:ing)?|discover(?:ing)?|recommend|suggest)\b"
+    r".{0,60}\b(?:new\s+)?(?:nodes?|node\s+packs?|packs?|packages?|"
+    r"extensions?|plugins?|registry|registries)\b",
     re.IGNORECASE,
 )
 
