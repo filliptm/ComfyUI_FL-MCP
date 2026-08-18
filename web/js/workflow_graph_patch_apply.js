@@ -3102,10 +3102,16 @@ function ledgerWithEntry(ledger, applicationId, entry) {
 }
 
 
+// A newly-created node's own normalization guard wait already paces its
+// appearance on the canvas, so node creation gets no extra delay here (see
+// the "node" phase reveal call below). This only paces the steps that have
+// no guard-driven wait of their own - edges, attachments, removals - so the
+// canvas doesn't redraw every link in the same instant.
+const GRAPH_PATCH_REVEAL_DELAY_MS = 100;
+
 function revealDelayMs(stepCount) {
     if (!Number.isInteger(stepCount) || stepCount <= 0) return 0;
-    const budget = Math.min(12_000, Math.max(3_500, stepCount * 300));
-    return Math.max(0, Math.min(700, Math.floor(budget / stepCount)));
+    return GRAPH_PATCH_REVEAL_DELAY_MS;
 }
 
 
@@ -4391,7 +4397,9 @@ export async function applyWorkflowGraphPatchAtomic(rawRequest, adapter) {
             } else {
                 await finishCreatedValues();
             }
-            await reveal(graphAdapter, { phase: "node", node_id: id, alias: created.alias }, delayMs);
+            // No extra pacing here: acceptCreatedNodeNormalization already
+            // waited out this node's own settling time.
+            await reveal(graphAdapter, { phase: "node", node_id: id, alias: created.alias }, 0);
         }
 
         for (const update of request.plan.update_nodes) {
