@@ -4,6 +4,7 @@ import test from "node:test";
 import {
     NarrowEditOperationLedger,
     canonicalNarrowOperationHash,
+    canonicalTypedText,
     validateNarrowOperationId,
 } from "../../web/js/narrow_edit_idempotency.js";
 
@@ -38,6 +39,72 @@ test("browser and backend typed canonical hash vectors remain identical", async 
         }),
         "e4ccc8b3329096322f2358b9c233be473a78d8291eeeedae64406dc5a8dfc50a",
     );
+});
+
+
+test("an undefined object property is dropped like JSON.stringify, not rejected", () => {
+    // Live regression: ComfyUI's own app.graphToPrompt() serializer includes
+    // fields like workflow.definitions as undefined (not omitted, not null)
+    // when there is nothing to define - a real, benign value from ComfyUI
+    // itself, not a bug in the user's workflow. JSON.stringify has always
+    // silently dropped undefined-valued object properties; canonicalTypedText
+    // must match that instead of erroring on every such payload.
+    const workflowShaped = {
+        output: {
+            "12": { class_type: "SaveImage", inputs: { filename_prefix: "out" } },
+        },
+        workflow: { nodes: [], definitions: undefined },
+    };
+    assert.equal(
+        canonicalTypedText(workflowShaped),
+        canonicalTypedText({
+            output: { "12": { class_type: "SaveImage", inputs: { filename_prefix: "out" } } },
+            workflow: { nodes: [] },
+        }),
+    );
+});
+
+
+test("an undefined array element is rendered as null like JSON.stringify", () => {
+    assert.equal(
+        canonicalTypedText([1, undefined, 3]),
+        canonicalTypedText([1, null, 3]),
+    );
+});
+
+
+test("a non-plain object nested in a payload names its exact path", () => {
+    assert.throws(
+        () => canonicalTypedText({ nodes: [{ widgets_values: new Map() }] }),
+        error => (
+            error?.code === "narrow_edit_payload_invalid"
+            && error.message.includes("$.nodes[0].widgets_values")
+        ),
+    );
+});
+
+
+test("a function value nested in a payload names its exact path", () => {
+    assert.throws(
+        () => canonicalTypedText({ output: { "34": { inputs: { callback: () => {} } } } }),
+        error => (
+            error?.code === "narrow_edit_payload_invalid"
+            && error.message.includes("$.output.34.inputs.callback")
+        ),
+    );
+});
+
+
+test("path tracking never changes the canonical text for valid payloads", async () => {
+    // The path suffix is diagnostic-only, used solely inside thrown error
+    // messages - it must never leak into the returned canonical text, since
+    // that text is hashed and compared against the backend's independently
+    // computed hash. The hardcoded cross-language vector test above already
+    // proves this end-to-end; this checks the property directly.
+    const withPath = canonicalTypedText({ a: [1, "x", true, null], b: 1 }, "some.custom.$path");
+    const withDefaultPath = canonicalTypedText({ b: 1, a: [1, "x", true, null] });
+    assert.equal(withPath, withDefaultPath);
+    assert.equal(withPath.includes("some.custom"), false);
 });
 
 

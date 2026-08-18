@@ -565,7 +565,7 @@ export class ToolExecutor {
     }
 
     async _handleWorkflowOverview(params) {
-        return this.queryExecutor.getWorkflowOverview();
+        return await this.queryExecutor.getWorkflowOverview();
     }
 
     async _handleWorkflowDiagram(params) {
