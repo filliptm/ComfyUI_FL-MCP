@@ -313,8 +313,13 @@ class _FakeCatalogClient:
         self.data = _catalog()
         self.catalog_hash = catalog_contract_hash(self.data)
 
-    async def catalog_snapshot(self, *, force_refresh: bool = False) -> NodeCatalogSnapshot:
-        assert force_refresh is True
+    async def catalog_snapshot(
+        self,
+        *,
+        force_refresh: bool = False,
+        max_age_seconds: float | None = None,
+    ) -> NodeCatalogSnapshot:
+        assert max_age_seconds == mcp_server.STRICT_CATALOG_FRESHNESS_SECONDS
         return NodeCatalogSnapshot(
             data=self.data,
             source=self.source,

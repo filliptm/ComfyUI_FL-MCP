@@ -248,18 +248,19 @@ class NodeLibraryCache:
         self._clock = clock
         self._lock = asyncio.Lock()
 
-    async def get(self) -> NodeCatalogSnapshot | None:
-        """Get cached data if valid."""
+    async def get(self, *, max_age_seconds: float | None = None) -> NodeCatalogSnapshot | None:
+        """Get cached data if valid, optionally against a stricter horizon than the TTL."""
         async with self._lock:
             if self._snapshot is None:
                 return None
 
             age = self._clock() - self._snapshot.fetched_at
-            if age > self._ttl:
-                logger.debug(f"[NodeLibrary] Cache expired (age: {age:.1f}s)")
+            horizon = self._ttl if max_age_seconds is None else max_age_seconds
+            if age > horizon:
+                logger.debug(f"[NodeLibrary] Cache expired (age: {age:.1f}s, horizon: {horizon:.1f}s)")
                 return None
 
-            logger.debug(f"[NodeLibrary] Cache hit (age: {age:.1f}s)")
+            logger.debug(f"[NodeLibrary] Cache hit (age: {age:.1f}s, horizon: {horizon:.1f}s)")
             return self._snapshot
 
     async def set(self, data: dict[str, Any], source: str) -> NodeCatalogSnapshot:
@@ -432,8 +433,18 @@ class NodeLibraryClient:
                 persistence=persistence,
             )
 
-    async def fetch_node_library(self, *, force_refresh: bool = False) -> dict[str, Any]:
+    async def fetch_node_library(
+        self,
+        *,
+        force_refresh: bool = False,
+        max_age_seconds: float | None = None,
+    ) -> dict[str, Any]:
         """Fetch node library from ComfyUI /object_info endpoint.
+
+        ``max_age_seconds`` lets a caller that needs a near-current catalog
+        (e.g. before pinning a compile/apply hash) skip a real re-fetch when
+        the cache is already fresh enough, without accepting the full
+        cache_ttl staleness window ``force_refresh=False`` alone would allow.
 
         Returns:
             Dictionary mapping node type names to node metadata
@@ -442,13 +453,13 @@ class NodeLibraryClient:
             NodeLibraryConnectionError: If ComfyUI server is unreachable
         """
         if not force_refresh:
-            cached = await self.cache.get()
+            cached = await self.cache.get(max_age_seconds=max_age_seconds)
             if cached is not None:
                 return cached.data
 
         async with self._fetch_lock:
             if not force_refresh:
-                cached = await self.cache.get()
+                cached = await self.cache.get(max_age_seconds=max_age_seconds)
                 if cached is not None:
                     return cached.data
 
@@ -497,9 +508,10 @@ class NodeLibraryClient:
         self,
         *,
         force_refresh: bool = False,
+        max_age_seconds: float | None = None,
     ) -> NodeCatalogSnapshot:
         """Return one internally consistent catalog data/hash generation."""
-        await self.fetch_node_library(force_refresh=force_refresh)
+        await self.fetch_node_library(force_refresh=force_refresh, max_age_seconds=max_age_seconds)
         snapshot = await self.cache.snapshot()
         if snapshot is None:
             raise NodeLibraryError("Loaded-node catalog snapshot is unavailable")

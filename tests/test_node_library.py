@@ -369,6 +369,45 @@ def test_cached_fetch_and_force_refresh_replace_catalog_generation(monkeypatch):
     assert first_status["catalog_hash"] != second_status["catalog_hash"]
 
 
+def test_max_age_seconds_serves_the_cache_within_its_own_short_horizon(monkeypatch):
+    first = {"KSampler": node_info(display_name="First")}
+    second = {"KSampler": node_info(display_name="Second")}
+    requests = install_fake_http(monkeypatch, [(200, first), (200, second)])
+    now = [100.0]
+
+    async def run():
+        client = NodeLibraryClient("http://comfy", cache_ttl=300, clock=lambda: now[0])
+        initial = await client.fetch_node_library(max_age_seconds=3.0)
+        now[0] = 102.0
+        within_horizon = await client.fetch_node_library(max_age_seconds=3.0)
+        return initial, within_horizon
+
+    initial, within_horizon = asyncio.run(run())
+
+    assert initial == within_horizon == first
+    assert requests == ["http://comfy/object_info"]
+
+
+def test_max_age_seconds_refetches_once_its_own_horizon_elapses(monkeypatch):
+    first = {"KSampler": node_info(display_name="First")}
+    second = {"KSampler": node_info(display_name="Second")}
+    requests = install_fake_http(monkeypatch, [(200, first), (200, second)])
+    now = [100.0]
+
+    async def run():
+        client = NodeLibraryClient("http://comfy", cache_ttl=300, clock=lambda: now[0])
+        initial = await client.fetch_node_library(max_age_seconds=3.0)
+        now[0] = 104.0
+        past_horizon = await client.fetch_node_library(max_age_seconds=3.0)
+        return initial, past_horizon
+
+    initial, past_horizon = asyncio.run(run())
+
+    assert initial == first
+    assert past_horizon == second
+    assert requests == ["http://comfy/object_info", "http://comfy/object_info"]
+
+
 def test_bound_persistence_reconciles_only_fresh_http_generations(monkeypatch):
     first = {"KSampler": node_info(display_name="First")}
     second = {"KSampler": node_info(display_name="Second")}

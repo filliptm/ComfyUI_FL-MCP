@@ -201,8 +201,8 @@ class FakeCatalogClient:
     def __init__(self, catalog_hash=CATALOG_HASH):
         self.catalog_hash = catalog_hash
 
-    async def catalog_snapshot(self, *, force_refresh=False):
-        assert force_refresh is True
+    async def catalog_snapshot(self, *, force_refresh=False, max_age_seconds=None):
+        assert max_age_seconds == mcp_server.STRICT_CATALOG_FRESHNESS_SECONDS
         return NodeCatalogSnapshot(
             data=catalog(),
             source=self.source,
